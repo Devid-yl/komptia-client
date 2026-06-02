@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ report_title | default('Rapport') }} - {{ company_name }}{% endblock %}
+
+{% block content %}
+<h2>{{ report_title | default('Votre Rapport') }}</h2>
+
+<p>Bonjour {{ recipient_name | default('Cher client') }},</p>
+
+<p>Veuillez trouver ci-joint votre rapport <strong>{{ report_title }}</strong> pour la période du <strong>{{ period_start }}</strong> au <strong>{{ period_end }}</strong>.</p>
+
+{% if summary %}
+<div class="info-box">
+    <p><strong>Résumé du rapport :</strong></p>
+    <p>{{ summary }}</p>
+</div>
+{% endif %}
+
+{% if key_figures %}
+<div class="info-box">
+    <p><strong>Chiffres clés :</strong></p>
+    {% for figure in key_figures %}
+    <p>• {{ figure }}</p>
+    {% endfor %}
+</div>
+{% endif %}
+
+{% if notes %}
+<p><strong>Notes importantes :</strong></p>
+<p>{{ notes }}</p>
+{% endif %}
+
+{% if cta_url %}
+<p style="text-align: center;">
+    <a href="{{ cta_url }}" class="button-cta">{{ cta_text | default('Consulter le rapport en ligne') }}</a>
+</p>
+{% endif %}
+
+<p>Le fichier PDF est joint à cet email. Si vous avez des questions concernant ce rapport, n'hésitez pas à nous contacter.</p>
+
+<p>Cordialement,<br>
+<strong>{{ sender_name | default("L'équipe de " ~ company_name) }}</strong></p>
+{% endblock %}

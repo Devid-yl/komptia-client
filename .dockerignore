@@ -1,0 +1,103 @@
+# Git
+.git
+.gitignore
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Data (montée en volume)
+data/
+
+# Tests (pas en production)
+tests/
+
+# Docs (sources exclues) — SAUF les guides PDF par rôle, servis dans
+# /settings → Aide. On exclut le CONTENU de docs/ (docs/*) et NON le dossier
+# lui-même (docs/) : exclure le dossier parent interdirait toute ré-inclusion
+# (règle Docker : « pas de ré-inclusion si un parent est exclu »). Whitelist :
+# on ne ré-inclut QUE les .pdf de docs/guides/ (pas les .md / .html / captures/
+# / fichiers temporaires _tmp_guide_*). Un nouveau .pdf généré par
+# scripts/build_guides.py est embarqué automatiquement.
+docs/*
+!docs/guides/
+docs/guides/*
+!docs/guides/*.pdf
+*.md
+
+# Dev files
+.env
+.env.example
+Makefile
+pyproject.toml
+modificationsFazia_verification.txt
+
+# Outils .NET
+SqlQueryComparer/
+
+# Scripts dev — exclure tout sauf les scripts utiles en prod (bootstrap)
+# Approche whitelist : un nouveau script dev ajouté est exclu par défaut.
+scripts/*.py
+scripts/*.sh
+!scripts/__init__.py
+!scripts/db_init.py
+!scripts/seed_admin.py
+!scripts/prefetch_models.py
+# pipeline.py = cœur NL→SQL d'Iris, importé au RUNTIME par pipeline_runner.py
+# (run_pipeline), ir_mutator.py et agent_tools.py. Sans lui dans l'image, toute
+# requête analytique Iris crashe en ModuleNotFoundError côté client.
+!scripts/pipeline.py
+# preflight.py = validation config déploiement, exécutée DANS le conteneur par
+# `make first-run` (compose exec app python -m scripts.preflight) avant db_init.
+!scripts/preflight.py
+# vacuum_db.py = reclaim disque, exécuté DANS un conteneur one-shot par
+# `make vacuum` (compose run --rm app python -m scripts.vacuum_db) → doit être
+# dans l'image. Sans ça, `make vacuum` échoue côté client (ModuleNotFoundError).
+!scripts/vacuum_db.py
+
+# Backups locaux (jamais dans une image)
+backups/
+
+# Fichiers de sauvegarde manuels — JAMAIS dans l'image livrée. Sans ce filtre,
+# un `static/**/*.bak` part via `COPY static/` et devient servable publiquement
+# (fuite de code source front obsolète, cf. audit S7). Couvre aussi les
+# snapshots .md de docs (`*.backup_<date>.md`).
+*.bak
+*.backup
+*.backup_*.md
+
+# Sauvegardes auto avant restore
+.env.before-restore-*
+config.yaml.before-restore-*
+
+# config/ — whitelist stricte (même doctrine que scripts/ et docs/guides).
+# Le Dockerfile fait `COPY config/ config/` ; sans ce filtre, tout fichier futur
+# déposé sous config/ (ex: un config/secrets.local.*) partirait silencieusement
+# dans l'image livrée au client. On ne ré-inclut QUE le .cnf legacy nécessaire.
+config/*
+!config/openssl_legacy.cnf
+
+# Tmpdirs make backup/restore
+.komptia-tmp.*
+
+# graphify (artefact dev, non utilisé en prod)
+graphify-out/
+
+# Logs LLM (PII)
+llm_log.md
+
+# Outputs apex
+.claude/output/

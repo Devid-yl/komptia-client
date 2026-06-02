@@ -1,0 +1,14 @@
+# requirements.lock — versions transitives FIGÉES pour un build reproductible.
+#
+# VIDE par défaut (commentaires seuls) → le Dockerfile retombe AUTOMATIQUEMENT sur
+# requirements.txt (= comportement actuel, zéro changement de build).
+#
+# Pour activer le build reproductible :
+#   1. Sur un hôte Linux/Docker : `make lock` (génère les pins DANS python:3.12-slim
+#      — JAMAIS sur Mac, les wheels macOS produiraient un lock faux pour Linux).
+#   2. Vérifier `git diff requirements.lock` puis committer ce fichier.
+# Le Dockerfile détecte alors les lignes de pins (non commentées) et installe
+# `-r requirements.lock` à la place de requirements.txt.
+#
+# NB : torch est volontairement EXCLU du lock (il est installé séparément via
+# l'index CPU par le Dockerfile ; son tag `+cpu` n'est pas résoluble sur PyPI).

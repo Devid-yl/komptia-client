@@ -1,0 +1,402 @@
+# Pattern store d'Iris — motifs analytiques réutilisables.
+#
+# PRINCIPES CRITIQUES (à respecter pour chaque nouveau motif) :
+#
+# 1. ZÉRO nom de table/colonne spécifique à une BDD particulière.
+#    Les placeholders utilisent des rôles génériques : <fact_table>,
+#    <measure_column>, <time_expression>, <scope_filter>, etc.
+#
+# 2. La structure SQL doit être VALIDE en T-SQL SQL Server (dialecte
+#    du projet). Évite les extensions propriétaires PostgreSQL/MySQL.
+#
+# 3. Les signatures de question sont GÉNÉRIQUES (pas de "SOFIGEC",
+#    pas de "EXPERTYS"…). Si une signature contient un mot métier,
+#    c'est un mot générique universellement valide (CA, balance,
+#    top, évolution…).
+#
+# 4. Le `sql_skeleton` est une INSPIRATION — le LLM doit l'instancier
+#    avec ses propres outils (search_schema / introspect_table). Il
+#    peut être plus long que strictement nécessaire pour montrer les
+#    "bonnes pratiques" du motif (CTE au lieu de sous-requêtes, LEFT
+#    JOIN par défaut, CAST explicite pour les montants…).
+#
+# 5. Chaque motif a un `slug` stable (ne jamais changer — le matcher
+#    et les logs y réfèrent). Les modifications évolutives se font
+#    dans `description`, `signatures`, `sql_skeleton`.
+
+patterns:
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: rollup_multi_dim_with_window_totals
+    name: "Rollup multi-dimensionnel avec totaux superposés"
+    description: |
+      L'utilisateur demande une mesure agrégée sur plusieurs dimensions
+      et s'attend à voir les totaux à chaque niveau (par ligne, par
+      dimension principale, par période, général). Pattern canonique :
+      CTE préparatoire + GROUP BY + window functions SUM(SUM(x)) OVER.
+    min_score: 2.0
+    question_signatures:
+      - pattern: "(chiffre d'affaires|vente|CA|total|montant|revenu|recette)"
+        weight: 1.0
+      - pattern: "\\bpar\\b.+\\bpar\\b|\\bpar\\b.+\\bet\\b"
+        weight: 1.5       # plusieurs dimensions
+      - pattern: "(exercice|année|annee|mois|trimestre|période|periode)"
+        weight: 0.8
+      - pattern: "(expert|collab|responsable|signataire|agent|vendeur|porteur)"
+        weight: 0.6
+      - pattern: "(categ|type|statistique|famille|classe|segment)"
+        weight: 0.6
+    required_inputs:
+      - name: fact_table
+        role: fact_source
+        description: "Table (ou vue) de faits contenant la mesure à agréger."
+      - name: measure_column
+        role: aggregable_number
+        description: "Colonne numérique à sommer (montant, quantité…)."
+      - name: time_expression
+        role: time_dimension
+        description: "Expression temporelle — soit une colonne directe, soit un calcul (YEAR/MONTH, CASE fiscal…)."
+      - name: primary_dimension
+        role: entity_or_category
+        description: "Dimension principale de regroupement (acteur ou catégorie)."
+      - name: secondary_dimension
+        role: entity_or_category
+        description: "Seconde dimension (classification, sous-type…)."
+      - name: scope_filters
+        role: where_filters
+        description: "Filtres WHERE mentionnés dans la question (valeurs IN, plages, exclusions NOT IN…)."
+    sql_skeleton: |
+      -- Pattern : Rollup multi-dim avec totaux superposés.
+      -- Étape 1 : CTE prépare les données au bon niveau de granularité.
+      WITH base AS (
+        SELECT
+          <time_expression> AS period,
+          <primary_dimension> AS dim_primary,
+          <secondary_dimension> AS dim_secondary,
+          CAST(<measure_column> AS DECIMAL(38, 2)) AS measure
+        FROM <fact_table> AS f
+        LEFT JOIN <auxiliary_tables> AS aux ON f.<fk_to_aux> = aux.<pk>
+        WHERE <scope_filters>
+      )
+      -- Étape 2 : agrégation + totaux superposés via window functions.
+      SELECT
+        period,
+        dim_primary,
+        dim_secondary,
+        SUM(measure) AS total,
+        SUM(SUM(measure)) OVER (PARTITION BY dim_primary, dim_secondary) AS total_all_periods,
+        SUM(SUM(measure)) OVER (PARTITION BY period, dim_primary) AS total_primary_per_period,
+        SUM(SUM(measure)) OVER (PARTITION BY period) AS total_per_period,
+        SUM(SUM(measure)) OVER () AS grand_total
+      FROM base
+      GROUP BY period, dim_primary, dim_secondary
+      ORDER BY period, dim_primary, dim_secondary;
+    tags: [rollup, window, multi_dimension, financial]
+    owner: system
+    last_validated: "2026-04-17"
+    examples:
+      - question: "Donne-moi le CA par expert et par catégorie sur les 3 derniers exercices"
+        should_match: true
+      - question: "Liste les factures du dossier X"
+        should_match: false
+      - question: "Combien de clients on a ?"
+        should_match: false
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: aggregate_single_dimension_with_filter
+    name: "Agrégation par une dimension avec filtre de scope"
+    description: |
+      L'utilisateur demande une mesure agrégée selon UNE dimension
+      avec un filtre explicite (client, période, catégorie). Le plus
+      simple mais aussi le plus fréquent. Pas de window function
+      nécessaire — GROUP BY suffit.
+    min_score: 1.5
+    question_signatures:
+      - pattern: "(total|somme|sum|moyenne|count|combien)"
+        weight: 1.0
+      - pattern: "\\bpar\\b\\s+\\w+"
+        weight: 1.0
+      - pattern: "(pour |du |de la |en )"
+        weight: 0.5  # filtre explicite probable
+    required_inputs:
+      - name: fact_table
+        role: fact_source
+        description: "Table/vue de faits."
+      - name: measure_column
+        role: aggregable_number
+        description: "Colonne à agréger (ou étoile pour COUNT)."
+      - name: dimension
+        role: dimension_column
+        description: "Dimension de regroupement."
+      - name: scope_filter
+        role: where_filter
+        description: "Au moins un filtre WHERE qui cadre le scope."
+    sql_skeleton: |
+      -- Pattern : agrégat simple par dimension avec filtre.
+      SELECT
+        <dimension> AS dim,
+        SUM(CAST(<measure_column> AS DECIMAL(38, 2))) AS total
+      FROM <fact_table>
+      WHERE <scope_filter>
+      GROUP BY <dimension>
+      ORDER BY total DESC;
+    tags: [aggregate, simple, scope_filter]
+    owner: system
+    last_validated: "2026-04-17"
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: year_over_year_comparison
+    name: "Comparaison année sur année (YoY) par dimension"
+    description: |
+      L'utilisateur veut comparer une mesure entre 2 (ou N) périodes
+      — 2024 vs 2023, mois N vs mois N-1, etc. Plusieurs formes
+      valides : GROUP BY period + pivot, CASE WHEN pour des colonnes
+      fixes, LAG() window function, self-join sur périodes.
+      Le motif donne la version la plus générique (GROUP BY period
+      + colonnes côte-à-côte via CASE).
+    min_score: 1.5
+    question_signatures:
+      - pattern: "(compar|évolution|evolution|vs|versus|N-1|rapport\\s+à)"
+        weight: 1.5
+      - pattern: "(entre|de\\s+\\d{4}\\s+à\\s+\\d{4}|sur\\s+\\d+\\s+ans)"
+        weight: 1.0
+      - pattern: "(mois|année|annee|trimestre|semestre)"
+        weight: 0.5
+    required_inputs:
+      - name: fact_table
+        role: fact_source
+      - name: measure_column
+        role: aggregable_number
+      - name: time_expression
+        role: time_dimension
+        description: "Dimension temporelle au GRAIN demandé (année, mois…)."
+      - name: group_dimension
+        role: optional_dimension
+        description: "Dimension secondaire si l'utilisateur veut comparer par segment."
+    sql_skeleton: |
+      -- Pattern : comparaison temporelle par dimension.
+      SELECT
+        <group_dimension> AS dim,
+        SUM(CASE WHEN <time_expression> = <period_current> THEN <measure_column> ELSE 0 END) AS current_period,
+        SUM(CASE WHEN <time_expression> = <period_previous> THEN <measure_column> ELSE 0 END) AS previous_period,
+        -- Évolution absolue + %. Gérer le div by zero côté previous_period.
+        SUM(CASE WHEN <time_expression> = <period_current> THEN <measure_column> ELSE 0 END)
+          - SUM(CASE WHEN <time_expression> = <period_previous> THEN <measure_column> ELSE 0 END) AS diff_abs
+      FROM <fact_table>
+      WHERE <time_expression> IN (<period_current>, <period_previous>)
+      GROUP BY <group_dimension>
+      ORDER BY dim;
+    tags: [yoy, comparison, temporal]
+    owner: system
+    last_validated: "2026-04-17"
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: top_n_by_measure
+    name: "Top N par mesure (classement)"
+    description: |
+      L'utilisateur veut "les N plus gros/petits/meilleurs/pires"
+      d'une dimension selon une mesure. TOP + ORDER BY est la solution
+      canonique en T-SQL. Attention au non-déterminisme si plusieurs
+      lignes ont la même valeur sur la colonne de tri.
+    min_score: 1.5
+    question_signatures:
+      - pattern: "(top\\s*\\d+|les\\s*\\d+\\s*(plus|meilleurs|gros|grands))"
+        weight: 2.0
+      - pattern: "(classement|ranking|palmarès)"
+        weight: 1.5
+      - pattern: "(plus grand|plus gros|plus élevé|meilleur|pire|moins)"
+        weight: 1.0
+    required_inputs:
+      - name: fact_table
+        role: fact_source
+      - name: measure_column
+        role: sortable_number
+      - name: dimension
+        role: entity_dimension
+      - name: n
+        role: limit_count
+        description: "Nombre de résultats demandés (par défaut 10)."
+    sql_skeleton: |
+      -- Pattern : Top N.
+      SELECT TOP (<n>)
+        <dimension> AS entity,
+        SUM(CAST(<measure_column> AS DECIMAL(38, 2))) AS total
+      FROM <fact_table>
+      WHERE <scope_filters>
+      GROUP BY <dimension>
+      ORDER BY total DESC;  -- Stabilise les ties en ajoutant une colonne secondaire si besoin
+    tags: [top_n, ranking]
+    owner: system
+    last_validated: "2026-04-17"
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: rolling_total_by_period
+    name: "Total cumulé (rolling) par période"
+    description: |
+      L'utilisateur veut voir l'évolution d'un cumul au fil du temps
+      (CA cumulé depuis le début de l'année, encours progressif…).
+      Pattern : GROUP BY period + SUM() OVER (ORDER BY period ROWS
+      UNBOUNDED PRECEDING).
+    min_score: 1.5
+    question_signatures:
+      - pattern: "(cumul|rolling|progressif|depuis le début|en cumulé)"
+        weight: 2.0
+      - pattern: "(évolution|evolution|par\\s+(mois|jour|semaine))"
+        weight: 1.0
+    required_inputs:
+      - name: fact_table
+        role: fact_source
+      - name: measure_column
+        role: aggregable_number
+      - name: time_expression
+        role: time_dimension
+    sql_skeleton: |
+      -- Pattern : total cumulé par période.
+      WITH periods AS (
+        SELECT
+          <time_expression> AS period,
+          SUM(CAST(<measure_column> AS DECIMAL(38, 2))) AS period_total
+        FROM <fact_table>
+        WHERE <scope_filters>
+        GROUP BY <time_expression>
+      )
+      SELECT
+        period,
+        period_total,
+        SUM(period_total) OVER (ORDER BY period ROWS UNBOUNDED PRECEDING) AS cumulative_total
+      FROM periods
+      ORDER BY period;
+    tags: [rolling, cumulative, temporal]
+    owner: system
+    last_validated: "2026-04-17"
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: aging_bucket_distribution
+    name: "Balance âgée / distribution par tranche d'âge"
+    description: |
+      L'utilisateur veut classifier des éléments dans des tranches
+      d'âge (échéances < 30 jours, 30-60j, 60-90j, >90j…). Pattern :
+      CASE WHEN DATEDIFF(...) BETWEEN... + SUM conditionnels, OU
+      bucketing explicite avec CROSS APPLY.
+    min_score: 1.5
+    question_signatures:
+      - pattern: "(balance\\s*âgée|aging|échéance|relance|retard)"
+        weight: 2.0
+      - pattern: "(\\d+\\s*(j|jour|day))"
+        weight: 1.0
+      - pattern: "(tranche|bucket|catégorie d'âge)"
+        weight: 1.0
+    required_inputs:
+      - name: fact_table
+        role: fact_source
+      - name: reference_date_column
+        role: date_column
+        description: "Colonne date de référence (échéance, création…)."
+      - name: measure_column
+        role: aggregable_number
+    sql_skeleton: |
+      -- Pattern : balance âgée / buckets d'âge.
+      SELECT
+        CASE
+          WHEN DATEDIFF(day, <reference_date_column>, GETDATE()) <= 30 THEN '0-30j'
+          WHEN DATEDIFF(day, <reference_date_column>, GETDATE()) <= 60 THEN '31-60j'
+          WHEN DATEDIFF(day, <reference_date_column>, GETDATE()) <= 90 THEN '61-90j'
+          ELSE '>90j'
+        END AS age_bucket,
+        SUM(CAST(<measure_column> AS DECIMAL(38, 2))) AS total,
+        COUNT(*) AS row_count
+      FROM <fact_table>
+      WHERE <scope_filters>
+      GROUP BY
+        CASE
+          WHEN DATEDIFF(day, <reference_date_column>, GETDATE()) <= 30 THEN '0-30j'
+          WHEN DATEDIFF(day, <reference_date_column>, GETDATE()) <= 60 THEN '31-60j'
+          WHEN DATEDIFF(day, <reference_date_column>, GETDATE()) <= 90 THEN '61-90j'
+          ELSE '>90j'
+        END
+      ORDER BY age_bucket;
+    tags: [aging, bucket, temporal_distribution]
+    owner: system
+    last_validated: "2026-04-17"
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: hierarchical_scope_rollup
+    name: "Rollup avec scope hiérarchique (parent + descendants)"
+    description: |
+      L'utilisateur veut des données pour une entité ET ses enfants
+      dans une hiérarchie (groupe + filiales, compte + sous-comptes).
+      Pattern : CTE récursive qui remonte la hiérarchie + JOIN sur
+      le scope élargi.
+    min_score: 1.5
+    question_signatures:
+      - pattern: "(groupe|hiérarchie|hierarchie|filiale|descendants?|sous-)"
+        weight: 2.0
+      - pattern: "(et ses|et son|avec ses|y compris|inclus)"
+        weight: 1.0
+    required_inputs:
+      - name: hierarchy_table
+        role: self_referencing_table
+        description: "Table avec une colonne parent_id qui pointe vers id."
+      - name: root_entity_id
+        role: scalar_or_list
+        description: "ID(s) des entités racines de la descendance voulue."
+      - name: fact_table
+        role: fact_source
+      - name: measure_column
+        role: aggregable_number
+    sql_skeleton: |
+      -- Pattern : scope hiérarchique via CTE récursive.
+      WITH scope AS (
+        -- Ancre : les racines demandées
+        SELECT id FROM <hierarchy_table> WHERE id IN (<root_entity_id>)
+        UNION ALL
+        -- Récursion : descendants niveau N
+        SELECT h.id
+        FROM <hierarchy_table> h
+        INNER JOIN scope s ON h.<parent_fk> = s.id
+      )
+      SELECT
+        <dimension> AS dim,
+        SUM(CAST(<measure_column> AS DECIMAL(38, 2))) AS total
+      FROM <fact_table> f
+      INNER JOIN scope sc ON f.<fk_to_hierarchy> = sc.id
+      WHERE <additional_filters>
+      GROUP BY <dimension>
+      ORDER BY total DESC;
+    tags: [hierarchy, recursive_cte, scope]
+    owner: system
+    last_validated: "2026-04-17"
+
+  # ──────────────────────────────────────────────────────────────────
+  - slug: filtered_list_no_aggregation
+    name: "Liste filtrée (pas d'agrégation)"
+    description: |
+      L'utilisateur veut juste VOIR des lignes — liste de clients,
+      factures, contrats… Pas d'agrégat attendu. Le motif est
+      intentionnellement simple et sert de garde-fou : si Iris est
+      tentée d'agréger par défaut, ce motif lui rappelle qu'un SELECT
+      plat est parfois la bonne réponse.
+    min_score: 1.0
+    question_signatures:
+      - pattern: "^(liste|affiche|montre|donne|quels|qui sont|qui ont|lister|montrer)"
+        weight: 1.5
+      - pattern: "(detail|ligne par ligne|chaque)"
+        weight: 1.0
+    required_inputs:
+      - name: fact_table
+        role: source_table
+      - name: columns
+        role: projection_columns
+        description: "Colonnes à projeter dans le SELECT."
+      - name: filters
+        role: where_filters
+    sql_skeleton: |
+      -- Pattern : liste simple sans agrégat.
+      SELECT
+        <columns>
+      FROM <fact_table>
+      WHERE <filters>
+      ORDER BY <stable_sort_column>;
+    tags: [list, simple]
+    owner: system
+    last_validated: "2026-04-17"

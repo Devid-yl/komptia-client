@@ -1,0 +1,50 @@
+# =================================================
+# Docker Compose - Komptia v2.0
+# Déploiement production
+# =================================================
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: komptia
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8888"
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+    volumes:
+      # Données persistantes (DB, rapports, logs)
+      - komptia-data:/opt/komptia/data
+      # Config externe (optionnel)
+      - ./config.yaml:/opt/komptia/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          # 3G (et non 2G) : le modèle d'embeddings se charge en RAM (~500 Mo) à
+          # la 1re requête Iris (téléchargé à la demande dans le volume, puis chargé
+          # en mémoire), en plus de torch CPU + pandas + Tornado. Ajuster selon la
+          # RAM du serveur.
+          memory: 3G
+          cpus: "2.0"
+
+volumes:
+  komptia-data:
+    name: komptia-data
+    driver: local

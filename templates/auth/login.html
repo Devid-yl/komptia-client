@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="fr" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connexion &mdash; {{ app_name }}</title>
+    <meta name="description" content="Connexion à {{ app_name }}">
+    {# Indique aux moteurs de recherche / aggrégateurs de NE PAS indexer la page de login (rien à montrer publiquement). #}
+    <meta name="robots" content="noindex, nofollow">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="stylesheet" href="/static/css/tailwind.min.css">
+    <link rel="stylesheet" href="/static/css/feedback-reporter.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
+    <script nonce="{{ handler.csp_nonce }}">
+        // Bootstrap thème — page anonyme (pas de préférence BDD).
+        //
+        // Règle alignée sur le reste de l'app : on suit la préférence OS
+        // par défaut (``prefers-color-scheme``). Un Mac en dark mode voit
+        // donc la page login en dark à la 1ère visite ; un OS en light
+        // voit en light. L'utilisateur peut forcer ``light`` ou ``dark``
+        // dans /settings (stocké en localStorage par base.html).
+        //
+        // Mapping :
+        //   localStorage = 'light'                 → light (forcé)
+        //   localStorage = 'dark'                  → dark (forcé)
+        //   localStorage = 'system' / vide / autre → suit prefers-color-scheme
+        (function() {
+            try {
+                // ADV-8 (2026-05-26) : la clé legacy ``komptia_theme`` est
+                // ACTIVEMENT supprimée par base.html (S-2 cleanup cross-user
+                // leak). Sur /login l'utilisateur n'est pas authentifié →
+                // lit la clé scopée anon ``komptia_theme_uanon`` (cohérent
+                // avec base.html qui écrit `komptia_theme_u` + userId() où
+                // userId() retourne 'anon' pour les visiteurs).
+                var m = localStorage.getItem('komptia_theme_uanon')
+                    || localStorage.getItem('komptia_theme');  // fallback transitoire
+                var dark;
+                if (m === 'light') {
+                    dark = false;
+                } else if (m === 'dark') {
+                    dark = true;
+                } else {
+                    // 'system' explicite OU rien d'enregistré → suit l'OS.
+                    dark = !!(window.matchMedia &&
+                              window.matchMedia('(prefers-color-scheme: dark)').matches);
+                }
+                document.documentElement.classList.toggle('dark', !!dark);
+            } catch(e) { /* localStorage indisponible → fallback prefers-color-scheme */
+                try {
+                    document.documentElement.classList.toggle('dark',
+                        !!(window.matchMedia &&
+                           window.matchMedia('(prefers-color-scheme: dark)').matches));
+                } catch(_) { /* totalement isolé : laissé en light */ }
+            }
+        })();
+    </script>
+    <style nonce="{{ handler.csp_nonce }}">
+        @keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse-glow { 0%,100% { opacity: .15; } 50% { opacity: .25; } }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .animate-fadeUp { animation: fadeUp .6s cubic-bezier(.16,1,.3,1) both; }
+        .animate-fadeUp-delay { animation: fadeUp .6s cubic-bezier(.16,1,.3,1) .15s both; }
+
+        /* Inclusivité : neutralise les animations pour les utilisateurs sensibles
+           au mouvement (vestibulaire) — recommandation WCAG 2.1 SC 2.3.3. */
+        @media (prefers-reduced-motion: reduce) {
+            .animate-fadeUp, .animate-fadeUp-delay { animation: none; }
+            .login-glow { animation: none; }
+            .login-btn { transition: none; }
+            .login-spinner { animation: none; }
+        }
+
+        /* ── LIGHT MODE — gradient bleu nuit dramatique + carte BLANCHE flottante ── */
+        body {
+            background: linear-gradient(145deg, #0f172a 0%, #1e293b 40%, #1a1a2e 100%);
+        }
+        .login-glow.glow-1 {
+            background: radial-gradient(circle, rgb(var(--brand-light-rgb) / 0.12), transparent 70%);
+        }
+        .login-glow.glow-2 {
+            background: radial-gradient(circle, rgb(var(--brand-rgb) / 0.08), transparent 70%);
+        }
+
+        /* ── DARK MODE — fond pratiquement noir + soupçon de chaleur brand ──
+           Décision produit : en dark mode, on pousse le fond aussi près
+           du noir pur que possible (#030305 / #000) avec un seul glow
+           radial très discret en haut pour éviter un mur uniforme. La
+           carte SOMBRE de la card ressort par contraste avec le liseré
+           brand subtil défini plus bas (``html.dark .login-card``). */
+        html.dark body {
+            background:
+                radial-gradient(ellipse 65% 45% at 50% 0%, rgba(96, 28, 24, 0.22), transparent 70%),
+                #030305;
+        }
+        html.dark .login-glow.glow-1 {
+            background: radial-gradient(circle, rgba(204, 110, 95, 0.18), transparent 70%);
+        }
+        html.dark .login-glow.glow-2 {
+            background: radial-gradient(circle, rgba(180, 90, 100, 0.14), transparent 70%);
+        }
+        /* En dark : carte sombre avec subtil liseré brand pour signature visuelle */
+        html.dark .login-card {
+            border-color: rgba(204, 110, 95, 0.18) !important;
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.7),
+                        0 0 0 1px rgba(204, 110, 95, 0.08);
+        }
+
+        .login-glow {
+            position: absolute;
+            border-radius: 50%;
+            filter: blur(80px);
+            animation: pulse-glow 8s ease-in-out infinite;
+            pointer-events: none;
+        }
+        .login-card {
+            backdrop-filter: blur(20px) saturate(1.2);
+            -webkit-backdrop-filter: blur(20px) saturate(1.2);
+        }
+        .login-input:focus { box-shadow: 0 0 0 3px rgb(var(--brand-light-rgb) / 0.12); }
+        .login-btn {
+            background: linear-gradient(135deg, var(--brand) 0%, var(--brand-light) 50%, #f07262 100%);
+            background-size: 200% 200%;
+            transition: all 0.3s cubic-bezier(.16,1,.3,1);
+        }
+        .login-btn:hover:not(:disabled) {
+            background-position: 100% 100%;
+            box-shadow: 0 8px 24px -4px rgb(var(--brand-rgb) / 0.4);
+            transform: translateY(-1px);
+        }
+        .login-btn:active:not(:disabled) { transform: translateY(0); }
+        .login-btn:disabled { opacity: 0.7; cursor: progress; transform: none; }
+        .login-divider {
+            background: linear-gradient(90deg, transparent, #e2e8f0, transparent);
+            height: 1px;
+        }
+        html.dark .login-divider {
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+        }
+        .login-spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255,255,255,0.5);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+            vertical-align: -2px;
+            margin-right: 6px;
+        }
+
+        /* Tooltip hover-après-délai (~800ms) — pattern 2026-05-26.
+           Le label « Garder ma session ouverte » est cliquable normalement
+           (toggle checkbox) ; le tooltip apparait UNIQUEMENT après un
+           survol prolongé. Aucun bouton « i » visible (doctrine
+           ``feedback_no_decorative_i_buttons.md``).
+           A11y : ``focus-within`` affiche aussi le tooltip pour clavier ;
+           ``aria-describedby`` permanent côté label pour SR. */
+        .login-remember {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+        }
+        .login-remember__tip {
+            position: absolute;
+            bottom: calc(100% + 8px);
+            left: 0;
+            min-width: 240px;
+            max-width: 320px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: #111827;
+            color: #f9fafb;
+            font-size: 11px;
+            font-weight: 400;
+            line-height: 1.45;
+            text-align: left;
+            box-shadow: 0 8px 20px -4px rgba(0,0,0,0.35);
+            z-index: 20;
+            white-space: normal;
+            pointer-events: none;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.15s ease, visibility 0s linear 0.15s;
+        }
+        /* Apparition : 800ms de délai au hover/focus (= "survol prolongé").
+           Disparition : immédiate (mouseleave / blur). */
+        .login-remember:hover .login-remember__tip,
+        .login-remember:focus-within .login-remember__tip {
+            opacity: 1;
+            visibility: visible;
+            transition: opacity 0.2s ease 0.8s, visibility 0s linear 0.8s;
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .login-remember__tip { transition: none !important; }
+        }
+    </style>
+</head>
+<body class="h-full antialiased flex items-center justify-center">
+
+    <!-- Decorative glows (background piloté par CSS via classes glow-1/2 pour s'adapter au thème) -->
+    <div class="absolute inset-0 overflow-hidden pointer-events-none" aria-hidden="true">
+        <div class="login-glow glow-1" style="width:500px; height:500px; top:-10%; right:-5%;"></div>
+        <div class="login-glow glow-2" style="width:400px; height:400px; bottom:-10%; left:-5%; animation-delay:-4s;"></div>
+        <!-- Subtle grid pattern -->
+        <div class="absolute inset-0 opacity-[0.03]" style="background-image: radial-gradient(circle at 1px 1px, white 1px, transparent 0); background-size: 32px 32px;"></div>
+    </div>
+
+    <main class="w-full max-w-[400px] px-5 relative z-10">
+        <!-- Logo + Brand -->
+        <div class="flex justify-center mb-10 animate-fadeUp">
+            <div class="flex items-center gap-3.5">
+                <div class="w-14 h-14 rounded-xl flex items-center justify-center shadow-lg overflow-hidden" aria-hidden="true">
+                    {# Logo identique partout : flancs en couleur de marque, partie
+                       centrale en gris (#9ca3af = tailwind gray-400) — choix de
+                       branding validé. Pas de surcharge dark mode : la couleur
+                       de marque + le gris fonctionnent sur les deux thèmes. #}
+                    <svg class="w-14 h-14" viewBox="0 0 100 100"><g transform="translate(0,100) scale(0.1,-0.1)" stroke="none"><path d="M325 804 l-169 -174 344 0 344 0 -169 174 c-94 95 -172 173 -175 173 -3 0 -81 -78 -175 -173z" fill="var(--brand-light)"/><path d="M25 500 c-18 -20 -18 -21 5 -45 23 -24 29 -25 144 -25 l120 0 -57 -58 c-31 -32 -57 -62 -57 -67 0 -5 12 -22 27 -37 l27 -28 63 62 63 62 0 -125 0 -125 45 -44 45 -44 0 247 0 247 -203 0 c-192 0 -205 -1 -222 -20z" fill="#9ca3af"/><path d="M555 275 l0 -246 124 128 c69 70 168 172 220 225 94 96 95 97 76 118 -17 19 -29 20 -219 20 l-201 0 0 -245z" fill="var(--brand-light)"/></g></svg>
+                </div>
+                <div>
+                    <span class="text-2xl font-bold text-white tracking-tight block">{{ app_name }}</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Login Card -->
+        <section class="login-card bg-white/[0.97] border border-white/20 rounded-2xl p-8 shadow-2xl shadow-black/20 animate-fadeUp-delay dark:bg-gray-900/90" aria-labelledby="login-heading">
+            <div class="mb-7 text-center">
+                <h1 id="login-heading" class="text-xl font-semibold text-gray-900 tracking-tight dark:text-gray-100">Bienvenue &nbsp;!</h1>
+                <p class="text-sm text-gray-500 mt-1.5 dark:text-gray-400">Connectez-vous &agrave; votre espace de travail</p>
+            </div>
+
+            {% if error %}
+            {# ADV-M26 : ``role="alert"`` implique déjà ``aria-live=assertive``,
+               le doublon était redondant. Garder uniquement le rôle. #}
+            <div role="alert" id="login-error"
+                 class="mb-5 px-3.5 py-3 bg-red-50 border border-red-200/80 rounded-xl text-sm text-red-700 flex items-center gap-2.5 dark:bg-red-900/20 dark:text-red-300">
+                <svg class="w-4 h-4 flex-shrink-0 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"/></svg>
+                <span>{{ error }}</span>
+            </div>
+            {% end %}
+
+            {# ADV-C5 : conditionner l'ATTRIBUT ENTIER (pas juste sa valeur).
+               Avant: ``aria-describedby=""`` quand pas d'erreur — invalide,
+               peut planter NVDA/JAWS sur certaines versions. #}
+            <form method="post" action="/login" id="login-form" novalidate{% if error %} aria-describedby="login-error"{% end %}>
+                {% module xsrf_form_html() %}
+                <input type="hidden" name="next" value="{{ next_url }}">
+
+                <div class="mb-5">
+                    <label for="email" class="block text-sm font-medium text-gray-700 mb-1.5 dark:text-gray-300">Email</label>
+                    {# Depuis 2026-05-11, l'identifiant de connexion est l'email
+                       (et plus le username — qui devient nom d'affichage). Le
+                       type="email" déclenche la validation native HTML5 (présence
+                       @), inputmode="email" affiche le clavier email sur mobile,
+                       maxlength=254 aligné RFC 5321 + colonne BDD. #}
+                    <input type="email" id="email" name="email"
+                        placeholder="email@exemple.fr"
+                        autocomplete="email" inputmode="email"
+                        autocapitalize="none" autocorrect="off" spellcheck="false"
+                        maxlength="254"
+                        required
+                        {% if not error %}autofocus{% end %}
+                        class="login-input w-full px-3.5 py-2.5 text-sm border border-gray-200 rounded-xl focus:border-brand-500 focus:ring-0 outline-none transition-all bg-gray-50/50 focus:bg-white dark:bg-gray-900/40 dark:border-gray-800 dark:focus:border-brand-400">
+                </div>
+
+                <div class="mb-5">
+                    <label for="password" class="block text-sm font-medium text-gray-700 mb-1.5 dark:text-gray-300">Mot de passe</label>
+                    <input type="password" id="password" name="password"
+                        placeholder="Votre mot de passe"
+                        autocomplete="current-password"
+                        required
+                        class="login-input w-full px-3.5 py-2.5 text-sm border border-gray-200 rounded-xl focus:border-brand-500 focus:ring-0 outline-none transition-all bg-gray-50/50 focus:bg-white dark:bg-gray-900/40 dark:border-gray-800 dark:focus:border-brand-400">
+                </div>
+
+                <div class="flex items-center mb-6">
+                    <input type="checkbox" id="remember_me" name="remember_me" class="w-4 h-4 rounded border-gray-300 text-brand-600 focus:ring-brand-500 cursor-pointer dark:border-gray-700 dark:focus:ring-brand-400">
+                    {# Label transparent : la session BDD plafonne à
+                       ``session_timeout_hours``. L'ancien libellé « Se souvenir
+                       de moi » suggérait des jours/semaines alors que c'est ``Nh``.
+                       Bug 2026-05-26 (L-NEW + question utilisateur).
+
+                       Tooltip hover-après-délai (~800ms) attaché AU LABEL via
+                       le wrapper ``.login-remember`` — pas de bouton « i »
+                       cliquable (doctrine 2026-05-26 :
+                       ``feedback_no_decorative_i_buttons.md``). Le tooltip
+                       apparaît SEULEMENT après un survol prolongé, sans
+                       indice visuel préalable (style identique à l'absence
+                       de tooltip — aucun nouveau visuel ajouté). #}
+                    <span class="login-remember">
+                        <label for="remember_me" class="ml-2 text-sm text-gray-600 cursor-pointer select-none dark:text-gray-400"
+                               aria-describedby="remember-tip">
+                            Se souvenir de moi 
+                        </label>
+                        <span class="login-remember__tip" id="remember-tip" role="tooltip">
+                            Si coché, votre session reste ouverte pendant {{ session_remember_human }}
+                            (même si vous fermez le navigateur). Sinon, vous serez déconnecté à la
+                            fermeture et après {{ session_timeout_hours }}h d'inactivité côté serveur.
+                            Ne cochez que sur votre appareil personnel.
+                        </span>
+                    </span>
+                </div>
+
+                <button type="submit" id="login-submit" class="login-btn w-full px-4 py-3 text-white text-sm font-semibold rounded-xl focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2 shadow-lg dark:focus:ring-brand-400">
+                    <span id="login-submit-label">Se connecter</span>
+                </button>
+            </form>
+
+            <div class="login-divider mt-6 mb-4" aria-hidden="true"></div>
+
+            <div class="space-y-1.5 text-center">
+                <p class="text-xs text-gray-400 dark:text-gray-500">
+                    Première connexion, email ou mot de passe oublié&nbsp;?
+                    {# ADV-S20 : aria-controls + aria-expanded + aria-haspopup
+                       pour que les screen readers signalent qu'un dialog
+                       va s'ouvrir. Le JS toggle aria-expanded au open/close. #}
+                    <button type="button" id="login-forgot-btn"
+                            aria-controls="login-help-overlay"
+                            aria-expanded="false"
+                            aria-haspopup="dialog"
+                            class="ml-1 text-brand-600 hover:underline focus:outline-none focus:underline dark:text-brand-400">
+                        Aide à la connexion
+                    </button>
+                </p>
+            </div>
+        </section>
+
+        <p class="mt-6 text-center text-xs text-gray-400 dark:text-gray-500">{{ app_name }}</p>
+    </main>
+
+    {# ── Modal "Aide à la connexion" ──
+       Pas de mécanisme d'auto-création de compte côté login (sécurité —
+       la création passe toujours par l'administrateur). On donne en
+       revanche un canal clair pour signaler un blocage. #}
+    <div id="login-help-overlay" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/50 backdrop-blur-sm"
+         role="dialog" aria-modal="true" aria-labelledby="login-help-title" aria-hidden="true">
+        <div class="w-full max-w-md mx-4 rounded-2xl bg-white dark:bg-gray-900 p-6 shadow-2xl">
+            <h2 id="login-help-title" class="text-base font-semibold text-gray-900 dark:text-gray-100">Aide à la connexion</h2>
+            <ul class="mt-3 space-y-2 text-sm text-gray-600 dark:text-gray-300 list-disc pl-5">
+                <li>Saisissez votre adresse email professionnelle (la casse n'a pas d'importance).</li>
+                <li>Vérifiez que la touche <kbd class="px-1 rounded border border-gray-300 dark:border-gray-700 text-xs">Verr. Maj.</kbd> est désactivée pour le mot de passe (sensible à la casse).</li>
+                <li>Si vous avez oublié votre email de connexion ou votre mot de passe, contactez votre administrateur Komptia (au sein de votre organisation).</li>
+                <li>Si le problème vient de l'application elle-même, vous pouvez le signaler à notre équipe support&nbsp;:</li>
+            </ul>
+            <div class="mt-4 flex flex-col sm:flex-row gap-2 justify-end">
+                <button type="button" id="login-help-close" class="px-4 py-2 text-sm rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-700">Fermer</button>
+                <button type="button" id="login-help-report" class="px-4 py-2 text-sm rounded-lg bg-brand-600 text-white hover:bg-brand-700 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2">Signaler un problème</button>
+            </div>
+        </div>
+    </div>
+
+    {# ADV-C6 : pas de ``defer`` ici. Le script inline qui suit appelle
+       ``window.komptiaReportFeedback`` (depuis le bouton "Signaler un
+       problème" du modal d'aide). Avec ``defer``, le inline s'exécute
+       AVANT que feedback-reporter.js soit chargé → la fonction n'existe
+       pas encore et le clic est silencieusement no-op. Le script
+       externe (~15 KB) est lu au parsing puis exécuté en synchrone,
+       garantissant que ``window.komptiaReportFeedback`` est défini AVANT
+       l'exécution du inline. #}
+    <script src="/static/js/feedback-reporter.js" nonce="{{ handler.csp_nonce }}"></script>
+    <script nonce="{{ handler.csp_nonce }}">
+    /*
+     * Login — comportements UI :
+     *   1. Désactive le bouton submit pendant la soumission (anti double-click)
+     *      AVEC timeout fallback de 15s pour éviter blocage si erreur réseau.
+     *   2. Re-focus le bon champ après erreur côté serveur.
+     *   3. Modal "Aide à la connexion" avec aria-expanded toggle, focus trap
+     *      via inert (fallback aria-hidden), et lien feedback-reporter.
+     *   4. Tooltip "i" cliquable avec exclusion via closest (pas stopPropagation).
+     *   5. Caps Lock hint multi-events (keydown + keyup + focus) — couvre
+     *      paste/blur/CapsLock toggle pendant la saisie.
+     */
+    (function() {
+        'use strict';
+
+        var form = document.getElementById('login-form');
+        var submitBtn = document.getElementById('login-submit');
+        var submitLabel = document.getElementById('login-submit-label');
+        var hasError = !!document.getElementById('login-error');
+
+        // ── 1. Anti double-submit avec timeout fallback (ADV-S18) ──────
+        // Si le serveur répond OK, la page est remplacée — le timeout
+        // n'est jamais atteint. Sinon (erreur réseau, 504, abandon par
+        // l'user), le bouton est ré-activé après 15s pour éviter un
+        // blocage permanent.
+        var submitResetTimer = null;
+        function resetSubmitButton() {
+            if (!submitBtn || !submitLabel) return;
+            submitBtn.disabled = false;
+            submitBtn.removeAttribute('aria-busy');
+            submitLabel.textContent = 'Se connecter';
+            if (submitResetTimer) {
+                clearTimeout(submitResetTimer);
+                submitResetTimer = null;
+            }
+        }
+        if (form && submitBtn && submitLabel) {
+            form.addEventListener('submit', function() {
+                submitBtn.disabled = true;
+                submitBtn.setAttribute('aria-busy', 'true');
+                submitLabel.innerHTML = '<span class="login-spinner" aria-hidden="true"></span>Connexion…';
+                // Filet de sécurité : 15s plus tard, si on est encore là,
+                // on ré-active. ADV-S18.
+                submitResetTimer = setTimeout(resetSubmitButton, 15000);
+            });
+            // Restauration aussi sur back/forward (bfcache).
+            window.addEventListener('pageshow', function(ev) {
+                if (ev.persisted) resetSubmitButton();
+            });
+        }
+
+        // ── 2. Re-focus email après erreur ──────────────────────────
+        if (hasError) {
+            var u = document.getElementById('email');
+            if (u && typeof u.focus === 'function') {
+                try { u.focus(); u.select(); } catch (_) {}
+            }
+        }
+
+        // ── 3. Modal "Aide à la connexion" + focus trap ─────────────────
+        var openBtn   = document.getElementById('login-forgot-btn');
+        var overlay   = document.getElementById('login-help-overlay');
+        var closeBtn  = document.getElementById('login-help-close');
+        var reportBtn = document.getElementById('login-help-report');
+        var mainEl    = document.querySelector('main');
+        var lastFocused = null;
+
+        // ADV-S21 : focus trap via ``inert`` (modern, supportée Chrome 102+,
+        // Firefox 112+, Safari 15.5+). Fallback : aria-hidden + tabindex=-1
+        // sur tous les éléments tabbables de <main>. Quand le modal est
+        // ouvert, <main> devient inert → impossible de Tab vers email
+        // /password derrière le modal.
+        function setMainInert(inert) {
+            if (!mainEl) return;
+            if ('inert' in HTMLElement.prototype) {
+                if (inert) mainEl.setAttribute('inert', '');
+                else mainEl.removeAttribute('inert');
+            } else {
+                // Fallback pour vieux navigateurs : aria-hidden + tabindex.
+                mainEl.setAttribute('aria-hidden', inert ? 'true' : 'false');
+            }
+        }
+
+        function openModal() {
+            if (!overlay) return;
+            lastFocused = document.activeElement;
+            overlay.classList.remove('hidden');
+            overlay.classList.add('flex');
+            overlay.setAttribute('aria-hidden', 'false');
+            if (openBtn) openBtn.setAttribute('aria-expanded', 'true');
+            setMainInert(true);
+            try { document.body.style.overflow = 'hidden'; } catch (_) {}
+            if (closeBtn) {
+                try { closeBtn.focus(); } catch (_) {}
+            }
+            document.addEventListener('keydown', escListener);
+        }
+        function closeModal() {
+            if (!overlay) return;
+            overlay.classList.add('hidden');
+            overlay.classList.remove('flex');
+            overlay.setAttribute('aria-hidden', 'true');
+            if (openBtn) openBtn.setAttribute('aria-expanded', 'false');
+            setMainInert(false);
+            try { document.body.style.overflow = ''; } catch (_) {}
+            try { if (lastFocused && lastFocused.focus) lastFocused.focus(); } catch (_) {}
+            document.removeEventListener('keydown', escListener);
+        }
+        function escListener(ev) { if (ev.key === 'Escape') closeModal(); }
+
+        if (openBtn) openBtn.addEventListener('click', openModal);
+        if (closeBtn) closeBtn.addEventListener('click', closeModal);
+        if (overlay) overlay.addEventListener('click', function(ev) { if (ev.target === overlay) closeModal(); });
+        if (reportBtn) reportBtn.addEventListener('click', function() {
+            closeModal();
+            if (typeof window.komptiaReportFeedback === 'function') {
+                window.komptiaReportFeedback({
+                    message: 'Problème rencontré sur la page de connexion : '
+                });
+            } else {
+                // Sécurité : si feedback-reporter.js n'est pas chargé
+                // (très improbable maintenant qu'on a retiré ``defer``),
+                // on indique simplement à l'user de recharger la page.
+                window.alert('Le module de signalement n\'est pas disponible. Rechargez la page puis réessayez.');
+            }
+        });
+
+        // ── 4. (Bloc tooltip "i" cliquable retiré 2026-05-26)
+        // Le bouton "i" + JS-toggle a été remplacé par un tooltip pur-CSS
+        // (``.login-remember:hover .login-remember__tip`` avec
+        // ``transition-delay: 0.8s``). Doctrine utilisateur 2026-05-26 :
+        // pas de petits "i" décoratifs cliquables, préférer le survol
+        // prolongé. Aucun JS nécessaire — moins de code, moins de surface
+        // d'attaque XSS, focus-within gère le clavier nativement.
+
+        // ── 5. Caps Lock multi-events (ADV-S19 + ADV-M25) ───────────────
+        // Lazy-create du hint au PREMIER event (pas au load) — pas de
+        // pollution DOM si l'utilisateur ne tape jamais dans le password.
+        // Multi-events : focus + keydown + keyup couvrent paste/blur/toggle.
+        var pwd = document.getElementById('password');
+        if (pwd) {
+            var capsHint = null;
+            function ensureCapsHint() {
+                if (capsHint) return capsHint;
+                capsHint = document.createElement('p');
+                capsHint.id = 'caps-lock-hint';
+                capsHint.className = 'mt-1.5 text-[11px] text-amber-600 dark:text-amber-400 hidden';
+                capsHint.setAttribute('role', 'status');
+                capsHint.textContent = 'Verr. Maj. activé.';
+                pwd.parentNode.appendChild(capsHint);
+                return capsHint;
+            }
+            function checkCapsLock(ev) {
+                try {
+                    if (!ev.getModifierState) return;
+                    var on = ev.getModifierState('CapsLock');
+                    var hint = ensureCapsHint();
+                    if (on) hint.classList.remove('hidden');
+                    else hint.classList.add('hidden');
+                } catch (_) { /* vieux navigateur */ }
+            }
+            pwd.addEventListener('focus', checkCapsLock);
+            pwd.addEventListener('keydown', checkCapsLock);
+            pwd.addEventListener('keyup', checkCapsLock);
+            pwd.addEventListener('blur', function() {
+                if (capsHint) capsHint.classList.add('hidden');
+            });
+        }
+    })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+[project]
+name = "komptia"
+version = "2.0.0"
+description = "Application web Tornado — automatisation et analyse de données SQL Server"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "e2e: tests end-to-end Playwright (navigateur)",
+    "slow: tests lents (>5s)",
+    "smoke: tests de fumée rapides",
+    "cross_schema: exerce le pipeline NL→SQL sur plusieurs schémas BDD distincts pour prouver la généricité (T18)",
+]
+timeout = 120
+timeout_method = "thread"
+norecursedirs = [
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    "_trash",
+    "data",
+    "outputs",
+    "htmlcov",
+    "build",
+    "dist",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+    "app/__pycache__/*",
+    "tests/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 60
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

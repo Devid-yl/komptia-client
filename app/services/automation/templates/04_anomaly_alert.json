@@ -1,0 +1,101 @@
+{
+  "komptia_export": {
+    "version": 2,
+    "type": "automation"
+  },
+  "template_meta": {
+    "id": "04_anomaly_alert",
+    "label": "Détection d'anomalies → Alerte par email",
+    "description": "Extrait les métriques, demande au format IA d'identifier les valeurs aberrantes, puis génère un rapport et alerte par email. Idéal pour de la surveillance proactive.",
+    "category": "monitoring",
+    "icon": "exclamation-triangle",
+    "difficulty": "moyen"
+  },
+  "automation": {
+    "name": "Modèle — Détection d'anomalies → Alerte",
+    "description": "Surveillance statistique avec alerte automatique sur valeurs aberrantes.",
+    "query_type": "sql",
+    "query_text": "-- Adaptez à vos métriques à surveiller\nSELECT * FROM votre_table_metriques WHERE date_jour >= DATEADD(day, -30, GETDATE())",
+    "schedule_type": "daily",
+    "schedule_config": {},
+    "output_format": "pdf",
+    "recipients": [],
+    "notification_emails": [],
+    "notify_on_failure": true,
+    "notify_on_success": false,
+    "fail_policy": "continue"
+  },
+  "steps": [
+    {
+      "name": "Extraction métriques",
+      "step_type": "extract_sql",
+      "step_order": 0,
+      "config": {
+        "sql": "-- Adaptez à vos métriques à surveiller\nSELECT * FROM votre_table_metriques WHERE date_jour >= DATEADD(day, -30, GETDATE())"
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 100,
+      "layout_y": 80
+    },
+    {
+      "name": "Repérage des anomalies par IA",
+      "step_type": "format_copilot",
+      "step_order": 1,
+      "config": {
+        "instruction": "Calcule la moyenne et l'écart-type pour chaque colonne numérique, puis identifie les lignes dont au moins une valeur s'écarte de plus de 2 écarts-types. Place ces lignes dans une feuille « Anomalies » et garde la feuille principale intacte."
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 100,
+      "layout_y": 240
+    },
+    {
+      "name": "Rapport PDF",
+      "step_type": "report",
+      "step_order": 2,
+      "config": {
+        "title": "Alerte anomalies",
+        "prompt": "Présente les anomalies détectées : combien, quelles colonnes, quelle ampleur ; recommande des actions de vérification."
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 100,
+      "layout_y": 400
+    },
+    {
+      "name": "Alerte mail",
+      "step_type": "email",
+      "step_order": 3,
+      "config": {
+        "subject": "[Alerte] Anomalies détectées",
+        "to": []
+      },
+      "is_enabled": true,
+      "max_retries": 2,
+      "retry_delay_seconds": 60,
+      "layout_x": 100,
+      "layout_y": 560
+    }
+  ],
+  "edges": [
+    {
+      "from_step_name": "Extraction métriques",
+      "to_step_name": "Repérage des anomalies par IA",
+      "data_type": "workbook"
+    },
+    {
+      "from_step_name": "Repérage des anomalies par IA",
+      "to_step_name": "Rapport PDF",
+      "data_type": "workbook"
+    },
+    {
+      "from_step_name": "Rapport PDF",
+      "to_step_name": "Alerte mail",
+      "data_type": "report_file"
+    }
+  ]
+}

@@ -1,0 +1,973 @@
+{% extends "../base.html" %}
+
+{% block title %}Santé système | {{ app_name }}{% end %}
+
+{% block head %}
+{# Chart.js self-hosté (Bug 2026-05-26 P-8 MOYEN). Voir
+   ``static/vendor/chartjs/README.md`` pour la version + politique. #}
+<script src="/static/vendor/chartjs/chart.umd.min.js" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-start justify-between mb-4 flex-wrap gap-3">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Santé système</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Process, stockage local, base source, cache, latence et activité applicative. Pour les métriques IA, voir <a href="/admin/ai-performance" class="underline">Performance Iris</a>.</p>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-xs text-gray-500 dark:text-gray-400" id="last-updated-ticker" data-ts="{{ last_updated_iso }}">à l'instant</span>
+            <label class="inline-flex items-center gap-1.5 text-xs text-gray-600 select-none cursor-pointer px-2.5 py-1 rounded-md border border-gray-200 bg-white dark:bg-gray-900 dark:border-gray-800 dark:text-gray-400">
+                <input type="checkbox" id="auto-refresh-toggle" class="h-3.5 w-3.5 rounded border-gray-300 text-brand-600 focus:ring-brand-500 dark:border-gray-700 dark:focus:ring-brand-400">
+                <span>Auto 30s</span>
+            </label>
+            <button type="button" id="btn-refresh-now" class="btn btn-secondary text-xs px-2.5 py-1" title="Actualiser maintenant" aria-label="Actualiser">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+            </button>
+            <div class="inline-flex rounded-md border border-gray-200 bg-white p-0.5 dark:bg-gray-900 dark:border-gray-800" role="group" aria-label="Période d'analyse">
+                {% for p in allowed_periods %}
+                <a href="?days={{ p }}"
+                   class="px-3 py-1 text-xs font-medium rounded {% if p == current_days %}bg-gray-900 text-white{% else %}text-gray-600 hover:bg-gray-50{% end %}"
+                   aria-current="{% if p == current_days %}page{% else %}false{% end %}">
+                    {{ p }} jours
+                </a>
+                {% end %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Hero status banner -->
+    <div class="card mb-6 border {{ overall_status['banner_class'] }}">
+        <div class="p-4 md:p-5">
+            <div class="flex items-start gap-4 flex-wrap">
+                <div class="flex items-center gap-3 flex-1 min-w-[220px]">
+                    <span class="relative flex h-3 w-3 flex-shrink-0" aria-hidden="true">
+                        {% if overall_status['level'] != 'ok' %}
+                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full {{ overall_status['dot_class'] }} opacity-60"></span>
+                        {% end %}
+                        <span class="relative inline-flex rounded-full h-3 w-3 {{ overall_status['dot_class'] }}"></span>
+                    </span>
+                    <div>
+                        <p class="text-base font-semibold text-gray-900 dark:text-gray-100">{{ overall_status['label'] }}</p>
+                        <p class="text-xs text-gray-600 mt-0.5 dark:text-gray-400">{{ overall_status['sublabel'] }}</p>
+                    </div>
+                    {% if overall_status['alert_count'] > 0 %}
+                    <a href="#recommendations" class="badge {{ overall_status['badge_class'] }} text-xs no-underline hover:opacity-80">
+                        Voir détails →
+                    </a>
+                    {% end %}
+                </div>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-2 w-full md:w-auto">
+                    <div class="px-3 py-2 rounded-md bg-white border border-gray-200 min-w-[110px] dark:bg-gray-900 dark:border-gray-800">
+                        <p class="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Source BDD</p>
+                        <p class="text-sm font-semibold {% if sage_status.ok %}text-emerald-700{% else %}text-red-600{% end %} mt-0.5">
+                            {% if sage_status.ok %}OK{% else %}Indisponible{% end %}
+                            {% if sage_status.get('latency_ms') is not None %}<span class="text-[10px] text-gray-500 font-normal ml-0.5 dark:text-gray-400">{{ sage_status.get('latency_ms') }} ms</span>{% end %}
+                        </p>
+                    </div>
+                    <div class="px-3 py-2 rounded-md bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800">
+                        <p class="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Cache hit</p>
+                        <p class="text-sm font-semibold {{ ui['cache_hit_class'] }} mt-0.5">{{ "%.1f" % ui['cache_hit_pct'] }}%</p>
+                    </div>
+                    <div class="px-3 py-2 rounded-md bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800">
+                        <p class="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">P90 exéc.</p>
+                        <p class="text-sm font-semibold text-gray-900 mt-0.5 dark:text-gray-100">{{ "%.2f" % (percentiles['exec_p90'] or 0) }}s</p>
+                    </div>
+                    <div class="px-3 py-2 rounded-md bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800">
+                        <p class="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Iris actives</p>
+                        <p class="text-sm font-semibold text-gray-900 mt-0.5 dark:text-gray-100">{{ active_conversations }}</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Process info -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 7.5V6.108c0-1.135.845-2.098 1.976-2.192.373-.03.748-.057 1.123-.08M15.75 18H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08M15.75 18.75v-1.875a3.375 3.375 0 00-3.375-3.375h-1.5a1.125 1.125 0 01-1.125-1.125v-1.5A3.375 3.375 0 006.375 7.5H5.25m11.9-3.664A2.251 2.251 0 0015 2.25h-1.5a2.251 2.251 0 00-2.15 1.586m5.8 0c.065.21.1.433.1.664v.75h-6V4.5c0-.231.035-.454.1-.664M6.75 7.5H4.875c-.621 0-1.125.504-1.125 1.125v12c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V16.5a9 9 0 00-9-9z"/>
+                </svg>
+                Processus serveur
+            </h2>
+            <span class="text-xs text-gray-500 dark:text-gray-400">PID {{ process_info.pid }} · {{ process_info.python_version }} · {{ process_info.platform }}</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-0 divide-x divide-gray-100 dark:divide-gray-800">
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Uptime</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ process_info.uptime_human }}</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Mémoire (max)</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ process_info.rss_human }}</p>
+                <p class="text-xs text-gray-400 mt-0.5 dark:text-gray-500">RSS pic</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">CPU cumulé</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ "%.0f" % (process_info.user_cpu_seconds + process_info.system_cpu_seconds) }}s</p>
+                <p class="text-xs text-gray-400 mt-0.5 dark:text-gray-500">user + system</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Threads</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ process_info.threads }}</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Tâches async</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ process_info.async_tasks }}</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Storage + Sage -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+
+        <!-- Stockage local SQLite -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75"/>
+                    </svg>
+                    Stockage local (SQLite)
+                </h2>
+                {% if storage['encryption_key_configured'] %}
+                <span class="badge badge-success text-xs" title="La clé est présente en config — l'activité réelle de SQLCipher dépend du driver chargé.">Clé configurée</span>
+                {% else %}
+                <span class="badge badge-warning text-xs">Aucune clé</span>
+                {% end %}
+            </div>
+            <div class="p-4">
+                <div class="flex items-baseline justify-between mb-3">
+                    <span class="text-xs text-gray-500 dark:text-gray-400">Taille du fichier</span>
+                    <span class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ storage.size_human }}</span>
+                </div>
+                <p class="text-xs text-gray-400 mb-3 truncate dark:text-gray-500" title="{{ storage.path }}">{{ storage.path }}</p>
+                {% if storage.tables %}
+                <div class="space-y-1.5 text-sm">
+                    {% for t in storage.tables %}
+                    <div class="flex justify-between">
+                        <span class="text-gray-600 dark:text-gray-400">{{ t['label'] }}</span>
+                        <span class="font-medium text-gray-900 dark:text-gray-100">{{ "{:,}".format(t['count']).replace(",", " ") }}</span>
+                    </div>
+                    {% end %}
+                </div>
+                {% else %}
+                <p class="text-sm text-gray-500 text-center py-3 dark:text-gray-400">Aucune donnée</p>
+                {% end %}
+
+                {# Mini-form admin : quota stockage par utilisateur (global) — #}
+                {# unique source de vérité pour TOUS les users (ignore rôles).  #}
+                <div class="mt-4 pt-3 border-t border-gray-200 dark:border-gray-800">
+                    <form id="storage-quota-form" class="space-y-2">
+                        <div class="flex items-baseline justify-between">
+                            <label for="storage-quota-input" class="text-xs text-gray-500 dark:text-gray-400" title="Quota identique pour tous les utilisateurs (ignore les rôles). Couvre fichiers datastore + données BDD scopées (anonymisation, conversations, automations, dashboards, contacts, etc.).">
+                                Quota stockage par utilisateur
+                            </label>
+                            <span class="text-xs text-gray-400 dark:text-gray-500" id="storage-quota-current">{{ "{:,}".format(storage_quota_mb).replace(",", " ") }} Mo actuel</span>
+                        </div>
+                        <div class="flex gap-2">
+                            <input type="number" id="storage-quota-input"
+                                   value="{{ storage_quota_mb }}"
+                                   min="1" step="1"
+                                   class="input flex-1 text-sm"
+                                   aria-label="Quota en Mo">
+                            <span class="text-sm text-gray-500 self-center dark:text-gray-400">Mo</span>
+                            <button type="submit"
+                                    class="btn btn-secondary text-xs px-3"
+                                    id="storage-quota-save">Enregistrer</button>
+                        </div>
+                        <p class="text-xs text-gray-400 dark:text-gray-500">
+                            Borne globale identique pour tous les utilisateurs. Couvre fichiers + données BDD.
+                        </p>
+                        <p class="text-xs hidden" id="storage-quota-status" role="status"></p>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- BDD source Sage -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M21.75 17.25v-.228a4.5 4.5 0 00-.12-1.03l-2.268-9.64a3.375 3.375 0 00-3.285-2.602H7.923a3.375 3.375 0 00-3.285 2.602l-2.268 9.64a4.5 4.5 0 00-.12 1.03v.228m19.5 0a3 3 0 01-3 3H5.25a3 3 0 01-3-3m19.5 0a3 3 0 00-3-3H5.25a3 3 0 00-3 3m16.5 0h.008v.008h-.008v-.008zm-3 0h.008v.008h-.008v-.008z"/>
+                    </svg>
+                    Base source (Sage)
+                </h2>
+                <span class="badge {{ ui['sage_badge_class'] }}">{{ ui['sage_badge_label'] }}</span>
+            </div>
+            <div class="p-4">
+                <div class="space-y-2 text-sm">
+                    <div class="flex justify-between">
+                        <span class="text-gray-500 dark:text-gray-400">Connecteur</span>
+                        <span class="font-mono text-xs text-gray-700 dark:text-gray-300">{{ sage_status.connector }}</span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-500 dark:text-gray-400">Latence ping</span>
+                        <span class="font-medium text-gray-900 dark:text-gray-100">
+                            {% if sage_status.get('latency_ms') is None %}—{% else %}{{ sage_status.get('latency_ms') }} ms{% end %}
+                        </span>
+                    </div>
+                    {% if sage_status.error %}
+                    <div class="mt-3 px-3 py-2 rounded bg-red-50 border border-red-100 text-xs text-red-700 dark:bg-red-900/20 dark:text-red-300">
+                        <span class="font-medium">Erreur :</span> {{ sage_status.error }}
+                    </div>
+                    {% end %}
+                    <div class="flex items-center justify-between gap-2 pt-2">
+                        <button type="button" id="btn-ping-sage" class="btn btn-secondary text-xs px-2.5 py-1">Tester maintenant</button>
+                        <p class="text-xs text-gray-400 dark:text-gray-500">Config : <a href="/admin/database" class="underline">/admin/database</a></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Taille max par fichier uploadé (SSoT AIConfig.MAX_UPLOAD_SIZE_BYTES) -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/>
+                </svg>
+                Taille maximale par fichier uploadé
+            </h2>
+        </div>
+        <div class="p-4">
+            <form id="upload-size-form" class="space-y-2">
+                <div class="flex items-baseline justify-between">
+                    <label for="upload-size-input" class="text-xs text-gray-500 dark:text-gray-400" title="S'applique aux uploads utilisateur : trombone Iris, datastore, upload de rapport, réponse de collaborateur. Limites dédiées distinctes (non couvertes ici) : rapports générés, pièces jointes des mails sortants (SMTP), import CSV de contacts, import de configuration d'automation.">
+                        Limite appliquée aux uploads utilisateur
+                    </label>
+                    <span class="text-xs text-gray-400 dark:text-gray-500" id="upload-size-current">{{ "{:,}".format(max_upload_size_mb).replace(",", " ") }} Mo actuel</span>
+                </div>
+                <div class="flex gap-2">
+                    <input type="number" id="upload-size-input"
+                           value="{{ max_upload_size_mb }}"
+                           min="1" max="2048" step="1"
+                           class="input flex-1 text-sm"
+                           aria-label="Taille max par fichier en Mo">
+                    <span class="text-sm text-gray-500 self-center dark:text-gray-400">Mo</span>
+                    <button type="submit"
+                            class="btn btn-secondary text-xs px-3"
+                            id="upload-size-save">Enregistrer</button>
+                </div>
+                <p class="text-xs text-gray-400 dark:text-gray-500">
+                    S'applique aux uploads utilisateur : trombone Iris, datastore, upload de rapport, réponse de collaborateur (étape wait_response). Min 1 Mo, max 2048 Mo.
+                </p>
+                <p class="text-xs hidden" id="upload-size-status" role="status"></p>
+            </form>
+        </div>
+    </div>
+
+    <!-- Schema sync + Cache -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+
+        <!-- Dernière sync schéma -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"/>
+                    </svg>
+                    Synchronisation du schéma
+                </h2>
+                <a href="/admin/ai-training" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Gérer</a>
+            </div>
+            <div class="p-4">
+                {% if last_sync %}
+                <div class="flex items-baseline justify-between mb-3">
+                    <span class="text-xs text-gray-500 dark:text-gray-400">Dernière exécution</span>
+                    <span class="badge {% if last_sync['success'] %}badge-success{% else %}badge-error{% end %} text-xs">
+                        {% if last_sync['success'] %}Réussie{% else %}Échec{% end %}
+                    </span>
+                </div>
+                <div class="space-y-1.5 text-sm">
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Type</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ last_sync['sync_type'] or '-' }}</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Durée</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % last_sync['duration_seconds'] }}s</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Tables</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ last_sync['total_tables'] }} (+{{ last_sync['tables_added'] }} / -{{ last_sync['tables_removed'] }})</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Colonnes</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ last_sync['total_columns'] }} (+{{ last_sync['columns_added'] }} / -{{ last_sync['columns_removed'] }})</span></div>
+                    {% if last_sync['error_message'] %}
+                    <div class="mt-3 px-3 py-2 rounded bg-red-50 border border-red-100 text-xs text-red-700 dark:bg-red-900/20 dark:text-red-300">{{ last_sync['error_message'] }}</div>
+                    {% end %}
+                </div>
+                {% else %}
+                <p class="text-sm text-gray-500 text-center py-6 dark:text-gray-400">Aucune synchronisation enregistrée.</p>
+                {% end %}
+            </div>
+        </div>
+
+        <!-- Cache de génération SQL -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/>
+                    </svg>
+                    Cache des requêtes SQL
+                </h2>
+            </div>
+            <div class="p-4">
+                <div class="flex items-baseline justify-between mb-3">
+                    <span class="text-xs text-gray-500 dark:text-gray-400">Taux de hit</span>
+                    <span class="text-lg font-semibold {{ ui['cache_hit_class'] }}">{{ "%.1f" % ui['cache_hit_pct'] }}%</span>
+                </div>
+                <div class="space-y-1.5 text-sm mb-4">
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Entrées</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ overview['cache_stats']['size'] or 0 }} / {{ overview['cache_stats']['max_size'] or 0 }}</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">TTL</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ (overview['cache_stats']['ttl_seconds'] or 0) // 60 }} min</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Hits</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ overview['cache_stats']['hits'] or 0 }}</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">Misses</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ overview['cache_stats']['misses'] or 0 }}</span></div>
+                </div>
+                <button type="button" id="btn-clear-cache" class="btn btn-danger text-sm w-full">Vider le cache</button>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Providers LLM -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418"/>
+                </svg>
+                Providers LLM
+            </h2>
+            <a href="/admin/ai-config" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Configurer</a>
+        </div>
+        <div class="p-4">
+            {% if providers_health.error %}
+            <div class="px-3 py-2 rounded bg-amber-50 border border-amber-100 text-xs text-amber-700 mb-3 dark:bg-amber-900/20 dark:text-amber-300">
+                <span class="font-medium">Vérification impossible :</span> {{ providers_health.error }}
+            </div>
+            {% end %}
+            {% if providers_health.providers %}
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+                {% for p in providers_health.providers %}
+                <div class="flex items-center justify-between px-3 py-2 rounded-md bg-gray-50 border border-gray-100 dark:bg-gray-900 dark:border-gray-800">
+                    <span class="text-sm font-medium text-gray-900 capitalize dark:text-gray-100">{{ p['name'] }}</span>
+                    <span class="badge {% if p['ok'] %}badge-success{% else %}badge-error{% end %} text-xs">
+                        {% if p['ok'] %}OK{% else %}Down{% end %}
+                    </span>
+                </div>
+                {% end %}
+            </div>
+            <div class="flex items-center justify-between gap-2 mt-3 flex-wrap">
+                <button type="button" id="btn-ping-llm" class="btn btn-secondary text-xs px-2.5 py-1">Tester maintenant</button>
+                <p class="text-xs text-gray-400 dark:text-gray-500">
+                    {% if providers_health.get('cache_age_seconds') is not None %}
+                    Vérifié il y a <span id="llm-cache-age" data-age="{{ providers_health.get('cache_age_seconds') }}">{{ "%.0f" % providers_health.get('cache_age_seconds') }}</span>s — cache serveur 5 min.
+                    {% else %}
+                    Jamais vérifié — cliquer "Tester" pour un état frais.
+                    {% end %}
+                </p>
+            </div>
+            {% else %}
+            {% if not providers_health.error %}
+            <p class="text-sm text-gray-500 text-center py-4 dark:text-gray-400">Aucun provider configuré. Voir <a href="/admin/ai-config" class="underline">/admin/ai-config</a>.</p>
+            {% end %}
+            {% end %}
+        </div>
+    </div>
+
+    <!-- Latence requêtes (percentiles + distribution) -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+
+        <!-- Génération SQL -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    Latence génération SQL
+                </h2>
+            </div>
+            <div class="p-4">
+                <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100">{{ "%.2f" % (overview['avg_generation'] or 0) }}s</p>
+                <p class="text-xs text-gray-500 mb-4 dark:text-gray-400">Moyenne · {{ current_days }} jours</p>
+                <div class="space-y-2 text-sm">
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">P50</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % (percentiles['gen_p50'] or 0) }}s</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">P90</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % (percentiles['gen_p90'] or 0) }}s</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">P99</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % (percentiles['gen_p99'] or 0) }}s</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Exécution SQL -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    Latence exécution SQL (Sage)
+                </h2>
+            </div>
+            <div class="p-4">
+                <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100">{{ "%.2f" % (overview['avg_execution'] or 0) }}s</p>
+                <p class="text-xs text-gray-500 mb-4 dark:text-gray-400">Moyenne · {{ current_days }} jours</p>
+                <div class="space-y-2 text-sm">
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">P50</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % (percentiles['exec_p50'] or 0) }}s</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">P90</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % (percentiles['exec_p90'] or 0) }}s</span></div>
+                    <div class="flex justify-between"><span class="text-gray-500 dark:text-gray-400">P99</span><span class="font-medium text-gray-900 dark:text-gray-100">{{ "%.2f" % (percentiles['exec_p99'] or 0) }}s</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Distribution des temps -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                    <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 6a7.5 7.5 0 107.5 7.5h-7.5V6z"/>
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 10.5H21A7.5 7.5 0 0013.5 3v7.5z"/>
+                    </svg>
+                    Distribution des temps
+                </h2>
+            </div>
+            <div class="p-4">
+                <div class="h-48">
+                    <canvas id="timeDistChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Évolution quotidienne -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 18L9 11.25l4.306 4.307a11.95 11.95 0 015.814-5.519l2.74-1.22m0 0l-5.94-2.28m5.94 2.28l-2.28 5.941"/>
+                </svg>
+                Évolution quotidienne
+            </h2>
+            <span class="text-xs text-gray-500 dark:text-gray-400">Recherches · {{ current_days }} derniers jours</span>
+        </div>
+        <div class="p-4">
+            <div id="daily-activity-empty" class="hidden text-sm text-gray-500 text-center py-12 dark:text-gray-400">Pas de recherches sur cette période.</div>
+            <div id="daily-activity-wrapper" class="h-64">
+                <canvas id="dailyActivityChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Activité système -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z"/>
+                </svg>
+                Activité système · {{ current_days }} jours
+            </h2>
+            <span class="text-xs text-gray-500 dark:text-gray-400">Volumes et taux d'échec</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-0 divide-x divide-gray-100 dark:divide-gray-800">
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Audit</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ activity['audit_events'] }}</p>
+                <p class="text-xs text-gray-400 mt-0.5 dark:text-gray-500">événements</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Recherches</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ activity['searches_total'] }}</p>
+                <p class="text-xs text-gray-400 mt-0.5 dark:text-gray-500">SearchHistory</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Automations</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ activity['executions_total'] }}</p>
+                <p class="text-xs {% if activity['executions_failure_rate'] > 10 %}text-red-600{% elif activity['executions_failure_rate'] > 0 %}text-amber-600{% else %}text-gray-400{% end %} mt-0.5">
+                    {{ activity['executions_failed'] }} échecs ({{ "%.1f" % activity['executions_failure_rate'] }}%)
+                </p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Emails</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ activity['emails_sent'] }}</p>
+                <p class="text-xs {% if activity['emails_failure_rate'] > 5 %}text-red-600{% elif activity['emails_failure_rate'] > 0 %}text-amber-600{% else %}text-gray-400{% end %} mt-0.5">
+                    {{ activity['emails_failed'] }} échecs ({{ "%.1f" % activity['emails_failure_rate'] }}%)
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recommandations -->
+    <div id="recommendations" class="card mb-6 scroll-mt-6">
+        <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 flex items-center gap-2 dark:text-gray-100">
+                <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z"/>
+                </svg>
+                Recommandations
+            </h2>
+        </div>
+        <div class="p-4">
+            <ul class="space-y-2 text-sm text-gray-700 dark:text-gray-300">
+                {% for r in recommendations %}
+                <li class="flex items-start gap-2">
+                    {% if r['level'] == 'success' %}
+                    <span class="text-emerald-600 flex-shrink-0 mt-0.5 dark:text-emerald-400">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                    </span>
+                    {% else %}
+                    <span class="text-amber-600 flex-shrink-0 mt-0.5 dark:text-amber-400">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/></svg>
+                    </span>
+                    {% end %}
+                    <span>{{ r['text'] }}</span>
+                </li>
+                {% end %}
+            </ul>
+        </div>
+    </div>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+(function() {
+    // Bug 2026-05-26 (Agent 3 P-9 + AI-14) : lit dynamiquement la font
+    // de marque depuis ``<body>`` (Tailwind/design system). Avant, la
+    // liste de fonts était hardcodée — si l'admin change ``/admin/branding``
+    // pour switcher de DM Sans à Inter, les charts gardaient l'ancienne
+    // font. Fallback string si getComputedStyle indispo (test/SSR).
+    try {
+        var _bodyFont = window.getComputedStyle(document.body).getPropertyValue('font-family');
+        Chart.defaults.font.family = (_bodyFont || '').trim()
+            || '-apple-system, BlinkMacSystemFont, DM Sans, Segoe UI, Roboto, sans-serif';
+    } catch (_e) {
+        Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, DM Sans, Segoe UI, Roboto, sans-serif';
+    }
+    Chart.defaults.font.size = 12;
+
+    // Couleurs adaptatives au thème (lues à la création du chart)
+    function isDark() { return document.documentElement.classList.contains('dark'); }
+    function gridColor() { return isDark() ? 'rgba(255,255,255,0.06)' : '#f3f4f6'; }
+    function tickColor() { return isDark() ? '#94a3b8' : '#64748b'; }
+    Chart.defaults.color = tickColor();
+    var _allCharts = [];
+
+    // Re-thématise les charts au changement de thème
+    window.addEventListener('komptia:themechange', function() {
+        Chart.defaults.color = tickColor();
+        _allCharts.forEach(function(c) {
+            try {
+                if (c.options.scales) {
+                    Object.keys(c.options.scales).forEach(function(k) {
+                        if (c.options.scales[k].grid) c.options.scales[k].grid.color = gridColor();
+                        if (c.options.scales[k].ticks) c.options.scales[k].ticks.color = tickColor();
+                    });
+                }
+                c.update('none');
+            } catch (e) {}
+        });
+    });
+
+    // ── Doughnut: Distribution des temps ──────────────────────
+    var timeDist = {% raw time_distribution_json %};
+    var distCanvas = document.getElementById('timeDistChart');
+    if (distCanvas) {
+        _allCharts.push(new Chart(distCanvas, {
+            type: 'doughnut',
+            data: {
+                labels: ['< 1s', '1-3s', '3-5s', '> 5s'],
+                datasets: [{
+                    data: [timeDist.under_1s || 0, timeDist['1_to_3s'] || 0, timeDist['3_to_5s'] || 0, timeDist.over_5s || 0],
+                    backgroundColor: ['#059669', '#0ea5e9', '#f59e0b', '#dc2626'],
+                    borderWidth: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12, font: { size: 11 } } } },
+                cutout: '55%'
+            }
+        }));
+    }
+
+    // ── Ligne: Évolution quotidienne ──────────────────────────
+    var dailyStats = {% raw daily_stats_json %};
+    var dailyCanvas = document.getElementById('dailyActivityChart');
+    var dailyEmpty = document.getElementById('daily-activity-empty');
+    var dailyWrapper = document.getElementById('daily-activity-wrapper');
+    if (Array.isArray(dailyStats) && dailyStats.length > 0 && dailyCanvas) {
+        _allCharts.push(new Chart(dailyCanvas, {
+            type: 'line',
+            data: {
+                labels: dailyStats.map(function(d) { return d.date; }),
+                datasets: [
+                    {
+                        label: 'Succès',
+                        data: dailyStats.map(function(d) { return d.success; }),
+                        borderColor: '#059669',
+                        backgroundColor: 'rgba(5, 150, 105, 0.08)',
+                        fill: true,
+                        tension: 0.3,
+                        borderWidth: 2,
+                        pointRadius: 2,
+                        pointHoverRadius: 4
+                    },
+                    {
+                        label: 'Échecs',
+                        data: dailyStats.map(function(d) { return d.failed; }),
+                        borderColor: '#dc2626',
+                        backgroundColor: 'rgba(220, 38, 38, 0.08)',
+                        fill: true,
+                        tension: 0.3,
+                        borderWidth: 2,
+                        pointRadius: 2,
+                        pointHoverRadius: 4
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12, font: { size: 11 } } } },
+                scales: {
+                    y: { beginAtZero: true, grid: { color: gridColor() }, ticks: { precision: 0, color: tickColor() } },
+                    x: { grid: { display: false }, ticks: { color: tickColor() } }
+                }
+            }
+        }));
+    } else if (dailyEmpty && dailyWrapper) {
+        dailyEmpty.classList.remove('hidden');
+        dailyWrapper.classList.add('hidden');
+    }
+
+    // Constantes partagées entre toutes les actions POST → évite les
+    // "magic numbers" dupliqués.
+    var POST_ACTION_RELOAD_MS = 900;
+    var BUTTON_SAFETY_TIMEOUT_MS = 5000;
+    var AUTO_INTERVAL_MS = 30000;
+    // Clé localStorage SCOPÉE par user-id (anti cross-user leak — bug
+    // 2026-05-26 P-11 + mémoire ``feedback_localstorage_cross_user_leak.md``).
+    // Sur poste partagé : Alice activait l'auto-refresh, Bob loggue → l'auto-
+    // refresh restait ON pour Bob sans qu'il l'ait demandé. Pattern identique
+    // à ``komptia_theme_u<id>`` du bootstrap base.html + iris-widget.js.
+    var _AUTO_KEY_USER_ID = (function () {
+        try {
+            var meta = document.querySelector('meta[name="komptia-user-id"]');
+            if (meta && meta.content) return String(meta.content);
+        } catch (e) { /* defensive */ }
+        return 'anon';
+    })();
+    var AUTO_KEY = 'komptia_admin_perf_auto_refresh_u' + _AUTO_KEY_USER_ID;
+    // Cleanup actif de la clé legacy non-scopée (équivalent au cleanup du
+    // bootstrap thème). Toute valeur historique non scopée est purgée pour
+    // qu'elle ne soit jamais relue par un autre user après login.
+    try { localStorage.removeItem('komptia_admin_perf_auto_refresh'); } catch (e) {}
+    var PAGE_LOADED_AT = Date.now();
+
+    // Helpers exposés globalement par base.html (showToast / appConfirm /
+    // getCookie) : pas de shim défensif — si l'un manque c'est un bug dans
+    // la chrome partagée, il faut le voir sauter plutôt que de le masquer.
+
+    // ── Action POST générique : désactive le bouton, fait l'appel,
+    //    affiche un toast, puis reload après un délai uniforme.
+    //    Fallback de sécurité : si la navigation n'a pas lieu (extension,
+    //    CSP, etc.), le bouton est réactivé au bout de BUTTON_SAFETY_TIMEOUT_MS
+    //    pour que l'admin puisse retenter.
+    async function performAction(btn, options) {
+        if (!btn) return;
+        var originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = options.pendingText || 'En cours…';
+
+        var reEnable = function() {
+            btn.disabled = false;
+            btn.textContent = originalText;
+        };
+        var safety = setTimeout(reEnable, BUTTON_SAFETY_TIMEOUT_MS);
+
+        try {
+            var res = await fetch(options.url, {
+                method: 'POST',
+                headers: { 'X-Xsrftoken': getCookie('_xsrf') }
+            });
+            var data = await res.json().catch(function() { return {}; });
+            if (res.status === 429) {
+                showToast(data.error || 'Trop de tests rapprochés.', 'error');
+                reEnable();
+                clearTimeout(safety);
+                return;
+            }
+            if (data.success) {
+                options.onSuccess && options.onSuccess(data);
+                // #66 polish (2026-05-26) : preserve scroll position via
+                // shared helper. Fallback location.reload() si module absent.
+                setTimeout(function() {
+                    if (window.komptiaReload && window.komptiaReload.preservingScroll) {
+                        window.komptiaReload.preservingScroll();
+                    } else {
+                        location.reload();
+                    }
+                }, POST_ACTION_RELOAD_MS);
+                // ``safety`` réactivera le bouton si le reload est bloqué.
+            } else {
+                showToast('Erreur : ' + (data.error || 'inconnue'), 'error');
+                reEnable();
+                clearTimeout(safety);
+            }
+        } catch (err) {
+            showToast('Erreur : ' + err.message, 'error');
+            reEnable();
+            clearTimeout(safety);
+        }
+    }
+
+    // ── Vider le cache SQL ────────────────────────────────────
+    async function clearCache() {
+        if (!(await appConfirm('Êtes-vous sûr de vouloir vider le cache des requêtes SQL ?'))) return;
+        var btn = document.getElementById('btn-clear-cache');
+        await performAction(btn, {
+            url: '/api/cache/clear',
+            pendingText: 'Vidage…',
+            onSuccess: function(data) { showToast(data.message || 'Cache vidé', 'success'); }
+        });
+    }
+    document.getElementById('btn-clear-cache')?.addEventListener('click', clearCache);
+
+    // ── Ping BDD source maintenant ────────────────────────────
+    document.getElementById('btn-ping-sage')?.addEventListener('click', function() {
+        var btn = document.getElementById('btn-ping-sage');
+        performAction(btn, {
+            url: '/api/performance/ping-source-db',
+            pendingText: 'Test en cours…',
+            onSuccess: function(data) {
+                var s = data.status || {};
+                if (s.ok) showToast('Source BDD OK (' + (s.latency_ms || '?') + ' ms)', 'success');
+                else showToast('Source BDD : ' + (s.error || 'indisponible'), 'error');
+            }
+        });
+    });
+
+    // ── Ping providers LLM maintenant ─────────────────────────
+    document.getElementById('btn-ping-llm')?.addEventListener('click', function() {
+        var btn = document.getElementById('btn-ping-llm');
+        performAction(btn, {
+            url: '/api/performance/ping-llm-providers',
+            pendingText: 'Test en cours…',
+            onSuccess: function(data) {
+                var h = data.health || {};
+                var providers = h.providers || [];
+                if (providers.length === 0) {
+                    showToast(h.error || 'Aucun provider configuré', 'error');
+                    return;
+                }
+                var down = providers.filter(function(p) { return !p.ok; });
+                if (down.length === 0) showToast('Tous les providers répondent', 'success');
+                else showToast(down.length + ' provider(s) down : ' + down.map(function(p) { return p.name; }).join(', '), 'error');
+            }
+        });
+    });
+
+    // ── Refresh manuel ────────────────────────────────────────
+    document.getElementById('btn-refresh-now')?.addEventListener('click', function() {
+        location.reload();
+    });
+
+    // ── Auto-refresh (persisté via localStorage) ──────────────
+    var autoTimer = null;
+
+    function autoRefreshOn() {
+        try { return localStorage.getItem(AUTO_KEY) === '1'; } catch (e) { return false; }
+    }
+    function setAutoRefresh(on) {
+        try { localStorage.setItem(AUTO_KEY, on ? '1' : '0'); } catch (e) {}
+        stopAutoTimer();
+        if (on) startAutoTimer();
+    }
+    function startAutoTimer() {
+        if (autoTimer) return;
+        autoTimer = setTimeout(function() {
+            // Ne recharge que si l'onglet est visible — économise Sage +
+            // providers LLM quand le dashboard est en arrière-plan.
+            if (!document.hidden) location.reload();
+            else autoTimer = null;
+        }, AUTO_INTERVAL_MS);
+    }
+    function stopAutoTimer() {
+        if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    }
+
+    var autoToggle = document.getElementById('auto-refresh-toggle');
+    if (autoToggle) {
+        autoToggle.checked = autoRefreshOn();
+        autoToggle.addEventListener('change', function() { setAutoRefresh(autoToggle.checked); });
+        if (autoToggle.checked) startAutoTimer();
+    }
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            stopAutoTimer();
+            return;
+        }
+        if (!autoRefreshOn()) return;
+        // Debounce : un alt-tab rapide ne doit pas déclencher un reload en
+        // cascade. On ne relance que si la page a vécu assez longtemps pour
+        // que les données méritent un refresh.
+        if (Date.now() - PAGE_LOADED_AT > AUTO_INTERVAL_MS) {
+            location.reload();
+        } else {
+            startAutoTimer();
+        }
+    });
+
+    // Ticker "Dernière mise à jour il y a Xs" — délégué au module partagé
+    // ``static/js/last-updated-ticker.js`` (chargé par base.html). Il cible
+    // ``#last-updated-ticker[data-ts]`` et tick toutes les 10 s. Dédup SSoT
+    // (ADV-17 2026-05-26) : ce template dupliquait l'implémentation alors
+    // que le module partagé existait déjà pour /admin/ai-performance.
+
+    // ── Ticker "Vérifié il y a Xs" pour le cache providers ────
+    function updateLLMCacheAge() {
+        var el = document.getElementById('llm-cache-age');
+        if (!el) return;
+        var base = parseFloat(el.getAttribute('data-age'));
+        if (!isFinite(base)) return;
+        var pageAgeSec = Math.floor((Date.now() - PAGE_LOADED_AT) / 1000);
+        var totalSec = Math.max(0, Math.floor(base + pageAgeSec));
+        if (totalSec < 60) el.textContent = totalSec;
+        else if (totalSec < 3600) el.textContent = Math.floor(totalSec / 60) + ' min ';
+        else el.textContent = Math.floor(totalSec / 3600) + ' h';
+    }
+    updateLLMCacheAge();
+    setInterval(updateLLMCacheAge, 10000);
+
+    // ── Form quota stockage par utilisateur (global) ──────────
+    var quotaForm = document.getElementById('storage-quota-form');
+    if (quotaForm) {
+        quotaForm.addEventListener('submit', function(ev) {
+            ev.preventDefault();
+            var input = document.getElementById('storage-quota-input');
+            var status = document.getElementById('storage-quota-status');
+            var btn = document.getElementById('storage-quota-save');
+            var mb = parseInt(input.value, 10);
+            if (!Number.isFinite(mb) || mb < 1) {
+                status.textContent = 'Valeur invalide (min 1 Mo).';
+                status.className = 'text-xs text-red-600 dark:text-red-400';
+                status.classList.remove('hidden');
+                return;
+            }
+            var bytes = mb * 1024 * 1024;
+            btn.disabled = true;
+            var oldLabel = btn.textContent;
+            btn.textContent = 'Enregistrement...';
+            status.classList.add('hidden');
+
+            // Utilise l'API AIConfig existante (single source of truth).
+            // XSRF cookie envoyé via X-Xsrftoken header.
+            var xsrf = document.cookie.split(';').map(function(c) {
+                return c.trim();
+            }).find(function(c) {
+                return c.indexOf('_xsrf=') === 0;
+            });
+            xsrf = xsrf ? decodeURIComponent(xsrf.substring(6)) : '';
+
+            // Format POST /api/ai/config = dict {cle: valeur} direct (pas {key, value})
+            // Cf. AIConfigAPIHandler.post() qui itère body.items().
+            var payload = {};
+            payload['storage_quota_per_user_bytes'] = bytes;
+            fetch('/api/ai/config', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Xsrftoken': xsrf,
+                },
+                body: JSON.stringify(payload),
+            })
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function() {
+                status.textContent = 'Quota mis à jour. Appliqué immédiatement à tous les utilisateurs.';
+                status.className = 'text-xs text-green-600 dark:text-green-400';
+                status.classList.remove('hidden');
+                document.getElementById('storage-quota-current').textContent = mb + ' Mo actuel';
+            })
+            .catch(function(err) {
+                status.textContent = 'Échec : ' + (err && err.message ? err.message : 'erreur réseau');
+                status.className = 'text-xs text-red-600 dark:text-red-400';
+                status.classList.remove('hidden');
+            })
+            .finally(function() {
+                btn.disabled = false;
+                btn.textContent = oldLabel;
+            });
+        });
+    }
+
+    // ── Form taille max par fichier uploadé (SSoT global) ──────
+    // Même pattern que le quota : POST /api/ai/config {cle: valeur}, XSRF
+    // header, conversion Mo→octets. ids distincts (upload-size-*).
+    var uploadSizeForm = document.getElementById('upload-size-form');
+    if (uploadSizeForm) {
+        uploadSizeForm.addEventListener('submit', function(ev) {
+            ev.preventDefault();
+            var input = document.getElementById('upload-size-input');
+            var status = document.getElementById('upload-size-status');
+            var btn = document.getElementById('upload-size-save');
+            var mb = parseInt(input.value, 10);
+            if (!Number.isFinite(mb) || mb < 1 || mb > 2048) {
+                status.textContent = 'Valeur invalide (1 à 2048 Mo).';
+                status.className = 'text-xs text-red-600 dark:text-red-400';
+                status.classList.remove('hidden');
+                return;
+            }
+            var bytes = mb * 1024 * 1024;
+            btn.disabled = true;
+            var oldLabel = btn.textContent;
+            btn.textContent = 'Enregistrement...';
+            status.classList.add('hidden');
+
+            var xsrf = document.cookie.split(';').map(function(c) {
+                return c.trim();
+            }).find(function(c) {
+                return c.indexOf('_xsrf=') === 0;
+            });
+            xsrf = xsrf ? decodeURIComponent(xsrf.substring(6)) : '';
+
+            var payload = {};
+            payload['max_upload_size_bytes'] = bytes;
+            fetch('/api/ai/config', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Xsrftoken': xsrf,
+                },
+                body: JSON.stringify(payload),
+            })
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function() {
+                status.textContent = 'Limite mise à jour. Appliquée immédiatement à tous les uploads.';
+                status.className = 'text-xs text-green-600 dark:text-green-400';
+                status.classList.remove('hidden');
+                document.getElementById('upload-size-current').textContent = mb + ' Mo actuel';
+            })
+            .catch(function(err) {
+                status.textContent = 'Échec : ' + (err && err.message ? err.message : 'erreur réseau');
+                status.className = 'text-xs text-red-600 dark:text-red-400';
+                status.classList.remove('hidden');
+            })
+            .finally(function() {
+                btn.disabled = false;
+                btn.textContent = oldLabel;
+            });
+        });
+    }
+})();
+</script>
+{% end %}

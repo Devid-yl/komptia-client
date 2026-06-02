@@ -1,0 +1,485 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * ── Komptia : design tokens ──────────────────────────────────────────
+ * Variables CSS sémantiques utilisées par les composants ET les CSS
+ * custom (iris-grid.css, iris-widget.css). Un seul endroit pour piloter
+ * la palette claire ET sombre.
+ */
+@layer base {
+    :root {
+        color-scheme: light;
+        accent-color: #C44133;
+
+        /* Surfaces */
+        --bg-app: #f8fafc;
+        --bg-surface: #ffffff;
+        --bg-surface-2: #f9fafb;
+        --bg-surface-3: #f1f5f9;
+        --bg-overlay: rgba(0, 0, 0, 0.5);
+        --bg-hover: rgba(0, 0, 0, 0.04);
+
+        /* Borders */
+        --border: #e2e8f0;
+        --border-strong: #cbd5e1;
+        --border-subtle: rgba(0, 0, 0, 0.08);
+
+        /* Text */
+        --text-primary: #1e293b;
+        --text-secondary: #475569;
+        --text-muted: #64748b;
+        --text-faint: #94a3b8;
+        --text-inverse: #ffffff;
+
+        /* Brand */
+        --brand: #C44133;
+        --brand-strong: #A33529;
+        --brand-light: #D94F3F;
+        --brand-soft: rgba(196, 65, 51, 0.1);
+        --brand-soft-hover: rgba(196, 65, 51, 0.18);
+
+        /* Brand RGB (composantes pour usage avec rgb(var() / alpha)) */
+        --brand-rgb: 196 65 51;
+        --brand-light-rgb: 217 79 63;
+        --brand-strong-rgb: 163 53 41;
+
+        /* Palette brand-50..950 (consommée par Tailwind via tailwind.config.js) */
+        --brand-50:  254 242 240;
+        --brand-100: 253 227 223;
+        --brand-200: 251 196 188;
+        --brand-300: 247 157 144;
+        --brand-400: 240 114 98;
+        --brand-500: 217 79 63;
+        --brand-600: 196 65 51;
+        --brand-700: 163 53 41;
+        --brand-800: 135 44 35;
+        --brand-900: 110 36 29;
+        --brand-950: 61 20 16;
+
+        /* Shadows (reused across elements) */
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+        --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+        --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.15);
+
+        /* Status colors (sémantique : erreur, succès, warn, info) */
+        --status-error: #dc2626;
+        --status-error-bg: rgba(220, 38, 38, 0.10);
+        --status-success: #16a34a;
+        --status-success-bg: rgba(22, 163, 74, 0.10);
+        --status-warn: #b45309;
+        --status-warn-bg: rgba(245, 158, 11, 0.12);
+        --status-info: #2563eb;
+        --status-info-bg: rgba(37, 99, 235, 0.10);
+    }
+
+    .dark {
+        color-scheme: dark;
+        accent-color: #D94F3F;
+
+        --bg-app: #0b1220;
+        --bg-surface: #0f172a;
+        --bg-surface-2: #111827;
+        --bg-surface-3: #1e293b;
+        --bg-overlay: rgba(0, 0, 0, 0.7);
+        --bg-hover: rgba(255, 255, 255, 0.04);
+
+        --border: #1f2937;
+        --border-strong: #334155;
+        --border-subtle: rgba(255, 255, 255, 0.08);
+
+        --text-primary: #f1f5f9;
+        --text-secondary: #cbd5e1;
+        --text-muted: #94a3b8;
+        --text-faint: #64748b;
+        --text-inverse: #0f172a;
+
+        /* Brand en dark : adoucis (moins saturés, moins agressifs aux yeux la nuit). */
+        --brand: #cc6e5f;
+        --brand-strong: #b85a4d;
+        --brand-light: #de8a7c;
+        --brand-soft: rgba(204, 110, 95, 0.16);
+        --brand-soft-hover: rgba(204, 110, 95, 0.28);
+
+        /* Brand RGB en dark (composantes adoucies pour rgba) */
+        --brand-rgb: 204 110 95;
+        --brand-light-rgb: 222 138 124;
+        --brand-strong-rgb: 184 90 77;
+
+        /* Palette brand-50..950 dark — désaturée et inversée pour les fonds clairs.
+           bg-brand-50 (très clair en light) devient sombre teinte rouge en dark.
+           text-brand-600 (rouge marqué en light) devient corail doux en dark. */
+        --brand-50:  47  25  22;
+        --brand-100: 64  36  32;
+        --brand-200: 92  52  47;
+        --brand-300: 138 86  76;
+        --brand-400: 184 119 105;
+        --brand-500: 204 110 95;
+        --brand-600: 217 130 117;
+        --brand-700: 230 156 144;
+        --brand-800: 240 184 174;
+        --brand-900: 248 213 206;
+        --brand-950: 253 240 235;
+
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+        --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+        --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.6);
+
+        /* Status colors — variantes claires pour fond sombre */
+        --status-error: #fca5a5;
+        --status-error-bg: rgba(239, 68, 68, 0.16);
+        --status-success: #86efac;
+        --status-success-bg: rgba(34, 197, 94, 0.16);
+        --status-warn: #fcd34d;
+        --status-warn-bg: rgba(245, 158, 11, 0.16);
+        --status-info: #93c5fd;
+        --status-info-bg: rgba(96, 165, 250, 0.16);
+    }
+
+    body {
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }
+    input, select, textarea, button {
+        font-family: inherit;
+    }
+
+    /* ── Native form elements : thème-aware pour checkbox/radio/range ──
+       accent-color hérite de :root/.dark, mais on laisse aussi un fallback
+       explicite pour les navigateurs qui ne le propagent pas aux pseudo-
+       éléments. Toutes les checkboxes natives (datastore, smtp, reports,
+       contacts) et les sliders (admin/ai-config) deviennent brand red. */
+    input[type="checkbox"],
+    input[type="radio"],
+    input[type="range"] {
+        accent-color: var(--brand);
+    }
+
+    /* ── File input : le bouton "Choisir un fichier" natif apparaît blanc
+       sur fond sombre → on le force en surface thématique. Fonctionne
+       pour tous les <input type="file"> dans l'app (contacts, modals…). */
+    input[type="file"]::file-selector-button,
+    input[type="file"]::-webkit-file-upload-button {
+        background: var(--bg-surface-3);
+        color: var(--text-primary);
+        border: 1px solid var(--border);
+        padding: 0.375rem 0.75rem;
+        border-radius: 0.375rem;
+        font-size: 0.8125rem;
+        font-family: inherit;
+        cursor: pointer;
+        margin-right: 0.75rem;
+        transition: background-color 0.15s, border-color 0.15s;
+    }
+    input[type="file"]::file-selector-button:hover,
+    input[type="file"]::-webkit-file-upload-button:hover {
+        background: var(--bg-hover);
+        border-color: var(--border-strong);
+    }
+    input[type="file"] {
+        color: var(--text-secondary);
+        font-size: 0.8125rem;
+    }
+
+    /* ── Select natif : harmoniser le contour sombre sans casser le thème
+       clair. color-scheme gère déjà le chevron, on ajoute les couleurs. */
+    .dark select:not([class*="bg-"]) {
+        background-color: var(--bg-surface);
+        color: var(--text-primary);
+        border-color: var(--border);
+    }
+
+    /* ── Scrollbar-color (Firefox) : évite le scrollbar blanc en dark ── */
+    .dark {
+        scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+    }
+}
+
+@layer components {
+    /* ── Menu d'actions (kebab ⋮) — réutilisable cross-pages ──────────
+       Pattern initial : ``templates/reports/list.html`` (scoped CSS).
+       Extrait ici comme composant générique pour /contacts et toute
+       future table avec actions par ligne (audit, datastore, etc.).
+       Convention : conteneur ``.actions-menu`` + trigger ``.actions-menu-trigger``
+       + dropdown ``.actions-menu-dropdown`` + items ``.actions-menu-item``.
+       Item destructif : ``.actions-menu-item.danger``. */
+    .actions-menu {
+        @apply relative inline-block;
+    }
+    .actions-menu-trigger {
+        @apply inline-flex items-center justify-center w-7 h-7 rounded-md border border-transparent text-gray-500 hover:bg-gray-100 hover:text-gray-700 hover:border-gray-200 transition-colors;
+        @apply dark:text-gray-400 dark:hover:bg-white/[0.06] dark:hover:text-gray-200 dark:hover:border-white/[0.12];
+    }
+    .actions-menu-dropdown {
+        @apply absolute top-full right-0 mt-1 min-w-[180px] p-1 rounded-lg border bg-white border-gray-200 shadow-lg z-50;
+        @apply dark:bg-gray-900 dark:border-gray-800;
+    }
+    .actions-menu-item {
+        @apply flex items-center gap-2 w-full px-2.5 py-1.5 text-xs text-left text-gray-700 rounded hover:bg-gray-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+        @apply dark:text-gray-200 dark:hover:bg-white/[0.06];
+    }
+    .actions-menu-item.danger {
+        @apply text-red-600 hover:bg-red-50;
+        @apply dark:text-red-400 dark:hover:bg-red-500/10;
+    }
+    .actions-menu-item svg {
+        @apply w-3.5 h-3.5 flex-shrink-0;
+    }
+
+    /* ── Schedule (Planification automation) ──────────────────────────
+       Composant scope de la modal Planification dans /automations/N/edit.
+       Cards radio horizontales + chips jours de semaine — l'ensemble se
+       comporte comme un radio group natif (clavier Tab/Space, ARIA herite
+       des inputs `sr-only` dessous). Couleurs alignees sur la palette
+       brand- du design system Komptia. */
+    .schedule-mode-card {
+        @apply cursor-pointer block;
+    }
+    .schedule-mode-card .schedule-mode-label {
+        @apply flex flex-col items-center justify-center gap-1 px-2 py-3 rounded-lg border border-gray-200 bg-white text-xs text-gray-700 transition-colors;
+        @apply dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300;
+    }
+    .schedule-mode-card .schedule-mode-label i {
+        @apply text-base text-gray-500 dark:text-gray-400;
+    }
+    .schedule-mode-card:hover .schedule-mode-label {
+        @apply border-gray-300 bg-gray-50 dark:border-gray-600 dark:bg-gray-700/50;
+    }
+    .schedule-mode-card input:checked + .schedule-mode-label {
+        @apply border-brand-500 bg-brand-50 text-brand-700;
+        @apply dark:bg-brand-900/20 dark:text-brand-300 dark:border-brand-500;
+    }
+    .schedule-mode-card input:checked + .schedule-mode-label i {
+        @apply text-brand-600 dark:text-brand-400;
+    }
+    .schedule-mode-card input:focus-visible + .schedule-mode-label {
+        @apply ring-2 ring-brand-500 ring-offset-1 dark:ring-offset-gray-900;
+    }
+    .schedule-day-chip {
+        @apply cursor-pointer;
+    }
+    .schedule-day-chip span {
+        @apply inline-block px-3 py-1.5 rounded-md border border-gray-200 bg-white text-xs font-medium text-gray-700 transition-colors;
+        @apply dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300;
+    }
+    .schedule-day-chip:hover span {
+        @apply border-gray-300 bg-gray-50 dark:border-gray-600 dark:bg-gray-700/50;
+    }
+    .schedule-day-chip input:checked + span {
+        @apply border-brand-500 bg-brand-500 text-white;
+        @apply dark:bg-brand-500 dark:border-brand-500;
+    }
+    .schedule-day-chip input:focus-visible + span {
+        @apply ring-2 ring-brand-500 ring-offset-1 dark:ring-offset-gray-900;
+    }
+
+    /* ── Sidebar (reste sombre dans les 2 modes — identité Komptia) ── */
+    .sidebar-link {
+        @apply flex items-center px-2.5 py-2 text-sm rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-colors duration-150;
+    }
+    .sidebar-link-active {
+        @apply flex items-center px-2.5 py-2 text-sm rounded-lg font-medium text-white bg-brand-600/20 border-l-[3px] border-brand-500 shadow-sm;
+    }
+
+    /* ── Boutons ────────────────────────────────────────── */
+    .btn {
+        @apply inline-flex items-center justify-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg border transition-all duration-150 focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:opacity-50 disabled:cursor-not-allowed;
+    }
+    .btn-primary {
+        @apply bg-brand-600 text-white border-brand-600 hover:bg-brand-700 focus:ring-brand-500/50 shadow-sm hover:shadow;
+        @apply dark:bg-brand-500 dark:border-brand-500 dark:hover:bg-brand-400 dark:focus:ring-brand-400/50;
+    }
+    .btn-secondary {
+        @apply bg-white text-gray-700 border-gray-200 hover:bg-gray-50 hover:border-gray-300 focus:ring-brand-500/30 shadow-sm;
+        @apply dark:bg-gray-800 dark:text-gray-200 dark:border-gray-700 dark:hover:bg-gray-700 dark:hover:border-gray-600 dark:focus:ring-brand-400/30;
+    }
+    .btn-danger {
+        @apply bg-red-600 text-white border-red-600 hover:bg-red-700 focus:ring-red-500/50 shadow-sm;
+        @apply dark:bg-red-800 dark:border-red-800 dark:hover:bg-red-700 dark:focus:ring-red-500/40;
+    }
+
+    /* ── Inputs/labels ─────────────────────────────────── */
+    .input {
+        @apply w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 outline-none transition-all duration-150;
+        @apply bg-white text-gray-900 placeholder-gray-400;
+        @apply dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-brand-400 dark:focus:ring-brand-400/20;
+    }
+    .label {
+        @apply block text-sm font-medium text-gray-700 mb-1;
+        @apply dark:text-gray-300;
+    }
+
+    /* ── Cards ────────────────────────────────────────── */
+    .card {
+        @apply bg-white border border-gray-200/80 rounded-xl overflow-hidden shadow-sm;
+        @apply dark:bg-gray-900 dark:border-gray-800;
+    }
+
+    /* ── Badges ───────────────────────────────────────── */
+    .badge {
+        @apply inline-flex items-center px-2.5 py-0.5 text-xs font-medium rounded-full bg-gray-100 text-gray-600;
+        @apply dark:bg-gray-800 dark:text-gray-300;
+    }
+    .badge-success {
+        @apply bg-emerald-50 text-emerald-700 ring-1 ring-emerald-600/10;
+        @apply dark:bg-emerald-900/30 dark:text-emerald-300 dark:ring-emerald-500/20;
+    }
+    .badge-error {
+        @apply bg-red-50 text-red-700 ring-1 ring-red-600/10;
+        @apply dark:bg-red-900/30 dark:text-red-300 dark:ring-red-500/20;
+    }
+    .badge-warning {
+        @apply bg-amber-50 text-amber-700 ring-1 ring-amber-600/10;
+        @apply dark:bg-amber-900/30 dark:text-amber-300 dark:ring-amber-500/20;
+    }
+    .badge-neutral {
+        @apply bg-gray-50 text-gray-600 ring-1 ring-gray-500/10;
+        @apply dark:bg-gray-800 dark:text-gray-300 dark:ring-gray-600/30;
+    }
+
+    /* ── Tables ───────────────────────────────────────── */
+    .table-header {
+        @apply px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider bg-gray-50/80 border-b border-gray-200;
+        @apply dark:text-gray-400 dark:bg-gray-800/60 dark:border-gray-800;
+    }
+    .table-cell {
+        @apply px-4 py-3 text-sm text-gray-700;
+        @apply dark:text-gray-300;
+    }
+
+    /* ── Sidebar collapsible (full remove) ── */
+    #app-sidebar.collapsed,
+    .sidebar-start-collapsed #app-sidebar {
+        display: none !important;
+    }
+
+    /* ── Topbar (appears when sidebar hidden) — pilotée par CSS vars ── */
+    .app-topbar {
+        height: 3rem;
+        background: var(--bg-surface);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        padding: 0 1.25rem;
+        flex-shrink: 0;
+        box-shadow: var(--shadow-sm);
+        animation: topbar-slide 0.3s cubic-bezier(0.4, 0, 0.2, 1) both;
+    }
+    @keyframes topbar-slide {
+        from { transform: translateY(-100%); opacity: 0; }
+        to   { transform: translateY(0); opacity: 1; }
+    }
+    .topbar-hamburger {
+        width: 2rem;
+        height: 2rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: none;
+        background: transparent;
+        color: var(--text-muted);
+        cursor: pointer;
+        border-radius: 0.375rem;
+        transition: background 0.15s, color 0.15s;
+        flex-shrink: 0;
+        padding: 0;
+    }
+    .topbar-hamburger:hover { background: var(--bg-surface-3); color: var(--text-primary); }
+    .topbar-hamburger svg { width: 1.125rem; height: 1.125rem; }
+    .topbar-brand {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-left: 0.75rem;
+        text-decoration: none;
+        flex-shrink: 0;
+    }
+    .topbar-brand-icon {
+        width: 1.625rem;
+        height: 1.625rem;
+        background: linear-gradient(135deg, #C44133, #D94F3F);
+        border-radius: 0.375rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 1px 2px rgba(196,65,51,0.3);
+    }
+    .topbar-brand-icon svg { width: 0.875rem; height: 0.875rem; color: white; }
+    .topbar-brand-name {
+        font-size: 0.875rem;
+        font-weight: 700;
+        color: var(--text-primary);
+        letter-spacing: -0.01em;
+    }
+    .topbar-sep {
+        width: 1px;
+        height: 1.25rem;
+        background: var(--border);
+        margin: 0 0.875rem;
+        flex-shrink: 0;
+    }
+    .topbar-page-title {
+        font-size: 0.8125rem;
+        font-weight: 500;
+        color: var(--text-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+    }
+    .topbar-spacer { flex: 1; }
+    .topbar-user {
+        display: flex;
+        align-items: center;
+        gap: 0.625rem;
+        flex-shrink: 0;
+    }
+    .topbar-avatar {
+        width: 1.75rem;
+        height: 1.75rem;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #C44133, #D94F3F);
+        color: white;
+        font-size: 0.6875rem;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-transform: uppercase;
+        flex-shrink: 0;
+    }
+    .topbar-user-text { line-height: 1.2; }
+    .topbar-username { font-size: 0.8125rem; font-weight: 500; color: var(--text-secondary); }
+    .topbar-role { font-size: 0.6875rem; color: var(--text-faint); }
+    .topbar-logout {
+        width: 1.75rem;
+        height: 1.75rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        color: var(--text-faint);
+        border-radius: 0.375rem;
+        transition: all 0.15s;
+        margin-left: 0.25rem;
+        text-decoration: none;
+    }
+    .topbar-logout:hover { background: rgba(239, 68, 68, 0.1); color: #ef4444; }
+    .topbar-logout svg { width: 0.9375rem; height: 0.9375rem; }
+
+    /* When sidebar hidden: center content with max-w */
+    #app-content-wrap.sidebar-fullscreen > div[class*="max-w-"] {
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    /* Theme option cards (settings page) */
+    .theme-option {
+        background: var(--bg-surface);
+        border-color: var(--border);
+    }
+    .theme-option:hover {
+        border-color: var(--border-strong);
+    }
+}

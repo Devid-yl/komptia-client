@@ -1,0 +1,198 @@
+/*
+ * Onboarding Tour — modal de bienvenue à la première visite.
+ *
+ * Style minimal CSP-safe (pas d'inline). Modal centré, overlay sombre,
+ * progression dot-stepper, transitions douces. Cohérent avec la palette
+ * Komptia (variables --brand-*, slate, gray).
+ */
+
+.komptia-onboard-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.65);
+    -webkit-backdrop-filter: blur(2px); /* Safari/WebKit (sinon le flou est silencieusement no-op) */
+    backdrop-filter: blur(2px);
+    z-index: 9997; /* sous syncModal/appConfirmModal (9999) et toast (10000) ;
+                      au-dessus de info-tooltip (9998). */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+}
+.komptia-onboard-overlay--open {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.komptia-onboard-modal {
+    background: white;
+    color: #1e293b;
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(15, 23, 42, 0.35);
+    width: min(520px, calc(100vw - 32px));
+    max-height: calc(100vh - 64px);
+    overflow: auto;
+    transform: translateY(8px) scale(0.98);
+    transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.komptia-onboard-overlay--open .komptia-onboard-modal {
+    transform: translateY(0) scale(1);
+}
+.dark .komptia-onboard-modal {
+    background: #131c2e;
+    color: #e2e8f0;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6),
+                0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.komptia-onboard-header {
+    padding: 24px 28px 0 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+.komptia-onboard-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin: 0;
+}
+.komptia-onboard-skip {
+    background: transparent;
+    border: none;
+    color: #64748b;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: background 0.12s, color 0.12s;
+}
+.komptia-onboard-skip:hover {
+    background: rgba(100, 116, 139, 0.08);
+    color: #1e293b;
+}
+.dark .komptia-onboard-skip { color: #94a3b8; }
+.dark .komptia-onboard-skip:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: #f1f5f9;
+}
+
+.komptia-onboard-body {
+    padding: 16px 28px 8px 28px;
+}
+.komptia-onboard-step-icon {
+    width: 56px;
+    height: 56px;
+    border-radius: 14px;
+    /* Fallback statique si --brand-rgb n'est pas défini (theme custom,
+       CSS purgé par Tailwind JIT en prod, tour invoqué hors layout admin).
+       La couleur figée est le terracotta Komptia (#D94F3F) — cf. logo SVG.
+       Sans ce fallback, l'icône devenait invisible (transparent).
+       Cf. review adversariale R2-A11. */
+    background: linear-gradient(135deg, rgba(217, 79, 63, 0.18), rgba(217, 79, 63, 0.05));
+    background: linear-gradient(135deg, rgb(var(--brand-rgb) / 0.18), rgb(var(--brand-rgb) / 0.05));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #D94F3F;
+    color: rgb(var(--brand-rgb));
+    margin-bottom: 16px;
+}
+.dark .komptia-onboard-step-icon {
+    background: linear-gradient(135deg, rgba(240, 169, 154, 0.22), rgba(240, 169, 154, 0.06));
+    background: linear-gradient(135deg, rgb(var(--brand-light-rgb) / 0.22), rgb(var(--brand-light-rgb) / 0.06));
+    color: #F0A99A;
+    color: rgb(var(--brand-light-rgb));
+}
+.komptia-onboard-step-title {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+}
+.komptia-onboard-step-text {
+    font-size: 14px;
+    line-height: 1.55;
+    color: #475569;
+    margin: 0;
+}
+.dark .komptia-onboard-step-text { color: #cbd5e1; }
+
+.komptia-onboard-footer {
+    padding: 16px 28px 24px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+.komptia-onboard-dots {
+    display: flex;
+    gap: 6px;
+}
+.komptia-onboard-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: rgba(100, 116, 139, 0.3);
+    transition: background 0.15s, transform 0.15s;
+}
+.komptia-onboard-dot--active {
+    background: #D94F3F;
+    background: rgb(var(--brand-rgb));
+    transform: scale(1.4);
+}
+.dark .komptia-onboard-dot { background: rgba(148, 163, 184, 0.3); }
+.dark .komptia-onboard-dot--active {
+    background: #F0A99A;
+    background: rgb(var(--brand-light-rgb));
+}
+
+.komptia-onboard-actions {
+    display: flex;
+    gap: 8px;
+}
+.komptia-onboard-btn {
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.12s, color 0.12s, box-shadow 0.12s;
+}
+.komptia-onboard-btn--ghost {
+    background: transparent;
+    color: #475569;
+    border-color: rgba(100, 116, 139, 0.25);
+}
+.komptia-onboard-btn--ghost:hover {
+    background: rgba(100, 116, 139, 0.08);
+}
+.komptia-onboard-btn--ghost:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.dark .komptia-onboard-btn--ghost {
+    color: #cbd5e1;
+    border-color: rgba(148, 163, 184, 0.25);
+}
+.dark .komptia-onboard-btn--ghost:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+.komptia-onboard-btn--primary {
+    background: #D94F3F;
+    background: rgb(var(--brand-rgb));
+    color: white;
+    border-color: #D94F3F;
+    border-color: rgb(var(--brand-rgb));
+}
+.komptia-onboard-btn--primary:hover {
+    background: rgba(217, 79, 63, 0.9);
+    background: rgb(var(--brand-rgb) / 0.9);
+}
+.komptia-onboard-btn--primary:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(217, 79, 63, 0.4);
+    box-shadow: 0 0 0 3px rgb(var(--brand-rgb) / 0.4);
+}

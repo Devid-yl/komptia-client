@@ -1,0 +1,13 @@
+{# Badge statut actif / inactif — partial partagé.
+
+   Variable attendue dans le scope du caller :
+   - ``user_is_active`` : booléen ``True`` si l'utilisateur est actif.
+
+   SSoT 2026-05-26 (F7) : palette green/red avec ring sober, alignée sur
+   les autres badges Komptia (cf. user_role_badge.html).
+#}
+{% if user_is_active %}
+<span class="text-xs font-medium px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-200/70 dark:bg-emerald-500/10 dark:text-emerald-300 dark:ring-emerald-500/25">Actif</span>
+{% else %}
+<span class="text-xs font-medium px-2 py-0.5 rounded bg-red-50 text-red-700 ring-1 ring-inset ring-red-200/70 dark:bg-red-500/10 dark:text-red-300 dark:ring-red-500/25">Inactif</span>
+{% end %}

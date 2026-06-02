@@ -1,0 +1,18 @@
+{{ company_name }}
+{% if tagline %}{{ tagline }}{% endif %}
+
+================================================================================
+
+{{ title | default('Information') }}
+
+{{ message | default('Contenu du message') }}
+
+================================================================================
+
+{{ company_name }}
+{% if address %}{{ address }}{% endif %}
+{% if phone %}Tél: {{ phone }}{% endif %}
+{% if contact_email %}Email: {{ contact_email }}{% endif %}
+
+Vous recevez cet email car vous êtes client de {{ company_name }}.
+Pour vous désabonner: {{ unsubscribe_url | default('Contactez-nous') }}

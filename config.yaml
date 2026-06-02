@@ -1,0 +1,62 @@
+# =================================================
+# Komptia v2.0 - Configuration
+# =================================================
+
+# Application
+app_name: Komptia
+app_version: 2.0.0
+
+# Serveur
+# host: 0.0.0.0 = écoute sur toutes les interfaces du container Docker.
+# Sécurité préservée : docker-compose mappe le port en `127.0.0.1:8888:8888`,
+# donc seul l'host local (et nginx reverse-proxy) peut atteindre l'app.
+server:
+  host: 0.0.0.0
+  port: 8888
+  debug: false
+  autoreload: false
+  num_processes: 1
+  # Derrière un reverse-proxy HTTPS (nginx) : passer à `true` pour honorer
+  # X-Forwarded-For/-Proto → vraie IP client (rate-limiter login per-user),
+  # émission HSTS, URLs https correctes. /!\ N'activer QUE si le port de l'app
+  # n'est joignable que via le proxy (docker-compose: 127.0.0.1:8888) — sinon
+  # ces en-têtes sont usurpables. Défaut `false` = fail-safe.
+  trust_proxy_headers: false
+
+# Base de données locale
+database:
+  echo: false
+  pool_size: 5
+
+# Base de données source (SQL Server)
+sage:
+  timeout: 30
+  max_rows: 1000
+  label: "Base SQL Server"  # Nom affiché (ex: "Sage Coala", "EBP", etc.)
+
+# Ollama
+ollama:
+  temperature: 0.1
+  timeout: 180
+  max_retries: 3
+
+# Sécurité
+security:
+  session_timeout_hours: 8
+  csrf_enabled: true
+  rate_limit_login: 5
+  bcrypt_rounds: 12
+
+# Limites applicatives
+limits:
+  max_users: 50                    # Nombre maximum d'utilisateurs actifs
+  max_users_warning_at: 45         # Alerte à 90% de la limite
+  allow_admin_override: true       # Les admins peuvent dépasser temporairement
+  # Taille max par fichier uploadé  -> reglage admin /admin/performance (AIConfig)
+  # Lignes max par requete SQL      -> reglage admin /admin/database (max_rows)
+  # (Anciennes cles max_file_size_mb / max_query_results retirees : jamais lues.)
+
+# SMTP
+smtp:
+  use_tls: true
+  from_name: Komptia

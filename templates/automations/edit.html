@@ -1,0 +1,614 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ automation_name or "Automatisation" }} | {{ app_name }}{% end %}
+
+{# Override : la page edit est full-bleed (canvas occupe tout l'espace).
+   Le block content_wrapper_class est defini en defaut "px-8 py-6" dans
+   base.html ; on le passe a "" pour que le canvas etende plein cadre. #}
+{% block content_wrapper_class %}{% end %}
+
+{% block head %}
+<link rel="stylesheet" href="/static/vendor/drawflow/drawflow.min.css">
+<link rel="stylesheet" href="/static/css/automation-canvas.css">
+<link rel="stylesheet" href="/static/css/automation-preview.css">
+<link rel="stylesheet" href="/static/css/automation-pickers.css">
+{# iris-grid.css : indispensable pour `automation-preview.js` qui rend les
+   workbooks via `GridTabManager` (meme composant que /iris et /datastore).
+   Sans ce CSS, la grille s'affiche en HTML brut sans styling — rendu degrade
+   immediatement repere par David sur /automations/N/edit (preview Source/Format). #}
+<link rel="stylesheet" href="/static/css/iris-grid.css">
+{# Auto-collapse de la sidebar : la palette + le panel config + le canvas
+   prennent deja toute la largeur. Sans collapse, l'utilisateur n'a plus la
+   place pour bosser. On declare `data-route-sidebar="collapsed"` sur le
+   <html> ; `base.html` lit cette directive et applique le collapse au
+   mount, en plus du localStorage user-pref. On N'ECRIT PAS dans
+   localStorage : le toggle manuel utilisateur reste maitre, et son choix
+   global est preserve sur les autres pages. La classe
+   `sidebar-start-collapsed` est aussi appliquee pour eviter le flash
+   blanc avant que le JS de base.html ne tourne. #}
+<script nonce="{{ handler.csp_nonce }}">
+    document.documentElement.setAttribute('data-route-sidebar', 'collapsed');
+    document.documentElement.classList.add('sidebar-start-collapsed');
+</script>
+{% end %}
+
+{% block content %}
+<div class="w-full h-full flex flex-col"
+     data-komptia-automation-id="{{ automation_id }}"
+     data-komptia-automation-name="{{ automation_name or 'Automatisation' }}"
+     data-komptia-editable="true"
+     id="komptia-edit-root">
+
+    <!-- Top bar -->
+    <div class="flex items-center gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900">
+        <a href="/automations"
+           class="inline-flex items-center gap-1.5 text-sm text-gray-600 hover:text-gray-900 dark:text-gray-300 dark:hover:text-gray-100 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800"
+           aria-label="Retour aux automatisations">
+            <i class="bi bi-arrow-left"></i>
+            <span>Retour</span>
+        </a>
+        <input type="text"
+               id="komptia-automation-name"
+               value="{{ automation_name or 'Automatisation' }}"
+               maxlength="200"
+               class="w-64 text-sm font-semibold bg-transparent border-0 focus:ring-1 focus:ring-brand-500 rounded px-2 py-1"
+               aria-label="Nom de l'automatisation">
+        {# Wrapper flex-1 centre : le save-indicator est absolument centre
+           dans l'espace restant entre le nom (a gauche) et les boutons
+           Actif/Valider (a droite). Sans wrapper, le span "Pret" etait
+           colle au nom et paraissait decentre. #}
+        <div class="flex-1 flex items-center justify-center">
+            <span id="komptia-save-indicator"
+                  class="komptia-save-indicator komptia-save-idle text-xs"
+                  data-state="idle"
+                  aria-live="polite">Pret</span>
+        </div>
+        {# Top bar actions : Planification (lien discret) + Valider
+           (CTA principal). Cliquer "Valider" valide la structure du DAG
+           ET active l'automatisation en une etape (decision David
+           2026-05-08) — le toggle Actif sur /automations reste dispo
+           pour desactiver/re-activer ulterieurement. En cas d'erreur de
+           validation, l'activation n'a pas lieu (defense en profondeur
+           cote backend). #}
+        <div class="flex items-center gap-2">
+            {# Planification : style "ghost" discret (pas un CTA solide).
+               L'aspect souligne sur hover signale le caractere "lien" de
+               l'action (ouvre une modal, pas une operation lourde). #}
+            <button type="button"
+                    id="komptia-schedule-btn"
+                    class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-100 dark:hover:bg-gray-800 transition-colors"
+                    title="Définit quand l'automation se déclenche : une fois, tous les jours, toutes les semaines, tous les mois, ou cron avancé. TZ stockage Europe/Paris, affichage TZ navigateur."
+                    aria-label="Configurer la planification">
+                <i class="bi bi-calendar2-event text-xs" aria-hidden="true"></i>
+                <span>Planification</span>
+                <span id="komptia-schedule-summary"
+                      class="hidden ml-0.5 px-1.5 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300"></span>
+            </button>
+
+            <button type="button"
+                    id="komptia-validate-btn"
+                    class="btn btn-primary btn-sm inline-flex items-center gap-1.5"
+                    title="Verifie la structure du DAG. Si valide, l'automatisation est activee automatiquement."
+                    aria-label="Valider l'automatisation">
+                <i class="bi bi-check2-circle" aria-hidden="true"></i>
+                <span>Valider</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex items-center gap-0 px-4 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900">
+        <button type="button"
+                class="px-4 py-2 text-sm font-medium border-b-2 border-brand-500 text-gray-900 dark:text-gray-100"
+                data-komptia-tab="editor">Editeur</button>
+        <a class="px-4 py-2 text-sm font-medium text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 border-b-2 border-transparent"
+           href="/automations/history/{{ automation_id }}">Historique</a>
+    </div>
+
+    <!-- Palette + Canvas + panel -->
+    <div id="komptia-edit-main" class="flex-1 flex relative overflow-hidden">
+
+        <!-- Panel "Types d'etapes" (gauche) — retractable via la fleche
+             externe `#komptia-palette-toggle` qui suit le bord droit du
+             panel. -->
+        <aside id="komptia-palette"
+               class="w-60 flex-shrink-0 border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 overflow-y-auto relative"
+               aria-label="Liste des types d'étapes">
+            <div class="p-3 border-b border-gray-100 dark:border-gray-800">
+                <h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                    Types d'étapes
+                </h2>
+                <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                    Glisser sur le canvas
+                </p>
+            </div>
+            <div id="komptia-palette-list"
+                 class="py-2"
+                 aria-live="polite">
+                <p class="text-xs text-gray-400 dark:text-gray-500 px-3 py-2">Chargement...</p>
+            </div>
+        </aside>
+
+        <!-- Fleche unique panel gauche. Position absolute dans le wrapper
+             flex parent. Au bord droit du panel quand il est ouvert
+             (left = 240px), dans le coin top-left du canvas quand il est
+             ferme (left = 0). Icones flip via CSS selon `.palette-collapsed`. -->
+        <button type="button"
+                id="komptia-palette-toggle"
+                class="komptia-edge-toggle komptia-edge-toggle-left"
+                aria-label="Réduire/afficher la liste des étapes"
+                title="Réduire/afficher la liste des étapes">
+            <i class="bi bi-chevron-left komptia-edge-icon-open"></i>
+            <i class="bi bi-chevron-right komptia-edge-icon-closed"></i>
+        </button>
+
+        <!-- Canvas -->
+        <div class="flex-1 relative">
+            <div id="komptia-canvas" class="w-full h-full"></div>
+            <!-- Empty state overlay -->
+            <div id="komptia-canvas-empty"
+                 class="absolute inset-0 flex items-center justify-center pointer-events-none hidden">
+                <div class="text-center">
+                    <p class="text-lg font-semibold text-gray-700 dark:text-gray-200">Canvas vide</p>
+                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                        Glissez un type d'étape depuis la palette pour commencer.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Panel config node — retractable via la fleche externe
+             `#komptia-panel-toggle` qui suit le bord gauche du panel. -->
+        <div id="komptia-node-panel"
+             class="w-96 flex-shrink-0 border-l border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 overflow-y-auto hidden"
+             aria-label="Configuration du node">
+            <div class="p-4">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-3" id="komptia-panel-title">Node</h2>
+                <form id="komptia-panel-form"
+                      class="space-y-3"
+                      autocomplete="off"
+                      aria-label="Formulaire de configuration">
+                    <!-- Rendu dynamique depuis automation-canvas.js selon step.step_type -->
+                </form>
+            </div>
+        </div>
+
+        <!-- Fleche unique panel droit. Position absolute dans le wrapper
+             flex parent. Au bord gauche du panel quand il est ouvert
+             (right = 384px), dans le coin top-right du canvas quand il
+             est ferme (right = 0). Icones flip via CSS selon
+             `.panel-collapsed`. Visible uniquement quand un node est
+             selectionne (cf. JS qui ajoute `.has-content` au mount). -->
+        <button type="button"
+                id="komptia-panel-toggle"
+                class="komptia-edge-toggle komptia-edge-toggle-right hidden"
+                aria-label="Réduire/afficher la configuration de l'étape"
+                title="Réduire/afficher la configuration de l'étape">
+            <i class="bi bi-chevron-right komptia-edge-icon-open"></i>
+            <i class="bi bi-chevron-left komptia-edge-icon-closed"></i>
+        </button>
+    </div>
+
+    <!-- Result area : zone preview du step en bas du canvas. Hide tant
+         qu'aucun preview n'a ete declenche. Le contenu (workbook via
+         GridTabManager, bouton ouvrir PDF, recap email dry-run) est
+         gere par automation-preview.js. -->
+    <section id="komptia-preview-area"
+             class="border-t border-gray-200 dark:border-gray-800"
+             aria-label="Aperçu du résultat de l'étape"
+             hidden>
+        <div class="komptia-preview-bar">
+            <span class="komptia-preview-title">Aperçu</span>
+            <span class="komptia-preview-meta" id="komptia-preview-meta"></span>
+            <button type="button"
+                    id="komptia-preview-collapse-btn"
+                    aria-label="Réduire/agrandir la zone d'aperçu"
+                    title="Réduire/agrandir">
+                <i class="bi bi-chevron-down" aria-hidden="true"></i>
+            </button>
+            <button type="button"
+                    id="komptia-preview-close-btn"
+                    aria-label="Fermer l'aperçu"
+                    title="Fermer">
+                <i class="bi bi-x-lg" aria-hidden="true"></i>
+            </button>
+        </div>
+        <div class="komptia-preview-body" id="komptia-preview-body">
+            <div class="komptia-preview-empty">
+                Sélectionnez une étape puis cliquez sur « Aperçu » pour voir ce qu'elle produit.
+            </div>
+        </div>
+    </section>
+
+    <!-- Zoom controls : `[-]  100%  [+]`. Le pourcentage central est cliquable
+         et reset le zoom a 100% (remplace l'ancien bouton fullscreen).
+         Position fixed bas-droite via CSS. Empile sous le FAB Iris. -->
+    <div id="komptia-canvas-zoom-controls"
+         class="komptia-canvas-zoom-controls bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700">
+        <button type="button" class="komptia-zoom-btn hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
+                id="komptia-zoom-out" aria-label="Zoom arriere" title="Zoom arriere">
+            <i class="bi bi-dash-lg"></i>
+        </button>
+        <button type="button"
+                id="komptia-zoom-level"
+                class="komptia-zoom-level hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
+                aria-label="Reinitialiser le zoom a 100 pourcent"
+                title="Cliquer pour reinitialiser a 100%">
+            <span id="komptia-zoom-level-text">100%</span>
+        </button>
+        <button type="button" class="komptia-zoom-btn hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
+                id="komptia-zoom-in" aria-label="Zoom avant" title="Zoom avant">
+            <i class="bi bi-plus-lg"></i>
+        </button>
+    </div>
+
+    {# Modal partage du selecteur de fichiers/feuilles. Single source
+       of truth avec /reports, /iris, /datastore — pas de duplication
+       (axe 7 du contrat Komptia). Le picker datastore_file_picker de
+       automation-pickers.js l'ouvre via window.ExternalSheetsPicker. #}
+    {% include "../partials/external_sheets_modal.html" %}
+
+    {# ── Modal Planification ────────────────────────────────────────
+       Configuration de schedule_type/schedule_config. 5 modes radio,
+       sections conditionnelles, preview live "5 prochaines executions"
+       calcule cote serveur (POST /api/automations/schedule/preview),
+       affiche en TZ navigateur via LocalDatetime. Pilote par
+       automation-schedule.js (init au DOMContentLoaded). #}
+    {# Cluster-O 2026-05-26 — Retrait du `style="z-index: 9050;"` inline.
+       OverlayManager pilote le z-index via `layer: 'modal'` (cf.
+       overlay-layers.css). Le 9050 inline forçait au-dessus des layers
+       OverlayManager, créant des conflits avec dropdowns/popovers et
+       violant l'axe 17 « dernier ouvert toujours devant ». #}
+    <div id="komptia-schedule-modal"
+         class="fixed inset-0 bg-black/50 flex items-center justify-center hidden"
+         role="dialog"
+         aria-modal="true"
+         aria-labelledby="komptia-schedule-modal-title">
+        <div class="bg-white dark:bg-gray-900 rounded-lg shadow-xl w-full max-w-xl mx-4 max-h-[85vh] flex flex-col">
+
+            <!-- Header -->
+            <div class="flex items-center justify-between px-5 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h3 id="komptia-schedule-modal-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                    Planification de l'automatisation
+                </h3>
+                <button type="button"
+                        id="komptia-schedule-close"
+                        class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
+                        aria-label="Fermer la fenêtre de planification">
+                    &times;
+                </button>
+            </div>
+
+            <!-- Body : scrollable, padding interne -->
+            <div class="px-5 py-4 overflow-y-auto space-y-5">
+
+                <!-- Mode selector : radio horizontal 5 options -->
+                <fieldset>
+                    <legend class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">
+                        Frequence
+                    </legend>
+                    <div class="grid grid-cols-2 sm:grid-cols-5 gap-2" role="radiogroup" aria-label="Type de planification">
+                        <label class="schedule-mode-card">
+                            <input type="radio" name="schedule-mode" value="once" class="sr-only">
+                            <span class="schedule-mode-label">
+                                <i class="bi bi-1-circle" aria-hidden="true"></i>
+                                <span>Une fois</span>
+                            </span>
+                        </label>
+                        <label class="schedule-mode-card">
+                            <input type="radio" name="schedule-mode" value="daily" class="sr-only" checked>
+                            <span class="schedule-mode-label">
+                                <i class="bi bi-sun" aria-hidden="true"></i>
+                                <span>Quotidien</span>
+                            </span>
+                        </label>
+                        <label class="schedule-mode-card">
+                            <input type="radio" name="schedule-mode" value="weekly" class="sr-only">
+                            <span class="schedule-mode-label">
+                                <i class="bi bi-calendar-week" aria-hidden="true"></i>
+                                <span>Hebdo</span>
+                            </span>
+                        </label>
+                        <label class="schedule-mode-card">
+                            <input type="radio" name="schedule-mode" value="monthly" class="sr-only">
+                            <span class="schedule-mode-label">
+                                <i class="bi bi-calendar-month" aria-hidden="true"></i>
+                                <span>Mensuel</span>
+                            </span>
+                        </label>
+                        <label class="schedule-mode-card">
+                            <input type="radio" name="schedule-mode" value="cron" class="sr-only">
+                            <span class="schedule-mode-label">
+                                <i class="bi bi-code-slash" aria-hidden="true"></i>
+                                <span>Avance</span>
+                            </span>
+                        </label>
+                    </div>
+                </fieldset>
+
+                <!-- Sections conditionnelles selon le mode (hidden par defaut, JS toggle) -->
+
+                <!-- ONCE : datetime-local -->
+                <div class="schedule-section" data-mode="once" hidden>
+                    <label for="komptia-sched-once-datetime" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        Date et heure d'exécution
+                    </label>
+                    <input type="datetime-local"
+                           id="komptia-sched-once-datetime"
+                           class="input w-full">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Si la date est passée au moment de la sauvegarde, l'automation ne sera pas déclenchée.
+                    </p>
+                </div>
+
+                <!-- DAILY : heure -->
+                <div class="schedule-section" data-mode="daily" hidden>
+                    <div class="flex items-end gap-3">
+                        <div>
+                            <label for="komptia-sched-daily-time" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                Heure de déclenchement
+                            </label>
+                            <input type="time"
+                                   id="komptia-sched-daily-time"
+                                   value="09:00"
+                                   class="input w-32">
+                        </div>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 pb-2">
+                            Tous les jours à cette heure (TZ Europe/Paris côté serveur).
+                        </p>
+                    </div>
+                </div>
+
+                <!-- WEEKLY : jour(s) + heure -->
+                <div class="schedule-section" data-mode="weekly" hidden>
+                    <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                        Jour(s) de la semaine
+                    </label>
+                    <div class="flex flex-wrap gap-1.5 mb-3" role="group" aria-label="Jour de la semaine">
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="mon" class="sr-only"><span>Lun</span></label>
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="tue" class="sr-only"><span>Mar</span></label>
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="wed" class="sr-only"><span>Mer</span></label>
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="thu" class="sr-only"><span>Jeu</span></label>
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="fri" class="sr-only"><span>Ven</span></label>
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="sat" class="sr-only"><span>Sam</span></label>
+                        <label class="schedule-day-chip"><input type="checkbox" name="schedule-dow" value="sun" class="sr-only"><span>Dim</span></label>
+                    </div>
+                    <label for="komptia-sched-weekly-time" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        Heure de declenchement
+                    </label>
+                    <input type="time"
+                           id="komptia-sched-weekly-time"
+                           value="09:00"
+                           class="input w-32">
+                </div>
+
+                <!-- MONTHLY : jour du mois + heure -->
+                <div class="schedule-section" data-mode="monthly" hidden>
+                    <div class="flex items-end gap-4 flex-wrap">
+                        <div>
+                            <label for="komptia-sched-monthly-day" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                Jour du mois (1-31)
+                            </label>
+                            <input type="number"
+                                   id="komptia-sched-monthly-day"
+                                   min="1" max="31" value="1"
+                                   class="input w-20">
+                        </div>
+                        <div>
+                            <label for="komptia-sched-monthly-time" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                Heure
+                            </label>
+                            <input type="time"
+                                   id="komptia-sched-monthly-time"
+                                   value="09:00"
+                                   class="input w-32">
+                        </div>
+                    </div>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1.5">
+                        Si vous choisissez 31 et que le mois n'a que 30 jours, l'automation ne se déclenche pas ce mois-là.
+                    </p>
+                </div>
+
+                <!-- CRON : expression libre + lien aide -->
+                <div class="schedule-section" data-mode="cron" hidden>
+                    <label for="komptia-sched-cron-expr" class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                        Expression cron
+                    </label>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mb-1.5">
+                        Format 5 champs : minute heure jour mois jour-semaine.
+                        Ex : <code class="font-mono text-gray-700 dark:text-gray-300">0 9 * * 1</code> (lundis 9h) ·
+                        <code class="font-mono text-gray-700 dark:text-gray-300">*/15 * * * *</code> (toutes les 15 min).
+                    </p>
+                    <input type="text"
+                           id="komptia-sched-cron-expr"
+                           placeholder="0 9 * * 1"
+                           autocomplete="off"
+                           spellcheck="false"
+                           class="input w-full font-mono text-sm">
+                    <div class="flex items-center justify-between mt-1.5">
+                        <p id="komptia-sched-cron-error" class="text-xs text-red-600 dark:text-red-400"></p>
+                        <a href="https://crontab.guru/"
+                           target="_blank" rel="noopener noreferrer"
+                           class="text-xs text-blue-600 hover:underline dark:text-blue-400">
+                            Aide visuelle (crontab.guru)
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Preview "5 prochaines executions" -->
+                <div class="rounded-lg border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/50 px-4 py-3">
+                    <div class="flex items-center gap-2 mb-2">
+                        <i class="bi bi-clock-history text-gray-500 dark:text-gray-400" aria-hidden="true"></i>
+                        <h4 class="text-xs font-semibold text-gray-700 dark:text-gray-300">
+                            Prochaines exécutions
+                        </h4>
+                        <span id="komptia-sched-preview-loading" class="text-xs text-gray-400 dark:text-gray-500 hidden">
+                            Calcul...
+                        </span>
+                    </div>
+                    <ol id="komptia-sched-preview-list" class="text-xs text-gray-600 dark:text-gray-400 space-y-0.5 list-decimal list-inside">
+                        <li class="text-gray-400 dark:text-gray-500 list-none italic">Aucune exécution prévue avec cette configuration.</li>
+                    </ol>
+                </div>
+
+            </div>
+
+            <!-- Footer : boutons -->
+            <div class="flex items-center justify-end gap-2 px-5 py-3 border-t border-gray-200 dark:border-gray-800">
+                <button type="button" id="komptia-schedule-cancel" class="btn btn-secondary">
+                    Annuler
+                </button>
+                <button type="button" id="komptia-schedule-save" class="btn btn-primary">
+                    Enregistrer
+                </button>
+            </div>
+        </div>
+    </div>
+
+    {# Styles des cards radio + chips jours sont definis dans
+       tailwind-input.css (single source of truth, pas inline) — voir
+       le bloc `Schedule (Planification automation)` du @layer components. #}
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script src="/static/vendor/drawflow/drawflow.min.js" nonce="{{ handler.csp_nonce }}"></script>
+{# ExternalSheetsPicker — composant partage avec /reports et /iris pour
+   le picker de fichier .afz.json/.xlsx/.csv. Charge avant pickers pour
+   que window.ExternalSheetsPicker soit dispo au moment du clic. #}
+<script src="/static/js/components/external_sheets_picker.js" nonce="{{ handler.csp_nonce }}"></script>
+{# Pickers chargés AVANT le canvas : `buildField()` consulte
+   `window.komptiaPickers` au render — disponibilité garantie. #}
+<script src="/static/js/automation-pickers.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/automation-canvas.js" nonce="{{ handler.csp_nonce }}"></script>
+{# iris-grid.js sert ici uniquement comme viewer de workbook (single
+   source of truth avec /iris). Charge en bas pour ne pas bloquer le
+   rendu initial du canvas. Le navigateur cache deja le fichier si
+   l'utilisateur a deja visite /iris.
+   Tokenizer d'anonymisation chargé juste avant : miroir Py↔JS dont
+   iris-grid délègue tokenize/auto-pseudo via window.AnonTokenizer. #}
+<script src="/static/js/anonymization/tokenizer.js" nonce="{{ handler.csp_nonce }}"></script>
+{# Détail d'un terme anonymisé (coverage + audit). Chargé pour que le modal
+   "Confidentialité" d'iris-grid puisse ouvrir le panneau détail depuis la
+   preview workbook. Le composant crée son DOM à la volée. #}
+<script src="/static/js/privacy/term-detail-panel.js" nonce="{{ handler.csp_nonce }}"></script>
+{# Module "Améliorer l'anonymisation" (LLM local). Chargé AVANT iris-grid.js
+   pour que le modal Confidentialité de la preview puisse y déléguer. #}
+<script src="/static/js/privacy/improve-pseudos.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/iris-grid.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/automation-preview.js" nonce="{{ handler.csp_nonce }}"></script>
+{# Schedule module : init la modal Planification au DOMContentLoaded.
+   Charge en bas du document pour ne pas bloquer le canvas (le bouton
+   declencheur est inerte tant que le script n'a pas branche son listener,
+   ce qui est OK : la page est utilisable sans planification). #}
+<script src="/static/js/automation-schedule.js" nonce="{{ handler.csp_nonce }}"></script>
+{# Defense en profondeur : on force la sidebar app collapsed cote DOM
+   apres le IIFE de base.html, et on initialise le toggle de la palette
+   d'edit avec persistance localStorage. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function () {
+        // 1. Sidebar app : force collapsed au mount (defense-in-depth en
+        //    plus du CSS-fallback de base.html). Pas d'ecriture dans
+        //    localStorage : la pref globale est preservee.
+        var sidebar = document.getElementById('app-sidebar');
+        var contentWrap = document.getElementById('app-content-wrap');
+        var topbar = document.getElementById('app-topbar');
+        if (sidebar && !sidebar.classList.contains('collapsed')) {
+            sidebar.classList.add('collapsed');
+            if (contentWrap) contentWrap.classList.add('sidebar-fullscreen');
+            if (topbar) topbar.style.display = '';
+        }
+
+        // 2. Panels retractables : un seul bouton fleche par panel,
+        //    positionne au bord externe (CSS gere le slide selon
+        //    `.palette-collapsed` / `.panel-collapsed`). L'icone flip
+        //    via CSS — pas de manipulation DOM ici.
+        var editMain = document.getElementById('komptia-edit-main');
+
+        function makeToggle(btnId, parentClass, storageKey) {
+            var btn = document.getElementById(btnId);
+            if (!btn || !editMain) return null;
+            // #15/F8 (2026-05-28) — clé scopée par user (doctrine Komptia,
+            // cf. komptia_theme_u<id>) : sans ça la pref UI (palette/panel
+            // collapsed) fuit entre comptes sur le même navigateur.
+            var _uidMeta = document.querySelector('meta[name="komptia-user-id"]');
+            var key = storageKey + '_u' + ((_uidMeta && _uidMeta.content) || 'anon');
+            // Restaurer l'etat sauvegarde au mount.
+            var saved = false;
+            try { saved = localStorage.getItem(key) === '1'; } catch(e) {}
+            if (saved) editMain.classList.add(parentClass);
+            btn.addEventListener('click', function () {
+                var now = !editMain.classList.contains(parentClass);
+                editMain.classList.toggle(parentClass, now);
+                try { localStorage.setItem(key, now ? '1' : '0'); } catch(e) {}
+            });
+            return btn;
+        }
+
+        // Palette gauche : toujours visible (sa fleche aussi). Pas de
+        // dependance sur la selection — l'utilisateur peut toujours
+        // afficher/cacher la liste des types d'etapes.
+        makeToggle(
+            'komptia-palette-toggle',
+            'palette-collapsed',
+            'komptia_palette_collapsed'
+        );
+
+        // Panel droit : la fleche n'apparait QUE si un node est selectionne
+        // (sinon le bouton revelerait un panel vide). On observe la classe
+        // `.hidden` du panel (geree par automation-canvas.js show/hide)
+        // via MutationObserver pour synchroniser. Note : le bouton est
+        // hidden par defaut (HTML `hidden` class).
+        makeToggle(
+            'komptia-panel-toggle',
+            'panel-collapsed',
+            'komptia_panel_collapsed'
+        );
+        var nodePanel = document.getElementById('komptia-node-panel');
+        var panelToggleBtn = document.getElementById('komptia-panel-toggle');
+        function syncPanelToggleVisibility() {
+            if (!panelToggleBtn || !nodePanel) return;
+            // Visible si un node est selectionne (panel n'a pas `.hidden`).
+            // Le state collapsed/non-collapsed est gere par CSS via la
+            // classe parent — la fleche slide selon. Pas besoin de la
+            // cacher quand le panel est collapsed (au contraire : c'est
+            // a ce moment qu'elle pointe le bouton "ouvrir").
+            var hasContent = !nodePanel.classList.contains('hidden');
+            panelToggleBtn.classList.toggle('hidden', !hasContent);
+        }
+        syncPanelToggleVisibility();
+        if (nodePanel && typeof MutationObserver !== 'undefined') {
+            new MutationObserver(syncPanelToggleVisibility).observe(
+                nodePanel, { attributes: true, attributeFilter: ['class'] }
+            );
+        }
+    })();
+
+    // U2 — Onboarding tour /automations/N/edit (premier user, pas que admin).
+    // localStorage clé `automations_edit_v1`. User peut Passer/X.
+    if (window.KomptiaOnboarding && typeof window.KomptiaOnboarding.start === 'function') {
+        window.KomptiaOnboarding.start({
+            key: 'automations_edit_v1',
+            title: 'Éditeur d\'automatisation',
+            steps: [
+                {
+                    icon: 'sparkle',
+                    title: 'Glisser-déposer une étape',
+                    text: 'À gauche, la palette propose 4 catégories d\'étapes : Source (récupérer des données), Agent IA (transformer un classeur avec l\'agent Iris), Conversion (générer un PDF ou un export Excel/CSV) et Sortie (envoi par email, sauvegarde…). Glissez le type voulu dans l\'espace de travail pour créer une étape.',
+                },
+                {
+                    icon: 'zap',
+                    title: 'Relier les étapes',
+                    text: 'Reliez la sortie d\'une étape à l\'entrée de la suivante en traçant un trait. Komptia vérifie la compatibilité : une étape Source ou Format produit un classeur, une étape Rapport produit un fichier prêt à envoyer. Les connexions incompatibles sont refusées avec un message clair.',
+                },
+                {
+                    icon: 'shield',
+                    title: 'Tester avant d\'activer',
+                    text: 'Le bouton « Aperçu » sur une étape sélectionnée la lance immédiatement et affiche le résultat (classeur, PDF, e-mail). Le bouton « Vérifier » contrôle l\'ensemble : étapes complètes, bien reliées, aucune boucle. L\'interrupteur « Actif » refuse l\'activation tant que des erreurs subsistent, avec la liste détaillée à corriger.',
+                },
+            ],
+        });
+    }
+</script>
+{% end %}

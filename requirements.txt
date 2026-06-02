@@ -1,0 +1,68 @@
+# Komptia v2.0 - Dépendances Python
+
+# Framework Web
+tornado>=6.4.0
+
+# Base de données
+SQLAlchemy>=2.0.25
+# sqlcipher3==0.5.2  # OPTIONNEL: chiffrement BDD – nécessite sqlcipher (brew install sqlcipher)
+aiosqlite>=0.19.0
+greenlet>=3.0.0
+
+# Authentification & Chiffrement
+bcrypt>=4.1.0
+cryptography>=42.0.0
+
+# Connexion SQL Server (BDD source)
+# Nécessite: brew install unixodbc
+pyodbc>=5.1.0
+
+# IA - Client HTTP async
+httpx>=0.25.2
+
+# IA - Embeddings vectoriels (local, gratuit, aucun appel API)
+sqlite-vec>=0.1.6
+sentence-transformers>=3.0.0
+
+# SQL Parsing & Validation
+sqlparse==0.5.5
+sqlglot>=26.0
+
+# Génération PDF
+reportlab>=4.0.9
+weasyprint>=60.2
+
+# Graphiques
+matplotlib>=3.8.2
+plotly>=5.18.0
+
+# Import/Export Excel (obligatoire pour feuilles externes)
+openpyxl>=3.1.0
+
+# Lecture CSV/Excel pour les outils Iris/copilot manipulant des uploads
+# (`analyze_attachment`, `transform_uploaded_file`, exports automation).
+# Utilisé via lazy import dans les handlers — l'absence faisait crasher
+# silencieusement analyze_attachment, formalisé ici 2026-05-26.
+pandas>=2.0,<3.0  # <3.0 : pandas 3.0 (Copy-on-Write par défaut) introduit des ruptures d'API non validées sur ce code
+
+# Hardening XML pour openpyxl (XXE, billion-laughs, quadratic blowup).
+# openpyxl >= 3.1 active automatiquement les parseurs sûrs lorsque
+# defusedxml est importable (cf. `openpyxl.xml.defusedxml_available`).
+# Sans ce paquet, un .xlsx hostile peut déclencher une expansion
+# d'entités exponentielle côté threadpool du serveur.
+defusedxml>=0.7.1
+
+# Scheduler
+APScheduler>=3.10.4
+
+# Email
+email-validator>=2.2.0  # 2.1.0 retirée de PyPI (yanked : oubli de drop py3.7)
+
+# Utilitaires
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+python-dateutil>=2.8.2
+
+# Tests & outils de dev → requirements-dev.txt
+# (séparés volontairement pour que l'image de production reste légère et
+#  sans pytest/coverage. En dev : `pip install -r requirements-dev.txt`.)

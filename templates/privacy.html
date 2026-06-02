@@ -1,0 +1,292 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{# privacy.css définit (entre autres) la règle ``.privacy-row-delete-btn``
+   utilisée par les boutons × du delete individuel. Le fichier était orphelin
+   depuis sa création (commit 7c869d9) — aucun ``<link>`` ne le chargeait,
+   donc ses ~800 lignes étaient mortes silencieusement. Reconnecté ici via
+   le block head. Toutes les règles sont scopées ``.privacy-*`` — pas de
+   risque de régression sur les autres pages. #}
+{% block head %}
+<link rel="stylesheet" href="/static/css/privacy.css">
+{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+
+    <!-- Card principale unique : design "grand frère" modal iris-grid -->
+    <div class="bg-white border border-gray-200 rounded-lg dark:bg-gray-900 dark:border-gray-800">
+
+        <!-- Header : titre + sous-titre count -->
+        <div class="px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                    <h1 class="text-base font-semibold text-gray-900 dark:text-gray-100">
+                        {{ page_title }} &mdash; termes &agrave; anonymiser
+                    </h1>
+                    <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                        <span id="stat-total" aria-live="polite">&mdash;</span> terme(s) d&eacute;tect&eacute;(s)
+                        &middot; <span id="stat-pending" aria-live="polite">&mdash;</span> &agrave; confirmer
+                        &middot; <span id="stat-enabled" aria-live="polite">&mdash;</span> anonymis&eacute;(s)
+                        <span id="stat-critical-wrap" hidden>&middot; <span id="stat-critical" class="text-red-600 dark:text-red-400 font-medium">0</span> critiques visibles</span>
+                    </p>
+                </div>
+                <div class="flex items-center gap-2 flex-wrap">
+                    <button type="button" id="action-add-manual"
+                            class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700"
+                            title="Ajouter manuellement un terme &agrave; anonymiser (nom, email, identifiant&hellip;)">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4v16m8-8H4"/></svg>
+                        <span>Ajouter un terme</span>
+                    </button>
+                    <button type="button" id="action-scan"
+                            class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700"
+                            title="Scanner votre datastore pour proposer des termes &agrave; anonymiser">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-4.35-4.35M11 18a7 7 0 110-14 7 7 0 010 14z"/></svg>
+                        <span>Scanner mes donn&eacute;es</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toolbar : recherche + filtres -->
+        <div class="flex flex-wrap items-center gap-3 px-5 py-3 border-b border-gray-200 dark:border-gray-800">
+            <label for="terms-search" class="sr-only">Rechercher un terme</label>
+            <input type="text" id="terms-search" placeholder="Rechercher un terme..." maxlength="200"
+                   aria-label="Rechercher un terme"
+                   class="flex-1 min-w-[200px] px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:border-gray-900 focus:ring-0 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100">
+            <label for="terms-filter-status" class="sr-only">Filtrer par statut</label>
+            <select id="terms-filter-status" aria-label="Filtrer par statut"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 focus:outline-none focus:border-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+                <option value="all">Tous</option>
+                <option value="enabled">Activ&eacute;s</option>
+                <option value="disabled">D&eacute;sactiv&eacute;s</option>
+                <option value="pending">En attente</option>
+            </select>
+            <label for="terms-filter-category" class="sr-only">Filtrer par provenance</label>
+            {# Largeur fixe en inline-style (Tailwind JIT ne compile pas
+               ``max-w-[14rem]`` car le bundle est pré-buildé statique).
+               ``width`` (pas ``max-width``) + ``text-overflow:ellipsis``
+               garantit la troncature visuelle sur les classeurs aux
+               noms longs (ex: « Bilan_consolidé_2024_v3_final.afz.json »)
+               peu importe la longueur de l'option sélectionnée. Le dropdown
+               ouvert affiche le nom complet (comportement natif HTML
+               <select>). #}
+            <select id="terms-filter-category" aria-label="Filtrer par provenance"
+                    style="width:14rem;text-overflow:ellipsis;"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 focus:outline-none focus:border-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+                <option value="all">Toutes provenances</option>
+            </select>
+            {# Filtre type (numérique/texte) — miroir du filtre du modal
+               "Confidentialité" iris-grid, pour parité fonctionnelle entre
+               vue globale et vue classeur courant. Logique partagée via
+               ``AnonTokenizer.isPureNumeric`` (single source of truth Py↔JS). #}
+            <label for="terms-filter-type" class="sr-only">Filtrer par type de valeur</label>
+            <select id="terms-filter-type" aria-label="Filtrer par type de valeur"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 focus:outline-none focus:border-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+                <option value="all">Tous types</option>
+                <option value="non-numeric">Texte uniquement</option>
+                <option value="numeric">Num&eacute;riques uniquement</option>
+            </select>
+        </div>
+
+        <!-- Actions visibles (4 pills) -->
+        <div class="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-gray-200 dark:border-gray-800">
+            <button type="button" id="action-enable-all"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700">
+                Tout anonymiser
+            </button>
+            <button type="button" id="action-disable-all"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700">
+                Rien anonymiser
+            </button>
+            <button type="button" id="action-confirm-visible"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700">
+                Confirmer visibles sans anonymiser
+            </button>
+            <button type="button" id="action-anonymize-visible"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700">
+                Anonymiser visibles
+            </button>
+        </div>
+
+        <!-- Am&eacute;liorer l'anonymisation (LLM local enrichit les pseudonymes) -->
+        <div class="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-gray-200 dark:border-gray-800">
+            {# Bouton « tertiaire/accent » : utilise .btn pour le layout
+               (padding, radius, focus ring) + utilities orange pour le tint
+               sémantique « action d'enrichissement IA ». Contraste validé
+               WCAG AA en light (orange-50 + orange-700 = 6.4:1) et dark
+               (orange-900/30 + orange-200). #}
+            <button type="button" id="action-improve-pseudos"
+                    title="Le LLM local configur&eacute; dans /admin/ai-config analyse les termes activ&eacute;s et propose un pseudonyme s&eacute;mantique (ex: 'DUPONT' devient &sect;NOM_4b3&sect; au lieu de &sect;TXT_4b3&sect;). Le LLM cloud verra un pseudonyme qui parle mais ne r&eacute;v&egrave;le jamais la valeur r&eacute;elle. Tes pseudonymes personnalis&eacute;s sont pr&eacute;serv&eacute;s."
+                    class="btn bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100 hover:border-orange-300 focus:ring-orange-500/30 dark:bg-orange-900/30 dark:text-orange-200 dark:border-orange-800 dark:hover:bg-orange-900/50 dark:hover:border-orange-700 dark:focus:ring-orange-400/30">
+                Am&eacute;liorer l'anonymisation
+            </button>
+            <span class="text-xs text-gray-500 dark:text-gray-400 ml-auto" id="classify-status" aria-live="polite"></span>
+        </div>
+
+        <!-- Liste groupée par catégorie -->
+        <div class="relative">
+            <div id="terms-loading" class="text-center py-12 text-sm text-gray-500 dark:text-gray-400" role="status">
+                Chargement&hellip;
+            </div>
+            <div id="terms-empty" class="text-center py-12 text-sm text-gray-500 dark:text-gray-400" role="status" hidden>
+                <p class="font-medium text-gray-700 dark:text-gray-300 mb-2">Aucun terme confidentiel</p>
+                <p>Lancez un <button type="button" class="text-blue-600 hover:underline dark:text-blue-400" id="terms-empty-scan-btn">scan de votre datastore</button> pour proposer des termes &agrave; anonymiser.</p>
+            </div>
+            <div id="terms-error" class="text-center py-12 text-sm text-red-600 dark:text-red-400" role="alert" hidden>
+                <p id="terms-error-msg" class="mb-2">Erreur de chargement.</p>
+                <button type="button" id="terms-retry-btn" class="btn btn-secondary text-sm">R&eacute;essayer</button>
+            </div>
+            <!-- Container des groupes catégorie (rempli par JS) -->
+            <div id="terms-groups" class="px-5 py-3 max-h-[60vh] overflow-y-auto" hidden></div>
+        </div>
+
+        <!-- Footer : compteur + Voir tous + Annuler/Enregistrer -->
+        <div class="flex items-center justify-between gap-3 flex-wrap px-5 py-3 border-t border-gray-200 dark:border-gray-800">
+            <span class="text-xs text-gray-500 dark:text-gray-400">
+                <span id="terms-count-visible" aria-live="polite">0</span> terme(s) affich&eacute;(s)
+            </span>
+            <div class="flex items-center gap-2">
+                <button type="button" id="btn-discard" class="btn btn-secondary text-sm" disabled>
+                    Annuler
+                </button>
+                <button type="button" id="btn-save" class="btn btn-primary text-sm" disabled>
+                    Enregistrer
+                </button>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<!-- Modal de confirmation pour la suppression bulk -->
+<div id="modal-bulk-delete"
+     class="fixed inset-0 bg-black/40 z-50 hidden items-center justify-center"
+     role="dialog" aria-modal="true" aria-labelledby="modal-bulk-delete-title" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-md dark:bg-gray-900">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 id="modal-bulk-delete-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">Confirmer la suppression</h3>
+            <button type="button" id="modal-bulk-delete-close"
+                    title="Fermer" aria-label="Fermer la fen&ecirc;tre"
+                    class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300">&times;</button>
+        </div>
+        <div class="p-5 space-y-3">
+            <p class="text-sm text-gray-700 dark:text-gray-300" role="alert">
+                <strong>Attention&nbsp;!</strong>
+                Vous &ecirc;tes sur le point de supprimer
+                <strong id="bulk-delete-count">&mdash;</strong>
+                terme(s) confidentiels. <strong>Cette action est irr&eacute;versible.</strong>
+            </p>
+        </div>
+        <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-gray-200 dark:border-gray-800">
+            <button type="button" id="modal-bulk-delete-cancel" class="btn btn-secondary text-sm">Annuler</button>
+            <button type="button" id="modal-bulk-delete-confirm" class="btn btn-danger text-sm">Supprimer d&eacute;finitivement</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal d'ajout manuel d'un terme — saisie volontaire user. -->
+<div id="modal-add-manual"
+     class="fixed inset-0 bg-black/40 z-50 hidden items-center justify-center"
+     role="dialog" aria-modal="true" aria-labelledby="modal-add-manual-title" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-md dark:bg-gray-900">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 id="modal-add-manual-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">Ajouter un terme &agrave; anonymiser</h3>
+            <button type="button" id="modal-add-manual-close"
+                    title="Fermer" aria-label="Fermer la fen&ecirc;tre"
+                    class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300">&times;</button>
+        </div>
+        <div class="p-5 space-y-3">
+            <label for="modal-add-manual-input" class="block text-xs font-medium text-gray-700 dark:text-gray-300">
+                Valeur en clair
+            </label>
+            <input type="text" id="modal-add-manual-input"
+                   placeholder="Ex&nbsp;: DUPONT, marie@dupont.com, 12345&hellip;"
+                   maxlength="500" autocomplete="off"
+                   class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:outline-none focus:border-gray-900 focus:ring-0 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100"
+                   aria-describedby="modal-add-manual-hint modal-add-manual-status">
+            <p id="modal-add-manual-hint" class="text-xs text-gray-500 dark:text-gray-400">
+                Le terme sera ajout&eacute; &agrave; votre dictionnaire d&apos;anonymisation et masqu&eacute; imm&eacute;diatement. Une saisie comme &laquo;&nbsp;DUPONT Marie&nbsp;&raquo; sera d&eacute;coup&eacute;e en deux termes ind&eacute;pendants&nbsp;; un email ou un identifiant complet reste intact.
+            </p>
+            <p id="modal-add-manual-status" class="text-xs hidden" role="status" aria-live="polite"></p>
+        </div>
+        <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-gray-200 dark:border-gray-800">
+            <button type="button" id="modal-add-manual-cancel"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700">Annuler</button>
+            <button type="button" id="modal-add-manual-confirm"
+                    class="px-3 py-1.5 text-sm border border-gray-900 rounded bg-gray-900 text-white hover:bg-gray-800 dark:bg-gray-100 dark:border-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Ajouter</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal de scan datastore (SSE progress). -->
+<div id="modal-scan"
+     class="fixed inset-0 bg-black/40 z-50 hidden items-center justify-center"
+     role="dialog" aria-modal="true" aria-labelledby="modal-scan-title" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-md dark:bg-gray-900">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 id="modal-scan-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">Scan du datastore</h3>
+            <button type="button" id="modal-scan-close"
+                    title="Fermer" aria-label="Fermer la fen&ecirc;tre"
+                    class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300">&times;</button>
+        </div>
+        <div class="p-5 space-y-3">
+            <p id="scan-status" class="text-sm text-gray-700 dark:text-gray-300" aria-live="polite">Pr&ecirc;t &agrave; lancer le scan.</p>
+            <div class="w-full h-2 bg-gray-200 rounded-full overflow-hidden dark:bg-gray-800" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="scan-progress-bar" hidden>
+                <div class="h-full bg-blue-600 transition-all" id="scan-progress-fill" style="width:0%"></div>
+            </div>
+            <div id="scan-results" class="text-xs text-gray-600 dark:text-gray-400" hidden></div>
+        </div>
+        <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-gray-200 dark:border-gray-800">
+            {# Pas de bouton "Lancer/Relancer le scan" : depuis 2026-05-19,
+               le scan d&eacute;marre automatiquement à l'ouverture
+               (``openAndStartScan``). Pour relancer après un &eacute;chec
+               ou pour un nouveau scan, l'user ferme la modal et re-clique
+               "Scanner mes donn&eacute;es" depuis le header. #}
+            <button type="button" id="modal-scan-cancel"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700"
+                    hidden>Annuler</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal d'am&eacute;lioration des pseudonymes (LLM local enrichit les pseudo_middle). -->
+<div id="modal-improve"
+     class="fixed inset-0 bg-black/40 z-50 hidden items-center justify-center"
+     role="dialog" aria-modal="true" aria-labelledby="modal-improve-title" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-md dark:bg-gray-900">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 id="modal-improve-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">Am&eacute;lioration des pseudonymes</h3>
+            <button type="button" id="modal-improve-close"
+                    title="Fermer (arr&ecirc;te le LLM local)" aria-label="Fermer la fen&ecirc;tre"
+                    class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300">&times;</button>
+        </div>
+        <div class="p-5 space-y-3">
+            <p id="improve-status" class="text-sm text-gray-700 dark:text-gray-300" aria-live="polite">D&eacute;marrage&hellip;</p>
+            <div class="w-full h-2 bg-gray-200 rounded-full overflow-hidden dark:bg-gray-800" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="improve-progress-bar" hidden>
+                <div class="h-full bg-blue-600 transition-all" id="improve-progress-fill" style="width:0%"></div>
+            </div>
+            <div id="improve-results" class="text-xs text-gray-600 dark:text-gray-400" hidden></div>
+        </div>
+        <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-gray-200 dark:border-gray-800">
+            {# Pas de bouton "Lancer" : d&eacute;marre automatiquement &agrave; l'ouverture
+               (``openAndStartImprove``). Pour relancer apr&egrave;s un succ&egrave;s/&eacute;chec,
+               l'user ferme la modal et re-clique "Am&eacute;liorer l'anonymisation"
+               (m&ecirc;me pattern que la modal de scan). Sortir = arr&ecirc;te le LLM local. #}
+            <button type="button" id="modal-improve-cancel"
+                    class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 hover:bg-gray-50 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700"
+                    hidden>Arr&ecirc;ter</button>
+        </div>
+    </div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script src="/static/js/anonymization/tokenizer.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/anonymization/save-helpers.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/privacy/scan-progress.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/privacy/improve-pseudos.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/privacy/term-detail-panel.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/privacy/privacy-page.js" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}

@@ -1,0 +1,29 @@
+{# Partial — bandeau jaune "Certaines statistiques n'ont pas pu être chargées".
+
+   Utilisé par les pages dashboard (admin/user) et certaines pages admin
+   (performance, data_access) qui affichent des stats agrégées et veulent
+   prévenir l'utilisateur qu'une partie est en erreur sans casser la page.
+
+   Variables attendues dans le scope du caller :
+   - ``errors`` : list/iterable falsy si OK, truthy si on doit afficher.
+     Typiquement ``stats.get("_errors")``. Le contenu n'est PAS affiché
+     individuellement (les détails techniques restent côté logs serveur),
+     seul le booléen "il y a des erreurs" remonte au user.
+
+   Variable optionnelle :
+   - ``message_override`` : texte custom à afficher (sinon message par défaut).
+
+   Usage Tornado :
+       {% set errors = stats.get("_errors") %}
+       {% include "_partials/stats_error_banner.html" %}
+#}
+{% if errors %}
+<div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 dark:bg-amber-900/20 dark:border-amber-800/60" role="alert">
+    <div class="flex items-center gap-2">
+        <svg class="w-5 h-5 text-amber-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+        </svg>
+        <p class="text-amber-800 text-sm dark:text-amber-200">{% if message_override %}{{ message_override }}{% else %}Certaines statistiques n'ont pas pu être chargées.{% end %}</p>
+    </div>
+</div>
+{% end %}

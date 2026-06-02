@@ -1,0 +1,36 @@
+{# Cluster-22 2026-05-26 — Defense in depth XSS : tous les `{{ var }}` ont
+   un filter `|e` explicite. L'EmailTemplateRenderer pose déjà
+   autoescape=True dans son Environment Jinja, mais si un dev futur
+   override le renderer ou utilise ce template avec un loader sans
+   autoescape, les filters explicites le protègent quand même. #}
+{% extends "base.html" %}
+
+{% block title %}{{ automation_name|e }} - Rapport automatisé{% endblock %}
+
+{% block content %}
+<h2>Rapport automatisé : {{ automation_name|e }}</h2>
+
+<p>Bonjour,</p>
+
+<p>Votre automatisation <strong>{{ automation_name|e }}</strong> a été exécutée avec succès.</p>
+
+{% if description %}
+<div class="info-box">
+    <p><strong>Description :</strong></p>
+    <p>{{ description|e }}</p>
+</div>
+{% endif %}
+
+<div class="info-box">
+    <p><strong>Résumé de l'exécution :</strong></p>
+    <p>• Lignes retournées : <strong>{{ result_rows|e }}</strong></p>
+    <p>• Format du rapport : <strong>{{ output_format|upper|e }}</strong></p>
+    <p>• Durée d'exécution : <strong>{{ execution_duration|e }}</strong></p>
+    <p>• Date d'exécution : <strong>{{ execution_date|e }}</strong></p>
+</div>
+
+<p>Le fichier {{ output_format|upper|e }} est joint à cet email.</p>
+
+<p>Cordialement,<br>
+<strong>{{ sender_name|default(company_name)|e }}</strong></p>
+{% endblock %}

@@ -1,0 +1,21 @@
+Rapport automatisé : {{ automation_name }}
+============================================
+
+Bonjour,
+
+Votre automatisation "{{ automation_name }}" a été exécutée avec succès.
+
+{% if description %}
+Description : {{ description }}
+
+{% endif %}
+Résumé de l'exécution :
+- Lignes retournées : {{ result_rows }}
+- Format du rapport : {{ output_format | upper }}
+- Durée d'exécution : {{ execution_duration }}
+- Date d'exécution : {{ execution_date }}
+
+Le fichier {{ output_format | upper }} est joint à cet email.
+
+Cordialement,
+{{ sender_name | default(company_name) }}

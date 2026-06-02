@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Iris — Approbation écriture SQL</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <style nonce="{{ handler.csp_nonce }}">
+        :root { color-scheme: light dark; }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.6;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            padding: 32px 16px;
+        }
+        @media (prefers-color-scheme: light) {
+            body { background: #f1f5f9; color: #1e293b; }
+            .card { background: #fff !important; border-color: #cbd5e1 !important; }
+            .meta { color: #64748b !important; }
+            pre.sql { background: #f8fafc !important; color: #0f172a !important; border-color: #e2e8f0 !important; }
+            .stat-label { color: #64748b !important; }
+            .stat-value { color: #0f172a !important; }
+        }
+        .container { max-width: 760px; margin: 0 auto; }
+        .card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 14px;
+            padding: 32px;
+            box-shadow: 0 4px 12px rgba(0,0,0,.25);
+        }
+        h1 { margin: 0 0 8px 0; font-size: 24px; font-weight: 700; }
+        h2 { margin: 24px 0 8px 0; font-size: 16px; font-weight: 600; color: #f8fafc; }
+        .meta { color: #cbd5e1; font-size: 13px; margin-bottom: 16px; }
+        .alert {
+            padding: 14px 16px; border-radius: 8px; margin: 16px 0; font-size: 14px;
+        }
+        .alert.warning { background: #78350f; color: #fef3c7; border: 1px solid #b45309; }
+        .alert.error   { background: #7f1d1d; color: #fee2e2; border: 1px solid #b91c1c; }
+        .alert.success { background: #064e3b; color: #d1fae5; border: 1px solid #059669; }
+        .alert.info    { background: #1e3a8a; color: #dbeafe; border: 1px solid #2563eb; }
+        @media (prefers-color-scheme: light) {
+            .alert.warning { background: #fef3c7; color: #78350f; border-color: #fbbf24; }
+            .alert.error   { background: #fee2e2; color: #7f1d1d; border-color: #ef4444; }
+            .alert.success { background: #d1fae5; color: #065f46; border-color: #10b981; }
+            .alert.info    { background: #dbeafe; color: #1e3a8a; border-color: #3b82f6; }
+        }
+        pre.sql {
+            background: #0f172a; color: #e2e8f0;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 14px;
+            overflow-x: auto;
+            font-family: ui-monospace, "SF Mono", Menlo, monospace;
+            font-size: 13px;
+            margin: 0;
+        }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0; }
+        .stat { padding: 10px 12px; background: rgba(255,255,255,.04); border-radius: 8px; }
+        .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #cbd5e1; }
+        .stat-value { font-size: 17px; font-weight: 600; color: #f1f5f9; margin-top: 4px; }
+        .actions { display: flex; gap: 12px; margin-top: 28px; flex-wrap: wrap; }
+        button.action {
+            border: none; border-radius: 8px; padding: 14px 24px;
+            font-size: 15px; font-weight: 600; cursor: pointer;
+            font-family: inherit;
+        }
+        button.action.confirm { background: #dc2626; color: #fff; }
+        button.action.confirm:hover { background: #b91c1c; }
+        button.action.reject  { background: #475569; color: #fff; }
+        button.action.reject:hover { background: #334155; }
+        textarea.reason {
+            width: 100%; padding: 10px; border-radius: 8px;
+            background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+            font-family: inherit; font-size: 14px; margin-top: 8px;
+            resize: vertical; min-height: 70px;
+        }
+        @media (prefers-color-scheme: light) {
+            textarea.reason { background: #f8fafc; color: #0f172a; border-color: #cbd5e1; }
+            .stat { background: #f1f5f9; }
+        }
+        .footer { font-size: 11px; color: #94a3b8; margin-top: 24px; text-align: center; }
+        details { margin-top: 12px; }
+        summary { cursor: pointer; color: #cbd5e1; font-size: 13px; }
+        button.action:disabled { opacity: 0.45; cursor: not-allowed; }
+        button.action { min-height: 44px; font-size: 16px; }
+        textarea.reason { font-size: 16px; }
+        .snapshot-check {
+            margin-top: 20px; padding: 14px; border-radius: 8px;
+            background: rgba(252, 211, 77, .08); border: 1px solid rgba(252, 211, 77, .25);
+            display: flex; gap: 12px; align-items: flex-start;
+        }
+        .snapshot-check input[type="checkbox"] {
+            width: 20px; height: 20px; margin-top: 2px; flex-shrink: 0;
+            accent-color: #fbbf24;
+        }
+        .snapshot-check label { color: #fef3c7; font-size: 14px; line-height: 1.5; cursor: pointer; }
+    </style>
+</head>
+<body>
+<div class="container">
+{% if state == "pending" %}
+    <div class="card">
+        <h1><span aria-hidden="true">⚠</span> Approbation requise — écriture SQL</h1>
+        <p class="meta">Iris a reçu une demande de modification de la base. Examinez attentivement avant de confirmer.</p>
+
+        <div class="alert warning" role="alert">
+            <strong>Avant tout :</strong> faites un <em>snapshot</em> de la base de données.
+            Cette opération est destructive ; un mauvais filtre peut toucher beaucoup
+            de lignes. <strong>Une fois exécutée, le rollback automatique n'est plus possible.</strong>
+        </div>
+
+        <h2>Détails de l'opération</h2>
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-label">Opération</div>
+                <div class="stat-value">{{ operation }}</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Lignes estimées</div>
+                <div class="stat-value">{{ estimated_rows }}</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Tables</div>
+                <div class="stat-value" style="font-size:14px;">{{ tables or "?" }}</div>
+            </div>
+        </div>
+
+        <h2>Intention déclarée</h2>
+        <p style="margin:0;">{{ intent }}</p>
+
+        <h2>SQL proposé</h2>
+        <pre class="sql">{{ sql }}</pre>
+
+        <form method="POST" id="dba-form">
+            {# XSRF désactivé sur ce handler (DBA externe non-auth, token HMAC fait foi). #}
+            <div class="snapshot-check">
+                <input type="checkbox" id="snapshot-confirm" name="snapshot_confirmed" required>
+                <label for="snapshot-confirm">
+                    J'ai effectué un <strong>snapshot complet</strong> de la base de données et je
+                    comprends que cette opération est <strong>irréversible</strong> une fois exécutée.
+                </label>
+            </div>
+
+            <details style="margin-top:16px;">
+                <summary>Raison (optionnelle, recommandée si refus)</summary>
+                <textarea name="reason" class="reason" placeholder="Expliquez votre décision (utile pour l'audit et le demandeur)" maxlength="400"></textarea>
+            </details>
+
+            <div class="actions">
+                <button type="submit" name="action" value="confirm" id="btn-confirm" class="action confirm" disabled>
+                    <span aria-hidden="true">✓</span> Confirmer &amp; exécuter
+                </button>
+                <button type="submit" name="action" value="reject" class="action reject">
+                    <span aria-hidden="true">✗</span> Refuser
+                </button>
+            </div>
+        </form>
+
+        <p class="footer">
+            Lien valide jusqu'au <strong>{{ expires_str }}</strong>. Audit ID : {{ audit.id }}.
+        </p>
+    </div>
+
+    <script nonce="{{ handler.csp_nonce }}">
+    (function () {
+        var checkbox = document.getElementById('snapshot-confirm');
+        var btnConfirm = document.getElementById('btn-confirm');
+        if (!checkbox || !btnConfirm) return;
+
+        function syncBtn() {
+            btnConfirm.disabled = !checkbox.checked;
+        }
+        checkbox.addEventListener('change', syncBtn);
+        syncBtn();
+
+        // Anti double-submit + loading state pendant l'exécution Sage
+        var form = document.getElementById('dba-form');
+        if (!form) return;
+        form.addEventListener('submit', function (ev) {
+            var clicked = document.activeElement;
+            if (clicked && clicked.name === 'action') {
+                // Désactiver les 2 boutons pour éviter double clic
+                Array.prototype.forEach.call(
+                    form.querySelectorAll('button.action'),
+                    function (b) { b.disabled = true; }
+                );
+                clicked.textContent = clicked.value === 'confirm'
+                    ? 'Exécution en cours… ne fermez pas la page'
+                    : 'Enregistrement…';
+            }
+        });
+    })();
+    </script>
+{% elif state == "executed" %}
+    <div class="card">
+        <h1><span aria-hidden="true">✓</span> Exécution réussie</h1>
+        <div class="alert success" role="status" aria-live="polite">
+            La requête SQL a été exécutée. <strong>{{ actual_rows or 0 }}</strong> ligne(s) modifiée(s).
+        </div>
+        <p>L'admin demandeur a été notifié par mail.</p>
+    </div>
+{% elif state == "failed" %}
+    <div class="card">
+        <h1><span aria-hidden="true">✗</span> Exécution échouée</h1>
+        <div class="alert error" role="alert" aria-live="assertive">
+            Le serveur SQL a retourné une erreur ; un rollback de la transaction a été tenté.
+            Vérifiez l'état réel de la base si le doute persiste.
+        </div>
+        {% if error %}
+        <p><strong>Détail :</strong> {{ error }}</p>
+        {% end %}
+    </div>
+{% elif state == "aborted" %}
+    <div class="card">
+        <h1><span aria-hidden="true">⊘</span> Demande refusée</h1>
+        <div class="alert info" role="status" aria-live="polite">
+            Vous avez refusé la demande. Aucune modification n'a été effectuée.
+        </div>
+    </div>
+{% elif state == "expired" %}
+    <div class="card">
+        <h1><span aria-hidden="true">⏱</span> Lien expiré</h1>
+        <div class="alert error" role="alert">
+            Le délai d'approbation est dépassé. L'admin doit refaire une nouvelle demande à Iris.
+        </div>
+    </div>
+{% elif state == "already_handled" %}
+    <div class="card">
+        <h1>Demande déjà traitée</h1>
+        <div class="alert info" role="status" aria-live="polite">
+            Cette demande est en statut <strong>{{ status or '?' }}</strong> — elle ne peut plus être modifiée.
+            {% if actual_rows is not None %}
+            <br/>Lignes touchées : <strong>{{ actual_rows }}</strong>.
+            {% end %}
+        </div>
+        {% if error %}
+        <p><strong>Détail :</strong> {{ error }}</p>
+        {% end %}
+    </div>
+{% else %}
+    <div class="card">
+        <h1>Lien invalide</h1>
+        <div class="alert error" role="alert">
+            Ce lien d'approbation n'est pas valide (corrompu, falsifié, ou inexistant).
+        </div>
+    </div>
+{% end %}
+</div>
+</body>
+</html>

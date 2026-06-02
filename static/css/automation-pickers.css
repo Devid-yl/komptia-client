@@ -1,0 +1,169 @@
+/* ============================================================
+ * Komptia — Pickers de ressources (config étapes automation)
+ *
+ * Styles pour les widgets pickers de ``automation-pickers.js`` :
+ * loading/empty/error states, datastore file picker (bouton +
+ * affichage path), multi-select onglets.
+ *
+ * Réutilise les classes ``.komptia-input`` / ``.komptia-select`` /
+ * ``.komptia-chip*`` déjà définies dans ``automation-canvas.css``.
+ * ============================================================ */
+
+.komptia-picker-wrap {
+    display: block;
+}
+
+/* ── États génériques ────────────────────────────────────── */
+
+.komptia-picker-loading,
+.komptia-picker-empty,
+.komptia-picker-error {
+    padding: 0.5rem 0.625rem;
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.komptia-picker-loading {
+    background: #f9fafb;
+    color: #6b7280;
+    border: 1px dashed #d1d5db;
+}
+
+.dark .komptia-picker-loading {
+    background: #111827;
+    color: #9ca3af;
+    border-color: #374151;
+}
+
+.komptia-picker-empty {
+    background: #fefce8;
+    color: #92400e;
+    border: 1px solid #fef08a;
+}
+
+.dark .komptia-picker-empty {
+    background: #422006;
+    color: #fef08a;
+    border-color: #78350f;
+}
+
+.komptia-picker-error {
+    background: #fef2f2;
+    color: #991b1b;
+    border: 1px solid #fecaca;
+}
+
+.dark .komptia-picker-error {
+    background: #450a0a;
+    color: #fecaca;
+    border-color: #7f1d1d;
+}
+
+/* ── Datastore file picker ─────────────────────────────── */
+
+.komptia-picker-file {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.komptia-picker-file-path {
+    display: block;
+    padding: 0.4rem 0.625rem;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    font-size: 12px;
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #111827;
+}
+
+.dark .komptia-picker-file-path {
+    background: #111827;
+    border-color: #374151;
+    color: #e5e7eb;
+}
+
+.komptia-picker-empty-inline {
+    color: #9ca3af;
+    font-style: italic;
+    font-family: inherit;
+}
+
+.komptia-picker-file-btn {
+    align-self: flex-start;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid #2563eb;
+    background: #2563eb;
+    color: #fff;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.komptia-picker-file-btn:hover {
+    background: #1d4ed8;
+}
+
+.komptia-picker-manual-link {
+    align-self: flex-start;
+    font-size: 11px;
+    color: #6b7280;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.dark .komptia-picker-manual-link {
+    color: #9ca3af;
+}
+
+.komptia-picker-manual-input {
+    margin-top: 0.25rem;
+}
+
+/* ── Chips with autocomplete (contacts) ───────────────── */
+
+.komptia-chips-with-suggest .komptia-chips-input {
+    /* Réserve un peu plus de place pour la suggestion native du browser */
+    min-width: 140px;
+}
+
+/* ── Multi-pick (tabs) ─────────────────────────────────── */
+
+.komptia-multi-pick-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.4rem;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+    color: #111827;
+}
+
+.komptia-multi-pick-row:hover {
+    background: #f3f4f6;
+}
+
+.dark .komptia-multi-pick-row {
+    color: #e5e7eb;
+}
+
+.dark .komptia-multi-pick-row:hover {
+    background: #1f2937;
+}
+
+.komptia-multi-pick-list {
+    margin-top: 0.25rem;
+    padding-left: 1rem;
+    border-left: 2px solid #e5e7eb;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.dark .komptia-multi-pick-list {
+    border-left-color: #374151;
+}
+

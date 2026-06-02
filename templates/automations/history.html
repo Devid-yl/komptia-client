@@ -1,0 +1,486 @@
+{% extends "../base.html" %}
+
+{% block title %}Historique - {{ automation.name }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Historique</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">{{ automation.name }}</p>
+        </div>
+        <a href="/automations" class="btn btn-secondary">Retour</a>
+    </div>
+
+    <!-- Webhook section (lazy-loaded) -->
+    <div class="card mb-4" id="webhook-section">
+        <div class="px-4 py-3 flex items-center justify-between border-b border-gray-100 dark:border-gray-800">
+            <div class="flex items-center gap-2">
+                <h2 class="text-sm font-medium text-gray-700 dark:text-gray-300">Webhooks</h2>
+                <span class="text-xs text-gray-400 dark:text-gray-500" id="webhook-count"></span>
+            </div>
+            <button id="btn-create-webhook" class="text-xs bg-gray-900 text-white px-3 py-1.5 rounded hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">
+                Creer un webhook
+            </button>
+        </div>
+        <div id="webhook-list">
+            <p class="px-4 py-4 text-center text-xs text-gray-400 dark:text-gray-500">Chargement...</p>
+        </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card mb-4">
+        <div class="flex flex-wrap items-center gap-4 px-4 py-3">
+            <div>
+                <select id="filter-status" class="input w-36">
+                    <option value="">Tous statuts</option>
+                    <option value="success" {% if status_filter == 'success' %}selected{% end %}>Succes</option>
+                    <option value="partial" {% if status_filter == 'partial' %}selected{% end %}>Partiel</option>
+                    <option value="failed" {% if status_filter == 'failed' %}selected{% end %}>Echec</option>
+                    <option value="pending" {% if status_filter == 'pending' %}selected{% end %}>En file</option>
+                    <option value="running" {% if status_filter == 'running' %}selected{% end %}>En cours</option>
+                    <option value="waiting" {% if status_filter == 'waiting' %}selected{% end %}>En attente</option>
+                    <option value="cancelled" {% if status_filter == 'cancelled' %}selected{% end %}>Annule</option>
+                </select>
+            </div>
+            <div>
+                <select id="filter-days" class="input w-40">
+                    <option value="">Toute periode</option>
+                    <option value="1" {% if days_filter == '1' %}selected{% end %}>Dernieres 24h</option>
+                    <option value="7" {% if days_filter == '7' %}selected{% end %}>7 derniers jours</option>
+                    <option value="30" {% if days_filter == '30' %}selected{% end %}>30 derniers jours</option>
+                </select>
+            </div>
+            {% if status_filter or days_filter %}
+            <a href="/automations/history/{{ automation.id }}" class="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">Reinitialiser</a>
+            {% end %}
+        </div>
+    </div>
+
+    {% if executions %}
+    <div class="card divide-y divide-gray-100 dark:divide-gray-800">
+        {% for execution in executions %}
+        <div class="px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-800">
+            <div class="flex items-start justify-between gap-4">
+                <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="badge {% if execution.status == 'success' %}badge-success{% elif execution.status == 'partial' %}badge-warning{% elif execution.status == 'failed' %}badge-error{% else %}badge-warning{% end %}">
+                            {% if execution.status == 'success' %}Succes{% elif execution.status == 'partial' %}Partiel{% elif execution.status == 'failed' %}Echec{% elif execution.status == 'running' %}En cours{% elif execution.status == 'waiting' %}En attente{% elif execution.status == 'pending' %}En file{% elif execution.status == 'cancelled' %}Annule{% else %}{{ execution.status }}{% end %}
+                        </span>
+                        {% if execution.duration_seconds is not None %}
+                        <span class="text-xs text-gray-500 dark:text-gray-400">{{ "%.2f" % execution.duration_seconds }}s</span>
+                        {% end %}
+                        {% if execution.has_steps %}
+                        <button class="text-xs text-blue-600 hover:text-blue-800 hover:underline step-toggle dark:text-blue-400"
+                                data-execution-id="{{ execution.id }}">
+                            Voir les etapes
+                        </button>
+                        {% end %}
+                        <a href="/executions/{{ execution.id }}" class="text-xs text-gray-500 hover:text-gray-700 hover:underline dark:text-gray-400 dark:hover:text-gray-200">Detail</a>
+                    </div>
+
+                    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-gray-600 dark:text-gray-400">
+                        {% if execution.result_rows is not None %}
+                        <span>{{ execution.result_rows }} ligne(s)</span>
+                        {% end %}
+                        {% if execution.output_file_path %}
+                        <a href="/automations/download/{{ execution.id }}" target="_blank" class="text-gray-900 hover:underline dark:text-gray-100">Telecharger</a>
+                        {% end %}
+                    </div>
+
+                    {% if execution.error_message %}
+                    <p class="text-sm text-red-600 mt-2 dark:text-red-400">{{ execution.error_message }}</p>
+                    {% end %}
+
+                    <!-- Step details container (lazy-loaded) -->
+                    <div id="steps-{{ execution.id }}" class="hidden mt-3"></div>
+                </div>
+
+                <time class="text-xs text-gray-400 flex-shrink-0 dark:text-gray-500"
+                      datetime="{{ execution.started_at.isoformat() }}+00:00"
+                      data-fmt-local="short"
+                      title="{{ execution.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC">
+                    {{ execution.started_at.strftime('%d/%m %H:%M') }} UTC
+                </time>
+            </div>
+        </div>
+        {% end %}
+    </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <div class="flex items-center justify-center gap-1 mt-6">
+        {% if page > 1 %}
+        <a href="/automations/history/{{ automation.id }}?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" class="btn btn-secondary">Precedent</a>
+        {% end %}
+        {% for p in range(1, total_pages + 1) %}
+        <a href="/automations/history/{{ automation.id }}?page={{ p }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" 
+           class="px-3 py-1.5 text-sm rounded {% if p == page %}bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900{% else %}border border-gray-300 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-800{% end %} dark:border-gray-700">{{ p }}</a>
+        {% end %}
+        {% if page < total_pages %}
+        <a href="/automations/history/{{ automation.id }}?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" class="btn btn-secondary">Suivant</a>
+        {% end %}
+    </div>
+    {% end %}
+
+    {% else %}
+    <div class="card px-4 py-12 text-center">
+        <p class="text-sm text-gray-500 dark:text-gray-400">Aucune execution pour le moment</p>
+    </div>
+    {% end %}
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+// ── Webhook management ───────────────────────────��──────────────
+var AUTOMATION_ID = {{ automation.id }};
+var webhooksData = [];
+
+function loadWebhooks() {
+    fetch('/api/automations/' + AUTOMATION_ID + '/webhooks', {
+        headers: { 'X-Xsrftoken': getCookie('_xsrf') || '' }
+    })
+    .then(function(res) {
+        if (!res.ok) throw new Error('Erreur ' + res.status);
+        return res.json();
+    })
+    .then(function(data) {
+        if (data.success) renderWebhooks(data.webhooks);
+    })
+    .catch(function() {
+        document.getElementById('webhook-list').innerHTML =
+            '<p class="px-4 py-3 text-xs text-red-500 dark:text-red-400">Erreur de chargement des webhooks</p>';
+    });
+}
+
+function renderWebhooks(webhooks) {
+    webhooksData = webhooks;
+    var container = document.getElementById('webhook-list');
+    var countEl = document.getElementById('webhook-count');
+    countEl.textContent = webhooks.length ? '(' + webhooks.length + ')' : '';
+
+    if (!webhooks.length) {
+        container.innerHTML =
+            '<p class="px-4 py-6 text-center text-sm text-gray-400 dark:text-gray-500">' +
+            'Aucun webhook. Creez-en un pour declencher cette automatisation via HTTP POST.' +
+            '</p>';
+        return;
+    }
+
+    var html = '';
+    for (var i = 0; i < webhooks.length; i++) {
+        var w = webhooks[i];
+        html += '<div class="px-4 py-3 border-b border-gray-50 dark:border-gray-800 last:border-0">';
+        html += '<div class="flex items-center gap-2 mb-1.5">';
+        html += '<span class="text-xs font-medium text-gray-700 dark:text-gray-300">' +
+            (w.description ? escapeHtml(w.description) : 'Webhook #' + w.id) + '</span>';
+        if (!w.is_active) {
+            html += '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">Inactif</span>';
+        }
+        html += '</div>';
+
+        // URL with copy button
+        html += '<div class="flex items-center gap-2 mb-2">';
+        html += '<code class="text-xs bg-gray-100 px-2 py-1 rounded font-mono text-gray-600 flex-1 overflow-x-auto whitespace-nowrap dark:bg-gray-800 dark:text-gray-400">' +
+            escapeHtml(w.webhook_url) + '</code>';
+        html += '<button class="text-xs text-blue-600 hover:text-blue-800 flex-shrink-0 copy-url-btn dark:text-blue-400" data-idx="' + i + '">Copier</button>';
+        html += '</div>';
+
+        // Stats + actions
+        html += '<div class="flex items-center justify-between">';
+        html += '<span class="text-xs text-gray-400 dark:text-gray-500">';
+        html += w.trigger_count + ' declenchement(s)';
+        if (w.last_triggered_at) {
+            html += ' — dernier: ' + new Date(w.last_triggered_at).toLocaleString('fr-FR');
+        }
+        html += '</span>';
+        html += '<div class="flex items-center gap-3">';
+        html += '<button class="text-xs text-gray-500 hover:text-gray-700 regen-btn dark:text-gray-400 dark:hover:text-gray-200" data-idx="' + i + '">Regenerer</button>';
+        html += '<button class="text-xs text-red-500 hover:text-red-700 delete-btn dark:text-red-400" data-idx="' + i + '">Supprimer</button>';
+        html += '</div></div></div>';
+    }
+    container.innerHTML = html;
+
+    // Attach event listeners (avoids inline onclick — CSP compliant)
+    container.querySelectorAll('.copy-url-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var idx = parseInt(this.getAttribute('data-idx'), 10);
+            var url = webhooksData[idx].webhook_url;
+            navigator.clipboard.writeText(url).then(function() {
+                showToast('URL copiee dans le presse-papier', 'success');
+            }).catch(function() {
+                showToast('Impossible de copier — copiez manuellement', 'error');
+            });
+        });
+    });
+    container.querySelectorAll('.regen-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var idx = parseInt(this.getAttribute('data-idx'), 10);
+            regenerateWebhook(webhooksData[idx].id);
+        });
+    });
+    container.querySelectorAll('.delete-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var idx = parseInt(this.getAttribute('data-idx'), 10);
+            deleteWebhook(webhooksData[idx].id);
+        });
+    });
+}
+
+function createWebhook() {
+    // Cluster-O 2026-05-26 — appPrompt (modal Komptia stylé) remplace
+    // window.prompt natif. Fallback console + abort si appPrompt indispo.
+    var btnCreate = document.getElementById('btn-create-webhook');
+    if (typeof window.appPrompt !== 'function') {
+        // Cluster-O : appPrompt vient de base.html. Absent = init cassée.
+        console.error('[history] appPrompt absent — abort createWebhook');
+        return;
+    }
+    var promptFn = window.appPrompt('Description (optionnel) :', 'Nouveau webhook');
+    promptFn.then(function (desc) {
+        if (desc === null) return null; // Annulation utilisateur
+
+        btnCreate.disabled = true;
+        btnCreate.textContent = 'Creation...';
+
+        return fetch('/api/automations/' + AUTOMATION_ID + '/webhooks', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Xsrftoken': getCookie('_xsrf') || ''
+            },
+            body: JSON.stringify({ description: desc || '' })
+        })
+        .then(function(res) { return res.json(); })
+        .then(function(data) {
+            if (data.success) {
+                showToast('Webhook cree', 'success');
+                loadWebhooks();
+            } else {
+                showToast(data.error || 'Erreur lors de la creation', 'error');
+            }
+        });
+    })
+    .catch(function() {
+        showToast('Erreur réseau', 'error');
+    })
+    .finally(function() {
+        // Restore seulement si on a effectivement lancé le fetch.
+        if (btnCreate.disabled) {
+            btnCreate.disabled = false;
+            btnCreate.textContent = 'Creer un webhook';
+        }
+    });
+}
+
+function regenerateWebhook(webhookId) {
+    appConfirm(
+        "Regenerer le token ? L'ancienne URL ne fonctionnera plus.",
+        'Regenerer le webhook'
+    ).then(function(ok) {
+        if (!ok) return;
+        fetch('/api/automations/' + AUTOMATION_ID + '/webhooks/' + webhookId + '/regenerate', {
+            method: 'POST',
+            headers: { 'X-Xsrftoken': getCookie('_xsrf') || '' }
+        })
+        .then(function(res) { return res.json(); })
+        .then(function(data) {
+            if (data.success) {
+                showToast('Token regenere', 'success');
+                loadWebhooks();
+            } else {
+                showToast(data.error || 'Erreur', 'error');
+            }
+        })
+        .catch(function() { showToast('Erreur réseau', 'error'); });
+    });
+}
+
+function deleteWebhook(webhookId) {
+    appConfirm(
+        'Supprimer ce webhook ? Les systemes externes ne pourront plus declencher cette automatisation via cette URL.',
+        'Supprimer le webhook'
+    ).then(function(ok) {
+        if (!ok) return;
+        fetch('/api/automations/' + AUTOMATION_ID + '/webhooks/' + webhookId, {
+            method: 'DELETE',
+            headers: { 'X-Xsrftoken': getCookie('_xsrf') || '' }
+        })
+        .then(function(res) { return res.json(); })
+        .then(function(data) {
+            if (data.success) {
+                showToast('Webhook supprime', 'success');
+                loadWebhooks();
+            } else {
+                showToast(data.error || 'Erreur', 'error');
+            }
+        })
+        .catch(function() { showToast('Erreur réseau', 'error'); });
+    });
+}
+
+// Init: load webhooks + attach create button
+document.getElementById('btn-create-webhook').addEventListener('click', createWebhook);
+loadWebhooks();
+
+// ── Filters ─────────────────────────────────────────────────────
+function applyFilter(name, value) {
+    var params = new URLSearchParams(window.location.search);
+    if (value) params.set(name, value);
+    else params.delete(name);
+    params.delete('page');
+    window.location.search = params.toString();
+}
+
+// Event listeners
+document.getElementById('filter-status')?.addEventListener('change', function(e) {
+    applyFilter('status', e.target.value);
+});
+document.getElementById('filter-days')?.addEventListener('change', function(e) {
+    applyFilter('days', e.target.value);
+});
+
+// Step detail toggle (lazy-loaded)
+var stepCache = {};
+
+function statusBadge(status) {
+    var map = {
+        success: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">OK</span>',
+        failed: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">Echec</span>',
+        skipped: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">Ignore</span>',
+        retried: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">Retry</span>',
+    };
+    return map[status] || '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-yellow-100 text-yellow-700 dark:text-yellow-300">' + escapeHtml(status) + '</span>';
+}
+
+function stepTypeLabel(type) {
+    // ⚠️ Tenir aligné avec STEP_TYPE_META.label (cf. all_executions.html
+    // pour la même map — duplication acceptée pour iteration courante,
+    // à factoriser dans static/js/automation-step-labels.js si la liste
+    // grandit). 9 step types : 4 Source + 1 Format + 2 Conversion + 2 Sortie.
+    var map = {
+        extract_sql: 'SQL',
+        load_workbook: 'Classeur',
+        load_saved_query: 'Requete sauvegardee',
+        format_copilot: 'Format IA',
+        report: 'Rapport',
+        export_workbook: 'Export',
+        email: 'Email',
+        save_to_datastore: 'Datastore',
+    };
+    return map[type] || type;
+}
+
+function formatDuration(ms) {
+    if (ms == null) return '-';
+    if (ms < 1000) return ms.toFixed(0) + 'ms';
+    return (ms / 1000).toFixed(2) + 's';
+}
+
+function renderSteps(steps) {
+    if (!steps.length) return '<p class="text-xs text-gray-400 dark:text-gray-500">Aucune donnée d\'étape</p>';
+    var html = '<div class="border border-gray-200 rounded-lg overflow-hidden dark:border-gray-800">';
+    html += '<table class="w-full text-xs">';
+    html += '<thead class="bg-gray-50 dark:bg-gray-900"><tr>';
+    html += '<th class="px-2 py-1.5 text-left text-gray-500 font-medium dark:text-gray-400">#</th>';
+    html += '<th class="px-2 py-1.5 text-left text-gray-500 font-medium dark:text-gray-400">Etape</th>';
+    html += '<th class="px-2 py-1.5 text-left text-gray-500 font-medium dark:text-gray-400">Type</th>';
+    html += '<th class="px-2 py-1.5 text-center text-gray-500 font-medium dark:text-gray-400">Statut</th>';
+    html += '<th class="px-2 py-1.5 text-center text-gray-500 font-medium dark:text-gray-400">Essai</th>';
+    html += '<th class="px-2 py-1.5 text-right text-gray-500 font-medium dark:text-gray-400">Lignes</th>';
+    html += '<th class="px-2 py-1.5 text-right text-gray-500 font-medium dark:text-gray-400">Duree</th>';
+    html += '</tr></thead><tbody class="divide-y divide-gray-100 dark:divide-gray-800">';
+    for (var i = 0; i < steps.length; i++) {
+        var s = steps[i];
+        var rowClass = s.status === 'failed' ? ' bg-red-50 dark:bg-red-900/20' : s.status === 'skipped' ? ' bg-gray-50 dark:bg-gray-800/50' : '';
+        html += '<tr class="' + rowClass + '">';
+        html += '<td class="px-2 py-1.5 text-gray-400 dark:text-gray-500">' + s.step_order + '</td>';
+        html += '<td class="px-2 py-1.5 font-medium text-gray-700 dark:text-gray-300">' + escapeHtml(s.step_name) + '</td>';
+        html += '<td class="px-2 py-1.5"><span class="inline-block px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 text-xs dark:bg-blue-900/20 dark:text-blue-400">' + stepTypeLabel(s.step_type) + '</span></td>';
+        html += '<td class="px-2 py-1.5 text-center">' + statusBadge(s.status) + '</td>';
+        html += '<td class="px-2 py-1.5 text-center text-gray-500 dark:text-gray-400">' + (s.attempt_number > 1 ? s.attempt_number : '-') + '</td>';
+        html += '<td class="px-2 py-1.5 text-right text-gray-600 dark:text-gray-400">';
+        if (s.rows_in != null && s.rows_out != null && s.status !== 'skipped') {
+            html += s.rows_in + ' &rarr; ' + s.rows_out;
+        } else {
+            html += '-';
+        }
+        html += '</td>';
+        html += '<td class="px-2 py-1.5 text-right text-gray-500 dark:text-gray-400">' + formatDuration(s.duration_ms) + '</td>';
+        html += '</tr>';
+        if (s.error_message) {
+            html += '<tr class="bg-red-50 dark:bg-red-900/20"><td colspan="7" class="px-3 py-1.5 text-red-600 dark:text-red-400">' + escapeHtml(s.error_message) + '</td></tr>';
+        }
+        if (s.warnings && s.warnings.length) {
+            html += '<tr class="bg-yellow-50 dark:bg-yellow-900/20"><td colspan="7" class="px-3 py-1.5 text-yellow-700 dark:text-yellow-300">';
+            for (var j = 0; j < s.warnings.length; j++) {
+                html += escapeHtml(s.warnings[j]) + '<br>';
+            }
+            html += '</td></tr>';
+        }
+    }
+    html += '</tbody></table></div>';
+    return html;
+}
+
+document.querySelectorAll('.step-toggle').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        var execId = this.getAttribute('data-execution-id');
+        var container = document.getElementById('steps-' + execId);
+        if (!container) return;
+
+        // Toggle visibility
+        if (!container.classList.contains('hidden') && container.innerHTML) {
+            container.classList.add('hidden');
+            this.textContent = 'Voir les etapes';
+            return;
+        }
+
+        // Load if not cached
+        if (stepCache[execId]) {
+            container.innerHTML = renderSteps(stepCache[execId]);
+            container.classList.remove('hidden');
+            this.textContent = 'Masquer les etapes';
+            return;
+        }
+
+        // Fetch from API
+        var self = this;
+        self.textContent = 'Chargement...';
+        self.disabled = true;
+
+        fetch('/api/executions/' + execId + '/steps', {
+            headers: { 'X-Xsrftoken': getCookie('_xsrf') || '' }
+        })
+        .then(function(res) {
+            if (!res.ok) throw new Error('Erreur ' + res.status);
+            return res.json();
+        })
+        .then(function(data) {
+            if (data.success && data.steps) {
+                stepCache[execId] = data.steps;
+                container.innerHTML = renderSteps(data.steps);
+                container.classList.remove('hidden');
+                self.textContent = 'Masquer les etapes';
+            } else {
+                container.innerHTML = '<p class="text-xs text-gray-400 dark:text-gray-500">Aucune donnée</p>';
+                container.classList.remove('hidden');
+                self.textContent = 'Masquer les etapes';
+            }
+        })
+        .catch(function() {
+            container.innerHTML = '<p class="text-xs text-red-500 dark:text-red-400">Erreur de chargement</p>';
+            container.classList.remove('hidden');
+            self.textContent = 'Masquer les etapes';
+        })
+        .finally(function() {
+            self.disabled = false;
+        });
+    });
+});
+</script>
+{% end %}

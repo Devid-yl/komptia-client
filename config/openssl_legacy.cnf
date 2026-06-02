@@ -1,0 +1,15 @@
+# OpenSSL config for Komptia — allows legacy TLS (1.0/1.1) for Sage Coala SQL Server
+# Sage Coala servers often don't support TLS 1.2+, but OpenSSL 3.x blocks old protocols by default.
+# This config lowers the minimum to TLS 1.0 ONLY for this application's ODBC connections.
+
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+MinProtocol = TLSv1
+CipherString = DEFAULT@SECLEVEL=0

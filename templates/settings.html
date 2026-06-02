@@ -1,0 +1,378 @@
+{% extends "base.html" %}
+
+{% block title %}Paramètres | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto space-y-8">
+
+    <!-- Header -->
+    <div>
+        <h1 class="text-2xl font-semibold text-gray-900 dark:text-gray-100">Paramètres</h1>
+        <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Gérez votre profil et l'apparence de Komptia.</p>
+    </div>
+
+    <!-- ── Profil ── -->
+    <section class="space-y-5">
+        <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.75">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z"/>
+            </svg>
+            <h2 class="text-sm font-semibold tracking-wide uppercase text-gray-500 dark:text-gray-400">Profil</h2>
+        </div>
+
+        <!-- Informations personnelles -->
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Informations</h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Ces informations sont visibles uniquement par vous.</p>
+            </div>
+            <form id="form-profile" class="p-5 space-y-4" autocomplete="off">
+                <div>
+                    <label for="pf-display-name" class="label">Nom d'affichage</label>
+                    <input id="pf-display-name" name="display_name" type="text" class="input" maxlength="100" placeholder="Votre nom">
+                    <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">Nom affiché sur votre page Paramètres.</p>
+                </div>
+                <div>
+                    <label for="pf-email" class="label">Adresse email</label>
+                    {# maxlength=254 = SSoT ``EMAIL_MAX_LENGTH`` (RFC 5321 + colonne
+                       ``User.email`` String(254) + ``_EMAIL_MAX_LEN`` handler).
+                       Idem ``templates/auth/login.html`` ; régression bloquée par
+                       ``tests/unit/test_settings_email_maxlength_aligned.py``. #}
+                    <input id="pf-email" name="email" type="email" class="input" maxlength="254" required>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-3 border-t border-gray-100 dark:border-gray-800">
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-gray-400 dark:text-gray-500">Identifiant</p>
+                        <p id="pf-username" class="text-sm font-medium text-gray-800 dark:text-gray-200 mt-0.5">—</p>
+                    </div>
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-gray-400 dark:text-gray-500">Rôle</p>
+                        <p id="pf-role" class="text-sm font-medium text-gray-800 dark:text-gray-200 mt-0.5">—</p>
+                    </div>
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-gray-400 dark:text-gray-500">Dernière connexion</p>
+                        <p id="pf-last-login" class="text-sm font-medium text-gray-800 dark:text-gray-200 mt-0.5">—</p>
+                    </div>
+                </div>
+                <div class="flex items-center justify-end gap-2 pt-3 border-t border-gray-100 dark:border-gray-800">
+                    <span id="pf-msg" class="text-xs text-gray-500 dark:text-gray-400"></span>
+                    <button type="submit" id="pf-submit" class="btn btn-primary text-sm">Enregistrer</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Mot de passe -->
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Mot de passe</h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Le changement déconnectera vos autres appareils.</p>
+            </div>
+            <form id="form-password" class="p-5 space-y-4" autocomplete="off">
+                <div>
+                    <label for="pw-current" class="label">Mot de passe actuel</label>
+                    <input id="pw-current" name="current_password" type="password" class="input" required autocomplete="current-password">
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label for="pw-new" class="label">Nouveau mot de passe</label>
+                        <input id="pw-new" name="new_password" type="password" class="input" minlength="8" required autocomplete="new-password">
+                    </div>
+                    <div>
+                        <label for="pw-confirm" class="label">Confirmer</label>
+                        <input id="pw-confirm" name="confirm_password" type="password" class="input" minlength="8" required autocomplete="new-password">
+                    </div>
+                </div>
+                <p class="text-xs text-gray-400 dark:text-gray-500">8 caractères minimum. Différent de l'actuel.</p>
+                <div class="flex items-center justify-end gap-2 pt-3 border-t border-gray-100 dark:border-gray-800">
+                    <span id="pw-msg" class="text-xs text-gray-500 dark:text-gray-400"></span>
+                    <button type="submit" id="pw-submit" class="btn btn-primary text-sm">Mettre à jour</button>
+                </div>
+            </form>
+        </div>
+    </section>
+
+    {% if current_user and getattr(getattr(current_user, "role", None), "value", str(getattr(current_user, "role", ""))).lower() == "admin" %}
+    <!-- ── Mon entreprise (admin only) ── -->
+    <section class="space-y-5">
+        <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.75">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 21h16.5M4.5 3h15M5.25 3v18m13.5-18v18M9 6.75h1.5m-1.5 3h1.5m-1.5 3h1.5m3-6H15m-1.5 3H15m-1.5 3H15M9 21v-3.375c0-.621.504-1.125 1.125-1.125h3.75c.621 0 1.125.504 1.125 1.125V21"/>
+            </svg>
+            <h2 class="text-sm font-semibold tracking-wide uppercase text-gray-500 dark:text-gray-400">Mon entreprise</h2>
+        </div>
+
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Nom de votre entreprise</h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Apparait dans les rapports PDF et l'expediteur des emails ("&lt;Votre nom&gt; via &lt;Mon entreprise&gt;").</p>
+            </div>
+            <form id="form-company" class="p-5 space-y-4" autocomplete="off">
+                <div>
+                    <label for="cp-company-name" class="label">Nom d'entreprise</label>
+                    {# placeholder = SSoT ``app.services.branding.PLACEHOLDER_COMPANY_NAME``
+                       injectée par SettingsPageHandler. Avant 2026-05-26 (S-12),
+                       c'était hardcodé en ``Ex: Cabinet Dupont`` (nom propre fictif
+                       + violation ``feedback_no_real_names_in_code``). Le JS écrase
+                       ensuite via ``res.data.placeholder`` (cf. S-1) — même valeur,
+                       cohérence garantie. #}
+                    <input id="cp-company-name" name="company_name" type="text" class="input" maxlength="200" placeholder="{{ company_placeholder }}">
+                    <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">Modifiable uniquement par les administrateurs. La valeur s'applique a toute l'instance.</p>
+                </div>
+                <div class="flex items-center justify-end gap-2 pt-3 border-t border-gray-100 dark:border-gray-800">
+                    <span id="cp-msg" class="text-xs text-gray-500 dark:text-gray-400"></span>
+                    <button type="submit" id="cp-submit" class="btn btn-primary text-sm">Enregistrer</button>
+                </div>
+            </form>
+        </div>
+    </section>
+    {% end %}
+
+    <!-- ── Apparence ── -->
+    <section class="space-y-5">
+        <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.75">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M7.5 14.25v2.25m3-4.5v4.5m3-6.75v6.75m3-9v9M6 20.25h12A2.25 2.25 0 0020.25 18V6A2.25 2.25 0 0018 3.75H6A2.25 2.25 0 003.75 6v12A2.25 2.25 0 006 20.25z"/>
+            </svg>
+            <h2 class="text-sm font-semibold tracking-wide uppercase text-gray-500 dark:text-gray-400">Apparence</h2>
+        </div>
+
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Mode de couleur</h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Choisissez le thème appliqué à Komptia. « Système » suit la préférence de votre appareil.</p>
+            </div>
+            <div class="p-5">
+                <div id="appearance-options" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <!-- Clair -->
+                    <label class="theme-option relative flex flex-col items-start gap-2 p-4 rounded-xl border cursor-pointer transition-all"
+                           data-theme="light">
+                        <input type="radio" name="theme_mode" value="light" class="sr-only">
+                        <div class="w-full h-20 rounded-lg border border-gray-200 bg-white overflow-hidden flex dark:bg-gray-900 dark:border-gray-800">
+                            <div class="w-1/3 bg-slate-900"></div>
+                            <div class="flex-1 p-2 flex flex-col gap-1">
+                                <div class="h-2 rounded bg-gray-300 w-3/4"></div>
+                                <div class="h-2 rounded bg-gray-200 w-1/2 dark:bg-gray-800"></div>
+                                <div class="mt-auto h-4 rounded bg-gray-100 dark:bg-gray-800"></div>
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between w-full">
+                            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">Clair</span>
+                            <svg class="theme-check w-5 h-5 text-brand-600 hidden" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+                        </div>
+                    </label>
+                    <!-- Sombre -->
+                    <label class="theme-option relative flex flex-col items-start gap-2 p-4 rounded-xl border cursor-pointer transition-all"
+                           data-theme="dark">
+                        <input type="radio" name="theme_mode" value="dark" class="sr-only">
+                        <div class="w-full h-20 rounded-lg border border-gray-800 bg-gray-900 overflow-hidden flex">
+                            <div class="w-1/3 bg-black"></div>
+                            <div class="flex-1 p-2 flex flex-col gap-1">
+                                <div class="h-2 rounded bg-gray-600 w-3/4"></div>
+                                <div class="h-2 rounded bg-gray-700 w-1/2"></div>
+                                <div class="mt-auto h-4 rounded bg-gray-800"></div>
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between w-full">
+                            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">Sombre</span>
+                            <svg class="theme-check w-5 h-5 text-brand-600 hidden" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+                        </div>
+                    </label>
+                    <!-- Système -->
+                    <label class="theme-option relative flex flex-col items-start gap-2 p-4 rounded-xl border cursor-pointer transition-all"
+                           data-theme="system">
+                        <input type="radio" name="theme_mode" value="system" class="sr-only">
+                        <div class="w-full h-20 rounded-lg border border-gray-300 dark:border-gray-700 overflow-hidden flex">
+                            <div class="w-1/2 bg-white flex dark:bg-gray-900">
+                                <div class="w-1/3 bg-slate-900"></div>
+                                <div class="flex-1 p-2 flex flex-col gap-1">
+                                    <div class="h-1.5 rounded bg-gray-300"></div>
+                                    <div class="h-1.5 rounded bg-gray-200 w-2/3 dark:bg-gray-800"></div>
+                                </div>
+                            </div>
+                            <div class="w-1/2 bg-gray-900 flex">
+                                <div class="w-1/3 bg-black"></div>
+                                <div class="flex-1 p-2 flex flex-col gap-1">
+                                    <div class="h-1.5 rounded bg-gray-600"></div>
+                                    <div class="h-1.5 rounded bg-gray-700 w-2/3"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex items-center justify-between w-full">
+                            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">Système</span>
+                            <svg class="theme-check w-5 h-5 text-brand-600 hidden" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+                        </div>
+                    </label>
+                </div>
+                <p id="ap-msg" class="mt-4 text-xs text-gray-500 dark:text-gray-400"></p>
+            </div>
+        </div>
+    </section>
+
+    {# ────────────────────────────────────────────────────────────────
+       Mémoire Iris user-scoped (parité copilot_memory) — déplacée
+       depuis /data/privacy vers /settings le 2026-05-26 pour cohérence :
+       c'est une préférence utilisateur, pas un terme de confidentialité.
+       Une seule chaîne consolidée par utilisateur, injectée automatiquement
+       dans le system prompt de toutes les conversations Iris. Auto-mise à
+       jour fin-de-conversation via fusion LLM. L'user peut consulter /
+       éditer / effacer ici (transparence + RGPD).
+       Endpoints : GET/PUT/DELETE /api/iris/user-memory (cf. ``app/handlers/iris.py``).
+       JS : ``static/js/privacy/iris-user-memory.js`` (chargé en bas de page).
+       ──────────────────────────────────────────────────────────────── #}
+    <section class="space-y-5">
+        <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.75">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"/>
+            </svg>
+            <h2 class="text-sm font-semibold tracking-wide uppercase text-gray-500 dark:text-gray-400">Mémoire Iris</h2>
+        </div>
+
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100 flex items-center gap-2" data-tooltip="Iris consolide automatiquement, à la fin de chaque conversation, une mémoire factuelle vous concernant (préférences, conventions, contexte). Cette mémoire est injectée dans toutes vos futures conversations avec Iris. Vous pouvez la modifier ou la vider directement dans le champ ci-dessous, puis cliquer Enregistrer. Elle n'est jamais partagée avec d'autres utilisateurs.">
+                    Ma mémoire Iris
+                </h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Mémoire factuelle privée, consolidée après vos conversations. Modifiez ou videz le contenu ci-dessous puis enregistrez. Jamais partagée avec d'autres utilisateurs.</p>
+            </div>
+            <div class="p-5 space-y-4">
+                <div class="flex items-center justify-between gap-3 flex-wrap">
+                    <label for="iris-memory-textarea" class="label !mb-0">Contenu</label>
+                    <p class="text-xs text-gray-400 dark:text-gray-500">
+                        <span id="iris-memory-char-count" aria-live="polite">0</span>&nbsp;/&nbsp;<span id="iris-memory-char-max">2000</span> caractères
+                    </p>
+                </div>
+                <textarea id="iris-memory-textarea" rows="8" maxlength="2000"
+                          placeholder="Aucune mémoire pour le moment. Elle se construira automatiquement après vos premières conversations avec Iris."
+                          class="input font-mono leading-relaxed resize-y"></textarea>
+                <div class="flex items-center justify-end gap-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+                    <span id="iris-memory-status" class="text-xs text-gray-500 dark:text-gray-400" role="status" aria-live="polite"></span>
+                    <button type="button" id="iris-memory-save-btn" class="btn btn-primary text-sm" disabled>Enregistrer</button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ── Confidentialité Iris ── -->
+    {# Préférence utilisateur sur le consentement de lecture des résultats SQL
+       par Iris (free-loop agent + pipeline). Avant qu'Iris n'envoie les
+       résultats d'une requête au LLM cloud, ce paramètre décide du flow
+       d'interaction. La pref est aussi mise à jour automatiquement quand
+       l'utilisateur coche « ne plus me redemander » dans le prompt inline
+       en plein flow Iris (cf. ``static/js/iris.js``). #}
+    <section class="space-y-5">
+        <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.75">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z"/>
+            </svg>
+            <h2 class="text-sm font-semibold tracking-wide uppercase text-gray-500 dark:text-gray-400">Confidentialit&eacute; Iris</h2>
+        </div>
+
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Lecture des r&eacute;sultats SQL par Iris</h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    Quand tu poses une question &agrave; Iris et qu'il ex&eacute;cute une requ&ecirc;te SQL,
+                    ses r&eacute;sultats doivent &ecirc;tre lus pour produire la r&eacute;ponse.
+                    Choisis comment Komptia g&egrave;re cette &eacute;tape.
+                    Les couches d'anonymisation auto (emails, t&eacute;l&eacute;phones, IBAN, SIRET, etc.)
+                    et tes termes confidentiels d&eacute;clar&eacute;s s'appliquent toujours, ind&eacute;pendamment de ce choix.
+                </p>
+            </div>
+            <div class="p-5">
+                <div id="iris-consent-options" class="space-y-3">
+                    <label class="iris-consent-option flex items-start gap-3 p-4 rounded-xl border cursor-pointer transition-all"
+                           data-value="ask">
+                        <input type="radio" name="iris_data_read_consent" value="ask" class="mt-1">
+                        <div class="flex-1">
+                            <div class="text-sm font-medium text-gray-900 dark:text-gray-100">Demander &agrave; chaque nouvelle conversation</div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                Recommand&eacute;. Au premier r&eacute;sultat SQL d'une conversation,
+                                Iris pause et te demande si tu autorises la lecture. Une seule fois par conversation.
+                            </p>
+                        </div>
+                    </label>
+                    <label class="iris-consent-option flex items-start gap-3 p-4 rounded-xl border cursor-pointer transition-all"
+                           data-value="always_allow">
+                        <input type="radio" name="iris_data_read_consent" value="always_allow" class="mt-1">
+                        <div class="flex-1">
+                            <div class="text-sm font-medium text-gray-900 dark:text-gray-100">Toujours autoriser</div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                Iris lit les r&eacute;sultats SQL sans demander. Les anonymisations automatiques s'appliquent toujours.
+                            </p>
+                        </div>
+                    </label>
+                    <label class="iris-consent-option flex items-start gap-3 p-4 rounded-xl border cursor-pointer transition-all"
+                           data-value="always_show_panel">
+                        <input type="radio" name="iris_data_read_consent" value="always_show_panel" class="mt-1">
+                        <div class="flex-1">
+                            <div class="text-sm font-medium text-gray-900 dark:text-gray-100">Toujours ouvrir le panneau d'anonymisation</div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                                Workflow le plus strict. Le panneau Confidentialit&eacute; s'ouvre &agrave; chaque
+                                r&eacute;sultat SQL, pr&eacute;-rempli avec les valeurs uniques d&eacute;tect&eacute;es.
+                            </p>
+                        </div>
+                    </label>
+                </div>
+                <p id="iris-consent-msg" class="mt-4 text-xs text-gray-500 dark:text-gray-400" aria-live="polite"></p>
+            </div>
+        </div>
+    </section>
+
+    {# ── Aide : guides d'utilisation PDF par rôle ──
+       La liste ``help_guides`` est pré-filtrée côté serveur
+       (``SettingsPageHandler.get`` → ``available_guides_for_user``) : un user
+       ne reçoit jamais l'entrée du guide admin. La frontière de sécurité réelle
+       reste l'endpoint ``/help/guides/<key>`` (re-check rôle + whitelist).
+       Liens directs (GET authentifié, pas de JS / pas de XSRF nécessaire). #}
+    <section class="space-y-5">
+        <div class="flex items-center gap-2">
+            <svg class="w-4 h-4 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.75" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25"/>
+            </svg>
+            <h2 class="text-sm font-semibold tracking-wide uppercase text-gray-500 dark:text-gray-400">Aide</h2>
+        </div>
+
+        <div class="card">
+            <div class="p-5 border-b border-gray-100 dark:border-gray-800">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Guides d'utilisation</h3>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Consultez ou téléchargez les guides PDF adaptés à votre rôle.</p>
+            </div>
+            <div class="p-5">
+                {% if help_guides %}
+                <ul class="space-y-3">
+                    {% for g in help_guides %}
+                    <li class="flex flex-col gap-3 p-4 rounded-xl border border-gray-100 dark:border-gray-800 sm:flex-row sm:items-center">
+                        <svg class="w-8 h-8 flex-shrink-0 text-brand-600 dark:text-brand-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/>
+                        </svg>
+                        <div class="flex-1 min-w-0">
+                            <div class="text-sm font-medium text-gray-900 dark:text-gray-100">{{ g.title }}</div>
+                            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ g.description }}</p>
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            <a href="/help/guides/{{ g.key }}?inline=true" target="_blank" rel="noopener"
+                               class="btn btn-secondary text-sm" aria-label="Consulter le {{ g.title }} (nouvel onglet)">Consulter</a>
+                            <a href="/help/guides/{{ g.key }}" download
+                               class="btn btn-primary text-sm" aria-label="Télécharger le {{ g.title }} (PDF)">Télécharger</a>
+                        </div>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <p class="text-sm text-gray-500 dark:text-gray-400">Aucun guide n'est disponible pour le moment.</p>
+                {% end %}
+            </div>
+        </div>
+    </section>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script src="{{ static_url('js/settings.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# static_url() ajoute un hash de contenu → invalide le cache navigateur à
+   chaque modif du JS. Sans ça, après le refactor du 2026-05-26 (qui change
+   les IDs DOM utilisés par le JS), les navigateurs servaient l'ancienne
+   version cachée et le bouton Enregistrer restait figé en `disabled`. #}
+<script src="{{ static_url('js/privacy/iris-user-memory.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}

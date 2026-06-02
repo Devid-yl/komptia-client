@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_title or "Repondre - " + app_name }}</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <style nonce="{{ handler.csp_nonce }}">
+        :root {
+            color-scheme: light dark;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            line-height: 1.5;
+            background: #f5f6f8;
+            color: #1a1a1a;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            padding: 24px;
+        }
+        @media (prefers-color-scheme: dark) {
+            body { background: #1a1a1a; color: #e5e5e5; }
+            .card { background: #262626 !important; border-color: #333 !important; }
+            .field-input, .field-textarea {
+                background: #1a1a1a !important;
+                color: #e5e5e5 !important;
+                border-color: #444 !important;
+            }
+            .meta { color: #a3a3a3 !important; }
+            .footer { color: #888 !important; }
+        }
+        .container {
+            max-width: 640px;
+            margin: 24px auto;
+            width: 100%;
+        }
+        .card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.05);
+        }
+        h1 {
+            margin: 0 0 8px 0;
+            font-size: 22px;
+            font-weight: 600;
+        }
+        .meta {
+            color: #6b7280;
+            font-size: 13px;
+            margin-bottom: 24px;
+        }
+        .body-text {
+            margin: 16px 0 24px 0;
+            white-space: pre-wrap;
+        }
+        .field {
+            margin-bottom: 20px;
+        }
+        .field-label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 6px;
+            font-size: 14px;
+        }
+        .field-input,
+        .field-textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            background: #fff;
+            color: #1a1a1a;
+        }
+        .field-textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+        .field-input:focus, .field-textarea:focus {
+            outline: 2px solid #2563eb;
+            outline-offset: -1px;
+            border-color: #2563eb;
+        }
+        .field-help {
+            color: #6b7280;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background .15s;
+        }
+        .btn-primary {
+            background: #2563eb;
+            color: #fff;
+        }
+        .btn-primary:hover { background: #1d4ed8; }
+        .btn-primary:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        .footer {
+            text-align: center;
+            color: #6b7280;
+            font-size: 12px;
+            margin-top: 32px;
+        }
+        .alert {
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+        .alert-error {
+            background: #fee2e2;
+            border: 1px solid #fca5a5;
+            color: #991b1b;
+        }
+        .alert-success {
+            background: #d1fae5;
+            border: 1px solid #6ee7b7;
+            color: #065f46;
+        }
+        @media (prefers-color-scheme: dark) {
+            .alert-error { background: #4c1d1d; border-color: #7f1d1d; color: #fecaca; }
+            .alert-success { background: #1d4c30; border-color: #064e3b; color: #a7f3d0; }
+        }
+        .expires {
+            display: inline-block;
+            font-size: 12px;
+            color: #6b7280;
+            background: #f3f4f6;
+            padding: 4px 10px;
+            border-radius: 4px;
+        }
+        @media (prefers-color-scheme: dark) {
+            .expires { background: #2d2d2d; color: #a3a3a3; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    {% if state == "expired" %}
+        <div class="card">
+            <div class="alert alert-error">
+                <strong>Lien expire</strong><br/>
+                Ce lien n'est plus valide. Si vous deviez encore repondre, contactez la
+                personne qui vous a envoye le mail.
+            </div>
+        </div>
+    {% elif state == "cancelled" %}
+        <div class="card">
+            <div class="alert alert-error">
+                <strong>Demande annulee</strong><br/>
+                Cette demande a ete annulee
+                {% if cancellation_reason %}({{ cancellation_reason }}){% end %}.
+                Vous pouvez ignorer ce mail.
+            </div>
+        </div>
+    {% elif state == "resolved" %}
+        <div class="card">
+            <div class="alert alert-success">
+                <strong>Reponse deja enregistree</strong><br/>
+                Merci, votre reponse a deja ete prise en compte le
+                {{ resolved_at_local or "" }}.
+            </div>
+        </div>
+    {% elif state == "submitted" %}
+        <div class="card">
+            <div class="alert alert-success">
+                <strong>Merci !</strong><br/>
+                Votre reponse a ete enregistree. L'automatisation va reprendre
+                automatiquement.
+            </div>
+            <p class="footer">Vous pouvez fermer cet onglet.</p>
+        </div>
+    {% elif state == "invalid" %}
+        <div class="card">
+            <div class="alert alert-error">
+                <strong>Lien invalide</strong><br/>
+                Ce lien n'est pas reconnu. Verifiez que vous avez bien copie l'URL
+                complete depuis le mail.
+            </div>
+        </div>
+    {% else %}
+        {# state == "pending" : afficher le form #}
+        <div class="card">
+            <h1>{{ subject or "Reponse demandee" }}</h1>
+            <div class="meta">
+                {{ company_name }} — {{ automation_name or "Automatisation" }}
+            </div>
+
+            {% if body %}
+            <div class="body-text">{{ body }}</div>
+            {% end %}
+
+            <p class="expires">Lien valable jusqu'au {{ expires_local }}</p>
+
+            <form id="wait-form" method="POST" enctype="multipart/form-data" action="" autocomplete="off">
+                {# Pas de XSRF token : la page est publique (pas d'auth user). Le token HMAC dans l'URL est l'unique vecteur d'auth (CSRF naturellement impossible sans capture du lien). #}
+
+                {% if response_kind in ("text", "both") %}
+                <div class="field">
+                    <label for="response-text" class="field-label">
+                        {% if response_kind == "both" %}Votre reponse (texte){% else %}Votre reponse{% end %}
+                        {% if response_kind == "text" %} *{% end %}
+                    </label>
+                    <textarea
+                        id="response-text"
+                        name="response_text"
+                        class="field-textarea"
+                        maxlength="50000"
+                        {% if response_kind == "text" %}required{% end %}
+                    ></textarea>
+                    <p class="field-help">Max 50 000 caracteres.</p>
+                </div>
+                {% end %}
+
+                {% if response_kind in ("file", "both") %}
+                <div class="field">
+                    <label for="response-file" class="field-label">
+                        {% if response_kind == "both" %}Fichier (optionnel){% else %}Fichier{% end %}
+                        {% if response_kind == "file" %} *{% end %}
+                    </label>
+                    <input
+                        id="response-file"
+                        type="file"
+                        name="response_file"
+                        class="field-input"
+                        accept="{% if file_format == 'csv' %}.csv{% elif file_format == 'xlsx' %}.xlsx{% else %}.csv,.xlsx{% end %}"
+                        {% if response_kind == "file" %}required{% end %}
+                    />
+                    <p class="field-help">
+                        Format accepte :
+                        {% if file_format == "csv" %}CSV (.csv){% elif file_format == "xlsx" %}Excel (.xlsx){% else %}CSV ou Excel{% end %}.
+                        Taille max : 50 Mo.
+                    </p>
+                </div>
+                {% end %}
+
+                <button type="submit" id="submit-btn" class="btn btn-primary">
+                    Envoyer ma reponse
+                </button>
+            </form>
+        </div>
+        <p class="footer">
+            {{ app_name }} — Lien securise. Ne le partagez pas.
+        </p>
+    {% end %}
+</div>
+
+{% if state == "pending" %}
+<script nonce="{{ handler.csp_nonce }}">
+(function () {
+    var form = document.getElementById('wait-form');
+    var btn = document.getElementById('submit-btn');
+    if (!form || !btn) return;
+    form.addEventListener('submit', function () {
+        btn.disabled = true;
+        btn.textContent = 'Envoi en cours...';
+    });
+})();
+</script>
+{% end %}
+</body>
+</html>

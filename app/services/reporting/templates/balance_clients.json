@@ -1,0 +1,64 @@
+{
+  "id": "balance_clients",
+  "name": "Balance Clients TOP 10",
+  "description": "Classement des 10 meilleurs clients avec répartition du CA",
+  "category": "commercial",
+  "icon": "👥",
+  
+  "query": {
+    "type": "sql",
+    "sql": "SELECT c.nom as client, SUM(f.montant_ttc) as ca_total, COUNT(f.id) as nb_factures FROM clients c JOIN factures f ON f.client_id = c.id WHERE f.date_facture >= CURRENT_DATE - INTERVAL '12 months' GROUP BY c.id, c.nom ORDER BY ca_total DESC LIMIT 10",
+    "parameters": []
+  },
+  
+  "chart": {
+    "enabled": true,
+    "type": "pie",
+    "label_column": "client",
+    "value_column": "ca_total",
+    "title": "Répartition du CA par Client",
+    "labels": {
+      "x": "Client",
+      "y": "CA (€)"
+    }
+  },
+  
+  "columns": [
+    {
+      "name": "client",
+      "label": "Client",
+      "format": "text"
+    },
+    {
+      "name": "ca_total",
+      "label": "CA Total",
+      "format": "currency",
+      "suffix": " €"
+    },
+    {
+      "name": "nb_factures",
+      "label": "Nombre de factures",
+      "format": "integer"
+    }
+  ],
+  
+  "aggregations": [
+    {
+      "column": "ca_total",
+      "operation": "sum",
+      "label": "Total CA TOP 10"
+    },
+    {
+      "column": "nb_factures",
+      "operation": "sum",
+      "label": "Total factures"
+    }
+  ],
+  
+  "metadata": {
+    "title": "Balance Clients TOP 10",
+    "description": "Classement des 10 meilleurs clients sur 12 mois",
+    "author": "Komptia",
+    "subject": "Analyse clientèle"
+  }
+}

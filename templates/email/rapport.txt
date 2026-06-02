@@ -1,0 +1,31 @@
+{% extends "email/base.txt" %}
+
+{{ report_title | default('Votre Rapport') }}
+
+Bonjour {{ recipient_name | default('Cher client') }},
+
+Veuillez trouver ci-joint votre rapport {{ report_title }} pour la période 
+du {{ period_start }} au {{ period_end }}.
+
+{% if summary %}
+RÉSUMÉ DU RAPPORT:
+{{ summary }}
+{% endif %}
+
+{% if key_figures %}
+CHIFFRES CLÉS:
+{% for figure in key_figures %}
+• {{ figure }}
+{% endfor %}
+{% endif %}
+
+{% if notes %}
+NOTES IMPORTANTES:
+{{ notes }}
+{% endif %}
+
+Le fichier PDF est joint à cet email. Si vous avez des questions concernant 
+ce rapport, n'hésitez pas à nous contacter.
+
+Cordialement,
+{{ sender_name | default("L'équipe de " ~ company_name) }}

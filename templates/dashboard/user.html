@@ -1,0 +1,353 @@
+{% extends "../base.html" %}
+
+{% block title %}Tableau de bord | {{ app_name }}{% end %}
+
+{% block head %}
+<style>
+    .stat-card { transition: all .2s; border-radius: 0.75rem; display: block; text-decoration: none; color: inherit; }
+    .stat-card:hover { box-shadow: 0 4px 16px rgb(var(--brand-rgb) / .10); transform: translateY(-2px); }
+    .dark .stat-card:hover { box-shadow: 0 4px 16px rgb(var(--brand-light-rgb) / .25), 0 4px 16px rgba(0,0,0,.3); }
+    .activity-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-in { animation: fadeSlideIn .4s ease; }
+</style>
+{% end %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto animate-in">
+
+    <!-- Header -->
+    <div class="mb-6">
+        <h1 class="text-xl font-bold text-gray-900 dark:text-gray-100">Bonjour, {{ user.username }} &#x1F44B;</h1>
+        <p class="text-sm text-gray-500 mt-1 dark:text-gray-400">Voici un r&eacute;sum&eacute; de votre activit&eacute; sur Komptia</p>
+        <p class="text-sm text-gray-500 mt-2 flex items-center gap-2 dark:text-gray-400">
+            {# aria-live retiré — annonce 30s = bruit (cf. finding D1). #}
+            Dernière mise à jour : <span id="update-time" class="font-medium">à l'instant</span>
+            <button id="btn-refresh" class="text-brand-500 hover:text-brand-700 underline text-sm dark:hover:text-brand-300" aria-label="Actualiser mon tableau de bord">Actualiser</button>
+        </p>
+    </div>
+
+    <!-- Error banner — partial réutilisable (cf. ../_partials/stats_error_banner.html) -->
+    {% set errors = stats.get("_errors") %}
+    {% include "../_partials/stats_error_banner.html" %}
+
+    <!-- KPI Cards (cliquables) -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <a href="/iris" class="stat-card bg-white border border-gray-200/80 p-4 shadow-sm no-underline dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="flex items-center justify-between mb-2">
+                <div class="w-8 h-8 bg-gradient-to-br from-brand-500 to-brand-700 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm">
+                    <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/></svg>
+                </div>
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400" data-tooltip="Toutes les recherches que vous avez envoy&eacute;es &agrave; Iris depuis votre premi&egrave;re connexion. Le sous-libell&eacute; pr&eacute;cise le compte du jour et celui des 7 derniers jours.">Mes recherches</p>
+            </div>
+            <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100">{{ stats.get("total_searches", 0) }}</p>
+            <p class="text-xs mt-1 text-gray-500 dark:text-gray-400">{{ stats.get("searches_today", 0) }} aujourd'hui &middot; {{ stats.get("searches_week", 0) }} cette semaine</p>
+        </a>
+
+        <a href="/reports" class="stat-card bg-white border border-gray-200/80 p-4 shadow-sm no-underline dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="flex items-center justify-between mb-2">
+                <div class="w-8 h-8 bg-gradient-to-br from-emerald-500 to-emerald-700 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm">
+                    <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+                </div>
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400" data-tooltip="Rapports g&eacute;n&eacute;r&eacute;s par vos automatisations ou export manuel depuis Iris (PDF, Excel, CSV).">Mes rapports</p>
+            </div>
+            <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100">{{ stats.get("total_reports", 0) }}</p>
+            <p class="text-xs mt-1 text-gray-500 dark:text-gray-400">{{ stats.get("reports_week", 0) }} cette semaine</p>
+        </a>
+
+        <a href="/automations" class="stat-card bg-white border border-gray-200/80 p-4 shadow-sm no-underline dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="flex items-center justify-between mb-2">
+                <div class="w-8 h-8 bg-gradient-to-br from-violet-500 to-purple-700 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm">
+                    <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75"/></svg>
+                </div>
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400" data-tooltip="Emails envoy&eacute;s par vos automatisations via le SMTP configur&eacute; par l'admin. Inclut les rapports planifi&eacute;s et les notifications.">Emails</p>
+            </div>
+            <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100">{{ stats.get("emails_sent", 0) }}</p>
+            <p class="text-xs mt-1 text-gray-500 dark:text-gray-400">via vos automatisations</p>
+        </a>
+
+        <a href="/datastore" class="stat-card bg-white border border-gray-200/80 p-4 shadow-sm no-underline dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="flex items-center justify-between mb-2">
+                <div class="w-8 h-8 bg-gradient-to-br from-amber-500 to-orange-600 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm">
+                    <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"/></svg>
+                </div>
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400" data-tooltip="Espace utilis&eacute; par vos fichiers Datastore et vos donn&eacute;es personnelles. Le quota est d&eacute;fini par l'administrateur ; au-del&agrave; de 80% une couleur d'avertissement appara&icirc;t.">Stockage</p>
+            </div>
+            {% set _su = stats.get("storage_used_mb", 0) %}
+            {% set _st = stats.get("storage_total_mb", 0) %}
+            {% set _sp = stats.get("storage_quota_percent", 0) %}
+            <p class="text-2xl font-semibold {% if _st > 0 and _sp >= 100 %}text-red-600 dark:text-red-400{% elif _st > 0 and _sp >= 80 %}text-amber-600 dark:text-amber-400{% else %}text-gray-900 dark:text-gray-100{% end %}">{{ "%.0f" % _su }} MB</p>
+            {% if _st > 0 %}
+            <p class="text-xs mt-1 text-gray-500 dark:text-gray-400">sur {{ "%.0f" % _st }} MB ({{ "%.0f" % _sp }}%)</p>
+            {% else %}
+            <p class="text-xs mt-1 text-gray-400 dark:text-gray-500 italic">quota non configur&eacute;</p>
+            {% end %}
+        </a>
+    </div>
+
+    <!-- Interactive Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm p-4 dark:bg-gray-900 dark:border-gray-800/80">
+            <h2 class="text-sm font-semibold text-gray-900 mb-1 dark:text-gray-100">Mes recherches (7 jours)</h2>
+            <p class="text-xs text-gray-500 mb-3 dark:text-gray-400">Tendance quotidienne</p>
+            {# role="figure" : Plotly SVG reste accessible (cf. finding D2). #}
+            <div id="chart-daily-searches" style="height: 200px;" role="figure" aria-label="Graphique de mes recherches Iris sur les 7 derniers jours"></div>
+        </div>
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm p-4 dark:bg-gray-900 dark:border-gray-800/80">
+            <h2 class="text-sm font-semibold text-gray-900 mb-1 dark:text-gray-100">Mes ex&eacute;cutions</h2>
+            <p class="text-xs text-gray-500 mb-3 dark:text-gray-400">Succ&egrave;s vs &eacute;checs</p>
+            <div id="chart-exec-breakdown" style="height: 200px;" role="figure" aria-label="R&eacute;partition de mes ex&eacute;cutions d'automatisations entre r&eacute;ussies et &eacute;chou&eacute;es"></div>
+        </div>
+    </div>
+
+    <!-- Second row -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+
+        <!-- Recent automation executions -->
+        <div class="lg:col-span-2 bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="px-5 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <div>
+                    <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Activit&eacute; r&eacute;cente</h2>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Derni&egrave;res ex&eacute;cutions de vos automatisations</p>
+                </div>
+                <a href="/executions" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Tout voir &rarr;</a>
+            </div>
+            <div>
+                {% if recent_executions %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for ex in recent_executions %}
+                    <li class="flex items-center gap-3 px-5 py-3">
+                        <div class="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 {% if ex.status == 'success' %}bg-emerald-50 dark:bg-emerald-900/20{% elif ex.status == 'failed' %}bg-red-50 dark:bg-red-900/20{% elif ex.status == 'running' %}bg-blue-50 dark:bg-blue-900/20{% else %}bg-gray-50 dark:bg-gray-800{% end %}">
+                            {% if ex.status == 'success' %}
+                            <svg class="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5"/></svg>
+                            {% elif ex.status == 'failed' %}
+                            <svg class="w-3.5 h-3.5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                            {% elif ex.status == 'running' %}
+                            <svg class="w-3.5 h-3.5 text-blue-500 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M2.985 19.644l3.182-3.182"/></svg>
+                            {% else %}
+                            <svg class="w-3.5 h-3.5 text-gray-400 dark:text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                            {% end %}
+                        </div>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ ex._automation_name }}</p>
+                            <p class="text-xs text-gray-400 dark:text-gray-500">
+                                {{ ex.started_at.strftime('%d/%m %H:%M') }}
+                                {% if ex.duration_seconds %} &middot; {{ "%.1f" % ex.duration_seconds }}s{% end %}
+                                {% if ex.result_rows is not None %} &middot; {{ ex.result_rows }} lignes{% end %}
+                            </p>
+                        </div>
+                        <span class="text-[10px] font-medium px-2 py-0.5 rounded-full {% if ex.status == 'success' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 {% elif ex.status == 'failed' %}bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 {% elif ex.status == 'running' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 {% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 {% end %}">
+                            {% if ex.status == 'success' %}R&eacute;ussi{% elif ex.status == 'failed' %}&Eacute;chec{% elif ex.status == 'running' %}En cours{% else %}{{ ex.status }}{% end %}
+                        </span>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-5 py-8 text-center">
+                    <svg class="w-8 h-8 text-gray-300 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">Aucune ex&eacute;cution r&eacute;cente</p>
+                    <a href="/automations" class="text-xs text-gray-400 hover:text-gray-600 no-underline mt-1 inline-block dark:text-gray-500 dark:hover:text-gray-300">Cr&eacute;er une automation &rarr;</a>
+                </div>
+                {% end %}
+            </div>
+        </div>
+
+        <!-- Automations summary -->
+        <div class="bg-white border border-gray-200/80 rounded-xl p-5 shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+            <h2 class="text-sm font-semibold text-gray-900 mb-1 dark:text-gray-100">Mes automatisations</h2>
+            <p class="text-xs text-gray-500 mb-4 dark:text-gray-400">Planifications actives</p>
+
+            <div class="space-y-4">
+                <div class="text-center">
+                    <p class="text-3xl font-semibold text-gray-900 dark:text-gray-100">{{ stats.get("active_automations", 0) }}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">actives sur {{ stats.get("total_automations", 0) }}</p>
+                </div>
+
+                {% if next_automations %}
+                <div class="space-y-2 pt-2 border-t border-gray-100 dark:border-gray-800">
+                    <p class="text-xs font-medium text-gray-600 mb-2 dark:text-gray-400">Prochaines ex&eacute;cutions</p>
+                    {% for auto in next_automations %}
+                    <div class="flex items-start gap-2">
+                        <div class="w-1 h-1 rounded-full bg-brand-500 mt-1.5 flex-shrink-0"></div>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-xs text-gray-900 truncate dark:text-gray-100">{{ auto.name }}</p>
+                            <p class="text-[10px] text-gray-400 dark:text-gray-500">
+                                {{ auto._next_run_time.strftime('%d/%m %H:%M') }}
+                                {% if auto.schedule_type == 'daily' %}
+                                    &middot; Quotidien
+                                {% elif auto.schedule_type == 'weekly' %}
+                                    &middot; Hebdo
+                                {% elif auto.schedule_type == 'monthly' %}
+                                    &middot; Mensuel
+                                {% end %}
+                            </p>
+                        </div>
+                    </div>
+                    {% end %}
+                </div>
+                {% else %}
+                <div class="pt-2 border-t border-gray-100 text-center dark:border-gray-800">
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Aucune automation planifi&eacute;e</p>
+                </div>
+                {% end %}
+            </div>
+
+            <div class="mt-4 pt-3 border-t border-gray-100 text-center dark:border-gray-800">
+                <a href="/automations" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">G&eacute;rer mes automatisations &rarr;</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Third row -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        <!-- Recent searches -->
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="px-5 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Derni&egrave;res recherches</h2>
+                <a href="/iris" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Nouvelle recherche &rarr;</a>
+            </div>
+            <div>
+                {% if recent_searches %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for s in recent_searches %}
+                    <li class="flex items-center gap-3 px-5 py-3">
+                        <span class="activity-dot {% if s.success %}bg-emerald-500{% else %}bg-red-400{% end %}"></span>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ s.question }}</p>
+                            <p class="text-xs text-gray-400 dark:text-gray-500">
+                                {% if s.result_count is not None %}{{ s.result_count }} r&eacute;s. &middot; {% end %}
+                                {{ s.created_at.strftime('%d/%m %H:%M') }}
+                                {% if s.generation_time %} &middot; {{ "%.1f" % s.generation_time }}s{% end %}
+                            </p>
+                        </div>
+                        {% if s.feedback == 'positive' %}
+                        <span class="text-emerald-500 text-xs"><i class="bi bi-hand-thumbs-up"></i></span>
+                        {% elif s.feedback == 'negative' %}
+                        <span class="text-red-400 text-xs"><i class="bi bi-hand-thumbs-down"></i></span>
+                        {% end %}
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-5 py-8 text-center">
+                    <p class="text-sm text-gray-500 dark:text-gray-400">Aucune recherche r&eacute;cente</p>
+                    <a href="/iris" class="text-xs text-gray-400 hover:text-gray-600 no-underline mt-1 inline-block dark:text-gray-500 dark:hover:text-gray-300">Lancer une recherche &rarr;</a>
+                </div>
+                {% end %}
+            </div>
+        </div>
+
+        <!-- Recent reports -->
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="px-5 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Derniers rapports</h2>
+                <a href="/reports" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Voir tout &rarr;</a>
+            </div>
+            <div>
+                {% if recent_reports %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for r in recent_reports %}
+                    <li class="flex items-center gap-3 px-5 py-3">
+                        <div class="w-7 h-7 bg-brand-50 rounded-lg flex items-center justify-center flex-shrink-0 dark:bg-brand-600/10">
+                            <svg class="w-3.5 h-3.5 text-brand-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+                        </div>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ r.title }}</p>
+                            <p class="text-xs text-gray-400 dark:text-gray-500">{{ r.file_format.upper() }} &middot; {{ r.created_at.strftime('%d/%m %H:%M') }}</p>
+                        </div>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-5 py-8 text-center">
+                    <p class="text-sm text-gray-500 dark:text-gray-400">Aucun rapport g&eacute;n&eacute;r&eacute;</p>
+                    <a href="/iris" class="text-xs text-gray-400 hover:text-gray-600 no-underline mt-1 inline-block dark:text-gray-500 dark:hover:text-gray-300">G&eacute;n&eacute;rer un rapport via la recherche &rarr;</a>
+                </div>
+                {% end %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Automations list -->
+    {% if user_automations %}
+    <div class="mt-4 bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+        <div class="px-5 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Mes automatisations r&eacute;centes</h2>
+            <a href="/automations" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Tout voir &rarr;</a>
+        </div>
+        <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+            {% for a in user_automations %}
+            <li class="flex items-center gap-3 px-5 py-3">
+                <span class="activity-dot {% if a.is_active %}bg-emerald-500{% else %}bg-gray-300{% end %}"></span>
+                <div class="min-w-0 flex-1">
+                    <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ a.name }}</p>
+                    <p class="text-xs text-gray-400 dark:text-gray-500">
+                        {{ a.schedule_type }}
+                        &middot; {{ a.output_format }}
+                        {% if a.is_active %} &middot; <span class="text-emerald-600 dark:text-emerald-400">active</span>{% else %} &middot; <span class="text-gray-400 dark:text-gray-500">inactive</span>{% end %}
+                    </p>
+                </div>
+            </li>
+            {% end %}
+        </ul>
+    </div>
+    {% end %}
+
+</div>
+{% end %}
+{# F6 (review loop) : ``{% block scripts %}`` était imbriqué DANS ``{% block
+   content %}`` → Tornado rendait le bloc 2× (Plotly ~1 MB, mount(), onboarding
+   chargés en double). On ferme ``content`` ci-dessus AVANT de déclarer
+   ``scripts`` en frère (même structure que iris.html / automations/list.html). #}
+
+{% block scripts %}
+{# Plotly self-hosté (cf. review #7) — réduit la dépendance externe (CDN
+   compromis ou bloqué par firewall corporate). 1 MB cached aggressivement
+   par Tornado static handler (Cache-Control: max-age=31536000 par défaut). #}
+<script src="/static/vendor/plotly/plotly-basic.min.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/dashboard-charts.js" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+// Mount du module commun. La logique (refresh visibility-aware, Plotly retry,
+// dark-mode restyle, loading states, ARIA) vit dans dashboard-charts.js pour
+// éviter la duplication avec admin.html.
+window.DashboardCharts.mount({ isAdmin: false });
+
+// Onboarding tour à la première visite (cf. review #30 + R2-A6). 4 steps
+// qui présentent Iris, rapports, automations, datastore. Le ``show_onboarding``
+// est calculé serveur-side (dashboard.py:_should_show_onboarding) pour
+// éviter d'afficher le tour aux users existants au moment du déploiement
+// — sinon localStorage ne ferait la distinction qu'après le premier render
+// (trop tard, modal déjà flashé).
+{% if show_onboarding %}
+if (window.KomptiaOnboarding) {
+    window.KomptiaOnboarding.start({
+        key: 'dashboard_user_v1',
+        title: 'Bienvenue sur Komptia',
+        steps: [
+            {
+                icon: 'sparkle',
+                title: 'Iris répond à vos questions',
+                text: 'Posez votre question en français (par exemple : « Top 10 clients par chiffre d\'affaires ») et Iris vous renvoie le résultat. Pratique pour les analyses ponctuelles, sans passer par Excel.',
+            },
+            {
+                icon: 'chart',
+                title: 'Vos indicateurs en un coup d\'œil',
+                text: 'Ce tableau de bord récapitule vos recherches, rapports, automatisations et votre stockage. Cliquez sur une carte pour ouvrir le détail correspondant.',
+            },
+            {
+                icon: 'bell',
+                title: 'Des automatisations programmées',
+                text: 'Transformez une recherche utile en automatisation hebdomadaire ou mensuelle. Komptia envoie ensuite le rapport par email aux destinataires que vous choisissez, sans intervention de votre part.',
+            },
+            {
+                icon: 'rocket',
+                title: 'Prêt·e à démarrer ?',
+                text: 'Cliquez sur « Iris » dans le menu pour poser votre première question. Et si vous avez un doute sur un libellé du tableau de bord, cliquez sur le petit « i » à côté : une explication courte s\'affiche.',
+            },
+        ],
+    });
+}
+{% end %}
+</script>
+{% end %}

@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+{# Classe `route-sidebar-collapsed` sur <html> pour les routes qui doivent
+   forcer la sidebar collapsed (ex: /automations/:id/edit). Ajoutee cote
+   serveur — aucun JS ni cache navigateur ne peut interferer. Le CSS
+   `<style>` plus bas cible cette classe pour cacher la sidebar par
+   defaut. Le JS de toggle (doToggle) retire la classe quand l'user
+   clique le hamburger pour rouvrir, et la remet quand il referme. #}
+<html lang="fr" class="h-full {% if handler.request.path.startswith('/automations/') and handler.request.path.endswith('/edit') %}route-sidebar-collapsed{% end %}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {# ``komptia-user-id`` permet au JS chargé sur TOUTES les pages
+       (iris-widget.js notamment) de namespacer ses caches localStorage
+       par utilisateur — sans ce tag, le widget réutilisait la clé
+       ``jw_open`` globale et un user voyait le panel ouvert d'un autre
+       sur poste partagé. Cf. mémoire `feedback_localstorage_cross_user_leak.md`.
+       Absent si visiteur anonyme : les scripts retombent sur ``anon``. #}
+    {% if current_user %}<meta name="komptia-user-id" content="{{ current_user.id }}">{% end %}
+    {# AI-7 (2026-05-26) : SSoT devise pour les pages JS qui affichent du coût LLM
+       (api_usage.js, ai_performance.html, etc.). Évite le hardcode du symbole ``$``
+       partout — la migration vers EUR future = changer constants_ai.py uniquement. #}
+    <meta name="komptia-pricing-symbol" content="{{ pricing_currency_symbol or '$' }}">
+    <meta name="komptia-pricing-code" content="{{ pricing_currency_code or 'USD' }}">
+    <title>{% block title %}{{ app_name }}{% end %}</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <script nonce="{{ handler.csp_nonce }}">
+    /* Thème : bootstrap (avant CSS) + listener système + broadcast event.
+       localStorage SCOPÉ par user-id pour éviter le cross-user leak
+       (Bug 2026-05-26 S-2 + mémoire `feedback_localstorage_cross_user_leak.md`).
+       Pattern identique à iris-widget.js (_getCurrentUserId + suffixe _u<id>).
+       La clé legacy ``komptia_theme`` non-scopée est nettoyée à l'init
+       pour éviter qu'un thème dark d'Alice persiste après login de Bob. */
+    (function(){
+        var VALID = {light:1, dark:1, system:1};
+        // ID utilisateur scopé via <meta name="komptia-user-id">. 'anon' si
+        // visiteur non-authentifié (la fuite anon↔anon est acceptée — pas
+        // de notion d'identité distincte côté frontend pour le visiteur).
+        function userId(){
+            try {
+                var meta = document.querySelector('meta[name="komptia-user-id"]');
+                if (meta && meta.content) return String(meta.content);
+            } catch(e){ /* defensive */ }
+            return 'anon';
+        }
+        var STORAGE = 'komptia_theme_u' + userId();
+        var LEGACY_STORAGE = 'komptia_theme';
+
+        // Cleanup actif de la clé legacy non-scopée : c'est ELLE qui
+        // créait le cross-user leak. On la retire dès que possible pour
+        // qu'elle ne soit jamais relue par un autre user sur ce navigateur.
+        // (Le SERVER_PREF + clé scopée prendront le relais.)
+        try { localStorage.removeItem(LEGACY_STORAGE); } catch(e){ /* ignore */ }
+
+        // Préférence utilisateur injectée par le serveur (BDD). Utilisée
+        // en fallback si localStorage scopé est vide — cas typique après
+        // suppression des données de navigation, ou premier login depuis
+        // un nouveau navigateur. Le DEFAULT ultime est 'system' (suit
+        // ``prefers-color-scheme`` de l'OS) pour les visiteurs sans préf.
+        //
+        // ADV-M24 : sécurité contexte JS — ``theme_mode_preference`` ne
+        // peut être que ``"light"|"dark"|"system"`` (cf. settings.py
+        // ``_THEME_MODE_VALUES`` qui filtre côté serveur), donc Tornado
+        // l'échappe en HTML mais aussi sans risque XSS dans une string
+        // JS quote-litérale. Defense-in-depth : ``VALID[SERVER_PREF]``
+        // ci-dessous filtre quand même tout ce qui ne matche pas
+        // l'ensemble attendu.
+        var SERVER_PREF = '{{ handler.theme_mode_preference }}';
+        function mode(){
+            try {
+                var m = localStorage.getItem(STORAGE);
+                if (VALID[m]) return m;
+                // localStorage scopé vide → préf BDD synchronisée par
+                // le serveur. 'system' si non définie (user anonyme,
+                // erreur DB, ou _DEFAULT_THEME_MODE).
+                return VALID[SERVER_PREF] ? SERVER_PREF : 'system';
+            } catch(e){
+                return VALID[SERVER_PREF] ? SERVER_PREF : 'system';
+            }
+        }
+        function resolve(m){
+            if (m === 'dark') return true;
+            if (m === 'light') return false;
+            try { return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches); }
+            catch(e){ return false; }
+        }
+        function apply(){
+            var d = resolve(mode());
+            document.documentElement.classList.toggle('dark', d);
+            try { window.dispatchEvent(new CustomEvent('komptia:themechange', { detail: { dark: d } })); }
+            catch(e){ /* ignore */ }
+        }
+        // Bootstrap synchrone AVANT le rendu CSS (évite FOUC)
+        apply();
+        // Suivre les changements OS si mode system (global, toutes pages)
+        try {
+            var mq = window.matchMedia('(prefers-color-scheme: dark)');
+            var on = function(){ if (mode() === 'system') apply(); };
+            if (mq.addEventListener) mq.addEventListener('change', on);
+            else if (mq.addListener) mq.addListener(on);
+        } catch(e){ /* ignore */ }
+        // S-17 multi-tab (2026-05-26 - #23 polish) : sync cross-onglets via
+        // ``storage`` event. Quand Tab 1 change le thème (komptiaSetTheme
+        // écrit dans localStorage), Tab 2 reçoit le ``storage`` event et
+        // ré-applique. ``storage`` event ne fire QUE dans les autres onglets
+        // (pas dans celui qui a écrit) — exactement ce qu'on veut.
+        // BroadcastChannel pas nécessaire ici : localStorage + storage suffit.
+        try {
+            window.addEventListener('storage', function(ev){
+                if (ev.key === STORAGE) apply();
+            });
+        } catch(e){ /* ignore */ }
+        // API publique pour settings.js : setTheme('light'|'dark'|'system')
+        window.komptiaSetTheme = function(m){
+            if (!VALID[m]) m = 'system';
+            try { localStorage.setItem(STORAGE, m); } catch(e){}
+            apply();
+        };
+        // API publique : nom de la clé scopée (utilisée par settings.js
+        // pour rester strictement aligné — pas de drift entre les 2 sites
+        // d'écriture).
+        window.komptiaThemeStorageKey = STORAGE;
+    })();
+    </script>
+    <link rel="stylesheet" href="/static/css/tailwind.min.css">
+    <link rel="stylesheet" href="/static/vendor/bootstrap-icons/bootstrap-icons.min.css">
+    <link rel="stylesheet" href="/static/css/overlay-layers.css">
+    <link rel="stylesheet" href="/static/css/info-tooltip.css">
+    <link rel="stylesheet" href="/static/css/onboarding-tour.css">
+    {# skeleton.css : utility .skeleton-shimmer pour loading states
+       (axe 15 contrat qualité Komptia). Globalement disponible sur toutes
+       les pages auth ET publiques. Documentation + exemples en tête du
+       fichier CSS lui-même (single source of truth). #}
+    <link rel="stylesheet" href="/static/css/skeleton.css">
+    <!-- Chargé en sync (sans defer/async) : les scripts inline du <body>
+         appellent `window.OverlayManager.open(...)` et doivent voir l'API
+         définie avant leur exécution. -->
+    <script src="/static/js/overlay-manager.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# toast.js : composant global window.showToast(msg, type). Chargé EN HEAD
+       (sync) car les scripts inline du <body> et les wraps de window.fetch
+       (session-status.js, feedback-reporter.js, network-status.js) appellent
+       showToast lazy via ``typeof window.showToast === 'function'``. Doit
+       donc être défini avant tout autre script qui peut déclencher un toast.
+       Module idempotent (boot guard ``__komptiaToastInit``). #}
+    <script src="/static/js/toast.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# local-datetime : convertit les <time data-fmt-local> rendues
+       server-side (ISO UTC-aware) vers l'heure locale du navigateur.
+       Chargé tôt et globalement — auto-init sur DOMContentLoaded. #}
+    <script src="/static/js/local-datetime.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# format-helpers : single source of truth des formatters JS
+       (window.KomptiaFormat — date / nombre / durée / taille / pourcentage).
+       Chargé EN HEAD avant {% block scripts %} pour être dispo dans les
+       inline scripts des templates enfantes (cf. mémoire
+       feedback_js_load_order_base_html.md). Module idempotent. #}
+    <script src="/static/js/format-helpers.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# session-status : composant global "401/403 -> banner Session expirée +
+       redirect /login". Chargé EN HEAD (avant le bloc inline <body> et avant
+       feedback-reporter.js + network-status.js du bas du <body>) pour que
+       son wrap de window.fetch soit l'INNERMOST -- il voit le response en
+       premier et peut déclencher banner + redirect avant que les wraps
+       externes ne loguent l'erreur comme bug applicatif (faux positif).
+       Remplace l'ancien wrap fetch inline qui ne couvrait que 401 (single
+       source of truth + tests Node purs). Couvre le cas (b) de la taxonomie
+       4-cas erreurs Komptia (4xx auth-related). #}
+    <script src="/static/js/session-status.js" nonce="{{ handler.csp_nonce }}"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
+    <script nonce="{{ handler.csp_nonce }}">try{var p=window.location.pathname;var routeCollapse=/^\/automations\/\d+\/edit\b/.test(p);if(localStorage.getItem('komptia_sidebar')==='1'||routeCollapse)document.documentElement.classList.add('sidebar-start-collapsed')}catch(e){}</script>
+    {# CSS-only fallback pour les pages avec `route-sidebar-collapsed` (la
+       classe est ajoutee server-side sur <html> tout en haut). Ce style
+       est inclus pour TOUTES les pages — le selecteur ne s'applique que
+       si la classe est presente sur <html>. Le `:not(.sidebar-user-shown)`
+       permet au hamburger de reprendre la main quand l'user clique pour
+       rouvrir (le doToggle ajoute la classe sur <html>). #}
+    <style nonce="{{ handler.csp_nonce }}">
+        /* Pages /automations/:id/edit : sidebar app collapsed par defaut. */
+        html.route-sidebar-collapsed:not(.sidebar-user-shown) #app-sidebar {
+            display: none !important;
+        }
+        html.route-sidebar-collapsed:not(.sidebar-user-shown) #app-topbar {
+            display: flex !important;
+        }
+        /* Le panel "Types d'etapes" et le panel de config peuvent etre
+         * retractes par l'utilisateur (chevron). Quand la classe parente
+         * `.steps-collapsed` ou `.panel-collapsed` est presente, on cache
+         * le panel correspondant — le bouton "reopen" est lui visible
+         * (cf. JS dans edit.html block scripts). */
+        #komptia-edit-main.palette-collapsed #komptia-palette {
+            display: none !important;
+        }
+        #komptia-edit-main.panel-collapsed #komptia-node-panel {
+            display: none !important;
+        }
+        /* jw-fab garde sa position d'origine (bottom-right). Les zoom
+         * controls sont positionnes a sa GAUCHE (cf. .komptia-canvas-zoom-controls
+         * dans automation-canvas.css : right offset pour laisser passer
+         * jw-fab + un petit gap). */
+
+        /* Badge global "X termes critiques visibles par l'IA" — anon-impl-loop #14.
+         * Affiche un compteur cliquable quand stats.critical_visible > 0.
+         * Visible sur toutes les pages qui extends base.html SAUF /data/privacy
+         * (la page de gestion elle-meme). Click → /data/privacy.
+         *
+         * Positionnement : par defaut fixed top-right. Le JS le deplace dans
+         * la iris-topbar / app-topbar quand presents (avoid overlap mode-toggle).
+         * Z-index 9500 < confirm/error modals (10010), > banner offline (9000)
+         * → respecte axe 17 "dernier ouvert toujours devant" (Komptia). */
+        .komptia-privacy-badge {
+            position: fixed;
+            top: 0.625rem;
+            right: 0.875rem;
+            z-index: 9500;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.375rem 0.75rem;
+            background: #d97706; /* amber-600 — couleur warning Komptia */
+            color: #ffffff;
+            border-radius: 9999px;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            line-height: 1.2;
+            text-decoration: none;
+            box-shadow: 0 2px 6px rgba(217, 119, 6, 0.35);
+            transition: background 0.15s ease, transform 0.15s ease,
+                        box-shadow 0.15s ease;
+            max-width: calc(100vw - 1.75rem);
+            min-height: 1.875rem; /* >= ~30px : tap target raisonnable. */
+        }
+        .komptia-privacy-badge[hidden] { display: none !important; }
+        .komptia-privacy-badge:hover {
+            background: #b45309; /* amber-700 */
+            transform: translateY(-1px);
+            box-shadow: 0 3px 9px rgba(180, 83, 9, 0.45);
+            color: #ffffff;
+        }
+        .komptia-privacy-badge:focus-visible {
+            outline: 2px solid #ffffff;
+            outline-offset: 2px;
+        }
+        .komptia-privacy-badge svg {
+            width: 0.95rem;
+            height: 0.95rem;
+            flex-shrink: 0;
+        }
+        .komptia-privacy-badge-count { font-weight: 700; }
+        .komptia-privacy-badge-text {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+        /* Variante "inline" : utilisee quand le JS deplace le badge dans une
+         * topbar existante (#app-topbar ou .iris-topbar). On retire le
+         * fixed-positioning pour suivre le flow de la topbar. */
+        .komptia-privacy-badge.komptia-privacy-badge--inline {
+            position: static;
+            top: auto;
+            right: auto;
+            margin-left: auto; /* pousse a droite dans la topbar */
+            box-shadow: 0 1px 3px rgba(217, 119, 6, 0.4);
+        }
+        .komptia-privacy-badge.komptia-privacy-badge--inline:hover {
+            transform: none; /* pas de translate dans une topbar */
+        }
+        /* Dark mode — la couleur amber reste lisible WCAG AA, on assombrit
+         * legerement le shadow pour ne pas trop "claquer" sur fond sombre. */
+        .dark .komptia-privacy-badge {
+            background: #b45309;
+            box-shadow: 0 2px 6px rgba(120, 53, 15, 0.45);
+        }
+        .dark .komptia-privacy-badge:hover {
+            background: #92400e;
+            box-shadow: 0 3px 9px rgba(120, 53, 15, 0.55);
+        }
+        /* Mobile : on cache le label texte, on garde icone + nombre. Le
+         * aria-label complet reste expose aux screen readers. */
+        @media (max-width: 640px) {
+            .komptia-privacy-badge .komptia-privacy-badge-text { display: none; }
+        }
+        /* Print : un badge UX n'a pas sa place sur une impression. */
+        @media print {
+            .komptia-privacy-badge { display: none !important; }
+        }
+        /* Conflit avec le banner offline (#komptia-offline-banner) : le
+         * banner occupe toute la largeur en haut (top: 0, height ~32-36px).
+         * Quand visible, on pousse le badge vers le bas pour eviter qu'il
+         * soit superpose au texte du banner. ``:has()`` est supporte par
+         * Chrome/Firefox/Safari 16.4+ stable (2024+) — en dehors, le badge
+         * reste a sa place et chevauche le banner (degradation gracieuse,
+         * cas rare = offline + critical_visible > 0 simultanement). */
+        body:has(#komptia-offline-banner:not(.hidden)) .komptia-privacy-badge:not(.komptia-privacy-badge--inline) {
+            top: 2.75rem;
+        }
+        /* Banner "IA non configurée" (#komptia-no-llm-banner) — meme
+         * problème que offline-banner : il overlay topbar/sidebar/iris-topbar.
+         * On pousse l'application entière de 2.75rem (44px ≈ hauteur banner)
+         * pour que la topbar reste cliquable (hamburger sidebar, profil
+         * dropdown, etc.). Le banner offline et celui-ci peuvent coexister :
+         * dans ce cas, on combine les 2 pushes (5.5rem). Le banner offline
+         * apparait dynamiquement (JS) à 9000, le no-llm apparait au SSR à
+         * 9001 — visuellement c'est le no-llm qui montre, le offline reste
+         * masque dessous mais le toast offline signale la transition.
+         *
+         * ``.komptia-privacy-badge`` recoit aussi le push pour rester sous
+         * le banner. Le ``:not(.hidden)`` permet au JS de cacher le banner
+         * (sessionStorage dismiss / event komptia:llm-config-changed) sans
+         * laisser le push CSS appliqué. */
+        body:has(#komptia-no-llm-banner:not(.hidden)) > .flex.h-full {
+            padding-top: 2.75rem;
+        }
+        body:has(#komptia-no-llm-banner:not(.hidden)) .komptia-privacy-badge:not(.komptia-privacy-badge--inline) {
+            top: 2.75rem;
+        }
+        /* Coexistence offline + no-llm : push cumulé. ``:has()`` chaîné
+         * supporté navigateurs modernes. Dégradation : si l'un n'est pas
+         * supporté, le push de l'autre reste effectif. */
+        body:has(#komptia-no-llm-banner:not(.hidden)):has(#komptia-offline-banner:not(.hidden)) > .flex.h-full {
+            padding-top: 5.5rem;
+        }
+        body:has(#komptia-no-llm-banner:not(.hidden)):has(#komptia-offline-banner:not(.hidden)) .komptia-privacy-badge:not(.komptia-privacy-badge--inline) {
+            top: 5.5rem;
+        }
+    </style>
+    {% block head %}{% end %}
+    {% if current_user and not handler.request.path.startswith('/iris') %}
+    <link rel="stylesheet" href="/static/css/iris-widget.css">
+    {% end %}
+</head>
+<body class="h-full bg-gray-50/50 text-gray-900 antialiased dark:bg-gray-950 dark:text-gray-100">
+    {# Banner global "IA non configurée" — appears sur toutes les pages auth
+       quand aucun provider LLM (cloud OU local) n'est enregistré dans le
+       LLMManager. Single source of truth via ``llm_configured`` injecté
+       dans get_template_namespace (cf. app/handlers/base.py).
+       Skip silencieux si anonyme (current_user None sur /login). #}
+    {% include "_partials/no_llm_banner.html" %}
+
+    {# Badge global "termes critiques visibles par l'IA" — anon-impl-loop #14.
+       Conditional 1 : ``current_user`` (l'API stats demande l'auth — pas la
+       peine d'afficher quoi que ce soit pour un anonyme).
+       Conditional 2 : exclure ``/data/privacy`` lui-meme (la page de gestion
+       est la cible du click, redondant d'y afficher un raccourci vers elle).
+       L'attribut ``hidden`` est present par defaut : le JS le retire seulement
+       quand ``stats.critical_visible > 0``. Pas de flash au load. #}
+    {% if current_user and not handler.request.path.startswith('/data/privacy') %}
+    {# ``data-user-id`` permet au JS de namespacer le cache localStorage
+       par utilisateur (defense in-depth multi-user sur poste partage —
+       findings adversarial review C1). L'id user est deja accessible via
+       cookies de session, l'exposer dans le DOM ne reduit pas la posture. #}
+    <a id="komptia-privacy-badge"
+       class="komptia-privacy-badge"
+       href="/data/privacy"
+       hidden
+       data-user-id="{{ current_user.id }}"
+       aria-label="Ouvrir la page de confidentialite"
+       title="Ouvrir la page de confidentialite">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+        </svg>
+        <span class="komptia-privacy-badge-count" data-role="count">0</span>
+        <span class="komptia-privacy-badge-text" data-role="text">termes critiques visibles par l'IA</span>
+    </a>
+    {% end %}
+    <div class="flex h-full">
+
+        <!-- Sidebar -->
+        <aside id="app-sidebar" class="w-60 flex-shrink-0 bg-gradient-to-b from-slate-900 via-slate-850 to-slate-900 flex flex-col h-full shadow-xl">
+            <div class="h-16 flex items-center px-5 border-b border-white/10 sidebar-header">
+                <a href="/dashboard" class="flex items-center gap-2.5 no-underline group">
+                    <div class="w-8 h-8 rounded-lg flex items-center justify-center shadow-sm flex-shrink-0 overflow-hidden">
+                        <svg class="w-8 h-8" viewBox="0 0 100 100"><g transform="translate(0,100) scale(0.1,-0.1)" stroke="none"><path d="M325 804 l-169 -174 344 0 344 0 -169 174 c-94 95 -172 173 -175 173 -3 0 -81 -78 -175 -173z" fill="#D94F3F"/><path d="M25 500 c-18 -20 -18 -21 5 -45 23 -24 29 -25 144 -25 l120 0 -57 -58 c-31 -32 -57 -62 -57 -67 0 -5 12 -22 27 -37 l27 -28 63 62 63 62 0 -125 0 -125 45 -44 45 -44 0 247 0 247 -203 0 c-192 0 -205 -1 -222 -20z" fill="#9ca3af"/><path d="M555 275 l0 -246 124 128 c69 70 168 172 220 225 94 96 95 97 76 118 -17 19 -29 20 -219 20 l-201 0 0 -245z" fill="#D94F3F"/></g></svg>
+                    </div>
+                    <span class="sidebar-label text-base font-bold text-white tracking-tight">{{ app_name }}</span>
+                </a>
+                <button id="sidebar-toggle" class="sidebar-toggle-btn ml-auto w-7 h-7 flex items-center justify-center rounded-md text-gray-500 hover:text-white hover:bg-white/10 transition-colors flex-shrink-0 dark:text-gray-400" title="Réduire le menu (Ctrl+B)">
+                    <svg class="w-4 h-4 sidebar-chevron" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5"/></svg>
+                </button>
+            </div>
+
+            {% set path = handler.request.path %}
+
+            <nav class="flex-1 overflow-y-auto px-3 py-4 space-y-6">
+                <!-- Accueil -->
+                <div>
+                    <p class="sidebar-section-title px-2.5 mb-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest select-none dark:text-gray-400">Accueil</p>
+                    <div class="space-y-0.5">
+                        <a href="/dashboard" title="Tableau de bord" class="{% if path == '/' or path == '/dashboard' %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0a1 1 0 01-1-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 01-1 1h-2z"/></svg>
+                            <span class="sidebar-label">Tableau de bord</span>
+                        </a>
+                        <a href="/iris" title="Iris" class="{% if path == '/iris' %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z"/></svg>
+                            <span class="sidebar-label">Iris</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Gestion -->
+                <div>
+                    <p class="sidebar-section-title px-2.5 mb-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest select-none dark:text-gray-400">Gestion</p>
+                    <div class="space-y-0.5">
+                        <a href="/contacts" title="Contacts" class="{% if path.startswith('/contacts') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                            <span class="sidebar-label">Contacts</span>
+                        </a>
+                        <a href="/automations" title="Automatisations" class="{% if path.startswith('/automations') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                            <span class="sidebar-label">Automatisations</span>
+                        </a>
+                        <a href="/reports" title="Rapports" class="{% if path.startswith('/reports') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                            <span class="sidebar-label">Rapports</span>
+                        </a>
+                        <a href="/dashboards" title="Visualisation" class="{% if path.startswith('/dashboards') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"/></svg>
+                            <span class="sidebar-label">Visualisation</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Donn&eacute;es & Communication -->
+                <div>
+                    <p class="sidebar-section-title px-2.5 mb-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest select-none dark:text-gray-400">Donn&eacute;es</p>
+                    <div class="space-y-0.5">
+                        <a href="/datastore" title="Mes donn&eacute;es" class="{% if path.startswith('/datastore') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/></svg>
+                            <span class="sidebar-label">Mes donn&eacute;es</span>
+                        </a>
+                        <a href="/executions" title="Ex&eacute;cutions" class="{% if path.startswith('/executions') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                            <span class="sidebar-label">Ex&eacute;cutions</span>
+                        </a>
+                        <a href="/data/privacy" title="Confidentialit&eacute;" class="{% if path.startswith('/data/privacy') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                            <span class="sidebar-label">Confidentialit&eacute;</span>
+                        </a>
+                        <a href="/email-history" title="Emails" class="{% if path.startswith('/email-history') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+                            <span class="sidebar-label">Emails</span>
+                        </a>
+                    </div>
+                </div>
+
+                {% if current_user and current_user.role.value == 'admin' %}
+                <!-- Administration -->
+                <div>
+                    <p class="sidebar-section-title px-2.5 mb-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest select-none dark:text-gray-400">Administration</p>
+                    <div class="space-y-0.5">
+                        <a href="/admin" title="Utilisateurs" class="{% if path == '/admin' %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
+                            <span class="sidebar-label">Utilisateurs</span>
+                        </a>
+                        <a href="/admin/data-access" title="Accès aux données" class="{% if path.startswith('/admin/data-access') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                            <span class="sidebar-label">Accès aux données</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Intelligence artificielle -->
+                <div>
+                    <p class="sidebar-section-title px-2.5 mb-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest select-none dark:text-gray-400">Intelligence artificielle</p>
+                    <div class="space-y-0.5">
+                        <a href="/admin/ai-config" title="Configuration IA" class="{% if path.startswith('/admin/ai-config') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                            <span class="sidebar-label">Configuration IA</span>
+                        </a>
+                        <a href="/admin/ai-performance" title="Performance Iris" class="{% if path.startswith('/admin/ai-performance') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 3v18h18M7 14l4-4 4 4 5-5"/></svg>
+                            <span class="sidebar-label">Performance Iris</span>
+                        </a>
+                        <a href="/admin/ai-training" title="Entra&icirc;nement" class="{% if path.startswith('/admin/ai-training') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+                            <span class="sidebar-label">Entraînement</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Syst&egrave;me -->
+                <div>
+                    <p class="sidebar-section-title px-2.5 mb-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-widest select-none dark:text-gray-400">Syst&egrave;me</p>
+                    <div class="space-y-0.5">
+                        <a href="/admin/database" title="Base de donn&eacute;es" class="{% if path.startswith('/admin/database') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/></svg>
+                            <span class="sidebar-label">Base de donn&eacute;es</span>
+                        </a>
+                        <a href="/admin/smtp-config" title="Configuration SMTP" class="{% if path.startswith('/admin/smtp-config') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+                            <span class="sidebar-label">Configuration SMTP</span>
+                        </a>
+                        <a href="/admin/performance" title="Santé système" class="{% if path == '/admin/performance' %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"/></svg>
+                            <span class="sidebar-label">Santé système</span>
+                        </a>
+                    </div>
+                </div>
+                {% end %}
+            </nav>
+
+            <div class="border-t border-white/10 px-4 py-3 sidebar-footer">
+                {% if current_user %}
+                <div class="flex items-center gap-3">
+                    <div class="w-8 h-8 rounded-full bg-brand-600 flex items-center justify-center text-white text-xs font-bold uppercase flex-shrink-0">
+                        {{ current_user.username[0] }}
+                    </div>
+                    <div class="sidebar-user-info min-w-0 flex-1">
+                        <p class="text-sm font-medium text-white truncate">{{ current_user.username }}</p>
+                        <p class="text-xs text-gray-400 dark:text-gray-500">{{ current_user.role.value }}</p>
+                    </div>
+                    <a href="/settings" class="text-gray-500 hover:text-brand-400 transition-colors no-underline dark:text-gray-400" title="Param&egrave;tres">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                    </a>
+                    <a href="/logout" class="text-gray-500 hover:text-brand-400 transition-colors no-underline dark:text-gray-400" title="D&eacute;connexion">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9"/></svg>
+                    </a>
+                </div>
+                {% end %}
+            </div>
+        </aside>
+
+        <!-- Main content -->
+        <div id="app-main" class="flex-1 overflow-hidden flex flex-col">
+            <!-- Topbar — visible only when sidebar is hidden -->
+            <nav id="app-topbar" class="app-topbar" style="display:none">
+                <button id="sidebar-open-btn" class="topbar-hamburger" title="Ouvrir le menu (Ctrl+B)">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"/></svg>
+                </button>
+                <a href="/dashboard" class="topbar-brand">
+                    <div class="topbar-brand-icon" style="background:transparent;box-shadow:none;overflow:hidden;">
+                        <svg viewBox="0 0 100 100" style="width:100%;height:100%;"><g transform="translate(0,100) scale(0.1,-0.1)" stroke="none"><path d="M325 804 l-169 -174 344 0 344 0 -169 174 c-94 95 -172 173 -175 173 -3 0 -81 -78 -175 -173z" fill="#D94F3F"/><path d="M25 500 c-18 -20 -18 -21 5 -45 23 -24 29 -25 144 -25 l120 0 -57 -58 c-31 -32 -57 -62 -57 -67 0 -5 12 -22 27 -37 l27 -28 63 62 63 62 0 -125 0 -125 45 -44 45 -44 0 247 0 247 -203 0 c-192 0 -205 -1 -222 -20z" fill="#6B7280"/><path d="M555 275 l0 -246 124 128 c69 70 168 172 220 225 94 96 95 97 76 118 -17 19 -29 20 -219 20 l-201 0 0 -245z" fill="#D94F3F"/></g></svg>
+                    </div>
+                    <span class="topbar-brand-name">{{ app_name }}</span>
+                </a>
+                <div class="topbar-sep"></div>
+                <span id="topbar-page-title" class="topbar-page-title"></span>
+                <div class="topbar-spacer"></div>
+                {% if current_user %}
+                <div class="topbar-user">
+                    <div class="topbar-avatar">{{ current_user.username[0] }}</div>
+                    <div class="topbar-user-text">
+                        <div class="topbar-username">{{ current_user.username }}</div>
+                        <div class="topbar-role">{{ current_user.role.value }}</div>
+                    </div>
+                    <a href="/settings" class="topbar-logout" title="Param&egrave;tres" style="margin-left:0">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                    </a>
+                    <a href="/logout" class="topbar-logout" title="D&eacute;connexion">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9"/></svg>
+                    </a>
+                </div>
+                {% end %}
+            </nav>
+            <div id="app-content-wrap" class="flex-1 overflow-y-auto {% block content_wrapper_class %}px-8 py-6{% end %}">
+                {% block content %}{% end %}
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Toasts : le container ``#toastStack`` est créé à la volée par
+         ``static/js/toast.js`` (ensureStack) au premier showToast. M6 a
+         retiré le div legacy ``#toast`` et la pré-déclaration du stack
+         pour découpler le DOM du markup (single source of truth: le JS). -->
+
+
+    <!-- Confirm Modal (global, available on all pages).
+         FIX M9 : z-index plus élevé que les toasts (10000-10001) pour
+         respecter l'axe 17 « dernier ouvert toujours devant ». Un confirm
+         est plus important qu'un toast informatif — il bloque l'action. -->
+    <div class="fixed inset-0 bg-black/50 z-[10010] flex items-center justify-center hidden" id="appConfirmModal" data-overlay-manual="true">
+        <div class="bg-white dark:bg-gray-900 rounded-md w-full max-w-sm p-6 shadow-xl">
+            <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100 mb-2" id="appConfirmTitle">Confirmer</h2>
+            <p class="text-sm text-gray-600 dark:text-gray-300 mb-4 dark:text-gray-400" id="appConfirmMessage"></p>
+            <div class="flex items-center justify-end gap-2">
+                <button type="button" class="btn btn-secondary text-sm" id="appConfirmCancel">Annuler</button>
+                <button type="button" class="btn btn-danger text-sm" id="appConfirmOk">Confirmer</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cluster-O 2026-05-26 — Global prompt modal (remplace window.prompt
+         qui est non-stylable, dark-mode-incompatible, ugly Safari/Chrome).
+         Pattern aligné sur appConfirmModal (single source of truth). -->
+    <div class="fixed inset-0 bg-black/50 z-[10010] flex items-center justify-center hidden" id="appPromptModal" data-overlay-manual="true" role="dialog" aria-modal="true" aria-labelledby="appPromptTitle">
+        <div class="bg-white dark:bg-gray-900 rounded-md w-full max-w-sm p-6 shadow-xl">
+            <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100 mb-2" id="appPromptTitle">Saisir</h2>
+            <p class="text-sm text-gray-600 dark:text-gray-300 mb-3 dark:text-gray-400" id="appPromptMessage"></p>
+            <input type="text" id="appPromptInput" class="w-full border border-gray-300 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 mb-4" autocomplete="off" />
+            <div class="flex items-center justify-end gap-2">
+                <button type="button" class="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 text-gray-700 dark:text-gray-200 text-sm rounded px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-700 dark:bg-gray-900 dark:hover:bg-gray-800 dark:text-gray-300" id="appPromptCancel">Annuler</button>
+                <button type="button" class="bg-brand-600 text-white text-sm font-medium rounded px-3 py-1.5 hover:bg-brand-700 dark:bg-brand-700 dark:hover:bg-brand-600" id="appPromptOk">Valider</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Errors Modal (global) — affiche une LISTE STRUCTURÉE d'erreurs serveur
+         (codes + messages FR + lien "Aller à cette étape" si context.node_id).
+         Utilisé pour validation DAG, activation refusée, et autres réponses
+         serveur qui retournent un tableau ``data.errors[]``. Évite de réduire
+         N erreurs à un toast tronqué illisible (axe 5b/c — taxonomie 4-cas). -->
+    <div class="fixed inset-0 bg-black/50 z-[10010] flex items-center justify-center hidden p-4" id="appShowErrorsModal" role="dialog" aria-modal="true" aria-labelledby="appShowErrorsTitle">
+        <div class="bg-white dark:bg-gray-900 rounded-md w-full max-w-2xl max-h-[80vh] flex flex-col p-6 shadow-xl">
+            <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100 mb-3" id="appShowErrorsTitle">Erreurs</h2>
+            <div id="appShowErrorsList" class="overflow-y-auto flex-1 mb-4 space-y-2 pr-1"></div>
+            <div class="flex items-center justify-end gap-2">
+                <button type="button" id="appShowErrorsClose" class="bg-brand-600 text-white text-sm font-medium rounded px-3 py-1.5 hover:bg-brand-700 dark:bg-brand-700 dark:hover:bg-brand-600">Fermer</button>
+            </div>
+        </div>
+    </div>
+
+    <script nonce="{{ handler.csp_nonce }}">
+    /* Toasts: ``window.showToast(msg, type)`` est défini par
+     * ``static/js/toast.js`` (chargé en <head>). Voir ce module pour le
+     * comportement détaillé (M6: queue max 3 visibles, FIFO, auto-dismiss
+     * 5s, mode 'error' = sticky avec bouton ×). */
+
+    /* Detection offline + banner sticky + retry auto : extrait dans
+     * ``static/js/network-status.js`` (charge EN DERNIER en bas du body,
+     * apres feedback-reporter.js, pour etre l'OUTERMOST wrap de
+     * window.fetch — sinon le retry bypasse les wraps internes
+     * session-status [401/403] et feedback-reporter [logging]).
+     * Le composant gere :
+     *   - banner ``#komptia-offline-banner`` (compat CSS ``:has()`` ci-dessus)
+     *   - toast a chaque transition online <-> offline
+     *   - detection ``TypeError: Failed to fetch`` (au-dela des events
+     *     online/offline, qui ratent les coupures sans changement de
+     *     navigator.onLine — captive portal, reverse proxy timeout, etc.)
+     *   - retry automatique GET/HEAD avec exponential backoff + jitter
+     *     (POST/PUT/DELETE: opt-in explicite via ``init.komptiaRetry: true``
+     *     pour eviter doublons). Couvre le cas (d) de la taxonomie 4-cas
+     *     erreurs Komptia. */
+
+    /* Détection 401/403 globale (banner Session expirée + redirect /login) :
+     * extraite dans ``static/js/session-status.js`` (chargé EN HEAD pour
+     * être l'INNERMOST wrap de window.fetch). Single source of truth (un
+     * seul wrap au lieu d'un inline + risque de duplication), tests Node
+     * purs des helpers (isAuthFailureStatus, isLoginPath,
+     * shouldRedirectOnAuthFailure) via ``tests/unit/test_session_status_js.py``,
+     * et couverture 403 (XSRF rotate, role insuffisant) en plus du 401.
+     * Couvre le cas (b) de la taxonomie 4-cas erreurs Komptia. */
+
+    function escapeHtml(str) {
+        if (str == null) return '';
+        var div = document.createElement('div');
+        div.textContent = String(str);
+        return div.innerHTML;
+    }
+    function getCookie(name) {
+        var v = '; ' + document.cookie;
+        var parts = v.split('; ' + name + '=');
+        // Retourne '' (pas undefined) quand le cookie est absent : les call-sites
+        // qui font `X-Xsrftoken: getCookie('_xsrf')` enverraient sinon le header
+        // littéral "undefined" (defense-in-depth — le cookie _xsrf est normalement
+        // toujours émis par BaseHandler.prepare).
+        if (parts.length === 2) return parts.pop().split(';').shift();
+        return '';
+    }
+    /* ── Global confirm modal (replaces browser confirm()) ── */
+    var _appConfirmResolve = null;
+    function appConfirm(message, title) {
+        // Si une confirmation est déjà pending (appel réentrant), la résoudre à
+        // false pour éviter que la promesse précédente reste orpheline.
+        if (_appConfirmResolve) {
+            var prev = _appConfirmResolve;
+            _appConfirmResolve = null;
+            prev(false);
+        }
+        return new Promise(function(resolve) {
+            _appConfirmResolve = resolve;
+            var modal = document.getElementById('appConfirmModal');
+            document.getElementById('appConfirmTitle').textContent = title || 'Confirmer';
+            document.getElementById('appConfirmMessage').textContent = message;
+            modal.classList.remove('hidden');
+            if (window.OverlayManager) {
+                window.OverlayManager.open(modal, {
+                    layer: 'system-modal',
+                    lockScroll: true,
+                    onClose: function() {
+                        modal.classList.add('hidden');
+                        if (_appConfirmResolve) { _appConfirmResolve(false); _appConfirmResolve = null; }
+                    }
+                });
+            }
+        });
+    }
+    function _closeAppConfirm(result) {
+        var savedResolver = _appConfirmResolve;
+        _appConfirmResolve = null;
+        var modal = document.getElementById('appConfirmModal');
+        if (window.OverlayManager) window.OverlayManager.close(modal);
+        modal.classList.add('hidden');
+        if (savedResolver) savedResolver(result);
+    }
+    document.getElementById('appConfirmOk').addEventListener('click', function() { _closeAppConfirm(true); });
+    document.getElementById('appConfirmCancel').addEventListener('click', function() { _closeAppConfirm(false); });
+    window.addEventListener('click', function(e) { if (e.target.id === 'appConfirmModal') _closeAppConfirm(false); });
+
+    /* ── Cluster-O 2026-05-26 — Global prompt modal (replaces browser prompt())
+       Pattern aligned with appConfirm — single source of truth. Renvoie une
+       Promise<string|null> (null = annulation, sinon trim de l'input).
+       Options : { defaultValue, placeholder, type='text', maxLength }. */
+    var _appPromptResolve = null;
+    function appPrompt(message, title, options) {
+        options = options || {};
+        if (_appPromptResolve) {
+            var prev = _appPromptResolve;
+            _appPromptResolve = null;
+            prev(null);
+        }
+        return new Promise(function(resolve) {
+            _appPromptResolve = resolve;
+            var modal = document.getElementById('appPromptModal');
+            var input = document.getElementById('appPromptInput');
+            document.getElementById('appPromptTitle').textContent = title || 'Saisir';
+            document.getElementById('appPromptMessage').textContent = message || '';
+            input.value = options.defaultValue != null ? String(options.defaultValue) : '';
+            input.type = options.type === 'password' ? 'password' : 'text';
+            input.placeholder = options.placeholder || '';
+            if (options.maxLength) input.maxLength = options.maxLength;
+            modal.classList.remove('hidden');
+            if (window.OverlayManager) {
+                window.OverlayManager.open(modal, {
+                    layer: 'system-modal',
+                    lockScroll: true,
+                    onClose: function() {
+                        modal.classList.add('hidden');
+                        if (_appPromptResolve) { _appPromptResolve(null); _appPromptResolve = null; }
+                    }
+                });
+            }
+            // Focus + sélection après render (next tick)
+            setTimeout(function() { input.focus(); input.select(); }, 0);
+        });
+    }
+    function _closeAppPrompt(value) {
+        var savedResolver = _appPromptResolve;
+        _appPromptResolve = null;
+        var modal = document.getElementById('appPromptModal');
+        if (window.OverlayManager) window.OverlayManager.close(modal);
+        modal.classList.add('hidden');
+        if (savedResolver) savedResolver(value);
+    }
+    document.getElementById('appPromptOk').addEventListener('click', function() {
+        var v = document.getElementById('appPromptInput').value;
+        _closeAppPrompt(v != null ? String(v).trim() : '');
+    });
+    document.getElementById('appPromptCancel').addEventListener('click', function() { _closeAppPrompt(null); });
+    document.getElementById('appPromptInput').addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); document.getElementById('appPromptOk').click(); }
+        else if (e.key === 'Escape') { e.preventDefault(); _closeAppPrompt(null); }
+    });
+    window.addEventListener('click', function(e) { if (e.target.id === 'appPromptModal') _closeAppPrompt(null); });
+    window.appPrompt = appPrompt;
+
+    /* ── Global errors modal (affiche une LISTE structurée d'erreurs) ──
+       Remplace les toasts tronqués pour les réponses serveur du type
+       ``{success: false, error: "...", errors: [{code, message, context}]}``.
+       Cas typiques : validation DAG, activation auto refusée, batch import.
+       options.onErrorClick(err) : callback optionnelle déclenchée si l'utilisateur
+       clique « Aller à cette étape » (visible si err.context.node_id existe). */
+    var _appShowErrorsResolve = null;
+    function appShowErrors(title, errors, options) {
+        options = options || {};
+        var modal = document.getElementById('appShowErrorsModal');
+        if (!modal || !Array.isArray(errors) || !errors.length) {
+            // Fallback gracieux : toast simple si modal absente ou liste vide.
+            var summary = (errors || []).map(function(e) {
+                return (e.code || '?') + ': ' + (e.message || '');
+            }).join(' | ');
+            showToast((title || 'Erreurs') + (summary ? ' — ' + summary : ''), 'error');
+            return Promise.resolve();
+        }
+        document.getElementById('appShowErrorsTitle').textContent = title || 'Erreurs';
+        var list = document.getElementById('appShowErrorsList');
+        list.textContent = ''; /* clear */
+        errors.forEach(function(err) {
+            var item = document.createElement('div');
+            item.className = 'border border-red-300 dark:border-red-700 rounded p-3 bg-red-50 dark:bg-red-900/20';
+            var code = document.createElement('div');
+            code.className = 'text-xs font-mono text-red-700 dark:text-red-300 mb-1';
+            code.textContent = err.code || 'ERROR';
+            var msg = document.createElement('div');
+            msg.className = 'text-sm text-gray-800 dark:text-gray-200';
+            msg.textContent = err.message || String(err);
+            item.appendChild(code);
+            item.appendChild(msg);
+            if (typeof options.onErrorClick === 'function' && err.context && err.context.node_id != null) {
+                var btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'mt-2 text-xs underline text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300';
+                btn.textContent = 'Aller à cette étape';
+                btn.addEventListener('click', function() {
+                    _closeAppShowErrors();
+                    try { options.onErrorClick(err); } catch (_) { /* noop */ }
+                });
+                item.appendChild(btn);
+            }
+            list.appendChild(item);
+        });
+        modal.classList.remove('hidden');
+        if (window.OverlayManager) {
+            window.OverlayManager.open(modal, {
+                layer: 'system-modal',
+                lockScroll: true,
+                onClose: function() {
+                    modal.classList.add('hidden');
+                    if (_appShowErrorsResolve) { _appShowErrorsResolve(); _appShowErrorsResolve = null; }
+                }
+            });
+        }
+        return new Promise(function(resolve) { _appShowErrorsResolve = resolve; });
+    }
+    function _closeAppShowErrors() {
+        var modal = document.getElementById('appShowErrorsModal');
+        if (window.OverlayManager) window.OverlayManager.close(modal);
+        modal.classList.add('hidden');
+        if (_appShowErrorsResolve) { _appShowErrorsResolve(); _appShowErrorsResolve = null; }
+    }
+    document.getElementById('appShowErrorsClose').addEventListener('click', _closeAppShowErrors);
+    window.addEventListener('click', function(e) { if (e.target.id === 'appShowErrorsModal') _closeAppShowErrors(); });
+    /* Escape key fermeture (axe a11y) */
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            var m = document.getElementById('appShowErrorsModal');
+            if (m && !m.classList.contains('hidden')) _closeAppShowErrors();
+        }
+    });
+    window.appShowErrors = appShowErrors;
+
+    /* ── Sidebar toggle ── */
+    (function() {
+        var sidebar = document.getElementById('app-sidebar');
+        var toggle = document.getElementById('sidebar-toggle');
+        var topbar = document.getElementById('app-topbar');
+        var openBtn = document.getElementById('sidebar-open-btn');
+        var contentWrap = document.getElementById('app-content-wrap');
+        if (!sidebar || !toggle) return;
+        var KEY = 'komptia_sidebar';
+        var isIris = !!document.querySelector('.iris-topbar');
+
+        // Detect page title for the topbar
+        var pageTitleEl = document.getElementById('topbar-page-title');
+        if (pageTitleEl) {
+            var titleSrc = document.querySelector('.iris-topbar-title')
+                || document.querySelector('#app-content-wrap h1');
+            if (titleSrc) pageTitleEl.textContent = titleSrc.textContent.trim();
+        }
+
+        // Iris: create a dedicated hamburger inside .iris-topbar
+        var irisBtn = null;
+        if (isIris) {
+            var irisTopbar = document.querySelector('.iris-topbar');
+            if (irisTopbar) {
+                irisBtn = document.createElement('button');
+                irisBtn.className = 'topbar-hamburger';
+                irisBtn.title = 'Ouvrir le menu (Ctrl+B)';
+                irisBtn.style.display = 'none';
+                irisBtn.style.marginRight = '0.5rem';
+                irisBtn.innerHTML = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"/></svg>';
+                irisTopbar.insertBefore(irisBtn, irisTopbar.firstChild);
+            }
+        }
+
+        function applyState(collapsed) {
+            if (collapsed) {
+                sidebar.classList.add('collapsed');
+                // Sync avec le CSS-fallback `:not(.sidebar-user-shown)` :
+                // on collapsed → user n'a pas demande la sidebar, on retire
+                // la classe pour que le CSS reprenne la main.
+                document.documentElement.classList.remove('sidebar-user-shown');
+                if (isIris) {
+                    if (topbar) topbar.style.display = 'none';
+                    if (irisBtn) irisBtn.style.display = 'flex';
+                } else {
+                    if (topbar) topbar.style.display = '';
+                    if (contentWrap) contentWrap.classList.add('sidebar-fullscreen');
+                }
+            } else {
+                sidebar.classList.remove('collapsed');
+                // User demande la sidebar : on ajoute la classe qui
+                // desactive le CSS-fallback collapse (cf. base.html
+                // `html:not(.sidebar-user-shown) #app-sidebar { display:
+                // none !important }`). Sans ca, le CSS forcerait collapse
+                // meme apres click hamburger sur /automations/:id/edit.
+                document.documentElement.classList.add('sidebar-user-shown');
+                if (topbar) topbar.style.display = 'none';
+                if (irisBtn) irisBtn.style.display = 'none';
+                if (contentWrap) contentWrap.classList.remove('sidebar-fullscreen');
+            }
+            document.documentElement.classList.remove('sidebar-start-collapsed');
+        }
+
+        var saved = false;
+        try { saved = localStorage.getItem(KEY) === '1'; } catch(e) {}
+        // Override per-route. Source unique de verite : la classe
+        // `route-sidebar-collapsed` que le serveur ajoute sur <html>
+        // pour /automations/:id/edit (cf. base.html top). Peut-etre
+        // aussi reconnue via regex pathname comme fallback (defense en
+        // profondeur si la classe est filtree par un proxy/extension).
+        // On NE TOUCHE PAS localStorage : la pref globale utilisateur
+        // est preservee — au prochain load sur une autre page, la
+        // sidebar revient a son etat saved.
+        var p = window.location.pathname;
+        var routeForce = (
+            document.documentElement.classList.contains('route-sidebar-collapsed') ||
+            /^\/automations\/\d+\/edit\b/.test(p)
+        );
+        applyState(saved || routeForce);
+
+        function doToggle() {
+            var collapsed = !sidebar.classList.contains('collapsed');
+            applyState(collapsed);
+            try { localStorage.setItem(KEY, collapsed ? '1' : '0'); } catch(e) {}
+        }
+
+        toggle.addEventListener('click', doToggle);
+        if (openBtn) openBtn.addEventListener('click', doToggle);
+        if (irisBtn) irisBtn.addEventListener('click', doToggle);
+
+        document.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'b' && !e.shiftKey && !e.altKey) {
+                e.preventDefault();
+                doToggle();
+            }
+        });
+    })();
+    </script>
+    {# ``#syncModal`` legacy supprimé : l'overlay unique ``#globalSyncOverlay``
+       (partial ``_partials/global_sync_overlay.html`` + ``global_sync_overlay.js``)
+       remplace désormais ce modal pour TOUS les utilisateurs. Le service
+       ``schema_sync.py`` publie inconditionnellement les événements SSE
+       ``schema_sync.started/progress/done`` sur l'event bus — donc tout
+       déclenchement (POST admin, scheduler auto, etc.) s'affiche
+       automatiquement chez tous les clients connectés. Le bouton « Annuler »
+       est rendu côté admin uniquement dans le partial global. #}
+
+    {# Onboarding tour : DOIT être chargé AVANT ``{% block scripts %}`` car
+       les templates enfants (iris.html, automations/list.html, etc.) injectent
+       dans ce block des ``<script>`` inline qui appellent
+       ``window.KomptiaOnboarding.start({ key, title, steps })`` directement.
+       Si ``onboarding-tour.js`` est chargé APRÈS le block, ``KomptiaOnboarding``
+       est ``undefined`` au moment de l'appel et les tours ne s'affichent pas
+       (silent fail via ``if (!window.KomptiaOnboarding) return``). Bug constaté
+       le 2026-05-18 (test2 ne voyait aucun tour). #}
+    <script src="/static/js/onboarding-tour.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# AI-10 + P-3 dedup (2026-05-26) : ticker "Dernière mise à jour" partagé
+       entre /admin/performance et /admin/ai-performance. Chargé globalement
+       pour éviter la duplication inline du updateRelativeTime() dans chaque
+       template. Self-init au DOMContentLoaded sur ``#last-updated-ticker``. #}
+    <script src="/static/js/last-updated-ticker.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# F15 (2026-05-26) : BroadcastChannel cross-tab pour les pages /admin*.
+       Chargé globalement (léger, self-init). Les pages /admin/users etc.
+       appellent ``window.komptiaAdminBroadcast.notify('...')`` après CRUD
+       et ``reloadOnRemoteChange()`` au load pour réagir aux changements
+       d'autres onglets. #}
+    <script src="/static/js/admin-broadcast.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# AT-M4 + #66 polish (2026-05-26) : helper partagé reloadPreservingScroll.
+       Réutilisé par /admin/ai-training (CRUD) et /admin/performance (POST-action).
+       Self-init au DOMContentLoaded ; ne s'active que si une clé sessionStorage
+       URL-scopée existe. Coût zéro sur les pages qui n'utilisent pas le helper. #}
+    <script src="/static/js/reload-scroll-preserve.js" nonce="{{ handler.csp_nonce }}"></script>
+
+    {% block scripts %}{% end %}
+    {% if current_user and not handler.request.path.startswith('/iris') %}
+    {# iris-common.js DOIT être chargé AVANT iris-widget.js (cf. task #14,
+       SSOT pour escapeHtml/escapeAttr/sanitizeHtml/getCookie). #}
+    <script src="/static/js/iris-common.js" nonce="{{ handler.csp_nonce }}"></script>
+    <script src="/static/js/iris-widget.js" nonce="{{ handler.csp_nonce }}"></script>
+    {% end %}
+
+    {# ── Feedback Reporter (capture erreurs JS + banner réactif "Signaler") ──
+       ATTENTION (ADV-M21) : si vous créez un template "anonyme" qui
+       n'``extends`` PAS base.html (typiquement ``templates/auth/login.html``
+       ou ``templates/error.html``), pensez à charger MANUELLEMENT
+       ``feedback-reporter.css`` + ``feedback-reporter.js`` côté ce
+       template — sinon l'utilisateur n'aura aucun moyen de signaler
+       un problème depuis ces pages. Le module est conçu pour s'auto-
+       initialiser (idempotent via ``window.__komptiaFeedbackInitialized``). #}
+    <link rel="stylesheet" href="/static/css/feedback-reporter.css">
+    <script src="/static/js/feedback-reporter.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# network-status : composant global offline + retry auto. Charge EN
+       DERNIER (apres feedback-reporter + apres le block scripts) pour etre
+       l'OUTERMOST wrap de window.fetch. Cela garantit que le retry interne
+       re-passe par tous les wraps en dessous (feedback-reporter logging
+       + session-status detection 401/403 chargee EN HEAD). Sans cet ordre,
+       un retry recevant un 401 serait silencieux (pas de redirect login).
+       Couvre le cas (d) de la taxonomie 4-cas erreurs Komptia. #}
+    <script src="/static/js/network-status.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# Banner "IA non configurée" : JS minimal pour le bouton dismiss
+       (sessionStorage). Idempotent — no-op si le banner SSR n'a pas
+       été rendu (cas où llm_configured=true). #}
+    <script src="/static/js/no-llm-banner.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# Info-tooltip : composant click-to-open pour expliquer un KPI/label
+       obscur. Charge globalement (toutes les pages) car le JS est borné
+       par un guard idempotent et ne s'attache qu'aux ``<button class=
+       "info-icon" data-info="...">`` présents dans le DOM. #}
+    <script src="/static/js/info-tooltip.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# Overlay global "Sync schéma en cours" — branché sur SSE
+       /api/system/events. Visible pour TOUS les utilisateurs authentifiés.
+       Chargé uniquement si user logged-in (le SSE require auth). #}
+    {% if current_user %}
+    {% include "_partials/global_sync_overlay.html" %}
+    <script src="/static/js/global_sync_overlay.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# Badge global "termes critiques visibles par l'IA" — anon-impl-loop #14.
+       Le DOM du badge est rendu plus haut dans <body> (conditional sur
+       /data/privacy). Le JS poll /api/anonymization/stats (cache 30s,
+       multi-onglets) et reveal le badge quand critical_visible > 0. #}
+    <script src="/static/js/privacy-badge.js" nonce="{{ handler.csp_nonce }}"></script>
+    {% end %}
+
+    {# T2.1 — Setup checklist admin (overlay modal pleine page).
+       Visible UNIQUEMENT sur les pages admin (path /admin/*) et SEULEMENT
+       pour les utilisateurs au rôle admin. Le partial est un conteneur
+       vide qui sert de marqueur d'activation au JS — le JS rend ensuite
+       l'overlay directement dans <body>. Le bandeau se cache automatiquement
+       si la checklist est complète ou dismissée (cf. should_hide_banner). #}
+    {% if current_user and current_user.role.value == 'admin' and path.startswith('/admin') %}
+    {% include "_partials/tenant_setup_checklist.html" %}
+    <script src="/static/js/tenant-setup-checklist.js" nonce="{{ handler.csp_nonce }}"></script>
+    {% end %}
+</body>
+</html>

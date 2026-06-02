@@ -1,0 +1,427 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+</div>
+
+<!-- Stats -->
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6" aria-label="Statistiques d'envoi">
+    <div class="bg-white border border-gray-200 rounded-lg p-4 dark:bg-gray-900 dark:border-gray-800">
+        {# A4-F1 : « Total traités » et non « Total envoyés » — cette carte compte
+           TOUTES les tentatives (réussis + erreurs) ; un échec n'est pas un envoi. #}
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Total traités</p>
+        <p class="mt-1 text-2xl font-semibold text-gray-900 dark:text-gray-100" id="stat-total" aria-live="polite">—</p>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4 dark:bg-gray-900 dark:border-gray-800">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Réussis</p>
+        <p class="mt-1 text-2xl font-semibold text-green-600 dark:text-green-400" id="stat-success" aria-live="polite">—</p>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4 dark:bg-gray-900 dark:border-gray-800">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Erreurs</p>
+        <p class="mt-1 text-2xl font-semibold text-red-600 dark:text-red-400" id="stat-errors" aria-live="polite">—</p>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg p-4 dark:bg-gray-900 dark:border-gray-800">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Taux de succès</p>
+        <p class="mt-1 text-2xl font-semibold text-gray-900 dark:text-gray-100" id="stat-rate" aria-live="polite">—</p>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="bg-white border border-gray-200 rounded-lg mb-4 dark:bg-gray-900 dark:border-gray-800">
+    <div class="flex flex-wrap items-center gap-3 px-4 py-3 border-b border-gray-100 dark:border-gray-800">
+        <label for="search-input" class="sr-only">Rechercher dans les sujets ou destinataires</label>
+        <input type="text" id="search-input" placeholder="Rechercher..." maxlength="200"
+               aria-label="Rechercher dans les sujets ou destinataires"
+               class="w-56 px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:border-gray-900 focus:ring-0 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100">
+        <label for="filter-status" class="sr-only">Filtrer par statut</label>
+        <select id="filter-status" aria-label="Filtrer par statut"
+                class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 focus:outline-none focus:border-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+            <option value="all">Tous les statuts</option>
+            <option value="success">Réussis</option>
+            <option value="error">Erreurs</option>
+        </select>
+        <label for="filter-period" class="sr-only">Filtrer par période</label>
+        <select id="filter-period" aria-label="Filtrer par période"
+                class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 focus:outline-none focus:border-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+            <option value="all">Toute la période</option>
+            <option value="7d">7 derniers jours</option>
+            <option value="30d">30 derniers jours</option>
+            <option value="90d">90 derniers jours</option>
+        </select>
+    </div>
+
+    <!-- Table -->
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm" aria-label="Historique des emails envoyés">
+            <thead>
+                <tr class="border-b border-gray-200 dark:border-gray-800">
+                    <th scope="col" class="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Date</th>
+                    <th scope="col" class="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Sujet</th>
+                    <th scope="col" class="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Destinataires</th>
+                    <th scope="col" class="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Template</th>
+                    <th scope="col" class="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">
+                        <abbr title="Pièces jointes" class="no-underline cursor-help">PJ</abbr>
+                    </th>
+                    <th scope="col" class="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Statut</th>
+                    <th scope="col" class="px-4 py-2.5"><span class="sr-only">Actions</span></th>
+                </tr>
+            </thead>
+            <tbody id="emails-body" aria-live="polite" aria-busy="false" class="divide-y divide-gray-100 dark:divide-gray-800"></tbody>
+        </table>
+    </div>
+
+    {# A4-F3 : ponctuation alignée sur le message JS (showEmpty 'Aucun email trouvé.') —
+       ce texte SSR n'est que le fallback no-JS, le JS le remplace au 1er load. #}
+    <div id="empty-state" role="status" class="hidden text-center py-12 text-sm text-gray-500 dark:text-gray-400">Aucun email trouvé.</div>
+    <nav id="pagination" aria-label="Pagination de l'historique des emails" class="flex items-center justify-center gap-1 px-4 py-3"></nav>
+</div>
+
+<!-- Detail modal -->
+<div id="detail-modal"
+     class="fixed inset-0 bg-black/40 z-50 hidden items-center justify-center"
+     role="dialog" aria-modal="true" aria-labelledby="detail-modal-title" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-[85vh] overflow-y-auto dark:bg-gray-900">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 id="detail-modal-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">Détail de l'email</h3>
+            <button type="button" id="close-detail-modal"
+                    title="Fermer" aria-label="Fermer la fenêtre de détail"
+                    class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300">&times;</button>
+        </div>
+        <div class="p-5 space-y-3" id="detail-body"></div>
+    </div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+(function() {
+    'use strict';
+
+    // Limites synchronisées avec le backend (voir app/handlers/email_history.py).
+    const PER_PAGE_DEFAULT = 25;
+    const PER_PAGE_MAX = 100;
+    const SEARCH_MAX_LEN = 200;
+    const SEARCH_DEBOUNCE_MS = 300;
+
+    const SUCCESS_CLASSES = 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300';
+    const ERROR_CLASSES = 'bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300';
+
+    let currentPage = 1;
+    let searchTimer = null;
+    let currentEmails = [];
+    let lastFocusedBeforeModal = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    const searchInput = $('search-input');
+    const filterStatus = $('filter-status');
+    const filterPeriod = $('filter-period');
+    const tbody = $('emails-body');
+    const empty = $('empty-state');
+    const pagination = $('pagination');
+    const modal = $('detail-modal');
+    const modalBody = $('detail-body');
+    const closeModalBtn = $('close-detail-modal');
+
+    const statElements = {
+        total_sent: $('stat-total'),
+        total_success: $('stat-success'),
+        total_errors: $('stat-errors'),
+        success_rate: $('stat-rate'),
+    };
+
+    function esc(value) {
+        if (value == null) return '';
+        const d = document.createElement('div');
+        d.textContent = String(value);
+        return d.innerHTML;
+    }
+
+    function debounceSearch() {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => {
+            currentPage = 1;
+            loadEmails();
+        }, SEARCH_DEBOUNCE_MS);
+    }
+
+    function showEmpty(message) {
+        tbody.innerHTML = '';
+        empty.textContent = message;
+        empty.classList.remove('hidden');
+        pagination.innerHTML = '';
+    }
+
+    function renderStats(stats) {
+        // A4-F5 : sur erreur (stats absent), réinitialiser les cartes à '—' au lieu
+        // de laisser des valeurs périmées d'un précédent succès (données fausses
+        // silencieuses : l'utilisateur croirait les stats à jour après un échec).
+        if (!stats) {
+            statElements.total_sent.textContent = '—';
+            statElements.total_success.textContent = '—';
+            statElements.total_errors.textContent = '—';
+            statElements.success_rate.textContent = '—';
+            return;
+        }
+        statElements.total_sent.textContent = stats.total_sent ?? 0;
+        statElements.total_success.textContent = stats.total_success ?? 0;
+        statElements.total_errors.textContent = stats.total_errors ?? 0;
+        statElements.success_rate.textContent = (stats.success_rate ?? 0) + '%';
+    }
+
+    function renderRow(email, idx) {
+        // Pour la ligne récap : on affiche to+cc+bcc concaténés. Le SENDER
+        // doit voir qui a reçu son mail, peu importe le canal d'enveloppe
+        // (notamment les "contact emails" qui passent en BCC pour la
+        // privacy inter-destinataires — la trace SMTP n'a que le sender
+        // dans `recipients`). La modale détail décompose par channel.
+        const toArr = Array.isArray(email.recipients) ? email.recipients : (email.recipients ? [email.recipients] : []);
+        const ccArr = Array.isArray(email.cc_recipients) ? email.cc_recipients : [];
+        const bccArr = Array.isArray(email.bcc_recipients) ? email.bcc_recipients : [];
+        const recipients = [...toArr, ...ccArr, ...bccArr].join(', ');
+        const date = email.sent_at ? new Date(email.sent_at).toLocaleString('fr-FR') : '-';
+        const badge = email.success
+            ? `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${SUCCESS_CLASSES}">OK</span>`
+            : `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${ERROR_CLASSES}">Erreur</span>`;
+        return `
+        <tr class="hover:bg-gray-50 cursor-pointer dark:hover:bg-gray-800" data-email-idx="${idx}" tabindex="0" role="button" aria-label="Voir les détails de l'email du ${esc(date)}">
+            <td class="px-4 py-2.5 whitespace-nowrap text-gray-600 dark:text-gray-400">${esc(date)}</td>
+            <td class="px-4 py-2.5 max-w-[250px] truncate">${esc(email.subject)}</td>
+            <td class="px-4 py-2.5 max-w-[200px] truncate text-gray-600 dark:text-gray-400">${esc(recipients)}</td>
+            <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400">${esc(email.template_name || '-')}</td>
+            <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400">${email.attachment_count || 0}</td>
+            <td class="px-4 py-2.5">${badge}</td>
+            <td class="px-4 py-2.5 text-gray-400 text-xs dark:text-gray-500" aria-hidden="true">Voir</td>
+        </tr>`;
+    }
+
+    function renderPagination(totalPages, total) {
+        if (totalPages <= 1) {
+            pagination.innerHTML = '';
+            return;
+        }
+        const parts = [];
+        parts.push(
+            `<button type="button" class="px-2.5 py-1 text-xs border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-40 dark:hover:bg-gray-800 dark:border-gray-700" data-page="${currentPage - 1}" aria-label="Page précédente" ${currentPage === 1 ? 'disabled' : ''}>Prec.</button>`
+        );
+        for (let i = 1; i <= totalPages; i++) {
+            const near = Math.abs(i - currentPage);
+            if (i === 1 || i === totalPages || near <= 2) {
+                const isCurrent = i === currentPage;
+                const baseClasses = 'px-2.5 py-1 text-xs border rounded';
+                const variant = isCurrent
+                    ? 'bg-gray-900 text-white border-gray-900 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-100'
+                    : 'border-gray-300 hover:bg-gray-50 text-gray-700 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800';
+                parts.push(
+                    `<button type="button" class="${baseClasses} ${variant}" data-page="${i}" aria-label="Page ${i}"${isCurrent ? ' aria-current="page"' : ''}>${i}</button>`
+                );
+            } else if (near === 3) {
+                parts.push('<span class="text-xs text-gray-400 px-1 dark:text-gray-500" aria-hidden="true">...</span>');
+            }
+        }
+        parts.push(
+            `<button type="button" class="px-2.5 py-1 text-xs border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-40 dark:hover:bg-gray-800 dark:border-gray-700" data-page="${currentPage + 1}" aria-label="Page suivante" ${currentPage === totalPages ? 'disabled' : ''}>Suiv.</button>`
+        );
+        parts.push(`<span class="text-xs text-gray-500 ml-2 dark:text-gray-400">${total} email${total > 1 ? 's' : ''}</span>`);
+        pagination.innerHTML = parts.join('');
+    }
+
+    async function loadEmails(page) {
+        if (typeof page === 'number') currentPage = page;
+        const query = (searchInput.value || '').slice(0, SEARCH_MAX_LEN);
+        const status = filterStatus.value || 'all';
+        const period = filterPeriod.value || 'all';
+        const params = new URLSearchParams({
+            q: query,
+            status,
+            period,
+            page: String(currentPage),
+            per_page: String(PER_PAGE_DEFAULT),
+        });
+
+        empty.classList.add('hidden');
+        tbody.setAttribute('aria-busy', 'true');
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-sm text-gray-400 dark:text-gray-500">Chargement…</td></tr>';
+
+        let response;
+        try {
+            response = await fetch('/api/email-history?' + params.toString(), {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                credentials: 'same-origin',
+            });
+        } catch (_networkErr) {
+            tbody.setAttribute('aria-busy', 'false');
+            renderStats(null);  // A4-F5 : ne pas garder des stats périmées sur erreur
+            showEmpty('Erreur réseau. Vérifiez votre connexion et réessayez.');
+            return;
+        }
+
+        tbody.setAttribute('aria-busy', 'false');
+
+        if (!response.ok) {
+            let message = 'Erreur de chargement de l\u2019historique.';
+            if (response.status === 429) message = 'Trop de requêtes. Patientez quelques secondes avant de réessayer.';
+            if (response.status === 401) message = 'Session expirée. Veuillez vous reconnecter.';
+            if (response.status === 400) message = 'Paramètres de filtre invalides.';
+            renderStats(null);  // A4-F5 : reset cartes stats (pas de valeurs périmées)
+            showEmpty(message);
+            // Taxonomie 4-cas (axe 5) : sur un 5xx on propose en plus
+            // « Signaler » via le helper centralisé (toast + overlay), sinon
+            // l'utilisateur n'a aucun moyen de transmettre l'incident serveur.
+            if (response.status >= 500 && window.komptiaReportError) {
+                window.komptiaReportError({ status: response.status }, { context: 'Historique des emails' });
+            }
+            return;
+        }
+
+        let data;
+        try {
+            data = await response.json();
+        } catch (_parseErr) {
+            renderStats(null);  // A4-F5 : reset cartes stats (pas de valeurs périmées)
+            showEmpty('Réponse serveur illisible.');
+            return;
+        }
+
+        renderStats(data.stats);
+        // A4-F4 (adversarial) : resynchroniser currentPage sur la page EFFECTIVE
+        // renvoyée par le serveur (clampée à total_pages). Sinon, si la rétention
+        // EmailLog réduit total_pages pendant la navigation, l'admin reste sur un
+        // numéro de page périmé → pagination incohérente (contenu de la dernière
+        // page affiché comme page N).
+        if (Number.isInteger(data.page) && data.page >= 1) currentPage = data.page;
+        currentEmails = Array.isArray(data.emails) ? data.emails : [];
+
+        if (currentEmails.length === 0) {
+            showEmpty('Aucun email trouvé.');
+            return;
+        }
+        empty.classList.add('hidden');
+
+        tbody.innerHTML = currentEmails.map(renderRow).join('');
+        renderPagination(data.total_pages || 1, data.total || 0);
+    }
+
+    function renderDetailModal(email) {
+        const recipientsList = Array.isArray(email.recipients) ? email.recipients : [];
+        const ccList = Array.isArray(email.cc_recipients) ? email.cc_recipients : [];
+        const bccList = Array.isArray(email.bcc_recipients) ? email.bcc_recipients : [];
+        const attachmentsList = Array.isArray(email.attachment_names) ? email.attachment_names : [];
+
+        const row = (label, value) => `<div class="flex gap-3"><span class="text-xs font-medium text-gray-500 w-28 shrink-0 dark:text-gray-400">${esc(label)}</span><span class="text-sm text-gray-900 break-words dark:text-gray-100">${value}</span></div>`;
+
+        const showList = (items, maxShow = 10) => {
+            if (items.length === 0) return 'Aucun';
+            const ulStart = '<ul class="list-disc list-inside max-h-40 overflow-y-auto">';
+            if (items.length <= maxShow) {
+                return ulStart + items.map((item) => `<li class="text-sm">${esc(item)}</li>`).join('') + '</ul>';
+            }
+            const remaining = items.length - maxShow;
+            const visible = items.slice(0, maxShow).map((item) => `<li class="text-sm">${esc(item)}</li>`).join('');
+            return ulStart + visible + `<li class="text-xs text-gray-500 italic dark:text-gray-400">… et ${remaining} de plus</li></ul>`;
+        };
+
+        const parts = [];
+        parts.push(row('Date', esc(email.sent_at ? new Date(email.sent_at).toLocaleString('fr-FR') : '-')));
+        parts.push(row('Sujet', `<span class="max-h-20 overflow-y-auto block">${esc(email.subject)}</span>`));
+        parts.push(`<div class="flex gap-3"><span class="text-xs font-medium text-gray-500 w-28 shrink-0 dark:text-gray-400">Destinataires<br/><span class="font-normal text-gray-400 dark:text-gray-500">(${recipientsList.length})</span></span><div class="text-sm text-gray-900 flex-1 dark:text-gray-100">${showList(recipientsList)}</div></div>`);
+        if (ccList.length > 0) {
+            parts.push(`<div class="flex gap-3"><span class="text-xs font-medium text-gray-500 w-28 shrink-0 dark:text-gray-400">CC<br/><span class="font-normal text-gray-400 dark:text-gray-500">(${ccList.length})</span></span><div class="text-sm text-gray-900 flex-1 dark:text-gray-100">${showList(ccList)}</div></div>`);
+        }
+        if (bccList.length > 0) {
+            parts.push(`<div class="flex gap-3"><span class="text-xs font-medium text-gray-500 w-28 shrink-0 dark:text-gray-400">BCC<br/><span class="font-normal text-gray-400 dark:text-gray-500">(${bccList.length})</span></span><div class="text-sm text-gray-900 flex-1 dark:text-gray-100">${showList(bccList)}</div></div>`);
+        }
+        parts.push(row('Template', esc(email.template_name || '-')));
+        const statusBadge = email.success
+            ? `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${SUCCESS_CLASSES}">Envoyé</span>`
+            : `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${ERROR_CLASSES}">Erreur</span>`;
+        parts.push(row('Statut', statusBadge));
+        parts.push(row('Message-ID', `<span class="text-xs">${esc(email.message_id || '-')}</span>`));
+        parts.push(`<div class="flex gap-3"><span class="text-xs font-medium text-gray-500 w-28 shrink-0 dark:text-gray-400">Pièces jointes<br/><span class="font-normal text-gray-400 dark:text-gray-500">(${email.attachment_count || 0})</span></span><div class="text-sm text-gray-900 flex-1 dark:text-gray-100">${showList(attachmentsList)}</div></div>`);
+        if (email.error_message) {
+            parts.push(`<div class="mt-3 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 max-h-40 overflow-y-auto dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-300" role="alert">${esc(email.error_message)}</div>`);
+        }
+        modalBody.innerHTML = parts.join('');
+    }
+
+    function openModal(idx) {
+        const email = currentEmails[idx];
+        if (!email) return;
+        renderDetailModal(email);
+        lastFocusedBeforeModal = document.activeElement;
+        modal.classList.remove('hidden');
+        modal.classList.add('flex');
+        modal.setAttribute('aria-hidden', 'false');
+        if (window.OverlayManager) window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+        closeModalBtn.focus();
+    }
+
+    function closeModal() {
+        if (window.OverlayManager) window.OverlayManager.close(modal);
+        modal.classList.add('hidden');
+        modal.classList.remove('flex');
+        modal.setAttribute('aria-hidden', 'true');
+        if (lastFocusedBeforeModal && typeof lastFocusedBeforeModal.focus === 'function') {
+            lastFocusedBeforeModal.focus();
+        }
+    }
+
+    function isModalOpen() {
+        return !modal.classList.contains('hidden');
+    }
+
+    // Static listeners
+    searchInput.addEventListener('input', () => {
+        if (searchInput.value.length > SEARCH_MAX_LEN) {
+            searchInput.value = searchInput.value.slice(0, SEARCH_MAX_LEN);
+        }
+        debounceSearch();
+    });
+    filterStatus.addEventListener('change', () => {
+        currentPage = 1;
+        loadEmails();
+    });
+    filterPeriod.addEventListener('change', () => {
+        currentPage = 1;
+        loadEmails();
+    });
+    closeModalBtn.addEventListener('click', closeModal);
+
+    modal.addEventListener('click', (ev) => {
+        if (ev.target === modal) closeModal();
+    });
+    // Echap géré globalement par OverlayManager — le listener local est
+    // retiré pour éviter les fermetures en cascade sur stack multi-overlay.
+
+    // Delegated listeners — survive re-rendering of rows/pagination.
+    tbody.addEventListener('click', (ev) => {
+        const row = ev.target.closest('tr[data-email-idx]');
+        if (!row) return;
+        const idx = parseInt(row.getAttribute('data-email-idx'), 10);
+        if (Number.isInteger(idx)) openModal(idx);
+    });
+    tbody.addEventListener('keydown', (ev) => {
+        const row = ev.target.closest('tr[data-email-idx]');
+        if (!row) return;
+        if (ev.key === 'Enter' || ev.key === ' ') {
+            ev.preventDefault();
+            const idx = parseInt(row.getAttribute('data-email-idx'), 10);
+            if (Number.isInteger(idx)) openModal(idx);
+        }
+    });
+    pagination.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('button[data-page]');
+        if (!btn || btn.hasAttribute('disabled')) return;
+        const page = parseInt(btn.getAttribute('data-page'), 10);
+        if (Number.isInteger(page) && page >= 1) loadEmails(page);
+    });
+
+    loadEmails();
+})();
+</script>
+</div>
+{% end %}

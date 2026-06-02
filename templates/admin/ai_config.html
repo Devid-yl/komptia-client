@@ -1,0 +1,2079 @@
+{% extends "../base.html" %}
+
+{% block title %}Configuration IA | {{ app_name }}{% end %}
+
+{% block content %}
+{# Mini style pour les sections pliables (mêmes règles que dashboard/admin.html
+   — pattern <details><summary><svg.chev>...). Nonce CSP obligatoire. #}
+<style nonce="{{ handler.csp_nonce }}">
+    details > summary { list-style: none; cursor: pointer; }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary .chev { transition: transform .2s; }
+    details[open] > summary .chev { transform: rotate(90deg); }
+</style>
+<div class="max-w-5xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Configuration IA</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Parametres du moteur de generation SQL</p>
+        </div>
+        <div class="flex items-center gap-2">
+            <button type="button" id="btn-reset-config" class="btn btn-secondary">Reinitialiser</button>
+            <button type="button" id="btn-save-config" class="btn btn-primary">Sauvegarder</button>
+        </div>
+    </div>
+
+    <!-- Alert -->
+    <div id="alert" class="hidden mb-4 px-4 py-3 rounded text-sm"></div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        <!-- API Key, URL & Model -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Connexion et modele</h2>
+            </div>
+            <div class="p-4 space-y-4">
+                <div>
+                    <label class="label" for="cfg-api_key">Cle API</label>
+                    <div class="flex gap-2">
+                        {# Pattern symétrique à l'URL de base : si une clé est
+                           enregistrée, on affiche un sentinel de bullets
+                           (••••••••••••••••, 16 char) dans l'input pour signifier
+                           "valeur présente sans la dévoiler". Le sentinel sert
+                           de tri-state côté JS : intact = no-op, vidé = clear,
+                           remplacé = update. data-has-saved-key permet à
+                           collectConfig() de distinguer "vidé volontairement"
+                           de "n'a jamais eu de clé". #}
+                        <input type="password" class="input flex-1" id="cfg-api_key"
+                               value="{% if config.get('api_key') %}••••••••••••••••{% end %}"
+                               data-has-saved-key="{% if config.get('api_key') %}1{% else %}0{% end %}"
+                               placeholder="Entrez votre cle API...">
+                        <button type="button" class="btn btn-secondary" id="btn-test-key">Tester</button>
+                    </div>
+                    {% if config.get('api_key') %}
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Une clé est déjà enregistrée. Laissez intact pour la conserver, tapez-en une nouvelle pour la remplacer, ou videz le champ pour l'effacer.</p>
+                    {% end %}
+                </div>
+
+                <div>
+                    <label class="label" for="cfg-base-url">URL de base <span class="font-normal text-gray-400 dark:text-gray-500">(facultatif)</span></label>
+                    <input type="text" class="input" id="cfg-base-url" value="{{ config.get('api_base_url', '') }}" placeholder="https://api.example.com/v1">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Videz ce champ pour revenir a l'API officielle (Anthropic, OpenAI). Pour Mistral, Groq, DeepSeek, Together, etc., entrez leur endpoint compatible OpenAI (.../v1).</p>
+                </div>
+
+                <!-- Indicateur du type détecté.
+                     Le bouton "Effacer la connexion" a été retiré : pour
+                     effacer une clé/URL/modèle, videz le champ correspondant
+                     et sauvegardez. Pour une réinitialisation complète,
+                     utiliser le bouton "Réinitialiser" en haut de page. -->
+                <div id="detected-provider-info" class="flex items-center gap-2 px-3 py-2 bg-gray-50 rounded text-sm dark:bg-gray-900">
+                    <span class="text-gray-500 dark:text-gray-400">Type detecte :</span>
+                    <span id="detected-provider-badge" class="badge badge-neutral" data-saved-provider="{{ config.get('primary_provider', '') }}" data-saved-provider-detail="{{ detected_provider }}">—</span>
+                </div>
+
+                <div>
+                    <label class="label" for="cfg-primary_model">Modele</label>
+                    <select class="input" id="cfg-primary_model" data-saved-model="{{ config.get('primary_model', '') }}">
+                        {% if not available_models and not config.get('primary_model') %}
+                        <option value="" disabled selected>
+                            -- Aucun modele detecte (testez une cle API) --
+                        </option>
+                        {% end %}
+                        {% for model in available_models %}
+                        <option value="{{ model.get('name', model) if isinstance(model, dict) else model }}"
+                                {% if config.get('primary_model') == (model.get('name', model) if isinstance(model, dict) else model) %}selected{% end %}>
+                            {{ model.get('display_name', model.get('name', model)) if isinstance(model, dict) else model }}
+                        </option>
+                        {% end %}
+                        {% if config.get('primary_model') and not any((model.get('name', model) if isinstance(model, dict) else model) == config.get('primary_model') for model in available_models) %}
+                        <option value="{{ config.get('primary_model') }}" selected>{{ config.get('primary_model') }}</option>
+                        {% end %}
+                    </select>
+                    {% if not available_models and not config.get('primary_model') %}
+                    <p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                        Aucun modele en base. Saisissez votre cle API ci-dessus puis cliquez
+                        <strong>Tester</strong> — Komptia recuperera la liste des modeles
+                        que votre provider expose.
+                    </p>
+                    {% else %}
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Testez votre cle API pour charger les modeles disponibles</p>
+                    {% end %}
+                    <div class="flex items-center gap-2 mt-2 flex-wrap" data-tooltip="Met a jour automatiquement les fenetres de contexte et tarifs des modeles depuis un registre public communautaire (LiteLLM), regulierement rafraichi. Necessaire car les API des providers n'exposent generalement pas ces valeurs. Vos overrides manuels sont preserves.">
+                        <button type="button" id="btn-sync-litellm" class="btn btn-secondary text-xs py-1 px-2">
+                            Mettre a jour fenetres &amp; tarifs
+                        </button>
+                        <span id="litellm-sync-status" class="text-xs text-gray-500 dark:text-gray-400" aria-live="polite"></span>
+                    </div>
+                </div>
+
+                <!-- LLM local (anonymiseur + fallback) — repliable discret.
+                     Le <summary> contrôle aussi l'affichage des sliders
+                     "Paramètres LLM local" dans la section Génération
+                     (synchro JS via id `local-llm-section`). -->
+                <details id="local-llm-section" class="text-xs text-gray-500 dark:text-gray-400 pt-2 border-t border-gray-100 dark:border-gray-800">
+                    <summary class="cursor-pointer select-none hover:text-gray-700 dark:hover:text-gray-300 py-1">
+                        LLM local (anonymisation &amp; fallback)
+                    </summary>
+                    <div class="mt-2 space-y-3 pt-2">
+                        <p class="text-xs text-gray-500 dark:text-gray-400">
+                            Optionnel. Sert à (1) faire ou refaire la liste
+                            des termes à anonymiser dans les classeurs et
+                            (2) servir de fallback quand le LLM cloud est
+                            indisponible.
+                        </p>
+                        {# Install / start / restart / upgrade Ollama : tout depuis cette page.
+                           Statut texte et boutons sont DANS DEUX CONTENEURS DISTINCTS pour
+                           éviter le wrap mixte quand le statut est long (ex: "✓ Ollama
+                           installé et démarré (ollama version is 0.24.0)" qui poussait
+                           certains boutons sous le span et d'autres restaient en haut). #}
+                        <div id="local-llm-install-info" class="text-xs">Détection…</div>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <button type="button" id="btn-local-llm-start"
+                                    class="btn btn-secondary text-xs"
+                                    style="display:none;">Démarrer Ollama</button>
+                            <button type="button" id="btn-local-llm-restart"
+                                    class="btn btn-secondary text-xs"
+                                    style="display:none;"
+                                    title="Tuer et relancer Ollama (utile si bloqué)">Redémarrer</button>
+                            <button type="button" id="btn-local-llm-upgrade"
+                                    class="btn btn-secondary text-xs"
+                                    style="display:none;"
+                                    title="brew upgrade ollama (Mac) ou install.sh (Linux)">Mettre à jour</button>
+                        </div>
+                        <div class="flex items-center justify-between py-1">
+                            <label class="text-sm text-gray-700 dark:text-gray-300" for="cfg-local_llm_enabled">
+                                Activer
+                            </label>
+                            <input type="checkbox" id="cfg-local_llm_enabled"
+                                   class="w-4 h-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900 dark:border-gray-700 dark:text-gray-100"
+                                   {% if config.get('local_llm_enabled', False) %}checked{% end %}>
+                        </div>
+                        <div>
+                            <label class="label" for="cfg-local_llm_base_url">URL</label>
+                            <input type="text" class="input"
+                                   id="cfg-local_llm_base_url"
+                                   placeholder="http://localhost:11434/v1"
+                                   value="{{ config.get('local_llm_base_url', '') }}">
+                            <div class="flex items-center gap-2 mt-1">
+                                <span id="local-llm-status-badge" class="badge badge-neutral">—</span>
+                                <button type="button" id="btn-local-llm-detect"
+                                        class="text-xs underline cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
+                                        style="background:none;border:none;padding:0;color:inherit;">
+                                    Tester maintenant
+                                </button>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="label" for="cfg-local_llm_model_select">Modèle</label>
+                            <!-- Hidden input = source de vérité (lue par collectConfig). -->
+                            <input type="hidden" id="cfg-local_llm_model"
+                                   value="{{ config.get('local_llm_model', '') }}">
+                            <!-- Dropdown : peuplé dynamiquement par detectLocalLlmStatus.
+                                 État initial = "(aucun modèle installé)" tant que la
+                                 détection n'a pas répondu. -->
+                            <div class="flex items-center gap-2">
+                                <select class="input flex-1" id="cfg-local_llm_model_select">
+                                    <option value="">(aucun modèle installé)</option>
+                                </select>
+                                {# Icône poubelle discrète : supprime le modèle sélectionné
+                                   d'Ollama (libère disque) + nettoie LlmModel BDD + reset
+                                   config si actif. Double-click pattern : 1er clic =
+                                   confirmation visuelle (icône rouge + tooltip), 2e clic
+                                   dans 4s = exécute. Masqué tant qu'aucun modèle réel
+                                   sélectionné (placeholder "" → bouton hidden). #}
+                                <button type="button" id="btn-local-llm-delete"
+                                        class="px-2 py-1 rounded text-gray-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                                        title="Supprimer ce modèle du disque"
+                                        aria-label="Supprimer le modèle sélectionné"
+                                        style="display:none;">
+                                    <i class="bi bi-trash3"></i>
+                                </button>
+                            </div>
+                            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">
+                                Recommandés (3B params, ~2 Go RAM) : <code>phi3:mini</code>,
+                                <code>llama3.2:3b</code>, <code>qwen2.5:3b</code>.
+                            </p>
+                            <div class="flex items-center gap-2 mt-2">
+                                <input type="text" class="input flex-1" id="cfg-local_llm_pull_name"
+                                       placeholder="Télécharger un nouveau modèle (ex: phi3:mini)">
+                                <button type="button" id="btn-local-llm-pull"
+                                        class="btn btn-secondary text-xs">Télécharger</button>
+                            </div>
+                            <p id="local-llm-pull-status" class="text-xs text-gray-500 mt-1 dark:text-gray-400" style="min-height:1rem;"></p>
+                        </div>
+                    </div>
+                    <!-- Compteur fallback déclenché — peuplé par le JS de
+                         /admin/ai-config (loadUsageStats). P2 #17 (review
+                         2026-05-15). Reste invisible tant que jamais
+                         déclenché ou que les données ne sont pas chargées. -->
+                    <div id="local-llm-fallback-summary" class="hidden mt-3 pt-3 border-t border-gray-100 text-xs text-gray-600 dark:border-gray-800 dark:text-gray-400">
+                        <span id="local-llm-fallback-text"></span>
+                    </div>
+                </details>
+            </div>
+        </div>
+
+        <!-- Generation Parameters -->
+        <div class="card" id="card-generation">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Parametres de generation</h2>
+            </div>
+            <div class="p-4 space-y-4">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">Temperature</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-temperature">{{ config.get('temperature', 0.1) }}</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-temperature" min="0" max="1" step="0.1" value="{{ config.get('temperature', 0.1) }}">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">0 = deterministe, 1 = creatif</p>
+                </div>
+
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">Tentatives max</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-max_retries">{{ config.get('max_retries', 3) }}</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-max_retries" min="1" max="5" step="1" value="{{ config.get('max_retries', 3) }}">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Nombre de tentatives de correction automatique</p>
+                </div>
+
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">Timeout</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-timeout_seconds">{{ config.get('timeout_seconds', 600) }}s</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-timeout_seconds" min="30" max="600" step="10" value="{{ config.get('timeout_seconds', 600) }}">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Delai maximum pour une generation</p>
+                </div>
+
+                <div class="pt-3 border-t border-gray-100 dark:border-gray-800 space-y-4">
+                    <h3 class="text-xs font-medium text-gray-500 uppercase dark:text-gray-400">
+                        Budget LLM par utilisateur
+                    </h3>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label class="label mb-0"
+                                   for="cfg-max_usd_per_user"
+                                   title="Cap commun à tous les utilisateurs, évalué séparément par compte. 0 = désactivé. Au-delà, la conversation stoppe avec un message clair.">Budget max par utilisateur</label>
+                            <span class="text-sm font-medium text-gray-900 dark:text-gray-100">USD</span>
+                        </div>
+                        <input type="number"
+                               class="block w-full rounded border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm py-1.5 px-2 text-gray-900 dark:text-gray-100 focus:ring-1 focus:ring-gray-900 dark:focus:ring-gray-100"
+                               id="cfg-max_usd_per_user"
+                               min="0" max="1000" step="0.01"
+                               value="{{ '%.2f' % config.get('max_usd_per_user', 1.00) }}"
+                               inputmode="decimal">
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label class="label mb-0"
+                                   for="cfg-budget_window_hours"
+                                   title="Durée de la fenêtre glissante (1 à 720h). Reset automatique : un appel sort du cumul dès que son timestamp est antérieur à maintenant moins cette durée. 24h par défaut.">Fenêtre de reset</label>
+                            <span class="text-sm font-medium text-gray-900 dark:text-gray-100">heures</span>
+                        </div>
+                        <input type="number"
+                               class="block w-full rounded border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm py-1.5 px-2 text-gray-900 dark:text-gray-100 focus:ring-1 focus:ring-gray-900 dark:focus:ring-gray-100"
+                               id="cfg-budget_window_hours"
+                               min="1" max="720" step="1"
+                               value="{{ config.get('budget_window_hours', 24) }}"
+                               inputmode="numeric">
+                    </div>
+                </div>
+
+                <!-- Paramètres LLM local — affichage piloté par le
+                     <details> "LLM local" de la section "Connexion et
+                     modèle" (un seul toggle pour les 2 zones). Masqué par
+                     défaut, le JS le toggle synchroniquement. -->
+                <div id="local-llm-gen-params" class="pt-3 border-t border-gray-100 dark:border-gray-800 space-y-4" style="display:none;">
+                    <h3 class="text-xs font-medium text-gray-500 uppercase dark:text-gray-400">
+                        LLM local
+                    </h3>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label class="label mb-0" for="cfg-local_llm_temperature">Température LLM local</label>
+                            <span class="text-sm font-medium text-gray-900 dark:text-gray-100"
+                                  id="val-local_llm_temperature">{{ config.get('local_llm_temperature', 0.0) }}</span>
+                        </div>
+                        <input type="range" class="w-full" id="cfg-local_llm_temperature"
+                               min="0" max="1" step="0.1"
+                               value="{{ config.get('local_llm_temperature', 0.0) }}">
+                        <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">
+                            0 = déterministe (recommandé pour l'anonymisation)
+                        </p>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label class="label mb-0" for="cfg-local_llm_max_retries">Tentatives max LLM local</label>
+                            <span class="text-sm font-medium text-gray-900 dark:text-gray-100"
+                                  id="val-local_llm_max_retries">{{ config.get('local_llm_max_retries', 3) }}</span>
+                        </div>
+                        <input type="range" class="w-full" id="cfg-local_llm_max_retries"
+                               min="1" max="5" step="1"
+                               value="{{ config.get('local_llm_max_retries', 3) }}">
+                        <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">
+                            Cold start (modèle pas en RAM) peut timeout. 3 retries tolérés.
+                        </p>
+                    </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-1">
+                            <label class="label mb-0" for="cfg-local_llm_timeout_seconds">Timeout LLM local</label>
+                            <span class="text-sm font-medium text-gray-900 dark:text-gray-100"
+                                  id="val-local_llm_timeout_seconds">{{ config.get('local_llm_timeout_seconds', 300) }}s</span>
+                        </div>
+                        <input type="range" class="w-full" id="cfg-local_llm_timeout_seconds"
+                               min="30" max="600" step="10"
+                               value="{{ config.get('local_llm_timeout_seconds', 300) }}">
+                        <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">
+                            GPU consumer 30-60s. CPU pur 120-300s. Ollama distant lent 600s.
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RAG Settings -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Parametres RAG</h2>
+            </div>
+            <div class="p-4 space-y-4">
+                <div data-tooltip="Score minimum (0-1) qu'une paire (question, SQL) doit atteindre pour être servie comme exemple few-shot à Iris. À 0, toutes les paires passent (filtre désactivé). Plus haut = plus exigeant mais RAG potentiellement vide. Recommandé 0.02-0.20.">
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">Seuil de confiance</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-rag_confidence_threshold">{{ config.get('confidence_threshold', 0.02) }}</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-rag_confidence_threshold" min="0" max="1" step="0.01" value="{{ config.get('confidence_threshold', 0.02) }}">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Score min des paires Q/SQL servies en few-shot</p>
+                </div>
+
+                <div data-tooltip="Nombre maximum d'éléments de contexte servis à Iris pour chaque question : paires (question, SQL) similaires en few-shot ET documents métier (descriptions, conventions). Une seule valeur pilote les deux. Plus = plus de contexte mais plus de tokens. Recommandé 3-7, >10 = forte hausse de coûts.">
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">Éléments de contexte max</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-max_rag_examples">{{ config.get('rag_example_count', 5) }}</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-max_rag_examples" min="1" max="20" step="1" value="{{ config.get('rag_example_count', 5) }}">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Paires Q/SQL et docs métier servis comme contexte</p>
+                </div>
+
+                <div data-tooltip="Nombre maximum de définitions de tables (DDL) servies à Iris pour contextualiser une question. Plus = plus de tables visibles dans le prompt mais plus de tokens.">
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">DDL max</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-rag_ddl_count">{{ config.get('rag_ddl_count', 5) }}</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-rag_ddl_count" min="0" max="20" step="1" value="{{ config.get('rag_ddl_count', 5) }}">
+                </div>
+
+                <div class="flex items-center justify-between py-2 border-t border-gray-200 dark:border-gray-800 pt-3 mt-3" data-tooltip="Activé : à la fin de chaque run Iris réussi (terminé positivement, pas abandonné), chaque SQL exécuté avec succès est automatiquement ajouté à la mémoire RAG (paire question + SQL). Iris apprend ainsi des conventions de votre BDD sans intervention manuelle. Désactivé : seuls les feedbacks ✅ explicites alimentent le RAG. Les runs abandonnés ne sont jamais appris (anti-pollution).">
+                    <div>
+                        <p class="text-sm font-medium text-gray-700 dark:text-gray-300">Auto-apprentissage</p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">Apprendre automatiquement des runs Iris réussis</p>
+                    </div>
+                    <input type="checkbox" id="cfg-enable_auto_learning" class="w-4 h-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900 dark:border-gray-700 dark:text-gray-100" {% if config.get('auto_learn', True) %}checked{% end %}>
+                </div>
+
+                <div class="flex items-center justify-between py-2" data-tooltip="Activé (recommandé) : utilise le prompt caching du provider LLM (Anthropic cache_control) pour réutiliser les portions stables du contexte d'un appel à l'autre. Économise typiquement 30-90% des tokens d'input. Désactivé : tous les tokens sont recomputés à chaque appel (utile pour debug ou si vous voulez économiser les breakpoints Anthropic limités à 4).">
+                    <div>
+                        <p class="text-sm font-medium text-gray-700 dark:text-gray-300">Cache LLM (prompt caching)</p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">Réutilisation du contexte stable côté provider LLM</p>
+                    </div>
+                    <input type="checkbox" id="cfg-cache_enabled" class="w-4 h-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900 dark:border-gray-700 dark:text-gray-100" {% if config.get('use_cache', True) %}checked{% end %}>
+                </div>
+            </div>
+        </div>
+
+        <!-- Schema Sync -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Synchronisation du schéma</h2>
+            </div>
+            <div class="p-4 space-y-4">
+                <div class="flex items-center justify-between py-2">
+                    <div>
+                        <p class="text-sm font-medium text-gray-700 dark:text-gray-300">Sync automatique</p>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">Synchroniser périodiquement le schéma de la base de données</p>
+                    </div>
+                    <input type="checkbox" id="cfg-auto_sync_schema" class="w-4 h-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900 dark:border-gray-700 dark:text-gray-100" {% if config.get('schema_sync_enabled', True) %}checked{% end %}>
+                </div>
+
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <label class="label mb-0">Intervalle</label>
+                        <span class="text-sm font-medium text-gray-900 dark:text-gray-100" id="val-schema_sync_interval_hours">{{ config.get('schema_sync_interval_hours', 24) }}h</span>
+                    </div>
+                    <input type="range" class="w-full" id="cfg-schema_sync_interval_hours" min="1" max="48" step="1" value="{{ config.get('schema_sync_interval_hours', 24) }}">
+                    <div class="flex items-center gap-2 mt-2">
+                        <label class="label mb-0 text-xs" for="cfg-schema_sync_start_time" data-tooltip="Heure locale du serveur a laquelle le sync auto se declenche (ex: 03:00 = 3h du matin). Si vide, le sync se declenche des qu'un intervalle est ecoule, alignement flottant sur le dernier sync.">Heure preferee</label>
+                        <input type="time" class="input text-xs py-0.5 px-2 w-24" id="cfg-schema_sync_start_time" value="{{ config.get('schema_sync_start_time', '') }}">
+                    </div>
+                </div>
+
+                <div class="bg-gray-50 rounded p-3 space-y-2 dark:bg-gray-900">
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-500 dark:text-gray-400">Etat</span>
+                        <span id="health-status" class="badge badge-neutral">...</span>
+                    </div>
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-500 dark:text-gray-400">Derniere sync</span>
+                        <span class="font-medium text-gray-900 dark:text-gray-100" id="last-sync">-</span>
+                    </div>
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-500 dark:text-gray-400">Tables</span>
+                        <span class="font-medium text-gray-900 dark:text-gray-100" id="table-count">-</span>
+                    </div>
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-500 dark:text-gray-400">Vues SQL</span>
+                        <span class="font-medium text-gray-900 dark:text-gray-100" id="view-count">-</span>
+                    </div>
+                </div>
+
+                <button type="button" class="btn btn-secondary w-full" id="btn-sync">Synchroniser maintenant</button>
+            </div>
+        </div>
+
+    </div>
+
+    {# Section "Casquette Iris-DBA-write" supprimée 2026-05-15 (demande user
+       explicite). La feature reste active pour les admins avec workflow
+       d'approbation par mail (cf. ``app/services/ai/iris_write_session.py``)
+       mais SANS configuration UI dédiée : TTL et activation sont figés
+       (cf. ``_get_iris_write_config()``), et l'adresse d'approbation
+       réutilise l'« Email support » de /admin/smtp-config (SSoT). L'admin
+       n'a rien à configurer ici — la casquette est toujours dispo, le lien
+       expire au bout de 7 jours. Pas de cap rows configurable (le DBA
+       décide humainement à la lecture du mail). #}
+
+    {# Section "Sécurité — Accès aux données (RLS)" retirée le 2026-05-18 :
+       David : « si les règles sont là c'est qu'il faut les appliquer ».
+       Les règles définies dans /admin/data-access sont désormais
+       TOUJOURS appliquées au runtime ; pas de toggle gate, pas de mode
+       compatibilité. La clé BDD ``data_access_enforcement_enabled``
+       reste lue mais ignorée (``is_enforcement_enabled()`` retourne
+       ``True`` inconditionnellement). Si on devait revenir à un toggle
+       (raison produit changée), restaurer la section + retirer le
+       comportement forcé dans ``enforcer.is_enforcement_enabled``. #}
+
+    <!-- Reset Documentation IA -->
+    <div class="card mt-4">
+        <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Reinitialisation documentation IA</h2>
+        </div>
+        <div class="p-4 space-y-3">
+            <p class="text-xs text-gray-500 dark:text-gray-400">Supprime toutes les données d'entraînement de l'IA (DDL, documentation métier, paires question/SQL). L'IA repart de zéro.</p>
+            <div id="reset-doc-result" class="hidden rounded p-3 text-sm"></div>
+            <button type="button" class="btn btn-danger w-full" id="btn-reset-doc">Réinitialiser toute la documentation</button>
+        </div>
+    </div>
+
+    <!-- Confirmation modal -->
+    <div id="modal-reset-doc" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+        <div class="bg-white rounded-lg shadow-xl max-w-md w-full mx-4 p-6 dark:bg-gray-900">
+            <h3 class="text-lg font-semibold text-gray-900 mb-2 dark:text-gray-100">Confirmer la réinitialisation</h3>
+            <p class="text-sm text-gray-600 mb-4 dark:text-gray-400">Cette action va <strong>supprimer définitivement</strong> toutes les données d'entraînement de l'IA (DDL, documentation métier, exemples question/SQL).</p>
+            <p class="text-sm text-red-600 font-medium mb-4 dark:text-red-400">Cette action est irréversible.</p>
+            <div class="flex gap-3 justify-end">
+                <button type="button" class="btn btn-secondary" id="btn-cancel-reset">Annuler</button>
+                <button type="button" class="btn btn-danger" id="btn-confirm-reset">Confirmer la réinitialisation</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- API Usage -->
+    <div class="card mt-4">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Consommation API</h2>
+            <select id="usage-period" class="text-xs border border-gray-300 rounded px-2 py-1 dark:border-gray-700">
+                <option value="7">7 jours</option>
+                <option value="30" selected>30 jours</option>
+                <option value="90">90 jours</option>
+            </select>
+        </div>
+        <div class="p-4">
+            <!-- Banner budget mensuel — affiché uniquement si KOMPTIA_LLM_BUDGET_USD_MONTH
+                 est configuré côté serveur. P2 #16 (review 2026-05-15). -->
+            <div id="usage-budget-banner" class="hidden mb-4 px-3 py-2 rounded text-sm border" role="status" aria-live="polite">
+                <span id="usage-budget-msg"></span>
+            </div>
+            <!-- Summary cards -->
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                <div class="bg-gray-50 rounded p-3 text-center dark:bg-gray-900">
+                    <p class="text-xs text-gray-500 dark:text-gray-400" data-tooltip="Compte uniquement les vrais appels au modèle d'IA (un appel = un message envoyé au provider). Les évènements internes (sauvegarde de contexte métier, hits de cache) sont exclus pour refléter votre consommation API réelle. Le détail Par utilisateur peut afficher un total légèrement différent : il inclut tous les évènements pour la traçabilité utilisateur.">
+                        Requêtes
+                    </p>
+                    <p class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="usage-requests">-</p>
+                </div>
+                <div class="bg-gray-50 rounded p-3 text-center dark:bg-gray-900">
+                    <p class="text-xs text-gray-500 dark:text-gray-400" data-tooltip="Somme prompt + completion sur la période sélectionnée. Exclut les évènements internes (cohérent avec l'indicateur Requêtes). Les cache reads sont comptés à part (10% du prix input côté provider). Le total ici peut différer du tableau de bord du provider si la période n'est pas alignée : ce compteur est sur les N derniers jours glissants, alors que le tableau de bord du provider affiche souvent le mois calendaire courant.">
+                        Tokens total
+                    </p>
+                    <p class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="usage-tokens">-</p>
+                </div>
+                <div class="bg-gray-50 rounded p-3 text-center dark:bg-gray-900">
+                    <p class="text-xs text-gray-500 dark:text-gray-400" data-tooltip="Calcul interne basé sur le prix enregistré dans /admin/ai-models. Inclut prompt + completion + thinking + cache_read (10% input) + cache_creation (125% input). Exclut les évènements internes (cohérent avec l'indicateur Requêtes). Les lignes historiques antérieures à la configuration du prix d'un modèle apparaissent à 0 — vérifier l'avertissement serveur « Prix inconnu » pour configurer.">
+                        Coût estimé
+                    </p>
+                    <p class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="usage-cost">-</p>
+                </div>
+                <div class="bg-gray-50 rounded p-3 text-center dark:bg-gray-900">
+                    <p class="text-xs text-gray-500 dark:text-gray-400" data-tooltip="Moyenne tokens / requete sur la periode. Indicateur du cout typique par appel : eleve = beaucoup de contexte (RAG + historique), bas = appel utilitaire (extraction, classification). Une derive vers le haut peut signaler un prompt qui gonfle ou un RAG mal calibre.">
+                        Tokens / requete
+                    </p>
+                    <p class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="usage-avg">-</p>
+                </div>
+            </div>
+
+            <!-- Per-model breakdown — skeleton initial 3 barres
+                 (P3 #24 review 2026-05-15). role="status" + aria-live
+                 pour annonce screen-reader. ``motion-safe:`` respecte
+                 ``prefers-reduced-motion`` pour accessibilité (WCAG 2.3.3).
+                 -->
+            <div class="mb-4">
+                <h3 class="text-xs font-medium text-gray-500 uppercase mb-2 dark:text-gray-400">Par modele</h3>
+                <div id="usage-models" class="space-y-2" role="status" aria-live="polite" aria-busy="true">
+                    <span class="sr-only">Chargement des données par modèle…</span>
+                    <div class="motion-safe:animate-pulse flex items-center gap-3"><div class="w-32 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="flex-1 h-2 bg-gray-200 dark:bg-gray-800 rounded-full"></div><div class="w-20 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="w-16 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div></div>
+                    <div class="motion-safe:animate-pulse flex items-center gap-3"><div class="w-32 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="flex-1 h-2 bg-gray-200 dark:bg-gray-800 rounded-full" style="width:65%"></div><div class="w-20 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="w-16 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div></div>
+                    <div class="motion-safe:animate-pulse flex items-center gap-3"><div class="w-32 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="flex-1 h-2 bg-gray-200 dark:bg-gray-800 rounded-full" style="width:30%"></div><div class="w-20 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="w-16 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div></div>
+                </div>
+            </div>
+
+            <!-- Per-feature (caller) breakdown — pliable, fermé par défaut
+                 (section secondaire : utile pour drill-down mais peu
+                 actionnable au quotidien, on évite de polluer l'écran). -->
+            <details class="mb-4">
+                <summary class="flex items-center gap-1.5 text-xs font-medium text-gray-400 uppercase mb-2 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 select-none outline-none focus-visible:ring-2 focus-visible:ring-brand-500 rounded">
+                    <svg class="chev w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+                    <span>Par feature</span>
+                    <span class="font-normal text-[10px] normal-case opacity-70">— origine sémantique</span>
+                </summary>
+                <div id="usage-callers" class="space-y-2 pt-1" role="status" aria-live="polite" aria-busy="true">
+                    <span class="sr-only">Chargement des données par feature…</span>
+                    <div class="motion-safe:animate-pulse flex items-center gap-3"><div class="w-40 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="flex-1 h-2 bg-gray-200 dark:bg-gray-800 rounded-full"></div><div class="w-12 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="w-20 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div></div>
+                    <div class="motion-safe:animate-pulse flex items-center gap-3"><div class="w-40 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="flex-1 h-2 bg-gray-200 dark:bg-gray-800 rounded-full" style="width:55%"></div><div class="w-12 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="w-20 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div></div>
+                    <div class="motion-safe:animate-pulse flex items-center gap-3"><div class="w-40 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="flex-1 h-2 bg-gray-200 dark:bg-gray-800 rounded-full" style="width:25%"></div><div class="w-12 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div><div class="w-20 h-3 bg-gray-200 dark:bg-gray-800 rounded"></div></div>
+                </div>
+            </details>
+
+            <!-- Daily chart (simple bar) — JS injecte les barres + ligne de
+                 légende. Le wrapper est un simple container : pas de flex
+                 ici, le layout interne est posé par le JS pour s'adapter au
+                 cas "pas assez de données". -->
+            <div>
+                <h3 class="text-xs font-medium text-gray-500 uppercase mb-2 dark:text-gray-400">Evolution quotidienne</h3>
+                <div id="usage-daily" role="status" aria-live="polite" aria-busy="true">
+                    <span class="sr-only">Chargement de l'évolution quotidienne…</span>
+                    <div class="motion-safe:animate-pulse h-24 bg-gray-100 dark:bg-gray-800 rounded mb-1"></div>
+                    <div class="motion-safe:animate-pulse flex justify-between"><div class="w-16 h-3 bg-gray-100 dark:bg-gray-800 rounded"></div><div class="w-20 h-3 bg-gray-100 dark:bg-gray-800 rounded"></div><div class="w-16 h-3 bg-gray-100 dark:bg-gray-800 rounded"></div></div>
+                </div>
+            </div>
+
+            <!-- Per-user breakdown — qui consomme quoi.
+                 Rendu via window.ApiUsage.renderUsersTable (api_usage.js). -->
+            <div class="mt-6">
+                <h3 class="text-xs font-medium text-gray-500 uppercase mb-2 dark:text-gray-400">Par utilisateur</h3>
+                <div id="usage-users" class="overflow-x-auto" role="status" aria-live="polite" aria-busy="true">
+                    <span class="sr-only">Chargement des données par utilisateur…</span>
+                    <div class="motion-safe:animate-pulse space-y-2"><div class="h-6 bg-gray-100 dark:bg-gray-800 rounded"></div><div class="h-6 bg-gray-100 dark:bg-gray-800 rounded"></div><div class="h-6 bg-gray-100 dark:bg-gray-800 rounded"></div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+</div>
+{% end %}
+
+{% block scripts %}
+{# Module partagé qui peuple le partial dashboard_api_usage.html (lazy-load
+   au toggle du <details>). Même fichier que /dashboard admin. #}
+<script src="/static/js/api_usage.js" nonce="{{ handler.csp_nonce }}"></script>
+{# P3 #21 — Plotly basic pour le chart "Évolution quotidienne" interactif
+   (zoom, hover, légende). Même CDN local que /dashboard pour cohérence
+   bundle. ~390KB minifié (chargé en background, page admin tolérante). #}
+<script src="/static/vendor/plotly/plotly-basic.min.js" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+function updateVal(field, suffix) {
+    var input = document.getElementById('cfg-' + field);
+    var display = document.getElementById('val-' + field);
+    display.textContent = input.value + (suffix || '');
+}
+
+// escapeHtml() inherited from base.html — utilise textContent qui échappe
+// <, >, & mais PAS les guillemets " ' . Insuffisant pour les attributs HTML
+// (title="...", alt="...", etc.) car un " dans la valeur casse l'attribut.
+// → escapeAttr ci-dessous échappe en plus les guillemets pour les contextes
+// d'attribut. Cf. P4 #29 (review adversariale 2026-05-15) — éviter XSS
+// attribute injection sur les noms de modèles/callers exotiques.
+function escapeAttr(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;');
+}
+
+// P3 #21 — Helper dark mode pour chart Plotly. Aligné sur le pattern
+// dashboard-charts.js:81 (``document.documentElement.classList.contains('dark')``)
+// pour cohérence avec /dashboard. Listener komptia:themechange ajouté
+// au mount() pour re-tracer le chart au switch dark/light.
+function _isDarkMode() {
+    return document.documentElement.classList.contains('dark');
+}
+
+// Layout/style Plotly du chart "Évolution quotidienne" — adapté
+// dark/light. Couleurs Komptia (gris/bleu) cohérentes avec les barres
+// CSS qu'on remplace.
+function _dailyChartLayout(maxTokens) {
+    var dark = _isDarkMode();
+    return {
+        autosize: true,
+        margin: { l: 50, r: 20, t: 10, b: 40 },
+        height: 200,
+        showlegend: false,
+        plot_bgcolor: 'transparent',
+        paper_bgcolor: 'transparent',
+        xaxis: {
+            type: 'category',
+            tickfont: { size: 10, color: dark ? '#94a3b8' : '#64748b' },
+            gridcolor: dark ? 'rgba(148,163,184,0.1)' : 'rgba(100,116,139,0.1)',
+        },
+        yaxis: {
+            tickfont: { size: 10, color: dark ? '#94a3b8' : '#64748b' },
+            gridcolor: dark ? 'rgba(148,163,184,0.15)' : 'rgba(100,116,139,0.1)',
+            title: { text: 'tokens / jour', font: { size: 10, color: dark ? '#94a3b8' : '#64748b' } },
+        },
+        hoverlabel: {
+            bgcolor: dark ? '#1f2937' : '#ffffff',
+            bordercolor: dark ? '#374151' : '#e5e7eb',
+            font: { color: dark ? '#e2e8f0' : '#1e293b', size: 11 },
+        },
+    };
+}
+
+function _drawDailyPlotly(elId, dailyData) {
+    if (typeof Plotly === 'undefined') {
+        // Fallback gracieux : Plotly pas chargé (CDN bloqué ?), affiche
+        // au moins le récap texte. Évite "écran blanc" si script pas dispo.
+        var el = document.getElementById(elId);
+        if (el) el.innerHTML = '<p class="text-sm text-gray-400 dark:text-gray-500">Bibliothèque graphique non chargée — rechargez la page.</p>';
+        return;
+    }
+    var dark = _isDarkMode();
+    // Trace bar interactif. ``customdata`` permet d'afficher tokens +
+    // requêtes + coût dans le hover sans recalculer côté JS.
+    var trace = {
+        x: dailyData.map(function(d) { return d.date; }),
+        y: dailyData.map(function(d) { return d.tokens; }),
+        type: 'bar',
+        marker: {
+            color: dark ? '#60a5fa' : '#3b82f6',  // blue-400 / blue-500
+            line: { width: 0 },
+        },
+        customdata: dailyData.map(function(d) {
+            return [d.requests || 0, d.estimated_cost_usd || 0];
+        }),
+        hovertemplate: (
+            '<b>%{x}</b><br>' +
+            '%{y:,d} tokens<br>' +
+            '%{customdata[0]:d} requêtes<br>' +
+            '$%{customdata[1]:.4f}<extra></extra>'
+        ),
+    };
+    var maxTokens = Math.max.apply(null, dailyData.map(function(d) { return d.tokens; })) || 1;
+    var config = {
+        displayModeBar: false,  // pas de barre d'outils Plotly (camera/zoom/etc.)
+        responsive: true,        // recompute layout au resize window
+        locale: 'fr',
+    };
+    Plotly.react(elId, [trace], _dailyChartLayout(maxTokens), config);
+}
+
+// Re-trace le chart Plotly daily au switch dark/light. ``komptia:themechange``
+// est dispatché par base.html (cf. dashboard-charts.js:27 commentaire).
+// Le listener est attaché une seule fois au load (pas de cleanup ici car
+// la page n'a pas de bfcache stricte vs /dashboard).
+window.addEventListener('komptia:themechange', function() {
+    var dailyEl = document.getElementById('usage-daily');
+    if (!dailyEl || dailyEl.children.length === 0) return;
+    // Re-trace seulement si le chart Plotly est actif (pas le récap 1-jour).
+    // On vérifie via la présence d'un .plotly-graph-div dans le container.
+    if (dailyEl.querySelector('.plotly') && _lastDailyData && _lastDailyData.length >= 2) {
+        _drawDailyPlotly('usage-daily', _lastDailyData);
+    }
+});
+
+// Cache des dernières données daily pour re-trace au themechange.
+var _lastDailyData = null;
+
+function showAlert(msg, type) {
+    var el = document.getElementById('alert');
+    el.textContent = msg;
+    el.className = 'mb-4 px-4 py-3 rounded text-sm ' + (type === 'error' ? 'bg-red-50 text-red-700 border border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800/60' : 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-900/20 dark:text-emerald-300 dark:border-emerald-800/60');
+    setTimeout(function() { el.className = 'hidden'; }, 4000);
+}
+
+// Sentinel rendu côté serveur dans ``#cfg-api_key`` quand une clé est
+// enregistrée : 16 bullets unicode. Permet à l'admin de voir que le champ
+// est "rempli" sans dévoiler la clé. Tri-state utilisé par collectConfig :
+// intact → no-op, vidé → effacer, remplacé → update.
+var KEY_SENTINEL = '••••••••••••••••';
+
+// ── Détection automatique du type de provider ──────────────────
+// Anthropic = seul provider avec un format API différent.
+// Tout le reste est OpenAI-compatible (/v1/chat/completions).
+function detectApiType(apiKey, baseUrl) {
+    // Sentinel = clé conservée intacte, ne fournit aucune info exploitable
+    // pour la détection. On le traite comme "pas de clé saisie".
+    if (apiKey === KEY_SENTINEL) apiKey = '';
+    if (apiKey && apiKey.startsWith('sk-ant-')) return 'anthropic';
+    if (baseUrl && baseUrl.toLowerCase().indexOf('anthropic') !== -1) return 'anthropic';
+    return 'openai';
+}
+
+function getDetectedProvider() {
+    var apiKey = document.getElementById('cfg-api_key').value;
+    var baseUrl = (document.getElementById('cfg-base-url').value || '').trim();
+    return detectApiType(apiKey, baseUrl);
+}
+
+function getBaseUrl() {
+    return (document.getElementById('cfg-base-url').value || '').trim();
+}
+
+// Met à jour l'indicateur visuel du type détecté
+function updateDetectedBadge() {
+    var apiKey = document.getElementById('cfg-api_key').value;
+    var baseUrl = getBaseUrl();
+    var badge = document.getElementById('detected-provider-badge');
+    // État sentinel : l'admin n'a pas touché à la clé. Comme on ne peut pas
+    // re-deviner le provider à partir d'un bullets-string, on affiche celui
+    // sauvé en BDD (rendu serveur dans data-saved-provider).
+    if (apiKey === KEY_SENTINEL) {
+        var savedProvider = (badge.dataset.savedProvider || '').toLowerCase();
+        if (savedProvider === 'anthropic') {
+            badge.textContent = 'Anthropic';
+            badge.className = 'badge badge-success';
+        } else if (savedProvider) {
+            // Marque précise (Groq/Mistral/…) résolue côté backend depuis le
+            // base_url (data-saved-provider-detail) — title-case, sans mapping
+            // host→provider dupliqué en JS. "openai"/inconnu → libellé générique.
+            var detail = (badge.dataset.savedProviderDetail || '').trim();
+            if (detail && detail !== 'openai') {
+                badge.textContent = detail.charAt(0).toUpperCase() + detail.slice(1);
+            } else {
+                badge.textContent = 'OpenAI-compatible';
+            }
+            badge.className = 'badge badge-info';
+        } else {
+            badge.textContent = '—';
+            badge.className = 'badge badge-neutral';
+        }
+        return;
+    }
+    if (!apiKey && !baseUrl) {
+        badge.textContent = '—';
+        badge.className = 'badge badge-neutral';
+        return;
+    }
+    var type = detectApiType(apiKey, baseUrl);
+    if (type === 'anthropic') {
+        badge.textContent = 'Anthropic';
+        badge.className = 'badge badge-success';
+    } else {
+        badge.textContent = 'OpenAI-compatible';
+        badge.className = 'badge badge-info';
+    }
+}
+document.getElementById('cfg-api_key')?.addEventListener('input', updateDetectedBadge);
+document.getElementById('cfg-base-url')?.addEventListener('input', updateDetectedBadge);
+// Init
+updateDetectedBadge();
+
+// Flags "le user a vraiment touché ce champ" — utilisés par collectConfig
+// pour ne pas écraser silencieusement ``api_base_url`` ou ``primary_model``
+// quand l'admin sauvegarde simplement un slider (temperature, timeout…)
+// sans toucher à la connexion provider. Sans ces flags, un cas edge
+// (``loadModelsForProvider`` retourne ``[]`` → ``updateModelSelect`` ajoute
+// une option ``value=""``) ferait POST ``primary_model: ""`` à chaque save
+// → écrasement silencieux du modèle configuré en BDD.
+// Reset à false après un save réussi (l'état initial post-reload reflète
+// la nouvelle BDD).
+var _userTouchedBaseUrl = false;
+var _userTouchedModel = false;
+document.getElementById('cfg-base-url')?.addEventListener('input', function () { _userTouchedBaseUrl = true; });
+document.getElementById('cfg-primary_model')?.addEventListener('change', function () { _userTouchedModel = true; });
+
+function collectConfig() {
+    var primaryModel = document.getElementById('cfg-primary_model').value;
+
+    var apiKey = document.getElementById('cfg-api_key').value;
+    var baseUrl = getBaseUrl();
+    var provider = detectApiType(apiKey, baseUrl);
+
+    var config = {
+        temperature: parseFloat(document.getElementById('cfg-temperature').value),
+        max_retries: parseInt(document.getElementById('cfg-max_retries').value),
+        timeout_seconds: parseInt(document.getElementById('cfg-timeout_seconds').value),
+        confidence_threshold: parseFloat(document.getElementById('cfg-rag_confidence_threshold').value),
+        rag_example_count: parseInt(document.getElementById('cfg-max_rag_examples').value),
+        rag_ddl_count: parseInt(document.getElementById('cfg-rag_ddl_count').value),
+        // Paramètres non exposés UI (rag_doc_count, rag_ddl_doc_min_score,
+        // rag_min_examples, rag_max_scan, rag_reusable_score,
+        // auto_learn_positive_only) restent en BDD comme SSoT runtime mais
+        // sans contrôle UI. rag_doc_count est dérivé de rag_example_count
+        // côté runtime (cf. training_store._get_rag_runtime_config). Les
+        // autres ont des valeurs calibrées par défaut. Pour les rares cas
+        // avancés, une future page /admin/ai-config/advanced pourrait les
+        // exposer.
+        auto_learn: document.getElementById('cfg-enable_auto_learning').checked,
+        use_cache: document.getElementById('cfg-cache_enabled').checked,
+        schema_sync_enabled: document.getElementById('cfg-auto_sync_schema').checked,
+        schema_sync_interval_hours: parseInt(document.getElementById('cfg-schema_sync_interval_hours').value),
+        schema_sync_start_time: (document.getElementById('cfg-schema_sync_start_time').value || '')
+    };
+
+    // Cap budget LLM par utilisateur × fenêtre glissante (USD + heures).
+    // Si un champ est vidé (NaN), on n'envoie rien pour cette clé → la
+    // valeur en BDD est préservée. Clamp défensif : HTML min/max +
+    // serveur `_validate_value` valident déjà mais on se ceinture pour
+    // les paste / DevTools edits.
+    var maxUsdInput = document.getElementById('cfg-max_usd_per_user');
+    if (maxUsdInput) {
+        var maxUsdRaw = parseFloat(maxUsdInput.value);
+        if (!isNaN(maxUsdRaw)) {
+            config.max_usd_per_user = Math.max(0, Math.min(1000, maxUsdRaw));
+        }
+    }
+    var windowInput = document.getElementById('cfg-budget_window_hours');
+    if (windowInput) {
+        var windowRaw = parseInt(windowInput.value, 10);
+        if (!isNaN(windowRaw)) {
+            config.budget_window_hours = Math.max(1, Math.min(720, windowRaw));
+        }
+    }
+
+    // api_base_url / primary_model : envoi conditionnel. Le champ contient
+    // déjà la valeur BDD au load (rendu serveur), donc ne pas l'envoyer ≡
+    // garder la valeur courante. On envoie SI ET SEULEMENT SI l'admin l'a
+    // touché — y compris la chaîne vide (= clear explicite, ex : retour à
+    // l'API officielle Anthropic après avoir testé Groq).
+    if (_userTouchedBaseUrl) config.api_base_url = baseUrl;
+    if (_userTouchedModel) config.primary_model = primaryModel;
+
+    // Clé API : champ SENSIBLE rendu avec un sentinel (••••••••••••••••)
+    // quand une clé est en BDD. Tri-state :
+    //   - value === KEY_SENTINEL → admin n'a pas touché → on n'envoie rien
+    //     (la clé en BDD est préservée).
+    //   - value !== '' && value !== KEY_SENTINEL → admin a tapé une nouvelle
+    //     clé → on l'envoie + on envoie le provider auto-détecté.
+    //   - value === '' && hasSavedKey → admin a explicitement vidé le champ
+    //     → on envoie api_key='' + provider='' + model='' pour effacer la
+    //     connexion (cohérent avec _PROVIDER_RESET_KEYS côté backend qui
+    //     déclenchera la réinit du LLMManager).
+    //   - value === '' && !hasSavedKey → no-op (rien en BDD, rien à envoyer).
+    var apiKeyInput = document.getElementById('cfg-api_key');
+    var hasSavedKey = apiKeyInput && apiKeyInput.dataset.hasSavedKey === '1';
+    if (apiKey === KEY_SENTINEL) {
+        // Sentinel intact → ne rien envoyer pour api_key/provider.
+    } else if (apiKey) {
+        config.api_key = apiKey;
+        config.primary_provider = provider;
+    } else if (hasSavedKey) {
+        // Vidé volontairement → effacer clé + provider + modèle. Sans clé,
+        // un modèle orphelin serait dangereux (re-set d'une clé d'un autre
+        // provider laisserait pointer vers un modèle incompatible).
+        config.api_key = '';
+        config.primary_provider = '';
+        config.primary_model = '';
+    }
+
+    // Casquette Iris-DBA-write : section UI supprimée 2026-05-15 — config
+    // entièrement hardcodée côté backend (cf. _get_iris_write_config dans
+    // app/services/ai/iris_write_session.py). Aucune clé envoyée par ce
+    // formulaire pour cette feature.
+
+    // LLM local (anonymiseur + fallback runtime). Section avancée.
+    var localEnabled = document.getElementById('cfg-local_llm_enabled');
+    if (localEnabled) {
+        config.local_llm_enabled = localEnabled.checked;
+        var localUrl = document.getElementById('cfg-local_llm_base_url');
+        var localModel = document.getElementById('cfg-local_llm_model');
+        if (localUrl) config.local_llm_base_url = (localUrl.value || '').trim();
+        if (localModel) config.local_llm_model = (localModel.value || '').trim();
+        // Paramètres de génération propres au LLM local
+        var localTemp = document.getElementById('cfg-local_llm_temperature');
+        var localRetries = document.getElementById('cfg-local_llm_max_retries');
+        var localTimeout = document.getElementById('cfg-local_llm_timeout_seconds');
+        if (localTemp) config.local_llm_temperature = parseFloat(localTemp.value);
+        if (localRetries) config.local_llm_max_retries = parseInt(localRetries.value);
+        if (localTimeout) config.local_llm_timeout_seconds = parseInt(localTimeout.value);
+        // Périmètre du fallback runtime — croisé avec la doctrine du caller
+        // côté backend dans llm_runtime._resolve_effective_fallback_policy.
+    }
+
+    return config;
+}
+
+async function saveConfig() {
+    try {
+        var configData = collectConfig();
+        var hasNewKey = !!configData.api_key;
+        // Connexion effacée volontairement (champ vidé + save). Après le
+        // POST réussi, on recharge la page : c'est plus simple et plus
+        // robuste que d'orchestrer le reset DOM (input vide, badge "—",
+        // data-has-saved-key=0, models list vide, etc.) à la main.
+        var isClearingConnection = (
+            'api_key' in configData
+            && configData.api_key === ''
+        );
+
+        // Guard UI : si l'admin tape une nouvelle clé API mais n'a pas
+        // cliqué "Tester" → le ``<select>`` modèle reste vide (aucun
+        // modèle chargé). Sauvegarder dans cet état provisionne le
+        // provider mais sans ``primary_model``, et le premier appel LLM
+        // crashe sur ``model_name=""``. On force le test d'abord.
+        // Cf. review adversariale 2026-05-14 MEDIUM finding.
+        if (hasNewKey) {
+            var modelSelect = document.getElementById('cfg-primary_model');
+            var hasModels = modelSelect && Array.from(modelSelect.options).some(function(o) {
+                return o.value && !o.disabled;
+            });
+            if (!hasModels) {
+                showAlert(
+                    'Cliquez "Tester" pour charger les modèles avant de '
+                    + 'sauvegarder une nouvelle clé. Sinon Iris ne saura '
+                    + 'pas quel modèle utiliser.',
+                    'error'
+                );
+                return;
+            }
+        }
+
+        var res = await fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Xsrftoken': getCookie('_xsrf') },
+            body: JSON.stringify(configData)
+        });
+        var data = await res.json();
+
+        if (data.success) {
+            // Reset les flags dirty : l'état UI ≡ état BDD post-save.
+            // Sans ça, un 2e save renvoie inutilement les mêmes valeurs.
+            _userTouchedBaseUrl = false;
+            _userTouchedModel = false;
+            if (isClearingConnection) {
+                showAlert('Connexion effacee', 'success');
+                setTimeout(function () { location.reload(); }, 800);
+                return;
+            }
+            showAlert('Configuration sauvegardee', 'success');
+            if (hasNewKey) {
+                showAlert('Initialisation du provider...', 'success');
+                await new Promise(function(r) { setTimeout(r, 2000); });
+                await loadAndDisplayModels();
+                showAlert('Configuration sauvegardee. Modeles charges.', 'success');
+            }
+        } else {
+            showAlert('Erreur: ' + (data.error || 'Echec'), 'error');
+        }
+    } catch (err) {
+        showAlert('Erreur: ' + err.message, 'error');
+    }
+}
+
+async function testApiKey() {
+    var apiKey = document.getElementById('cfg-api_key').value;
+    var btn = document.getElementById('btn-test-key');
+    var baseUrl = getBaseUrl();
+    var provider = detectApiType(apiKey, baseUrl);
+
+    if (apiKey === KEY_SENTINEL) {
+        // Pas de vraie clé saisie — l'admin doit taper une nouvelle valeur
+        // pour la tester (impossible de tester la clé déjà en BDD car le
+        // sentinel ne la représente pas, c'est juste un visuel "rempli").
+        showAlert('Tapez une nouvelle clé API dans le champ pour la tester. La clé déjà enregistrée ne peut pas être re-testée depuis cette page.', 'error');
+        return;
+    }
+    if (!apiKey) { showAlert('Veuillez entrer une clé API', 'error'); return; }
+
+    btn.disabled = true;
+    btn.textContent = 'Validation...';
+
+    try {
+        // 1. Save key + provider (auto-détecté) + base_url. ``api_base_url``
+        // toujours envoyé (vide = effacer) : sinon, tester une clé Anthropic
+        // après avoir testé un Groq/Mistral garderait l'ancienne URL et le
+        // ``AnthropicProvider`` se construirait avec ``base_url=Groq``.
+        var configData = {
+            primary_provider: provider,
+            api_key: apiKey,
+            api_base_url: baseUrl,
+        };
+
+        var res = await fetch('/api/ai/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Xsrftoken': getCookie('_xsrf') },
+            body: JSON.stringify(configData)
+        });
+        var data = await res.json();
+        if (!data.success) { showAlert('Erreur: ' + (data.error || 'Echec'), 'error'); return; }
+
+        // 2. Wait for provider init
+        showAlert('Initialisation du provider...', 'success');
+        await new Promise(function(r) { setTimeout(r, 2000); });
+
+        // 3. Load models dynamically from the provider API
+        showAlert('Chargement des modeles...', 'success');
+        var models = await loadModelsForProvider(provider);
+
+        if (models.length > 0) {
+            updateModelSelect('cfg-primary_model', models);
+            showAlert('Cle valide ! ' + models.length + ' modele(s) disponible(s)', 'success');
+        } else {
+            showAlert('Clé enregistrée mais aucun modèle retourné. Vérifiez la clé ou saisissez le nom du modèle manuellement.', 'error');
+        }
+    } catch (err) {
+        showAlert('Erreur: ' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Tester';
+    }
+}
+
+async function loadAndDisplayModels() {
+    try {
+        var res = await fetch('/api/ai/config');
+        var data = await res.json();
+        if (data.success && data.config && data.config.primary_provider) {
+            var models = await loadModelsForProvider(data.config.primary_provider);
+            updateModelSelect('cfg-primary_model', models);
+        }
+    } catch (err) {
+        console.error('Erreur chargement modeles:', err);
+    }
+}
+
+async function resetConfig() {
+    if (!(await appConfirm(
+        'Cette action remet les paramètres IA aux valeurs par défaut (sauf clé API et modèle principal qui restent intacts) ET efface tout l\'historique de consommation API (tokens, coûts, statistiques par modèle/fonctionnalité/utilisateur). Continuer ?',
+        'Réinitialiser la configuration IA'
+    ))) return;
+    try {
+        var res = await fetch('/api/ai/config/reset', { method: 'POST', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
+        var data = await res.json();
+        if (data.success) { showAlert('Configuration reinitialisee', 'success'); setTimeout(function() { location.reload(); }, 800); }
+        else showAlert('Erreur: ' + data.error, 'error');
+    } catch (err) { showAlert('Erreur: ' + err.message, 'error'); }
+}
+
+async function syncSchema() {
+    // Le sync schéma a UN seul modal partout : ``#globalSyncOverlay``
+    // (cf. ``_partials/global_sync_overlay.html``). On déclenche juste le
+    // POST côté admin — le service ``schema_sync.py`` publie ``started/
+    // progress/done`` sur l'event bus global et l'overlay s'affiche tout
+    // seul chez TOUS les clients connectés (admin + users).
+    var btn = document.getElementById('btn-sync');
+    var prevLabel = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Synchronisation…'; }
+    try {
+        var res = await fetch('/api/ai/schema/sync', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'X-Xsrftoken': getCookie('_xsrf') }
+        });
+        // Taxonomie 4-cas (CLAUDE.md axe 5) : 429 cooldown / 409 lock /
+        // 5xx interne — chaque cas a un message UX dédié, jamais silencieux.
+        if (res.status === 429) {
+            var data429 = await res.json().catch(function () { return {}; });
+            showAlert(data429.error || 'Sync déjà effectué récemment. Réessayez plus tard.', 'error');
+            return;
+        }
+        if (res.status === 409) {
+            var data409 = await res.json().catch(function () { return {}; });
+            showAlert(data409.error || 'Une synchronisation est déjà en cours.', 'error');
+            return;
+        }
+        if (!res.ok) {
+            var dataErr = await res.json().catch(function () { return {}; });
+            showAlert(dataErr.error || 'Échec de la synchronisation (' + res.status + ').', 'error');
+            return;
+        }
+        var data = await res.json();
+        if (data && data.success) {
+            // Refresh les stats affichées en bas du card (last_sync, tables_count, views_count).
+            if (typeof checkHealth === 'function') checkHealth();
+        } else {
+            showAlert((data && data.error) || 'Synchronisation échouée.', 'error');
+        }
+    } catch (err) {
+        showAlert('Erreur réseau : ' + (err && err.message ? err.message : 'inconnue'), 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = prevLabel || 'Synchroniser maintenant'; }
+    }
+}
+
+async function checkHealth() {
+    try {
+        var res = await fetch('/api/ai/health');
+        var data = await res.json();
+        var el = document.getElementById('health-status');
+        if (data.healthy) { el.className = 'badge badge-success'; el.textContent = 'Operationnel'; }
+        else { el.className = 'badge badge-error'; el.textContent = 'Probleme'; }
+        if (data.last_sync) document.getElementById('last-sync').textContent = data.last_sync;
+        if (data.tables_count !== undefined) document.getElementById('table-count').textContent = data.tables_count;
+        if (data.views_count !== undefined) document.getElementById('view-count').textContent = data.views_count;
+    } catch (err) {
+        document.getElementById('health-status').className = 'badge badge-error';
+        document.getElementById('health-status').textContent = 'Hors ligne';
+    }
+}
+
+async function loadModelsForProvider(provider) {
+    try {
+        var res = await fetch('/api/ai/models?provider=' + encodeURIComponent(provider));
+        var data = await res.json();
+        if (data.success) {
+            return data.models || [];
+        }
+        return [];
+    } catch (err) {
+        console.error('Erreur chargement modeles:', err);
+        return [];
+    }
+}
+
+function updateModelSelect(selectId, models) {
+    var select = document.getElementById(selectId);
+    if (!select) return;
+
+    var savedModel = select.getAttribute('data-saved-model') || '';
+    var currentValue = savedModel || select.value;
+
+    select.innerHTML = '';
+
+    if (models.length === 0) {
+        if (currentValue) {
+            var option = document.createElement('option');
+            option.value = currentValue;
+            option.textContent = currentValue;
+            option.selected = true;
+            select.appendChild(option);
+        } else {
+            var option = document.createElement('option');
+            option.value = '';
+            option.textContent = 'Aucun modele disponible';
+            select.appendChild(option);
+        }
+    } else {
+        var found = false;
+        models.forEach(function(model) {
+            var option = document.createElement('option');
+            var modelName = model.name || model;
+            var displayName = model.display_name || modelName;
+            option.value = modelName;
+            option.textContent = displayName;
+            if (modelName === currentValue) {
+                option.selected = true;
+                found = true;
+            }
+            select.appendChild(option);
+        });
+        if (!found && currentValue) {
+            var option = document.createElement('option');
+            option.value = currentValue;
+            option.textContent = currentValue;
+            option.selected = true;
+            select.appendChild(option);
+        }
+    }
+
+    select.removeAttribute('data-saved-model');
+}
+
+// Event listeners
+document.getElementById('btn-reset-config')?.addEventListener('click', resetConfig);
+document.getElementById('btn-save-config')?.addEventListener('click', saveConfig);
+
+// (Sync display sliders Iris-DBA-write supprimé 2026-05-15 — section UI retirée)
+document.getElementById('btn-sync')?.addEventListener('click', syncSchema);
+document.getElementById('btn-test-key')?.addEventListener('click', testApiKey);
+document.getElementById('btn-sync-litellm')?.addEventListener('click', syncFromLitellm);
+
+// ── Sync LiteLLM (fenetres de contexte / tarifs) ───────────────
+async function syncFromLitellm(opts) {
+    opts = opts || {};
+    var btn = document.getElementById('btn-sync-litellm');
+    var statusEl = document.getElementById('litellm-sync-status');
+    if (!btn) return;
+    var prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Synchronisation...';
+    if (statusEl) statusEl.textContent = '';
+    // Indicateur de progression : si la requete depasse 3s on indique
+    // explicitement que ca peut prendre 15s (fetch GitHub + commit BDD).
+    // Sans ca, l'admin pense que la page hang et reload — race condition.
+    var slowTimer = setTimeout(function() {
+        if (statusEl) statusEl.textContent = 'Telechargement registre LiteLLM (peut prendre 15s)...';
+    }, 3000);
+    try {
+        var payload = { force_refresh: !!opts.forceRefresh, allow_regression: !!opts.allowRegression };
+        var res = await fetch('/api/admin/llm/models/sync-litellm', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Xsrftoken': getCookie('_xsrf')
+            },
+            body: JSON.stringify(payload)
+        });
+        var data = await res.json();
+        if (!res.ok || !data.success) {
+            var msg = (data && data.error) ? data.error : ('HTTP ' + res.status);
+            showAlert('Échec de la synchronisation des modèles : ' + msg, 'error');
+            if (statusEl) statusEl.textContent = 'Echec : ' + msg;
+            return;
+        }
+        var stats = data.stats || {};
+        // Erreur metier remontee dans les stats (registry vide).
+        if (stats.error) {
+            showAlert('Sync incomplete : ' + stats.error, 'warning');
+            if (statusEl) statusEl.textContent = 'Sync incomplete : ' + stats.error;
+            return;
+        }
+        var n = stats.updated || 0;
+        var skippedReg = stats.skipped_regression || 0;
+        var msg2 = n + ' modele(s) mis a jour'
+            + ' (scannes: ' + (stats.scanned || 0)
+            + ', registry: ' + (stats.fetched_entries || 0)
+            + ', overrides preserves: ' + (stats.skipped_overridden || 0) + ')';
+        if (skippedReg > 0) {
+            msg2 += ' — ' + skippedReg + ' regression(s) ignoree(s)';
+        }
+        showAlert(msg2, n > 0 ? 'success' : 'info');
+        if (statusEl) statusEl.textContent = msg2;
+        // Si des regressions ont ete bloquees, proposer de les forcer.
+        if (skippedReg > 0 && !opts.allowRegression) {
+            if (window.confirm(skippedReg + ' valeur(s) du registre LiteLLM sont PLUS PETITES que celles en BDD (regression amont possible). Appliquer quand meme ?')) {
+                await syncFromLitellm({ forceRefresh: opts.forceRefresh, allowRegression: true });
+                return;
+            }
+        }
+        if (typeof loadAndDisplayModels === 'function') {
+            try { await loadAndDisplayModels(); } catch (e) { /* defensive */ }
+        }
+    } catch (err) {
+        showAlert('Erreur réseau : ' + err.message, 'error');
+        if (statusEl) statusEl.textContent = 'Erreur réseau';
+    } finally {
+        clearTimeout(slowTimer);
+        btn.disabled = false;
+        btn.textContent = prevText;
+    }
+}
+
+
+// Range inputs
+document.getElementById('cfg-temperature')?.addEventListener('input', () => updateVal('temperature'));
+document.getElementById('cfg-max_retries')?.addEventListener('input', () => updateVal('max_retries'));
+document.getElementById('cfg-timeout_seconds')?.addEventListener('input', () => updateVal('timeout_seconds', 's'));
+// Paramètres LLM local (sliders distincts du primary)
+document.getElementById('cfg-local_llm_temperature')?.addEventListener('input', () => updateVal('local_llm_temperature'));
+document.getElementById('cfg-local_llm_max_retries')?.addEventListener('input', () => updateVal('local_llm_max_retries'));
+document.getElementById('cfg-local_llm_timeout_seconds')?.addEventListener('input', () => updateVal('local_llm_timeout_seconds', 's'));
+document.getElementById('cfg-rag_confidence_threshold')?.addEventListener('input', () => updateVal('rag_confidence_threshold'));
+document.getElementById('cfg-max_rag_examples')?.addEventListener('input', () => updateVal('max_rag_examples'));
+document.getElementById('cfg-rag_ddl_count')?.addEventListener('input', () => updateVal('rag_ddl_count'));
+document.getElementById('cfg-schema_sync_interval_hours')?.addEventListener('input', () => updateVal('schema_sync_interval_hours', 'h'));
+
+// ── Reset documentation IA ───────────────────────────────────
+function confirmResetDoc() {
+    var m = document.getElementById('modal-reset-doc');
+    m.classList.remove('hidden');
+    if (window.OverlayManager) window.OverlayManager.open(m, { layer: 'modal', lockScroll: true });
+}
+
+function closeResetModal() {
+    var m = document.getElementById('modal-reset-doc');
+    if (window.OverlayManager) window.OverlayManager.close(m);
+    m.classList.add('hidden');
+}
+
+document.getElementById('btn-reset-doc')?.addEventListener('click', confirmResetDoc);
+document.getElementById('btn-cancel-reset')?.addEventListener('click', closeResetModal);
+document.getElementById('btn-confirm-reset')?.addEventListener('click', executeResetDoc);
+
+async function executeResetDoc() {
+    var btn = document.getElementById('btn-confirm-reset');
+    var mainBtn = document.getElementById('btn-reset-doc');
+    var resultEl = document.getElementById('reset-doc-result');
+
+    // Fermer la modale immédiatement
+    closeResetModal();
+
+    // Montrer le loading sur le bouton principal
+    mainBtn.disabled = true;
+    mainBtn.innerHTML = '<span class="inline-block animate-spin mr-2">&#9696;</span>Reinitialisation en cours...';
+
+    // Afficher un indicateur dans la zone résultat
+    resultEl.classList.remove('hidden');
+    resultEl.className = 'bg-blue-50 border border-blue-200 rounded p-3 text-sm text-blue-800 dark:bg-blue-900/20 dark:border-blue-800/60 dark:text-blue-200';
+    resultEl.innerHTML = '<strong>Suppression en cours...</strong> Veuillez patienter.';
+
+    try {
+        var res = await fetch('/api/ai/doc/reset', {method: 'POST', headers: {'X-Xsrftoken': getCookie('_xsrf')}});
+        var data = await res.json();
+
+        if (data.success) {
+            resultEl.className = 'bg-green-50 border border-green-200 rounded p-3 text-sm text-green-800 dark:bg-green-900/20 dark:border-green-800/60 dark:text-green-200';
+            var msg = '<strong>Réinitialisation terminée avec succès.</strong><br>';
+            msg += data.deleted_count + ' entrée' + (data.deleted_count > 1 ? 's' : '') + ' supprimée' + (data.deleted_count > 1 ? 's' : '') + '.';
+            resultEl.innerHTML = msg;
+            checkHealth();
+        } else {
+            resultEl.className = 'bg-red-50 border border-red-200 rounded p-3 text-sm text-red-800 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-200';
+            resultEl.innerHTML = '<strong>Échec de la réinitialisation.</strong><br>' + escapeHtml(data.error || 'Erreur inconnue');
+        }
+    } catch (err) {
+        resultEl.className = 'bg-red-50 border border-red-200 rounded p-3 text-sm text-red-800 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-200';
+        resultEl.innerHTML = '<strong>Erreur réseau.</strong><br>' + escapeHtml(err.message);
+    } finally {
+        mainBtn.disabled = false;
+        mainBtn.textContent = 'Reinitialiser toute la documentation';
+        btn.disabled = false;
+        btn.textContent = 'Confirmer la reinitialisation';
+    }
+}
+
+// ── Usage stats ──────────────────────────────────────────────
+function formatNumber(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+}
+
+// AI-7 extension (2026-05-26 adversarial #89) : symbole devise lu depuis
+// <meta name="komptia-pricing-symbol"> (SSoT). Évite le hardcode '$' qui
+// apparaissait à 4 endroits dans ce template avant correction. Fallback '$'
+// si le meta n'est pas chargé (defense-in-depth — base.html l'injecte).
+var _PRICING_SYMBOL = (function () {
+    try {
+        var meta = document.querySelector('meta[name="komptia-pricing-symbol"]');
+        if (meta && meta.content) return String(meta.content);
+    } catch (e) { /* defensive */ }
+    return '$';
+})();
+
+async function loadUsageStats(days) {
+    var skeletonContainers = ['usage-models', 'usage-callers', 'usage-daily', 'usage-users'];
+    try {
+        var res = await fetch('/api/ai/usage?days=' + days);
+        var data = await res.json();
+        if (!data.success) {
+            // Erreur métier serveur (success=false) : afficher un message
+            // d'erreur dans chaque section au lieu de laisser les skeletons
+            // tourner indéfiniment. Cf. CLAUDE.md axe 5 (taxonomie 4-cas
+            // erreurs : (a) métier prévue → message FR clair).
+            var errMsg = data.error || 'Impossible de charger les statistiques de consommation API.';
+            skeletonContainers.forEach(function(id) {
+                var el = document.getElementById(id);
+                if (el) el.innerHTML = '<p class="text-sm text-red-600 dark:text-red-400">' + escapeHtml(errMsg) + '</p>';
+            });
+            return;
+        }
+
+        // Summary
+        document.getElementById('usage-requests').textContent = formatNumber(data.total_requests);
+        document.getElementById('usage-tokens').textContent = formatNumber(data.total_tokens);
+        document.getElementById('usage-cost').textContent = data.estimated_total_cost_usd > 0
+            ? _PRICING_SYMBOL + data.estimated_total_cost_usd.toFixed(2)
+            : _PRICING_SYMBOL + '0.00';
+        var avg = data.total_requests > 0 ? Math.round(data.total_tokens / data.total_requests) : 0;
+        document.getElementById('usage-avg').textContent = formatNumber(avg);
+
+        // Per-model breakdown
+        var modelsEl = document.getElementById('usage-models');
+        if (data.by_model.length === 0) {
+            modelsEl.innerHTML = '<p class="text-sm text-gray-400 dark:text-gray-500">Aucune donnee</p>';
+        } else {
+            var maxTokens = Math.max.apply(null, data.by_model.map(function(m) { return m.total_tokens; })) || 1;
+            modelsEl.innerHTML = data.by_model.map(function(m) {
+                var pct = Math.round(m.total_tokens / maxTokens * 100);
+                var modelName = escapeHtml(m.model);
+                var modelAttr = escapeAttr(m.model);
+                // P3 #18 — latence avg / P95 / max (None si <2 samples)
+                var latP95 = (m.latency_p95_s != null) ? m.latency_p95_s.toFixed(1) + 's' : '—';
+                var latAvg = (m.latency_avg_s != null) ? m.latency_avg_s.toFixed(1) + 's' : '—';
+                var latMax = (m.latency_max_s != null) ? m.latency_max_s.toFixed(1) + 's' : '—';
+                // P3 #20 — breakdown tokens (cache_read / cache_creation / thinking)
+                var cacheR = m.cache_read_tokens || 0;
+                var cacheC = m.cache_creation_tokens || 0;
+                var think = m.thinking_tokens || 0;
+                var hasExtras = (cacheR + cacheC + think) > 0;
+                var extrasParts = [];
+                if (cacheR > 0) extrasParts.push(formatNumber(cacheR) + ' cache_read');
+                if (cacheC > 0) extrasParts.push(formatNumber(cacheC) + ' cache_creation');
+                if (think > 0) extrasParts.push(formatNumber(think) + ' thinking');
+                var extrasLine = hasExtras
+                    ? '<div class="ml-32 text-xs text-gray-400 dark:text-gray-500 mt-0.5">' + escapeHtml(extrasParts.join(' · ')) + '</div>'
+                    : '';
+                return '<div>' +
+                    '<div class="flex items-center gap-3">' +
+                        '<div class="w-32 text-xs text-gray-700 truncate dark:text-gray-300" title="' + modelAttr + '">' + modelName + '</div>' +
+                        '<div class="flex-1 bg-gray-100 rounded-full h-2 dark:bg-gray-800">' +
+                            '<div class="bg-gray-700 rounded-full h-2" style="width:' + pct + '%"></div>' +
+                        '</div>' +
+                        '<div class="w-20 text-xs text-right text-gray-500 dark:text-gray-400" title="Latence avg ' + escapeAttr(latAvg) + ' · P95 ' + escapeAttr(latP95) + ' · max ' + escapeAttr(latMax) + '">' + escapeHtml(latP95) + ' P95</div>' +
+                        '<div class="w-20 text-xs text-right text-gray-500 dark:text-gray-400">' + formatNumber(m.total_tokens) + ' tok</div>' +
+                        '<div class="w-16 text-xs text-right font-medium">' +
+                            (m.estimated_cost_usd > 0 ? _PRICING_SYMBOL + m.estimated_cost_usd.toFixed(2) : '-') +
+                        '</div>' +
+                    '</div>' +
+                    extrasLine +
+                '</div>';
+            }).join('');
+        }
+
+        // Per-caller (feature) breakdown — répartition par origine sémantique.
+        // Permet à l'admin de voir quelle feature consomme : Iris ?
+        // Sync schéma ? Copilote ? Automations ? etc.
+        var callersEl = document.getElementById('usage-callers');
+        var byCaller = data.by_caller || [];
+        if (byCaller.length === 0) {
+            callersEl.innerHTML = '<p class="text-sm text-gray-400 dark:text-gray-500">Aucune donnee</p>';
+        } else {
+            var maxCallerTokens = Math.max.apply(null, byCaller.map(function(c) { return c.total_tokens; })) || 1;
+            callersEl.innerHTML = byCaller.map(function(c) {
+                var pct = Math.round(c.total_tokens / maxCallerTokens * 100);
+                var name = escapeHtml(c.caller);
+                var nameAttr = escapeAttr(c.caller);
+                // P3 #19 — badge VRAIES erreurs LLM (LLM_ERROR + TIMEOUT)
+                // uniquement. Les erreurs métier (VALIDATION + EXECUTION)
+                // sont dans le tooltip mais pas dans le badge — sinon
+                // l'admin change de modèle alors que c'est Sage qui rejette.
+                // Seuil min : 5 requêtes (sinon 1 timeout aléatoire = 100%
+                // rouge à tort). Vert si 0%, orange ≥1%, rouge ≥5%.
+                var llmErrPct = c.llm_error_rate_pct;  // null si <5 requêtes
+                var llmErr = c.llm_errors || 0;
+                var bizErr = c.business_errors || 0;
+                var reqs = parseInt(c.requests) || 0;
+                var errBadge = '';
+                if (llmErrPct != null) {
+                    var errClass = llmErrPct >= 5
+                        ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+                        : (llmErrPct >= 1
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'
+                            : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300');
+                    var tipParts = [llmErr + ' erreur(s) IA (timeout/provider) sur ' + reqs + ' requête(s)'];
+                    if (bizErr > 0) tipParts.push(bizErr + ' erreur(s) métier (validation/exécution SQL) en plus');
+                    errBadge = '<span role="status" aria-label="Taux erreur LLM ' + llmErrPct.toFixed(1) + ' pourcent" class="px-1.5 py-0.5 rounded text-xs font-medium ' + errClass + '" title="' + escapeAttr(tipParts.join(' — ')) + '">' + llmErrPct.toFixed(1) + '% err</span>';
+                } else if (llmErr > 0 || bizErr > 0) {
+                    // Échantillon trop petit pour un % crédible : afficher
+                    // juste le count brut sans verdict couleur.
+                    var insufTip = llmErr + ' erreur(s) IA / ' + bizErr + ' erreur(s) métier sur ' + reqs + ' requête(s) — échantillon insuffisant pour un taux fiable';
+                    errBadge = '<span class="text-xs text-gray-500 dark:text-gray-400" title="' + escapeAttr(insufTip) + '">' + (llmErr + bizErr) + ' err</span>';
+                }
+                return '<div class="flex items-center gap-3">' +
+                    '<div class="w-40 text-xs text-gray-700 truncate dark:text-gray-300" title="' + nameAttr + '">' + name + '</div>' +
+                    '<div class="flex-1 bg-gray-100 rounded-full h-2 dark:bg-gray-800">' +
+                        '<div class="bg-blue-600 rounded-full h-2" style="width:' + pct + '%"></div>' +
+                    '</div>' +
+                    '<div class="w-16 text-xs text-right">' + errBadge + '</div>' +
+                    '<div class="w-12 text-xs text-right text-gray-500 dark:text-gray-400">' + parseInt(c.requests) + 'x</div>' +
+                    '<div class="w-20 text-xs text-right text-gray-500 dark:text-gray-400">' + formatNumber(c.total_tokens) + ' tok</div>' +
+                    '<div class="w-16 text-xs text-right font-medium">' +
+                        (c.estimated_cost_usd > 0 ? _PRICING_SYMBOL + c.estimated_cost_usd.toFixed(4) : '-') +
+                    '</div>' +
+                '</div>';
+            }).join('');
+        }
+
+        // Daily chart — P3 #21 (review 2026-05-15) : remplacé les barres
+        // CSS bricolées par un chart Plotly interactif (zoom, hover précis
+        // tokens+req+coût, theme dark/light adaptatif via _drawDailyPlotly).
+        // Le fallback texte pour 0/1 jour reste — un chart 1-barre serait
+        // trompeur (rien à comparer).
+        var dailyEl = document.getElementById('usage-daily');
+        if (data.daily.length === 0) {
+            dailyEl.innerHTML = '<p class="text-sm text-gray-400 dark:text-gray-500">Aucune consommation sur la periode.</p>';
+            _lastDailyData = null;  // reset pour le themechange listener
+        } else if (data.daily.length === 1) {
+            var d0 = data.daily[0];
+            dailyEl.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400">'
+                + 'Activite sur 1 seul jour (' + escapeHtml(d0.date) + ') — '
+                + formatNumber(d0.tokens) + ' tokens, '
+                + parseInt(d0.requests) + ' req. '
+                + 'Le graphique apparait a partir de 2 jours d\'activite.'
+                + '</p>';
+            _lastDailyData = null;
+        } else {
+            // Cache pour re-trace au themechange (cf. listener plus haut).
+            _lastDailyData = data.daily;
+            // Plotly a besoin d'un container avec une hauteur définie.
+            // On le wrap dans un <div> avec la classe ``plotly`` pour que
+            // le listener komptia:themechange puisse détecter sa présence.
+            // hauteur 200px alignée avec _dailyChartLayout.
+            dailyEl.innerHTML = '<div id="usage-daily-plot" class="plotly" style="width:100%;height:200px;"></div>';
+            _drawDailyPlotly('usage-daily-plot', data.daily);
+        }
+
+        // Per-user breakdown — rendu via window.ApiUsage (api_usage.js).
+        // Single source of truth pour _buildUserRow / _buildTableHead avec
+        // le partial dashboard. Si le module n'est pas chargé (cas
+        // dégradé), on log mais on ne casse pas la page.
+        var usersEl = document.getElementById('usage-users');
+        if (usersEl && window.ApiUsage && window.ApiUsage.renderUsersTable) {
+            window.ApiUsage.renderUsersTable(usersEl, data);
+        } else if (usersEl) {
+            usersEl.innerHTML = '<p class="text-sm text-gray-400 dark:text-gray-500">Module api_usage.js non chargé</p>';
+        }
+
+        // ── P2 #16 — Banner budget mensuel ────────────────────────────
+        // Affiché uniquement si l'admin a configuré KOMPTIA_LLM_BUDGET_USD_MONTH
+        // côté serveur (env var). Sinon le banner reste hidden pour ne pas
+        // distraire (pas d'incitation forcée à configurer un budget).
+        var budgetBanner = document.getElementById('usage-budget-banner');
+        var budgetMsg = document.getElementById('usage-budget-msg');
+        var budget = data.monthly_budget;
+        // Defense-in-depth : exiger explicitement budget_usd non-null avant
+        // de l'afficher (évite NPE si demain le backend renvoie un statut
+        // non-unset avec budget_usd null par erreur de refacto).
+        if (budgetBanner && budgetMsg && budget && budget.status
+            && budget.status !== 'unset' && budget.budget_usd != null) {
+            budgetBanner.classList.remove('hidden');
+            // 3 niveaux : ok (vert/discret) / warning (orange) / exceeded (rouge)
+            var bgMap = {
+                ok: 'bg-emerald-50 border-emerald-200 text-emerald-800 dark:bg-emerald-900/20 dark:border-emerald-800/60 dark:text-emerald-200',
+                warning: 'bg-amber-50 border-amber-300 text-amber-800 dark:bg-amber-900/20 dark:border-amber-700/60 dark:text-amber-200',
+                exceeded: 'bg-red-50 border-red-300 text-red-800 dark:bg-red-900/20 dark:border-red-700/60 dark:text-red-200'
+            };
+            budgetBanner.className = 'mb-4 px-3 py-2 rounded text-sm border ' + (bgMap[budget.status] || bgMap.ok);
+            var pctTxt = (budget.percent != null) ? budget.percent.toFixed(1) + '%' : '?';
+            var prefix = budget.status === 'exceeded'
+                ? 'Budget mensuel dépassé — '
+                : (budget.status === 'warning' ? 'Budget mensuel proche de la limite — ' : 'Budget mensuel — ');
+            // Note TZ : le mois est calculé en UTC (aligné facturation cloud
+            // providers). Indiquer "(mois UTC)" évite que l'admin pense à un
+            // bug si le compteur "remet à zéro" 1-2h après minuit local.
+            budgetMsg.textContent = prefix + _PRICING_SYMBOL + (budget.spent_usd || 0).toFixed(2)
+                + ' dépensé sur ' + _PRICING_SYMBOL + budget.budget_usd.toFixed(2)
+                + ' (' + pctTxt + ' du mois UTC en cours).';
+        } else if (budgetBanner) {
+            budgetBanner.classList.add('hidden');
+        }
+
+        // ── P2 #17 — Compteur fallback déclenché ──────────────────────
+        // Affiché dans la section LLM local (réplique le contexte sémantique).
+        var fbSummary = document.getElementById('local-llm-fallback-summary');
+        var fbText = document.getElementById('local-llm-fallback-text');
+        var fb = data.fallback;
+        if (fbSummary && fbText && fb && typeof fb.count_period === 'number') {
+            fbSummary.classList.remove('hidden');
+            if (fb.count_period === 0) {
+                fbText.textContent = 'Aucun fallback déclenché sur les ' + (fb.period_days || 30) + ' derniers jours — le LLM cloud principal est resté disponible.';
+            } else {
+                var lastInfo = '';
+                if (fb.last_at_iso) {
+                    try {
+                        var dt = new Date(fb.last_at_iso);
+                        lastInfo = ' (dernier : ' + dt.toLocaleString() + ')';
+                    } catch (_) { lastInfo = ''; }
+                }
+                fbText.textContent = 'Fallback local déclenché ' + fb.count_period
+                    + ' fois sur les ' + (fb.period_days || 30) + ' derniers jours' + lastInfo + '.';
+            }
+        }
+
+    } catch (err) {
+        // Erreur réseau / parse JSON / 5xx serveur (fetch lève rarement
+        // sur 4xx/5xx, mais le .json() peut throw sur HTML d'erreur).
+        // Affiche un message clair au lieu de skeletons éternels.
+        console.error('Erreur chargement usage:', err);
+        skeletonContainers.forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) el.innerHTML = '<p class="text-sm text-red-600 dark:text-red-400">Erreur réseau lors du chargement. Vérifiez votre connexion ou rechargez la page.</p>';
+        });
+    } finally {
+        // P3 #24 — Sortie GARANTIE du mode "chargement" même en cas
+        // d'erreur. Sans ``finally``, un échec laisse aria-busy=true
+        // éternel + skeletons indéfinis (review adversariale 2026-05-15).
+        skeletonContainers.forEach(function(id) {
+            var el = document.getElementById(id);
+            if (el) el.setAttribute('aria-busy', 'false');
+        });
+    }
+}
+
+document.getElementById('usage-period')?.addEventListener('change', function() {
+    loadUsageStats(parseInt(this.value));
+});
+
+// ── LLM local : install / start / détection / pull modèle ───────
+async function detectLocalLlmInstall() {
+    // Détecte si le binaire Ollama est installé sur le serveur Komptia
+    // ET si le daemon tourne. Affiche les actions appropriées.
+    var startBtn = document.getElementById('btn-local-llm-start');
+    var restartBtn = document.getElementById('btn-local-llm-restart');
+    var upgradeBtn = document.getElementById('btn-local-llm-upgrade');
+    var installInfo = document.getElementById('local-llm-install-info');
+    if (!installInfo) return;
+    function hideAll() {
+        if (startBtn) startBtn.style.display = 'none';
+        if (restartBtn) restartBtn.style.display = 'none';
+        if (upgradeBtn) upgradeBtn.style.display = 'none';
+    }
+    try {
+        var res = await fetch('/api/admin/llm-local/install-status', {
+            headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
+        });
+        if (!res.ok) {
+            installInfo.innerHTML = '<span class="text-red-600">Erreur ' + res.status + '</span>';
+            hideAll();
+            return;
+        }
+        var data = await res.json();
+        if (!data.installed) {
+            installInfo.innerHTML =
+                '<span class="text-amber-600">⚠ Ollama non installé sur ce serveur.</span> ' +
+                '<a href="https://ollama.com" target="_blank" class="underline">Télécharger Ollama</a> ' +
+                'puis recharger cette page.';
+            hideAll();
+        } else if (data.running) {
+            installInfo.innerHTML =
+                '<span class="text-green-600">✓ Ollama installé et démarré</span>' +
+                (data.version ? ' (' + data.version + ')' : '');
+            if (startBtn) startBtn.style.display = 'none';
+            // Toujours visibles quand Ollama tourne — restart résout les
+            // zombies, upgrade met à jour la version.
+            if (restartBtn) restartBtn.style.display = '';
+            if (upgradeBtn) upgradeBtn.style.display = '';
+        } else {
+            installInfo.innerHTML =
+                '<span class="text-amber-600">⚠ Ollama installé mais pas démarré.</span>' +
+                (data.version ? ' <span class="text-gray-400">' + data.version + '</span>' : '');
+            if (startBtn) startBtn.style.display = '';
+            if (restartBtn) restartBtn.style.display = 'none';
+            if (upgradeBtn) upgradeBtn.style.display = '';
+        }
+    } catch (e) {
+        installInfo.innerHTML = '<span class="text-red-600">Erreur réseau</span>';
+        hideAll();
+    }
+}
+
+async function restartLocalLlm() {
+    var btn = document.getElementById('btn-local-llm-restart');
+    if (!btn) return;
+    if (!confirm('Tuer et relancer Ollama ? Les chargements en cours seront perdus.')) {
+        return;
+    }
+    var prev = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Redémarrage…';
+    try {
+        var res = await fetch('/api/admin/llm-local/restart', {
+            method: 'POST',
+            headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
+        });
+        var data = await res.json().catch(function() { return {}; });
+        if (!res.ok) {
+            alert('Échec : ' + (data.error || 'HTTP ' + res.status));
+            return;
+        }
+        await detectLocalLlmInstall();
+        await detectLocalLlmStatus();
+    } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+    }
+}
+
+async function upgradeLocalLlm() {
+    var btn = document.getElementById('btn-local-llm-upgrade');
+    if (!btn) return;
+    if (!confirm('Mettre à jour Ollama ? Cela peut prendre 1-3 minutes.')) {
+        return;
+    }
+    var prev = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Mise à jour…';
+    try {
+        var res = await fetch('/api/admin/llm-local/upgrade', {
+            method: 'POST',
+            headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
+        });
+        var data = await res.json().catch(function() { return {}; });
+        if (!res.ok) {
+            alert('Échec : ' + (data.error || 'HTTP ' + res.status) +
+                  '\n\nMise à jour manuelle : ' +
+                  '\n  brew upgrade ollama   (macOS)' +
+                  '\n  ou télécharger sur https://ollama.com');
+            return;
+        }
+        alert('✓ Ollama mis à jour (' + data.method + '). Redémarrer le daemon pour appliquer.');
+        await detectLocalLlmInstall();
+    } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+    }
+}
+
+async function startLocalLlm() {
+    var btn = document.getElementById('btn-local-llm-start');
+    if (!btn) return;
+    var prevText = btn.textContent;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Démarrage…';
+    try {
+        var res = await fetch('/api/admin/llm-local/start', {
+            method: 'POST',
+            headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
+        });
+        var data = await res.json().catch(function() { return {}; });
+        if (!res.ok) {
+            alert('Échec démarrage : ' + (data.error || 'HTTP ' + res.status));
+            return;
+        }
+        // Re-détection pour cacher le bouton + rafraîchir le badge
+        await detectLocalLlmInstall();
+        await detectLocalLlmStatus();
+    } catch (e) {
+        alert('Erreur réseau : ' + (e && e.message ? e.message : 'inconnue'));
+    } finally {
+        btn.disabled = false;
+        btn.textContent = prevText;
+    }
+}
+
+async function detectLocalLlmStatus() {
+    var badge = document.getElementById('local-llm-status-badge');
+    var modelSelect = document.getElementById('cfg-local_llm_model_select');
+    var modelInput = document.getElementById('cfg-local_llm_model');
+    if (!badge) return;
+    badge.textContent = 'Sondage…';
+    badge.className = 'badge badge-neutral';
+    try {
+        var res = await fetch('/api/admin/llm-local/status', {
+            headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
+        });
+        if (!res.ok) {
+            badge.textContent = 'Erreur ' + res.status;
+            badge.className = 'badge badge-error';
+            return;
+        }
+        var data = await res.json();
+        if (data.reachable) {
+            badge.textContent = '✓ Connecté' + (data.ollama_native ? ' (Ollama)' : '');
+            badge.className = 'badge badge-success';
+        } else {
+            badge.textContent = data.error ? '✗ Injoignable' : '✗ Non démarré';
+            badge.className = 'badge badge-warning';
+        }
+        // Peuple le dropdown des modèles installés. Toujours visible —
+        // s'il est vide, l'admin doit télécharger via le bloc plus bas.
+        var currentValue = modelInput.value;
+        modelSelect.innerHTML = '';
+        if (Array.isArray(data.models) && data.models.length > 0) {
+            // Placeholder explicite si l'utilisateur n'a rien sélectionné
+            var placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = '— choisir un modèle —';
+            modelSelect.appendChild(placeholder);
+            data.models.forEach(function(m) {
+                var opt = document.createElement('option');
+                opt.value = m.name;
+                var sizeStr = m.size_bytes
+                    ? ' (' + (m.size_bytes / 1e9).toFixed(1) + ' Go)'
+                    : '';
+                opt.textContent = m.name + sizeStr;
+                if (m.name === currentValue) opt.selected = true;
+                modelSelect.appendChild(opt);
+            });
+            modelSelect.disabled = false;
+        } else {
+            // Aucun modèle disponible — message explicite + dropdown désactivé
+            var noneOpt = document.createElement('option');
+            noneOpt.value = '';
+            noneOpt.textContent = data.reachable
+                ? '(aucun modèle installé — télécharger ci-dessous)'
+                : '(Ollama non joignable — démarrer ci-dessus)';
+            modelSelect.appendChild(noneOpt);
+            modelSelect.disabled = true;
+        }
+        // Sync hidden input à chaque change. addEventListener idempotent
+        // tant qu'on n'attache qu'une seule fois — on attache via flag.
+        if (!modelSelect._syncWired) {
+            modelSelect.addEventListener('change', function() {
+                modelInput.value = modelSelect.value;
+                _updateDeleteIconVisibility();
+                // Si la poubelle était armée pour un autre modèle, désarmer
+                // pour éviter qu'un 2e clic supprime la nouvelle sélection.
+                if (_deleteLocalLlmState.armed && _deleteLocalLlmState.armedModel !== modelSelect.value) {
+                    _disarmDeleteButton();
+                }
+            });
+            modelSelect._syncWired = true;
+        }
+        _updateDeleteIconVisibility();
+    } catch (e) {
+        badge.textContent = '✗ Erreur réseau';
+        badge.className = 'badge badge-error';
+    }
+}
+
+async function pullLocalLlmModel() {
+    var input = document.getElementById('cfg-local_llm_pull_name');
+    var status = document.getElementById('local-llm-pull-status');
+    var btn = document.getElementById('btn-local-llm-pull');
+    var name = (input.value || '').trim();
+    if (!name) {
+        status.textContent = 'Saisir un nom de modèle (ex: phi3:mini)';
+        status.style.color = 'var(--status-error,#dc2626)';
+        return;
+    }
+    if (!confirm('Télécharger « ' + name + ' » ? Cela peut prendre plusieurs minutes selon la taille du modèle et votre connexion.')) {
+        return;
+    }
+    btn.disabled = true;
+    var prevBtnText = btn.textContent;
+    btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Téléchargement…';
+    status.textContent = 'Téléchargement en cours… Cette opération peut durer 5-30 min selon le modèle. Ne pas fermer la page.';
+    status.style.color = 'var(--text-muted, #6b7280)';
+    try {
+        var res = await fetch('/api/admin/llm-local/pull', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : ''
+            },
+            body: JSON.stringify({ model: name })
+        });
+        if (!res.ok) {
+            var err = await res.json().catch(function() { return {}; });
+            status.textContent = 'Échec : ' + (err.error || ('HTTP ' + res.status));
+            status.style.color = 'var(--status-error,#dc2626)';
+            return;
+        }
+        var data = await res.json();
+        var sizeStr = data.size_bytes
+            ? ' (' + (data.size_bytes / 1e9).toFixed(1) + ' Go)'
+            : '';
+        status.textContent = '✓ Téléchargé : ' + data.model + sizeStr + '. Sélectionné automatiquement.';
+        status.style.color = 'var(--status-success, #059669)';
+        input.value = '';
+        // Pré-sélectionner le modèle qui vient d'être pull dans le hidden
+        // AVANT le refresh dropdown (la fonction lit modelInput.value).
+        var modelInput = document.getElementById('cfg-local_llm_model');
+        if (modelInput) modelInput.value = data.model;
+        await detectLocalLlmStatus();
+    } catch (e) {
+        status.textContent = 'Erreur réseau : ' + (e && e.message ? e.message : 'inconnue');
+        status.style.color = 'var(--status-error,#dc2626)';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = prevBtnText;
+    }
+}
+
+// Affiche/cache l'icône poubelle selon que le dropdown a un vrai modèle
+// sélectionné (pas le placeholder vide). Appelé après chaque
+// detectLocalLlmStatus + sur changement de sélection.
+function _updateDeleteIconVisibility() {
+    var sel = document.getElementById('cfg-local_llm_model_select');
+    var btn = document.getElementById('btn-local-llm-delete');
+    if (!sel || !btn) return;
+    btn.style.display = (sel.value && sel.value !== '') ? '' : 'none';
+}
+
+// Suppression d'un modèle local — double-click pattern (cohérent avec
+// les autres actions destructrices Komptia). 1er clic = confirmation
+// visuelle inline (icône devient rouge + tooltip "Cliquer à nouveau pour
+// confirmer"), reset auto après 4s. 2e clic = POST /api/admin/llm-local/delete.
+//
+// Le nom du modèle est CAPTURÉ au 1er clic (pas relu au 2e) — sinon un
+// changement de dropdown entre les 2 clics supprimerait le mauvais modèle.
+var _deleteLocalLlmState = { armed: false, timer: null, armedModel: null };
+
+function _disarmDeleteButton() {
+    var btn = document.getElementById('btn-local-llm-delete');
+    var status = document.getElementById('local-llm-pull-status');
+    if (_deleteLocalLlmState.timer) {
+        clearTimeout(_deleteLocalLlmState.timer);
+        _deleteLocalLlmState.timer = null;
+    }
+    _deleteLocalLlmState.armed = false;
+    _deleteLocalLlmState.armedModel = null;
+    if (btn) {
+        btn.classList.remove('text-red-600', 'bg-red-50', 'dark:bg-red-900/20');
+        btn.classList.add('text-gray-400', 'hover:text-red-600');
+        btn.title = 'Supprimer ce modèle du disque';
+        btn.innerHTML = '<i class="bi bi-trash3"></i>';
+    }
+    if (status && (status.textContent.indexOf('Confirmer') === 0 || status.textContent.indexOf('Sélection changée') === 0)) {
+        status.textContent = '';
+    }
+}
+
+async function deleteLocalLlmModel() {
+    var btn = document.getElementById('btn-local-llm-delete');
+    var sel = document.getElementById('cfg-local_llm_model_select');
+    var status = document.getElementById('local-llm-pull-status');
+    if (!btn || !sel) return;
+    var currentSel = (sel.value || '').trim();
+
+    // 1er clic : armement (capture le modèle visé), attente d'un 2e clic dans 4s.
+    if (!_deleteLocalLlmState.armed) {
+        if (!currentSel) return;
+        _deleteLocalLlmState.armed = true;
+        _deleteLocalLlmState.armedModel = currentSel;
+        btn.classList.remove('text-gray-400', 'hover:text-red-600');
+        btn.classList.add('text-red-600', 'bg-red-50', 'dark:bg-red-900/20');
+        btn.title = 'Cliquer à nouveau pour confirmer la suppression de « ' + currentSel + ' »';
+        btn.innerHTML = '<i class="bi bi-exclamation-triangle-fill"></i>';
+        if (status) {
+            status.textContent = 'Confirmer la suppression de « ' + currentSel + ' » en re-cliquant l\'icône (4s).';
+            status.style.color = 'var(--status-warning, #d97706)';
+        }
+        _deleteLocalLlmState.timer = setTimeout(_disarmDeleteButton, 4000);
+        return;
+    }
+
+    // 2e clic : sécurité — si l'admin a changé la sélection entre-temps, on
+    // disarme et on ne supprime rien. L'admin doit re-cliquer pour le nouveau.
+    var modelName = _deleteLocalLlmState.armedModel;
+    if (currentSel !== modelName) {
+        if (status) {
+            status.textContent = 'Sélection changée entre-temps — suppression annulée.';
+            status.style.color = 'var(--status-warning, #d97706)';
+        }
+        _disarmDeleteButton();
+        return;
+    }
+    if (_deleteLocalLlmState.timer) {
+        clearTimeout(_deleteLocalLlmState.timer);
+        _deleteLocalLlmState.timer = null;
+    }
+    _deleteLocalLlmState.armed = false;
+    _deleteLocalLlmState.armedModel = null;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="bi bi-hourglass-split"></i>';
+    if (status) {
+        status.textContent = 'Suppression de « ' + modelName + ' »…';
+        status.style.color = 'var(--text-muted, #6b7280)';
+    }
+    try {
+        var res = await fetch('/api/admin/llm-local/delete', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : ''
+            },
+            body: JSON.stringify({ model: modelName })
+        });
+        if (!res.ok) {
+            var err = await res.json().catch(function() { return {}; });
+            if (status) {
+                status.textContent = 'Échec suppression : ' + (err.error || ('HTTP ' + res.status));
+                status.style.color = 'var(--status-error, #dc2626)';
+            }
+            return;
+        }
+        var data = await res.json();
+        var hints = [];
+        if (data.cleanup && data.cleanup.model_removed_from_registry) hints.push('registre nettoyé');
+        if (data.cleanup && data.cleanup.config_reset) hints.push('config reset');
+        var hintsStr = hints.length ? ' (' + hints.join(', ') + ')' : '';
+        if (status) {
+            status.textContent = '✓ « ' + data.model + ' » supprimé' + hintsStr + '.';
+            status.style.color = 'var(--status-success, #059669)';
+        }
+        // Refresh la dropdown (le modèle supprimé disparaît).
+        await detectLocalLlmStatus();
+    } catch (e) {
+        if (status) {
+            status.textContent = 'Erreur réseau : ' + (e && e.message ? e.message : 'inconnue');
+            status.style.color = 'var(--status-error, #dc2626)';
+        }
+    } finally {
+        btn.disabled = false;
+        btn.classList.remove('text-red-600', 'bg-red-50', 'dark:bg-red-900/20');
+        btn.classList.add('text-gray-400', 'hover:text-red-600');
+        btn.title = 'Supprimer ce modèle du disque';
+        btn.innerHTML = '<i class="bi bi-trash3"></i>';
+        _updateDeleteIconVisibility();
+    }
+}
+
+// Sync l'affichage du bloc "LLM local" dans Paramètres de génération
+// avec le <details> de Connexion (un seul toggle pour les 2 zones).
+function syncLocalLlmGenParamsVisibility() {
+    var details = document.getElementById('local-llm-section');
+    var genParams = document.getElementById('local-llm-gen-params');
+    if (!details || !genParams) return;
+    genParams.style.display = details.open ? '' : 'none';
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    checkHealth();
+    loadUsageStats(30);
+    // Détection install Ollama + status au chargement
+    detectLocalLlmInstall();
+    detectLocalLlmStatus();
+    // Sync Paramètres LLM local avec le <details> de Connexion
+    var localDetails = document.getElementById('local-llm-section');
+    if (localDetails) {
+        localDetails.addEventListener('toggle', syncLocalLlmGenParamsVisibility);
+        syncLocalLlmGenParamsVisibility();  // état initial
+    }
+    // Re-détection quand l'admin change l'URL
+    document.getElementById('cfg-local_llm_base_url')?.addEventListener('change', detectLocalLlmStatus);
+    document.getElementById('btn-local-llm-detect')?.addEventListener('click', function(e) {
+        e.preventDefault();
+        detectLocalLlmInstall();
+        detectLocalLlmStatus();
+    });
+    document.getElementById('btn-local-llm-start')?.addEventListener('click', startLocalLlm);
+    document.getElementById('btn-local-llm-restart')?.addEventListener('click', restartLocalLlm);
+    document.getElementById('btn-local-llm-upgrade')?.addEventListener('click', upgradeLocalLlm);
+    document.getElementById('btn-local-llm-pull')?.addEventListener('click', pullLocalLlmModel);
+    document.getElementById('btn-local-llm-delete')?.addEventListener('click', deleteLocalLlmModel);
+});
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/ai-config. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_ai_config_v1',
+                title: 'Configurer l\'intelligence artificielle',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Connecter votre fournisseur IA',
+                        text: 'Collez votre clé API dans le champ « Clé API » (Anthropic, OpenAI, Mistral, Groq, DeepSeek...). Komptia détecte automatiquement le fournisseur à partir du préfixe de la clé et liste les modèles disponibles. Sans clé valide, Iris ne peut pas répondre.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Choisir le modèle principal',
+                        text: 'Sélectionnez le modèle qu\'Iris utilisera (par exemple Sonnet pour la précision, Haiku pour la rapidité). Vous pouvez ajuster les paramètres (température, nombre maximal de tokens) si vous savez ce que vous faites — les valeurs par défaut conviennent à la plupart des usages.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Suivre votre consommation',
+                        text: 'La section « Consommation API » affiche le nombre de requêtes, les tokens utilisés et le coût estimé sur 7, 30 ou 90 jours. Le détail par utilisateur permet de voir qui consomme quoi. Idéal pour surveiller le budget mensuel.'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Apprentissage automatique',
+                        text: 'Si l\'apprentissage est activé, Iris retient les questions validées (👍) et les paires question/SQL pour s\'améliorer sur votre base. Vous pouvez tout réinitialiser à zéro depuis la section « Réinitialisation » en bas de page (action irréversible).'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+{% end %}

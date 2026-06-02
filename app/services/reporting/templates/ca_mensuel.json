@@ -1,0 +1,63 @@
+{
+  "id": "ca_mensuel",
+  "name": "Chiffre d'Affaires Mensuel",
+  "description": "Rapport mensuel du CA avec évolution et graphique ligne",
+  "category": "commercial",
+  "icon": "📈",
+  
+  "query": {
+    "type": "sql",
+    "sql": "SELECT DATE_TRUNC('month', date_facture) as mois, SUM(montant_ttc) as ca FROM factures WHERE date_facture >= CURRENT_DATE - INTERVAL '12 months' GROUP BY mois ORDER BY mois",
+    "parameters": []
+  },
+  
+  "chart": {
+    "enabled": true,
+    "type": "line",
+    "x_column": "mois",
+    "y_column": "ca",
+    "title": "Évolution du Chiffre d'Affaires",
+    "xlabel": "Mois",
+    "ylabel": "CA (€)"
+  },
+  
+  "columns": [
+    {
+      "name": "mois",
+      "label": "Mois",
+      "format": "date",
+      "format_string": "%B %Y"
+    },
+    {
+      "name": "ca",
+      "label": "Chiffre d'Affaires",
+      "format": "currency",
+      "suffix": " €"
+    }
+  ],
+  
+  "aggregations": [
+    {
+      "column": "ca",
+      "operation": "sum",
+      "label": "Total CA"
+    },
+    {
+      "column": "ca",
+      "operation": "avg",
+      "label": "CA moyen mensuel"
+    }
+  ],
+  
+  "ai_analysis": {
+    "enabled": true,
+    "context_columns": ["mois", "ca"]
+  },
+  
+  "metadata": {
+    "title": "Rapport Chiffre d'Affaires Mensuel",
+    "description": "Évolution du chiffre d'affaires sur les 12 derniers mois",
+    "author": "Komptia",
+    "subject": "Analyse commerciale"
+  }
+}

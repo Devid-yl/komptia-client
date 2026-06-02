@@ -1,0 +1,577 @@
+{% extends "../base.html" %}
+
+{% block title %}Dashboard Admin | {{ app_name }}{% end %}
+
+{% block head %}
+<style>
+    /* Cards KPI compactes : padding reduit + label discret + valeur visible */
+    .kpi-card { transition: all .15s; border-radius: 0.625rem; }
+    .kpi-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.05); transform: translateY(-1px); }
+    .dark .kpi-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+    .activity-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-in { animation: fadeSlideIn .4s ease; }
+    .status-ok { color: #059669; }
+    .status-warn { color: #d97706; }
+    .status-error { color: #dc2626; }
+    .dark .status-ok { color: #6ee7b7; }
+    .dark .status-warn { color: #fcd34d; }
+    .dark .status-error { color: #fca5a5; }
+    /* Health-strip : pastilles discrtes en header */
+    .health-pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px;
+        font-size: 11px; line-height: 1; background: rgba(148,163,184,.10); color: #475569;
+        max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dark .health-pill { background: rgba(148,163,184,.18); color: #cbd5e1; }
+    .health-pill .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .health-pill .dot.ok { background: #10b981; }
+    .health-pill .dot.warn { background: #f59e0b; }
+    .health-pill .dot.error { background: #ef4444; }
+    .health-pill .dot.muted { background: #94a3b8; }
+    /* Texte tronquable dans la pill : besoin d'un span enfant pour ellipsis */
+    .health-pill .pill-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    /* Group section sub-header dense */
+    .kpi-section-label { font-size: 10px; font-weight: 600; letter-spacing: .08em;
+        text-transform: uppercase; color: #94a3b8; margin: 0 0 6px 2px; }
+    .dark .kpi-section-label { color: #64748b; }
+    /* Cards stat-mini : layout horizontal label + valeur, padding minimal */
+    .stat-mini { padding: 10px 12px; border-radius: 0.5rem; display: flex; flex-direction: column; gap: 2px; }
+    .stat-mini .label { font-size: 10px; font-weight: 500; color: #64748b; text-transform: uppercase;
+        letter-spacing: .04em; line-height: 1.1; }
+    .dark .stat-mini .label { color: #94a3b8; }
+    .stat-mini .value { font-size: 18px; font-weight: 600; line-height: 1.2; color: #0f172a; }
+    .dark .stat-mini .value { color: #f1f5f9; }
+    .stat-mini .sub { font-size: 10px; color: #94a3b8; line-height: 1.2; }
+    .dark .stat-mini .sub { color: #64748b; }
+    /* Scroll containers (table users, listes) */
+    .scroll-y { overflow-y: auto; }
+    .scroll-y::-webkit-scrollbar { width: 6px; }
+    .scroll-y::-webkit-scrollbar-thumb { background: rgba(148,163,184,.4); border-radius: 3px; }
+    /* Details/summary discret pour section pliable */
+    details > summary { list-style: none; cursor: pointer; }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary .chev { transition: transform .2s; }
+    details[open] > summary .chev { transform: rotate(90deg); }
+
+    /* ──────────────────────────────────────────────────────────────────
+       DARK MODE — corrections de couleur ciblées
+       Le problème de fond : les cartes internes (.stat-mini avec
+       `dark:bg-gray-900/40`) finissent plus sombres que l'outer
+       (`dark:bg-gray-900`) parce que /40 compose avec `body
+       dark:bg-gray-950`. Hiérarchie visuelle inversée. On rétablit
+       ici la pile : outer (gray-900) > inner (légèrement éclairci).
+       ────────────────────────────────────────────────────────────────── */
+
+    /* Inner KPI cards : éclaircies au-dessus de la surface gray-900. */
+    .dark .stat-mini {
+        background: rgba(255, 255, 255, 0.03) !important;
+        border-color: rgba(255, 255, 255, 0.04) !important;
+        transition: background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+    }
+    .dark .kpi-card.stat-mini:hover {
+        background: rgba(255, 255, 255, 0.05) !important;
+        border-color: rgb(var(--brand-light-rgb) / 0.30) !important;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), 0 0 0 1px rgb(var(--brand-light-rgb) / 0.08) inset;
+    }
+    .dark .stat-mini .label { color: #a3afc2; }
+    .dark .stat-mini .sub   { color: #7b899e; }
+
+    /* Section labels (uppercase eyebrows) — plus lisibles. */
+    .dark .kpi-section-label { color: #a3afc2; }
+
+    /* Health-pill : fond plus net + texte plus contrasté + dot muted visible. */
+    .dark .health-pill {
+        background: rgba(255, 255, 255, 0.05);
+        color: #e2e8f0;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    .dark .health-pill .dot.muted { background: #cbd5e1; }
+
+    /* Status badges génériques (statut "déjà défini" — on ajuste seulement
+       les nuances pour qu'elles popent un poil mieux sur fond très sombre). */
+    .dark .status-warn { color: #fbbf24; }
+    .dark .status-error { color: #f87171; }
+
+    /* Refresh link header : actuellement underline brand, OK. On bump le
+       contraste hover pour le retour visuel. */
+    .dark #btn-refresh { color: #f0a99a; }
+    .dark #btn-refresh:hover { color: #fca5a5; }
+
+    /* Séparateurs middots dans la barre meta du header (utilisent une
+       classe Tailwind `text-gray-300 dark:text-gray-700` qui rend le dot
+       invisible sur dark — gray-700 = #374151 ≈ identique au bg). On
+       vise la balise précise via le contexte de la barre meta. */
+    .dark .text-gray-300.dark\:text-gray-700 { color: #475569 !important; }
+
+    /* Container principal des KPI : la bordure gray-800/80 disparaît. On
+       lui donne un peu plus de présence sans devenir tape-à-l'œil.
+       (Bordures dialées DOWN : elles formaient un effet strié blanc qui
+       fatiguait l'œil quand cumulées avec divide-y / row separators.) */
+    .dark .border-gray-800\/80 { border-color: rgba(255, 255, 255, 0.04) !important; }
+    .dark .border-gray-800\/60 { border-color: rgba(255, 255, 255, 0.025) !important; }
+    .dark .dark\:border-gray-800 { border-color: rgba(255, 255, 255, 0.04) !important; }
+    /* Divide-y dans les listes (top users, erreurs, exécutions, etc.) — c'était
+       le `divide-gray-800` natif Tailwind = #1f2937, qui sur #131c2e donne
+       une stripe bien visible à chaque ligne. On passe en blanc très atténué. */
+    .dark .dark\:divide-gray-800 > :not([hidden]) ~ :not([hidden]) {
+        border-color: rgba(255, 255, 255, 0.025) !important;
+    }
+
+    /* Lignes de table users — la ligne hover est presque invisible. */
+    .dark tr.hover\:bg-gray-50:hover,
+    .dark tr.dark\:hover\:bg-gray-800\/60:hover {
+        background: rgba(255, 255, 255, 0.04) !important;
+    }
+
+    /* Mini quota bar des users : la track gray-800 sur card gray-900
+       n'a quasiment aucun contraste. On passe à un blanc transparent. */
+    .dark .bg-gray-100.dark\:bg-gray-800 { background: rgba(255, 255, 255, 0.08) !important; }
+
+    /* Carte enveloppe (gros container blanc en light) — en dark on lui
+       donne un voile blanc subtil au lieu de gray-900 pur, pour qu'elle
+       ne se confonde pas avec body gray-950. */
+    .dark .bg-white.dark\:bg-gray-900 {
+        background: #131c2e !important;
+    }
+
+    /* Sticky thead du monitoring users — il était `bg-gray-900` qui
+       devient invisible une fois la carte parente changée. On le réaligne. */
+    .dark thead.dark\:bg-gray-900 { background: #131c2e !important; }
+
+    /* ── Monitoring utilisateurs : améliorations dark mode ─────────────
+       La table était techniquement OK en dark mais "fade" : entêtes peu
+       lisibles, "jamais" placeholder quasi-invisible, badge user terne. */
+
+    /* Column headers (Utilisateur, Rôle, Sessions, etc.) — bump contrast. */
+    .dark thead .dark\:text-gray-400 { color: #cbd5e1 !important; }
+
+    /* Bordure sous le thead sticky — assez nette pour séparer le header
+       du tbody mais sans être agressive. */
+    .dark thead tr.dark\:border-gray-800 { border-bottom-color: rgba(255, 255, 255, 0.05) !important; }
+
+    /* "Jamais" placeholder dans la colonne "Dernière connexion" — était
+       `dark:text-gray-600` (#4b5563), donc presque invisible sur la
+       card #131c2e. */
+    .dark .text-gray-300.dark\:text-gray-600 { color: #64748b !important; font-style: italic; }
+
+    /* Badge "user" dans la colonne Rôle — tonalité plate (gray-800 +
+       gray-300) sur card sombre = pas assez de présence. On lui donne
+       une légère teinte blanche transparente, plus de contraste texte. */
+    .dark span.dark\:bg-gray-800.dark\:text-gray-300 {
+        background: rgba(255, 255, 255, 0.08) !important;
+        color: #e2e8f0 !important;
+    }
+
+    /* Lien "Gérer les comptes →" et "Voir tous les comptes →" — dim. */
+    .dark a.dark\:hover\:text-gray-100:hover { color: #f1f5f9 !important; }
+</style>
+{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto animate-in">
+
+    <!-- Header dense : titre + strip sant&eacute; syst&egrave;me + meta -->
+    <div class="mb-4 flex items-start justify-between gap-3 flex-wrap">
+        <div class="min-w-0">
+            <div class="flex items-center gap-2 mb-1">
+                <h1 class="text-lg font-bold text-gray-900 dark:text-gray-100">Tableau de bord administrateur</h1>
+                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] rounded-md bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-300">
+                    <span class="w-1 h-1 rounded-full bg-brand-500 dark:bg-brand-300"></span>
+                    Admin
+                </span>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-2 flex-wrap">
+                <span>Vue globale de l'activit&eacute; et sant&eacute; de l'application</span>
+                <span class="text-gray-300 dark:text-gray-700">&middot;</span>
+                {# ``aria-live`` retiré — le timestamp change toutes les 30 s
+                   et serait annoncé en boucle aux lecteurs d'écran (bruit
+                   non-actionnable). Cf. review adversariale finding D1. #}
+                <span>Derni&egrave;re mise &agrave; jour&nbsp;: <span id="update-time" class="font-medium">&agrave; l'instant</span></span>
+                <button id="btn-refresh" class="text-brand-500 hover:text-brand-700 underline text-xs dark:hover:text-brand-300" aria-label="Actualiser le tableau de bord administrateur">Actualiser</button>
+            </p>
+        </div>
+        <!-- Health strip : 4 indicateurs syst&egrave;me en pastilles discr&egrave;tes -->
+        <div class="flex items-center gap-1.5 flex-wrap" aria-label="Sant&eacute; syst&egrave;me">
+            {# F2 (review loop) : pastille pilotée par le MÊME snapshot que le
+               bandeau d'alerte (stats.sage_status, 4 états) — plus de pastille
+               verte « connectée » mensongère sur un last_test_success périmé.
+               3 rendus : connecté=ok(vert), non testé=muted(neutre, dot déjà
+               utilisé par les pastilles IA/Train), panne/non configuré=warn. #}
+            {% set _sage_status = stats.get("sage_status", "untested") %}
+            {% set _source_label = stats.get("source_db_label", "Base SQL Server") %}
+            {% if _sage_status == "connected" %}{% set _sage_dot = "ok" %}{% elif _sage_status == "untested" %}{% set _sage_dot = "muted" %}{% else %}{% set _sage_dot = "warn" %}{% end %}
+            <span class="health-pill" title="{{ _source_label }}&nbsp;: {% if _sage_status == "connected" %}connect&eacute;e{% elif _sage_status == "untested" %}non test&eacute;e (aucune requ&ecirc;te depuis le d&eacute;marrage){% elif _sage_status == "unconfigured" %}non configur&eacute;e{% else %}non connect&eacute;e{% end %}">
+                <span class="dot {{ _sage_dot }}"></span>
+                <span class="pill-label">{{ _source_label }}</span>
+            </span>
+            <span class="health-pill" title="Mod&egrave;le IA actif : {{ stats.get('ai_model', '') }}">
+                <span class="dot {% if stats.get('ai_model_available') %}ok{% else %}muted{% end %}"></span>
+                <span class="pill-label">{{ stats.get("ai_model", "") }}</span>
+            </span>
+            <span class="health-pill" title="Donn&eacute;es d'entra&icirc;nement disponibles">
+                <span class="dot {% if stats.get('training_data_count', 0) > 0 %}ok{% else %}muted{% end %}"></span>
+                Train&nbsp;{{ stats.get("training_data_count", 0) }}
+            </span>
+            {% set _err_rate = 100 - stats.get("success_rate", 0) if stats.get("total_searches", 0) > 0 else 0 %}
+            <span class="health-pill" title="Taux d'erreur Iris (1 - succ&egrave;s)">
+                <span class="dot {% if _err_rate <= 10 %}ok{% elif _err_rate <= 30 %}warn{% else %}error{% end %}"></span>
+                Err&nbsp;{{ "%.0f" % _err_rate }}%
+            </span>
+        </div>
+    </div>
+
+    <!-- Error banner — partial réutilisable (cf. ../_partials/stats_error_banner.html) -->
+    {% set errors = stats.get("_errors") %}
+    {% include "../_partials/stats_error_banner.html" %}
+
+    <!-- System alerts (security_stats.system_alerts) -->
+    {% if security_stats and security_stats.get("system_alerts") %}
+    <div class="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 dark:bg-red-900/20 dark:border-red-800/60">
+        <div class="flex items-start gap-2">
+            <svg class="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+            </svg>
+            <div class="flex-1">
+                <p class="text-sm font-semibold text-red-800 mb-1 dark:text-red-200">Alertes syst&egrave;me</p>
+                <ul class="text-sm text-red-700 dark:text-red-300 space-y-1 list-disc list-inside">
+                    {% for alert in security_stats.get("system_alerts", []) %}
+                    <li>{{ alert }}</li>
+                    {% end %}
+                </ul>
+            </div>
+        </div>
+    </div>
+    {% end %}
+
+    <!-- KPI Cards : 12 mtriques regroupes en 3 mini-sections (Activit /
+         Op&eacute;rations / S&eacute;curit&eacute;), denses, padding minimal, valeurs
+         premires. Sub-headers discrets (uppercase 10px) qui restent
+         lisibles tout en compactant l'cran de plus de 50%. -->
+    <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm p-4 mb-4 dark:bg-gray-900 dark:border-gray-800/80">
+        <p class="kpi-section-label">Activit&eacute; globale</p>
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-2 mb-3">
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Nombre total de recherches Iris envoy&eacute;es par tous les utilisateurs depuis la mise en service. Le sous-libell&eacute; affiche le compte aujourd'hui et sur les 7 derniers jours.">Recherches totales</span>
+                <span class="value">{{ stats.get("total_searches", 0) }}</span>
+                <span class="sub">{{ stats.get("searches_today", 0) }} aujourd'hui &middot; {{ stats.get("searches_week", 0) }} /7j</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Pourcentage de recherches Iris ayant produit un r&eacute;sultat exploitable (sans erreur SQL ni timeout). Vert &agrave; 80%+, ambre 50-79%, rouge en dessous.">Taux de succ&egrave;s</span>
+                {% set _ts = stats.get("total_searches", 0) %}
+                {% set _sr = stats.get("success_rate", 0) %}
+                {% if _ts == 0 %}
+                <span class="value !text-gray-400 dark:!text-gray-500">&mdash;</span>
+                <span class="sub italic">aucune recherche encore</span>
+                {% else %}
+                <span class="value {% if _sr >= 80 %}!text-emerald-600 dark:!text-emerald-400{% elif _sr >= 50 %}!text-amber-600 dark:!text-amber-400{% else %}!text-red-600 dark:!text-red-400{% end %}">{{ "%.0f" % _sr }}%</span>
+                <span class="sub">{{ stats.get("successful_searches", 0) }}/{{ _ts }}</span>
+                {% end %}
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Dur&eacute;e moyenne de g&eacute;n&eacute;ration du SQL par l'IA, hors ex&eacute;cution sur la base de donn&eacute;es source. Mesur&eacute; entre l'envoi de la question et la r&eacute;ception du SQL final.">Temps IA moyen</span>
+                {% set _agt = stats.get("avg_generation_time", 0) %}
+                {% if _ts == 0 or _agt <= 0 %}
+                <span class="value !text-gray-400 dark:!text-gray-500">&mdash;</span>
+                <span class="sub italic">aucune g&eacute;n&eacute;ration</span>
+                {% else %}
+                <span class="value {% if _agt <= 3 %}!text-emerald-600 dark:!text-emerald-400{% elif _agt <= 8 %}!text-amber-600 dark:!text-amber-400{% else %}!text-red-600 dark:!text-red-400{% end %}">{{ "%.1f" % _agt }}s</span>
+                <span class="sub">G&eacute;n&eacute;ration SQL</span>
+                {% end %}
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Nombre total de comptes utilisateur cr&eacute;&eacute;s. Le sous-libell&eacute; pr&eacute;cise combien ont effectu&eacute; au moins une recherche durant les 7 derniers jours.">Utilisateurs</span>
+                <span class="value">{{ stats.get("total_users", 0) }}</span>
+                <span class="sub">{{ stats.get("active_users_week", 0) }} actifs cette semaine</span>
+            </div>
+        </div>
+
+        <p class="kpi-section-label">Op&eacute;rations</p>
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-2 mb-3">
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Vue admin globale : automatisations actives / total cr&eacute;&eacute;es par TOUS les utilisateurs du syst&egrave;me. Une automatisation est active si son interrupteur est sur ON. Pour voir uniquement les v&ocirc;tres, allez sur /automations.">Automatisations (tous utilisateurs)</span>
+                <span class="value">{{ stats.get("active_automations", 0) }}<span class="text-sm font-normal text-gray-400 dark:text-gray-500">/{{ stats.get("total_automations", 0) }}</span></span>
+                <span class="sub">{{ stats.get("total_executions", 0) }} ex&eacute;cutions{% if stats.get("failed_executions", 0) > 0 %} &middot; <span class="text-red-500">{{ stats.get("failed_executions", 0) }} &eacute;checs</span>{% end %}</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Nombre total de rapports g&eacute;n&eacute;r&eacute;s (PDF, Excel, CSV) par les automatisations ou exports manuels Iris.">Rapports</span>
+                <span class="value">{{ stats.get("total_reports", 0) }}</span>
+                <span class="sub">{{ stats.get("reports_week", 0) }} cette semaine</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Emails envoy&eacute;s par les automatisations via le SMTP configur&eacute;. Les &eacute;checs proviennent g&eacute;n&eacute;ralement d'un destinataire invalide ou d'une coupure SMTP.">Emails</span>
+                <span class="value">{{ stats.get("emails_sent", 0) }}</span>
+                <span class="sub">envoy&eacute;s{% if stats.get("emails_failed", 0) > 0 %} &middot; <span class="text-red-500">{{ stats.get("emails_failed", 0) }} &eacute;checs</span>{% end %}</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Exemples Question&rarr;SQL approuv&eacute;s qui aident Iris &agrave; apprendre vos habitudes m&eacute;tier.">Donn&eacute;es training</span>
+                <span class="value">{{ stats.get("training_data_count", 0) }}</span>
+                <span class="sub">exemples valid&eacute;s</span>
+            </div>
+        </div>
+
+        {% if security_stats %}
+        <p class="kpi-section-label">S&eacute;curit&eacute; &amp; supervision temps r&eacute;el</p>
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-2">
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Nombre de sessions utilisateur valides actuellement (cookie de session non expir&eacute; et flag actif). Inclut les utilisateurs qui ont ferm&eacute; leur onglet sans se d&eacute;connecter.">Sessions actives</span>
+                <span class="value">{{ security_stats.get("active_sessions_count", 0) }}</span>
+                <span class="sub">Connect&eacute;s en ce moment</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                {# Bug 2026-05-26 (F6) : "Au-delà de 20 tentatives" était
+                   hardcodé dans le data-info alors que le seuil est dynamique
+                   (env var ``KOMPTIA_FAILED_LOGINS_ALERT_THRESHOLD``). On
+                   inline le seuil réel via ``security_stats.failed_logins_threshold``
+                   — même source de vérité que la condition de coloriage
+                   ci-dessous. Si l'admin baisse à 5 ou monte à 100, le tooltip
+                   ET le coloriage suivent la même valeur. #}
+                {% set _failed = security_stats.get("failed_logins_24h", 0) %}
+                {% set _failed_thr = security_stats.get("failed_logins_threshold", 20) %}
+                <span class="label" data-tooltip="Tentatives de connexion ayant &eacute;chou&eacute; (mauvais mot de passe, compte inexistant) sur les 24 derni&egrave;res heures. Au-del&agrave; de {{ _failed_thr }} tentatives, une alerte syst&egrave;me est lev&eacute;e en haut du tableau de bord.">Connexions &eacute;chou&eacute;es 24h</span>
+                <span class="value {% if _failed >= _failed_thr %}!text-red-600 dark:!text-red-400{% elif _failed > 0 %}!text-amber-600 dark:!text-amber-400{% end %}">{{ _failed }}</span>
+                <span class="sub">Tentatives invalides</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                <span class="label" data-tooltip="Utilisateurs dont l'occupation totale (fichiers stock&eacute;s + donn&eacute;es de la base locale) d&eacute;passe le quota configur&eacute;. Ils ne peuvent plus envoyer de nouveaux fichiers tant que la situation n'est pas r&eacute;gularis&eacute;e.">Quotas d&eacute;pass&eacute;s</span>
+                <span class="value {% if security_stats.get('users_quota_exceeded', 0) > 0 %}!text-amber-600 dark:!text-amber-400{% end %}">{{ security_stats.get("users_quota_exceeded", 0) }}</span>
+                <span class="sub">Utilisateurs concern&eacute;s</span>
+            </div>
+            <div class="kpi-card stat-mini bg-gray-50/60 dark:bg-gray-900/40 border border-gray-100 dark:border-gray-800/60">
+                {% set _stuck_thr = security_stats.get("stuck_executions_threshold", 1) %}
+                <span class="label" data-tooltip="Ex&eacute;cutions d'automatisations rest&eacute;es au statut &laquo;en cours&raquo; depuis plus de {{ _stuck_thr }}h. Sympt&ocirc;me typique d'un processus bloqu&eacute; ou d'un service externe (base de donn&eacute;es, SMTP) qui ne r&eacute;pond plus.">Ex&eacute;cutions bloqu&eacute;es</span>
+                <span class="value {% if security_stats.get('stuck_executions', 0) > 0 %}!text-red-600 dark:!text-red-400{% end %}">{{ security_stats.get("stuck_executions", 0) }}</span>
+                <span class="sub">Running depuis &gt; {{ _stuck_thr }}h</span>
+            </div>
+        </div>
+        {% end %}
+    </div>
+
+    <!-- Interactive Charts (denses : 180px au lieu de 220, gap 3 au lieu de 4) -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 mb-4">
+        <div class="lg:col-span-2 bg-white border border-gray-200/80 rounded-xl shadow-sm p-3 dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="flex items-baseline justify-between mb-1">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Recherches sur 7 jours</h2>
+                <span class="text-[10px] text-gray-400 dark:text-gray-500">Tendance quotidienne</span>
+            </div>
+            {# role="figure" plutôt que role="img" : un graphique Plotly génère
+               du SVG accessible (titles + labels lisibles par lecteurs d'écran).
+               role="img" forcerait à lire UNIQUEMENT aria-label et masquerait
+               le contenu SVG. role="figure" + aria-label sert de légende sans
+               masquer le détail. Cf. review adversariale finding D2. #}
+            <div id="chart-daily-searches" style="height: 180px;" role="figure" aria-label="Graphique des recherches Iris quotidiennes sur les 7 derniers jours"></div>
+        </div>
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm p-3 dark:bg-gray-900 dark:border-gray-800/80">
+            <div class="flex items-baseline justify-between mb-1">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Ex&eacute;cutions</h2>
+                <span class="text-[10px] text-gray-400 dark:text-gray-500">Succ&egrave;s / &eacute;checs</span>
+            </div>
+            <div id="chart-exec-breakdown" style="height: 180px;" role="figure" aria-label="R&eacute;partition des ex&eacute;cutions d'automatisations entre r&eacute;ussies et &eacute;chou&eacute;es"></div>
+        </div>
+    </div>
+
+    <!-- Activits & insights : 3 colonnes dense (gain : -1 row pleine).
+         Colonne 1 : excutions automations rcentes
+         Colonne 2 : recherches Iris rcentes
+         Colonne 3 : Top users + Erreurs + Feedback empils en mini-widgets -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 mb-4">
+
+        <!-- Col 1 : Activit automations -->
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80 flex flex-col">
+            <div class="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Activit&eacute; des automatisations</h2>
+                <a href="/automations" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">G&eacute;rer &rarr;</a>
+            </div>
+            <div class="scroll-y" style="max-height: 320px;">
+                {% if recent_executions %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for ex in recent_executions %}
+                    <li class="flex items-center gap-2 px-4 py-1.5">
+                        <span class="activity-dot {% if ex.status == 'success' %}bg-emerald-500{% elif ex.status == 'failed' %}bg-red-500{% elif ex.status == 'running' %}bg-blue-500{% else %}bg-gray-400{% end %}"></span>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-xs text-gray-900 truncate dark:text-gray-100">{{ ex._automation_name }}</p>
+                            <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate">
+                                {# F18 (2026-05-26) : ``<time data-fmt-local>`` pour conversion
+                                   timezone côté navigateur (cf. local-datetime.js). Fallback SSR
+                                   UTC explicite — sinon "16:30" trompe un user en GMT-5. #}
+                                {% if ex._username %}{{ ex._username }} &middot; {% end %}<time datetime="{{ ex.started_at.isoformat() }}" data-fmt-local="short">{{ ex.started_at.strftime('%d/%m %H:%M') }} UTC</time>{% if ex.duration_seconds %} &middot; {{ "%.1f" % ex.duration_seconds }}s{% end %}
+                            </p>
+                        </div>
+                        <span class="text-[9px] font-medium px-1.5 py-0.5 rounded {% if ex.status == 'success' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300{% elif ex.status == 'failed' %}bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300{% elif ex.status == 'running' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300{% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300{% end %}">
+                            {% if ex.status == 'success' %}OK{% elif ex.status == 'failed' %}KO{% elif ex.status == 'running' %}...{% else %}{{ ex.status }}{% end %}
+                        </span>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-4 py-6 text-center">
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Aucune ex&eacute;cution r&eacute;cente</p>
+                </div>
+                {% end %}
+            </div>
+        </div>
+
+        <!-- Col 2 : Recherches Iris rcentes (tous users) -->
+        <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80 flex flex-col">
+            <div class="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Activit&eacute; r&eacute;cente</h2>
+                <a href="/admin/ai-performance" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Performance &rarr;</a>
+            </div>
+            <div class="scroll-y" style="max-height: 320px;">
+                {% if recent_searches %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for s in recent_searches %}
+                    <li class="flex items-center gap-2 px-4 py-1.5">
+                        <span class="activity-dot {% if s.success %}bg-emerald-500{% else %}bg-red-400{% end %}"></span>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-xs text-gray-900 truncate dark:text-gray-100">{{ s.question }}</p>
+                            <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate">
+                                {# F18 (2026-05-26) : ``<time data-fmt-local>`` pour conversion timezone. #}
+                                {{ s._username }} &middot; <time datetime="{{ s.created_at.isoformat() }}" data-fmt-local="short">{{ s.created_at.strftime('%d/%m %H:%M') }} UTC</time>{% if s.result_count is not None %} &middot; {{ s.result_count }} r.{% end %}{% if s.generation_time %} &middot; {{ "%.1f" % s.generation_time }}s{% end %}
+                            </p>
+                        </div>
+                        {% if s.feedback == 'positive' %}<span class="text-[10px]"><i class="bi bi-hand-thumbs-up"></i></span>{% elif s.feedback == 'negative' %}<span class="text-[10px]"><i class="bi bi-hand-thumbs-down"></i></span>{% end %}
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-4 py-6 text-center">
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Aucune activit&eacute; r&eacute;cente</p>
+                </div>
+                {% end %}
+            </div>
+        </div>
+
+        <!-- Col 3 : Stack vertical compact - Top users + Erreurs + Feedback -->
+        <div class="space-y-3">
+            <!-- Top users (compact) -->
+            <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+                <div class="px-4 py-2 border-b border-gray-200 dark:border-gray-800">
+                    <h2 class="text-xs font-semibold text-gray-900 dark:text-gray-100">Top utilisateurs (7j)</h2>
+                </div>
+                {% if top_users %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for u in top_users %}
+                    <li class="flex items-center justify-between px-4 py-1.5">
+                        <span class="text-xs text-gray-700 dark:text-gray-300 truncate">{{ u["username"] }}</span>
+                        <span class="text-[10px] font-medium px-1.5 py-0.5 bg-gray-100 rounded text-gray-700 dark:bg-gray-800 dark:text-gray-300 flex-shrink-0">{{ u["search_count"] }}</span>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-4 py-2 text-center"><p class="text-[10px] text-gray-400 dark:text-gray-500">Aucune activit&eacute;</p></div>
+                {% end %}
+            </div>
+
+            <!-- Erreurs rcentes (compact) -->
+            <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm dark:bg-gray-900 dark:border-gray-800/80">
+                <div class="px-4 py-2 border-b border-gray-200 dark:border-gray-800">
+                    <h2 class="text-xs font-semibold text-gray-900 dark:text-gray-100">Derni&egrave;res erreurs</h2>
+                </div>
+                {% if recent_errors %}
+                <ul class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% for e in recent_errors %}
+                    <li class="px-4 py-1.5">
+                        <p class="text-xs text-red-600 truncate dark:text-red-400">{{ e.question }}</p>
+                        <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate">{# F18 #}{{ e._username }} &middot; <time datetime="{{ e.created_at.isoformat() }}" data-fmt-local="short">{{ e.created_at.strftime('%d/%m %H:%M') }} UTC</time></p>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <div class="px-4 py-2 text-center"><p class="text-[10px] text-emerald-500">Aucune erreur <i class="bi bi-check-circle-fill"></i></p></div>
+                {% end %}
+            </div>
+
+            <!-- Feedback global (compact, 3 mini-bars sur 2 lignes) -->
+            <div class="bg-white border border-gray-200/80 rounded-xl shadow-sm p-3 dark:bg-gray-900 dark:border-gray-800/80">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-xs font-semibold text-gray-900 dark:text-gray-100">Feedback global</h2>
+                    <span class="text-[10px] text-gray-400 dark:text-gray-500">{{ stats.get("feedback_total", 0) }} total</span>
+                </div>
+                {% set _fb_total = max(stats.get("feedback_total", 1), 1) %}
+                {% set _fb_pos_pct = (stats.get("feedback_positive", 0) / _fb_total) * 100 %}
+                {% set _fb_neg_pct = (stats.get("feedback_negative", 0) / _fb_total) * 100 %}
+                {% set _fb_non_pct = (stats.get("feedback_none", 0) / _fb_total) * 100 %}
+                <div class="flex w-full h-2 rounded-full overflow-hidden bg-gray-100 dark:bg-gray-800 mb-1.5">
+                    <div class="bg-emerald-500 h-2" style="width: {{ "%.1f" % _fb_pos_pct }}%"></div>
+                    <div class="bg-red-500 h-2" style="width: {{ "%.1f" % _fb_neg_pct }}%"></div>
+                    <div class="bg-gray-300 dark:bg-gray-600 h-2" style="width: {{ "%.1f" % _fb_non_pct }}%"></div>
+                </div>
+                <div class="flex items-center justify-between text-[10px] text-gray-500 dark:text-gray-400">
+                    <span class="text-emerald-600 dark:text-emerald-400"><i class="bi bi-hand-thumbs-up"></i> {{ stats.get("feedback_positive", 0) }}</span>
+                    <span class="text-red-600 dark:text-red-400"><i class="bi bi-hand-thumbs-down"></i> {{ stats.get("feedback_negative", 0) }}</span>
+                    <span>&middot; {{ stats.get("feedback_none", 0) }} sans</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monitoring utilisateurs : extrait dans partial pour limiter la taille
+         de admin.html (cf. review #31). -->
+    {% include "../_partials/dashboard_users_table.html" %}
+
+    <!-- API Consumption : extrait dans partial. -->
+    {% include "../_partials/dashboard_api_usage.html" %}
+
+    {# La section "Sant du systme" historique a t dplace en HAUT
+       de la page sous forme d'un strip de pastilles compact (#health-strip),
+       qui affiche les memes 4 indicateurs (Modele IA, Sage, Training, Taux
+       d'erreur) sans occuper une row complte en bas. #}
+
+</div>
+{% end %}
+{# F6 (review loop) : ``{% block scripts %}`` était imbriqué DANS ``{% block
+   content %}`` → Tornado rend le bloc 2× (inline ici + à la position scripts
+   de base.html) : Plotly ~1 MB, mount(), onboarding et api_usage chargés en
+   double. On ferme ``content`` ci-dessus AVANT de déclarer ``scripts`` en
+   frère (même structure que iris.html / automations/list.html). #}
+
+{% block scripts %}
+{# Plotly self-hosté (cf. review #7) — élimine la dépendance CDN externe. #}
+<script src="/static/vendor/plotly/plotly-basic.min.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/dashboard-charts.js" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+// Mount du module commun (refresh, Plotly retry, theme restyle, ARIA loading
+// states). La logique vit dans dashboard-charts.js pour éviter la duplication
+// avec user.html. Le bloc admin-only (consommation API par utilisateur) reste
+// inline ci-dessous car il est spécifique à cette vue.
+window.DashboardCharts.mount({ isAdmin: true });
+
+// Onboarding tour admin (cf. review #30 + R2-A6). Cible le premier admin
+// qui arrive — souvent la personne qui vient d'installer Komptia et n'a
+// pas encore configuré la BDD source ni les comptes. ``show_onboarding``
+// est calculé serveur-side pour ne PAS l'afficher aux admins existants.
+{% if show_onboarding %}
+if (window.KomptiaOnboarding) {
+    window.KomptiaOnboarding.start({
+        key: 'dashboard_admin_v1',
+        title: 'Configuration administrateur',
+        steps: [
+            {
+                icon: 'sparkle',
+                title: 'Vous êtes administrateur',
+                text: 'Votre rôle vous donne accès à la configuration de l\'application, à la supervision des utilisateurs et aux paramètres de l\'intelligence artificielle. Les utilisateurs standards n\'ont accès qu\'à leur propre espace.',
+            },
+            {
+                icon: 'chart',
+                title: 'Configurez la base de données',
+                text: 'Allez dans « Base de données » dans le menu de gauche pour relier Komptia à votre base de données métier (SQL Server). Sans cette connexion active, Iris ne peut pas répondre aux questions métier.',
+            },
+            {
+                icon: 'bell',
+                title: 'Surveillez l\'activité en temps réel',
+                text: 'Les indicateurs « Sécurité & supervision » remontent les sessions actives, les connexions échouées (au-delà de {{ security_stats.get("failed_logins_threshold", 20) }} = alerte), les quotas dépassés et les exécutions bloquées. Survolez le « i » de chaque indicateur pour le détail.',
+            },
+            {
+                icon: 'rocket',
+                title: 'Créez les comptes utilisateurs',
+                text: 'Allez dans « Utilisateurs » pour créer des comptes. Définissez le rôle (administrateur ou utilisateur), le quota de stockage et les permissions. Les utilisateurs apparaîtront ensuite dans le tableau « Suivi des utilisateurs » plus bas.',
+            },
+        ],
+    });
+}
+{% end %}
+
+// Bloc consommation API IA — voir static/js/api_usage.js (chargé ci-dessous,
+// même fichier réutilisé sur /admin/ai-config).
+</script>
+<script src="/static/js/api_usage.js" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}

@@ -1,0 +1,407 @@
+{% extends "../base.html" %}
+
+{% block title %}Execution #{{ execution.id }} | {{ app_name }}{% end %}
+
+{% block head %}
+<link rel="stylesheet" href="/static/vendor/drawflow/drawflow.min.css">
+<link rel="stylesheet" href="/static/css/automation-canvas.css">
+{% end %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto"
+     id="komptia-viewer-root"
+     data-komptia-execution-id="{{ execution.id }}"
+     data-komptia-automation-id="{{ automation.id }}">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <div class="flex items-center gap-2 mb-1">
+                <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Execution #{{ execution.id }}</h1>
+                <span class="text-xs font-medium px-2.5 py-1 rounded-full {% if execution.status == 'success' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 {% elif execution.status == 'partial' %}bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300 {% elif execution.status == 'failed' %}bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 {% elif execution.status == 'running' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 {% elif execution.status == 'cancelled' %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 {% else %}bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300 {% end %}">
+                    {% if execution.status == 'success' %}R&eacute;ussi
+                    {% elif execution.status == 'partial' %}Partiel
+                    {% elif execution.status == 'failed' %}&Eacute;chec
+                    {% elif execution.status == 'running' %}En cours
+                    {% elif execution.status == 'cancelled' %}Annul&eacute;
+                    {% elif execution.status == 'pending' %}En attente
+                    {% else %}{{ execution.status }}{% end %}
+                </span>
+            </div>
+            <p class="text-sm text-gray-500 dark:text-gray-400">
+                <a href="/automations/history/{{ automation.id }}" class="text-brand-600 hover:text-brand-700 hover:underline dark:hover:text-brand-300">{{ automation.name }}</a>
+            </p>
+        </div>
+        <div class="flex items-center gap-2">
+            {% if stats.total > 0 %}
+            <!-- Replay : valable seulement si l'execution avait des steps
+                 (sinon il n'y a rien a relancer + le JS qui binde le click
+                 n'est pas charge — voir block scripts en bas). -->
+            <button type="button" id="komptia-replay-btn"
+                    class="btn btn-secondary text-sm"
+                    aria-label="Relancer cette execution">
+                <i class="bi bi-arrow-clockwise"></i> Relancer
+            </button>
+            {% end %}
+            <a href="/automations/history/{{ automation.id }}" class="btn btn-secondary text-sm">Historique</a>
+            <a href="/executions" class="btn btn-secondary text-sm">Toutes les ex&eacute;cutions</a>
+        </div>
+    </div>
+
+    <!-- Overview Card -->
+    <div class="card mb-4">
+        <div class="grid grid-cols-2 sm:grid-cols-4 divide-x divide-gray-100 dark:divide-gray-800">
+            <div class="px-4 py-3">
+                <p class="text-xs text-gray-500 mb-0.5 dark:text-gray-400">D&eacute;but</p>
+                <p class="text-sm font-medium text-gray-900 dark:text-gray-100">
+                    {% if execution.started_at %}
+                    <time datetime="{{ execution.started_at.isoformat() }}+00:00"
+                          data-fmt-local="datetime">{{ execution.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC</time>
+                    {% else %}-{% end %}
+                </p>
+            </div>
+            <div class="px-4 py-3">
+                <p class="text-xs text-gray-500 mb-0.5 dark:text-gray-400">Fin</p>
+                <p class="text-sm font-medium text-gray-900 dark:text-gray-100">
+                    {% if execution.finished_at %}
+                    {{ execution.finished_at.strftime('%d/%m/%Y %H:%M:%S') }}
+                    {% else %}-{% end %}
+                </p>
+            </div>
+            <div class="px-4 py-3">
+                <p class="text-xs text-gray-500 mb-0.5 dark:text-gray-400">Dur&eacute;e</p>
+                <p class="text-sm font-medium text-gray-900 dark:text-gray-100">
+                    {% if execution.duration_seconds is not None %}
+                    {{ "%.2f" % execution.duration_seconds }}s
+                    {% else %}-{% end %}
+                </p>
+            </div>
+            <div class="px-4 py-3">
+                <p class="text-xs text-gray-500 mb-0.5 dark:text-gray-400">Lignes r&eacute;sultat</p>
+                <p class="text-sm font-medium text-gray-900 dark:text-gray-100">
+                    {% if execution.result_rows is not None %}
+                    {{ execution.result_rows }}
+                    {% else %}-{% end %}
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Error Banner -->
+    {% if execution.error_message %}
+    <div class="card mb-4 border-red-200 bg-red-50 dark:bg-red-900/20 dark:border-red-800/60">
+        <div class="px-4 py-3">
+            <div class="flex items-start gap-2">
+                <svg class="w-4 h-4 text-red-500 mt-0.5 flex-shrink-0 dark:text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"/>
+                </svg>
+                <div class="min-w-0 flex-1">
+                    <p class="text-sm font-medium text-red-800 mb-1 dark:text-red-200">Erreur d'ex&eacute;cution</p>
+                    <!-- pre-wrap pour preserver les sauts de ligne du
+                         message tronque (handler sanitize_error_message). -->
+                    <p class="text-sm text-red-700 dark:text-red-300 whitespace-pre-wrap break-words">{{ execution.error_message }}</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% end %}
+
+    <!-- Download Link -->
+    {% if execution.output_file_path %}
+    <div class="card mb-4 border-emerald-200 bg-emerald-50 dark:bg-emerald-900/20 dark:border-emerald-800/60">
+        <div class="px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+                <svg class="w-4 h-4 text-emerald-600 dark:text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m.75 12l3 3m0 0l3-3m-3 3v-6m-1.5-9H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/>
+                </svg>
+                <span class="text-sm font-medium text-emerald-800 dark:text-emerald-200">Fichier g&eacute;n&eacute;r&eacute;</span>
+            </div>
+            <a href="/automations/download/{{ execution.id }}" class="text-sm text-emerald-700 hover:text-emerald-800 underline dark:text-emerald-300" target="_blank">T&eacute;l&eacute;charger</a>
+        </div>
+    </div>
+    {% end %}
+
+    <!-- Tabs : DAG (Phase 3c) / Timeline (legacy) -->
+    {% if stats.total > 0 %}
+    <div class="flex items-center gap-0 border-b border-gray-200 dark:border-gray-800 mb-4" role="tablist">
+        <button type="button"
+                class="komptia-tab-btn px-4 py-2 text-sm font-medium border-b-2 border-brand-500 text-gray-900 dark:text-gray-100"
+                data-komptia-tab="dag"
+                aria-selected="true"
+                role="tab">DAG</button>
+        <button type="button"
+                class="komptia-tab-btn px-4 py-2 text-sm font-medium text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 border-b-2 border-transparent"
+                data-komptia-tab="timeline"
+                aria-selected="false"
+                role="tab">Timeline</button>
+    </div>
+
+    <!-- Step Stats Bar (visible aux deux modes) -->
+    <div class="card mb-4">
+        <div class="px-4 py-3 flex flex-wrap items-center gap-4">
+            <span class="text-sm text-gray-700 font-medium dark:text-gray-300">{{ stats.total }} &eacute;tape{{ 's' if stats.total > 1 else '' }}</span>
+            {% if stats.success > 0 %}
+            <span class="flex items-center gap-1 text-xs">
+                <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+                <span class="text-gray-600 dark:text-gray-400">{{ stats.success }} r&eacute;ussie{{ 's' if stats.success > 1 else '' }}</span>
+            </span>
+            {% end %}
+            {% if stats.failed > 0 %}
+            <span class="flex items-center gap-1 text-xs">
+                <span class="w-2 h-2 rounded-full bg-red-500"></span>
+                <span class="text-gray-600 dark:text-gray-400">{{ stats.failed }} &eacute;chou&eacute;e{{ 's' if stats.failed > 1 else '' }}</span>
+            </span>
+            {% end %}
+            {% if stats.skipped > 0 %}
+            <span class="flex items-center gap-1 text-xs">
+                <span class="w-2 h-2 rounded-full bg-gray-400 dark:bg-gray-600"></span>
+                <span class="text-gray-600 dark:text-gray-400">{{ stats.skipped }} ignor&eacute;e{{ 's' if stats.skipped > 1 else '' }}</span>
+            </span>
+            {% end %}
+            {% if stats.retried > 0 %}
+            <span class="flex items-center gap-1 text-xs">
+                <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+                <span class="text-gray-600 dark:text-gray-400">{{ stats.retried }} relanc&eacute;e{{ 's' if stats.retried > 1 else '' }}</span>
+            </span>
+            {% end %}
+        </div>
+    </div>
+
+    <!-- DAG pane (Phase 3c, visible par defaut) -->
+    <div data-komptia-tab-pane="dag" class="komptia-tab-pane">
+        <div class="card mb-4 p-0 overflow-hidden">
+            <div class="flex h-[calc(100vh-360px)] min-h-[420px]">
+                <!-- Canvas viewer -->
+                <div class="flex-1 relative bg-gray-50 dark:bg-gray-950">
+                    <div id="komptia-viewer-canvas" class="w-full h-full"></div>
+                    <div id="komptia-viewer-empty"
+                         class="absolute inset-0 flex items-center justify-center pointer-events-none hidden">
+                        <div class="text-center">
+                            <p class="text-sm text-gray-500 dark:text-gray-400">Workflow vide</p>
+                        </div>
+                    </div>
+                    <!-- Canvas controls -->
+                    <div class="absolute bottom-4 left-4 flex items-center gap-1 bg-white dark:bg-gray-900 rounded shadow px-1 py-1">
+                        <button type="button" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
+                                id="komptia-viewer-zoom-out" aria-label="Zoom arriere">
+                            <i class="bi bi-dash"></i>
+                        </button>
+                        <button type="button" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
+                                id="komptia-viewer-zoom-reset" aria-label="Zoom 100 pourcent">
+                            <i class="bi bi-fullscreen"></i>
+                        </button>
+                        <button type="button" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded"
+                                id="komptia-viewer-zoom-in" aria-label="Zoom avant">
+                            <i class="bi bi-plus"></i>
+                        </button>
+                    </div>
+                    <div class="absolute top-3 right-3">
+                        <span id="komptia-viewer-status"
+                              class="text-xs text-gray-400 dark:text-gray-500"
+                              aria-live="polite">Chargement...</span>
+                    </div>
+                </div>
+
+                <!-- Panel detail step_execution -->
+                <div id="komptia-viewer-panel"
+                     class="w-96 flex-shrink-0 border-l border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 overflow-y-auto hidden"
+                     aria-label="Detail de l'execution d'etape">
+                    <div class="p-4">
+                        <div class="flex items-center justify-between mb-3">
+                            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100"
+                                id="komptia-viewer-panel-title">Etape</h2>
+                            <button type="button" id="komptia-viewer-panel-close"
+                                    class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100" aria-label="Fermer">
+                                <i class="bi bi-x-lg"></i>
+                            </button>
+                        </div>
+                        <div id="komptia-viewer-panel-body"
+                             class="space-y-3 text-sm text-gray-700 dark:text-gray-300">
+                            <p class="text-gray-500 dark:text-gray-400">Cliquez sur un node.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Task #17 (2026-05-27) — Panneau Décisions Iris (audit_logs IRIS_AUTOMATION_DECISION) -->
+    {% if iris_decisions %}
+    <div class="mt-4 mb-6 card border-violet-200 dark:border-violet-900/60">
+        <div class="card-header flex items-center gap-2">
+            <i class="bi bi-robot text-violet-600 dark:text-violet-300"></i>
+            <h3 class="font-semibold text-gray-800 dark:text-gray-200">D&eacute;cisions Iris</h3>
+            <span class="text-xs text-gray-500 dark:text-gray-400">({{ len(iris_decisions) }})</span>
+        </div>
+        <div class="card-body space-y-3">
+            {% for d in iris_decisions %}
+            <div class="border-l-4 {% if d.aborted %}border-red-500{% else %}border-violet-400{% end %} pl-3 py-2 bg-gray-50 dark:bg-gray-800/40">
+                <div class="flex items-center justify-between flex-wrap gap-2 mb-1">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-mono text-gray-500 dark:text-gray-400">step #{{ d.step_id }}</span>
+                        {% if d.aborted %}
+                        <span class="inline-block px-2 py-0.5 text-xs rounded bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">Abort</span>
+                        {% else %}
+                        <span class="inline-block px-2 py-0.5 text-xs rounded bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300">D&eacute;cid&eacute;</span>
+                        {% end %}
+                    </div>
+                    <span class="text-xs text-gray-400 dark:text-gray-500">{{ d.turns_used }} tours &middot; {{ d.trace_length }} tools &middot; ${{ "%.4f"|format(d.llm_cost_usd) }}</span>
+                </div>
+                {% if d.instruction %}
+                <p class="text-xs text-gray-500 dark:text-gray-400 mb-1"><strong>Instruction&nbsp;:</strong> {{ d.instruction }}</p>
+                {% end %}
+                {% if d.decision_summary %}
+                <p class="text-sm text-gray-700 dark:text-gray-200">{{ d.decision_summary }}</p>
+                {% end %}
+                {% if d.aborted and d.abort_reason %}
+                <p class="text-sm text-red-700 dark:text-red-300 mt-1"><strong>Raison abort&nbsp;:</strong> {{ d.abort_reason }}</p>
+                {% end %}
+                {% if d.variables_written %}
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1"><strong>Variables &eacute;crites&nbsp;:</strong> {{ ", ".join(d.variables_written) }}</p>
+                {% end %}
+            </div>
+            {% end %}
+        </div>
+    </div>
+    {% end %}
+
+    <!-- Timeline pane (legacy view, masque par defaut) -->
+    <div data-komptia-tab-pane="timeline" class="komptia-tab-pane hidden">
+
+    <!-- Step Timeline -->
+    <div class="relative">
+        {% for step_idx, step in enumerate(steps) %}
+        {# step_idx 0-based : "il y a un suivant" = step_idx + 1 < len(steps).
+           Tornado n'a pas de variable `loop.index`/`loop.last` (Jinja2-only),
+           on utilise `enumerate()` natif Python a la place. #}
+        <div class="flex gap-4 mb-0 {% if step_idx + 1 < len(steps) %}pb-0{% end %}">
+            <!-- Timeline Connector -->
+            <div class="flex flex-col items-center flex-shrink-0" style="width: 32px;">
+                <!-- Node -->
+                <div class="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 z-10 {% if step.status == 'success' %}bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-300 {% elif step.status == 'failed' %}bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-300 {% elif step.status == 'running' %}bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-300 {% elif step.status == 'skipped' %}bg-gray-100 text-gray-400 dark:bg-gray-800 dark:text-gray-300 {% elif step.status == 'retried' %}bg-amber-100 text-amber-600 dark:bg-amber-900/30 dark:text-amber-300 {% else %}bg-gray-100 text-gray-400 dark:bg-gray-800 dark:text-gray-300 {% end %}">
+                    <span class="text-xs font-bold">{{ step.step_order }}</span>
+                </div>
+                <!-- Vertical line -->
+                {% if step_idx + 1 < len(steps) %}
+                <div class="w-0.5 flex-1 min-h-[16px] {% if step.status == 'success' %}bg-emerald-200 dark:bg-emerald-700/60 {% elif step.status == 'failed' %}bg-red-200 dark:bg-red-700/60 {% else %}bg-gray-200 dark:bg-gray-700{% end %}"></div>
+                {% end %}
+            </div>
+
+            <!-- Step Card -->
+            <div class="flex-1 mb-3">
+                <div class="card {% if step.status == 'failed' %}border-red-200 dark:border-red-900/60{% elif step.status == 'skipped' %}border-gray-200 dark:border-gray-800 opacity-60{% end %}">
+                    <!-- Step Header -->
+                    <div class="px-4 py-3">
+                        <div class="flex items-center justify-between mb-1">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <!-- Type Badge -->
+                                {# Couleur badge par categorie (cf. STEP_CATEGORIES dans
+                                   app/models/automation_step.py). Sources bleues, Format
+                                   violet, Conversion (report+export) orange, Sortie
+                                   (email + save_to_datastore) rouge. Tenir aligné si
+                                   nouveau step type. Fallback gris pour types inconnus. #}
+                                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium {% if step.step_type in ('extract_sql', 'load_workbook', 'load_saved_query') %}bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 {% elif step.step_type == 'format_copilot' %}bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300 {% elif step.step_type in ('report', 'export_workbook') %}bg-orange-50 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300 {% elif step.step_type in ('email', 'save_to_datastore') %}bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300 {% else %}bg-gray-50 text-gray-700 dark:bg-gray-800 dark:text-gray-300{% end %}">
+                                    {{ step.step_type.replace('_', ' ').upper() }}
+                                </span>
+                                <!-- Name -->
+                                <h3 class="text-sm font-medium text-gray-900 truncate dark:text-gray-100">{{ step.step_name }}</h3>
+                            </div>
+
+                            <!-- Status Badge -->
+                            <span class="text-xs font-medium px-2 py-0.5 rounded-full flex-shrink-0 {% if step.status == 'success' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 {% elif step.status == 'failed' %}bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 {% elif step.status == 'running' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 {% elif step.status == 'skipped' %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-300 {% elif step.status == 'retried' %}bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 {% else %}bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300 {% end %}">
+                                {% if step.status == 'success' %}OK
+                                {% elif step.status == 'failed' %}&Eacute;chec
+                                {% elif step.status == 'running' %}En cours
+                                {% elif step.status == 'skipped' %}Ignor&eacute;
+                                {% elif step.status == 'retried' %}Relance
+                                {% else %}{{ step.status }}{% end %}
+                            </span>
+                        </div>
+
+                        <!-- Step Metrics -->
+                        <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 mt-2 dark:text-gray-400">
+                            {% if step.duration_ms is not None %}
+                            <span class="flex items-center gap-1">
+                                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                </svg>
+                                {% if step.duration_ms < 1000 %}
+                                {{ "%.0f" % step.duration_ms }}ms
+                                {% else %}
+                                {{ "%.2f" % (step.duration_ms / 1000) }}s
+                                {% end %}
+                            </span>
+                            {% end %}
+                            {% if step.rows_in is not None and step.rows_out is not None and step.status != 'skipped' %}
+                            <span class="flex items-center gap-1">
+                                {{ step.rows_in }} &rarr; {{ step.rows_out }}
+                            </span>
+                            {% end %}
+                            {% if step.attempt_number > 1 %}
+                            <span class="flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                                Tentative {{ step.attempt_number }}
+                            </span>
+                            {% end %}
+                            {% if step.started_at %}
+                            <time class="text-gray-400 dark:text-gray-500"
+                                  datetime="{{ step.started_at.isoformat() }}+00:00"
+                                  data-fmt-local="time"
+                                  title="{{ step.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC">{{ step.started_at.strftime('%H:%M:%S') }} UTC</time>
+                            {% end %}
+                        </div>
+                    </div>
+
+                    <!-- Error Detail -->
+                    {% if step.error_message %}
+                    <div class="border-t border-red-100 bg-red-50 px-4 py-2 dark:border-red-900/40 dark:bg-red-900/20">
+                        <p class="text-xs text-red-700 dark:text-red-300 whitespace-pre-wrap break-words">
+                            <span class="font-medium">Erreur:</span> {{ step.error_message }}
+                        </p>
+                    </div>
+                    {% end %}
+
+                    <!-- Warnings -->
+                    {% if step.warnings %}
+                    <div class="border-t border-yellow-100 bg-yellow-50 px-4 py-2 dark:border-yellow-900/40 dark:bg-yellow-900/20">
+                        {% for w_idx, warning in enumerate(step.warnings) %}
+                        {# Tornado n'a pas `loop.last` : on derive depuis l'index 0-based. #}
+                        <p class="text-xs text-yellow-700 dark:text-yellow-300 {% if w_idx + 1 < len(step.warnings) %}mb-1{% end %}">
+                            <span class="font-medium">Avertissement:</span> {{ warning }}
+                        </p>
+                        {% end %}
+                    </div>
+                    {% end %}
+                </div>
+            </div>
+        </div>
+        {% end %}
+    </div>
+
+    </div><!-- /timeline pane -->
+
+    {% else %}
+    <!-- No steps (simple execution, not workflow) -->
+    <div class="card px-4 py-8 text-center">
+        <svg class="w-10 h-10 text-gray-300 dark:text-gray-600 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/>
+        </svg>
+        <p class="text-sm text-gray-500 dark:text-gray-400">Ex&eacute;cution simple (pas de workflow multi-&eacute;tapes)</p>
+        <p class="text-xs text-gray-400 mt-1 dark:text-gray-500">
+            {% if execution.status == 'success' %}
+            R&eacute;sultat: {{ execution.result_rows if execution.result_rows is not None else 0 }} ligne(s)
+            {% elif execution.error_message %}
+            Erreur: {{ execution.error_message }}
+            {% end %}
+        </p>
+    </div>
+    {% end %}
+
+</div>
+{% end %}
+
+{% block scripts %}
+{% if stats.total > 0 %}
+<script src="/static/vendor/drawflow/drawflow.min.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/automation-canvas.js" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}
+{% end %}

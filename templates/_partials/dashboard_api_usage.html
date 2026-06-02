@@ -1,0 +1,27 @@
+{# Partial — Section "Consommation API par utilisateur" (dashboard admin).
+
+   Carte pliable via ``<details>``. Le contenu est lazy-loadé en JS
+   (cf. admin.html bloc ``loadApiUsage``) et inséré dans
+   ``#api-usage-container``. Le partial expose juste la coquille.
+
+   Aucune variable requise — le partial est purement structurel. Le contenu
+   dynamique vient d'un fetch ``/api/ai/usage?days=30`` côté client.
+#}
+<div class="bg-white border border-gray-200/80 rounded-xl shadow-sm mb-4 dark:bg-gray-900 dark:border-gray-800/80">
+    <div class="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+        {# Lien "Config IA" SORTI du summary pour éviter le conflit clavier
+           (Enter sur un <a> dans <summary> toggle ET navigue). #}
+        <details id="api-usage-details" class="flex-1">
+            <summary class="flex items-center gap-2 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-brand-500 rounded">
+                <svg class="chev w-3 h-3 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Consommation API par utilisateur <span class="text-xs font-normal text-gray-400 dark:text-gray-500">(30 jours)</span></h2>
+            </summary>
+        </details>
+        <a href="/admin/ai-config" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100 ml-2 flex-shrink-0">Config IA &rarr;</a>
+    </div>
+    <div id="api-usage-container" class="hidden">
+        <div class="px-5 py-6 text-center">
+            <p class="text-sm text-gray-400 dark:text-gray-500">Chargement...</p>
+        </div>
+    </div>
+</div>

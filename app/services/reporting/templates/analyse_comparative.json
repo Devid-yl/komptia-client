@@ -1,0 +1,77 @@
+{
+  "id": "analyse_comparative",
+  "name": "Analyse Comparative Annuelle",
+  "description": "Comparaison des indicateurs N vs N-1",
+  "category": "analyse",
+  "icon": "📊",
+  
+  "query": {
+    "type": "sql",
+    "sql": "WITH current_year AS (SELECT 'CA Total' as indicateur, SUM(montant_ttc) as annee_courante FROM factures WHERE EXTRACT(YEAR FROM date_facture) = EXTRACT(YEAR FROM CURRENT_DATE) UNION SELECT 'Nombre factures', COUNT(*) FROM factures WHERE EXTRACT(YEAR FROM date_facture) = EXTRACT(YEAR FROM CURRENT_DATE) UNION SELECT 'Panier moyen', AVG(montant_ttc) FROM factures WHERE EXTRACT(YEAR FROM date_facture) = EXTRACT(YEAR FROM CURRENT_DATE)), previous_year AS (SELECT 'CA Total' as indicateur, SUM(montant_ttc) as annee_precedente FROM factures WHERE EXTRACT(YEAR FROM date_facture) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 UNION SELECT 'Nombre factures', COUNT(*) FROM factures WHERE EXTRACT(YEAR FROM date_facture) = EXTRACT(YEAR FROM CURRENT_DATE) - 1 UNION SELECT 'Panier moyen', AVG(montant_ttc) FROM factures WHERE EXTRACT(YEAR FROM date_facture) = EXTRACT(YEAR FROM CURRENT_DATE) - 1) SELECT c.indicateur, ROUND(p.annee_precedente::numeric, 2) as annee_n_1, ROUND(c.annee_courante::numeric, 2) as annee_n, ROUND(((c.annee_courante - p.annee_precedente) / p.annee_precedente * 100)::numeric, 2) as evolution_pct FROM current_year c JOIN previous_year p ON c.indicateur = p.indicateur ORDER BY c.indicateur",
+    "parameters": []
+  },
+  
+  "chart": {
+    "enabled": true,
+    "type": "bar",
+    "x_column": "indicateur",
+    "y_columns": ["annee_n_1", "annee_n"],
+    "title": "Comparaison Année N vs N-1",
+    "xlabel": "Indicateur",
+    "ylabel": "Valeur",
+    "multi_series": true,
+    "legend": ["Année N-1", "Année N"]
+  },
+  
+  "columns": [
+    {
+      "name": "indicateur",
+      "label": "Indicateur",
+      "format": "text"
+    },
+    {
+      "name": "annee_n_1",
+      "label": "Année N-1",
+      "format": "decimal",
+      "decimals": 2
+    },
+    {
+      "name": "annee_n",
+      "label": "Année N",
+      "format": "decimal",
+      "decimals": 2
+    },
+    {
+      "name": "evolution_pct",
+      "label": "Évolution (%)",
+      "format": "percentage",
+      "highlight_positive": true,
+      "highlight_negative": true
+    }
+  ],
+  
+  "insights": [
+    {
+      "condition": "evolution_pct > 10 AND indicateur = 'CA Total'",
+      "message": "✅ Forte croissance du CA (+{evolution_pct}%)",
+      "level": "success"
+    },
+    {
+      "condition": "evolution_pct < -5 AND indicateur = 'CA Total'",
+      "message": "⚠️ Baisse significative du CA ({evolution_pct}%)",
+      "level": "warning"
+    },
+    {
+      "condition": "evolution_pct > 15 AND indicateur = 'Panier moyen'",
+      "message": "📈 Augmentation du panier moyen (+{evolution_pct}%)",
+      "level": "info"
+    }
+  ],
+  
+  "metadata": {
+    "title": "Analyse Comparative Annuelle",
+    "description": "Comparaison des principaux indicateurs entre année en cours et année précédente",
+    "author": "Komptia",
+    "subject": "Analyse stratégique"
+  }
+}

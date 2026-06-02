@@ -1,0 +1,503 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+        <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Gérez les contacts et listes de diffusion</p>
+    </div>
+    <div class="flex items-center gap-2" id="tab-actions-contacts">
+        <button id="btnOpenImportModal" class="btn btn-secondary">
+            Importer CSV
+        </button>
+        <button id="btnOpenCreateModal" class="btn btn-primary">
+            Nouveau contact
+        </button>
+    </div>
+    <div class="flex items-center gap-2 hidden" id="tab-actions-lists">
+        <button id="btnOpenListModal" class="btn btn-primary">
+            Nouvelle liste
+        </button>
+    </div>
+</div>
+
+<!-- Tabs (WAI-ARIA Authoring Practices : tablist) -->
+<div class="flex border-b border-gray-200 mb-6 dark:border-gray-800" role="tablist" aria-label="Sections">
+    <button id="tab-contacts" data-tab="contacts" role="tab" aria-selected="true" aria-controls="panel-contacts" tabindex="0"
+        class="px-4 py-2 text-sm font-medium border-b-2 border-brand-600 text-brand-600 -mb-px">
+        Contacts
+    </button>
+    <button id="tab-lists" data-tab="lists" role="tab" aria-selected="false" aria-controls="panel-lists" tabindex="-1"
+        class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700 -mb-px dark:text-gray-400 dark:hover:text-gray-200">
+        Listes de diffusion
+    </button>
+</div>
+
+<!-- ══════════════════════ TAB: Contacts ══════════════════════ -->
+<div id="panel-contacts" role="tabpanel" aria-labelledby="tab-contacts">
+    <!-- Loading state -->
+    <div id="contacts-loading" class="hidden text-center py-12" role="status" aria-live="polite">
+        <svg class="animate-spin h-8 w-8 text-brand-600 mx-auto mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+        </svg>
+        <p class="text-sm text-gray-500 dark:text-gray-400">Chargement des contacts…</p>
+    </div>
+    <!-- Error state -->
+    <div id="contacts-error" class="hidden text-center py-12" role="alert">
+        <p class="text-sm text-red-600 mb-1 dark:text-red-400" id="contacts-error-message">Impossible de charger les contacts</p>
+        <p class="text-xs text-gray-500 mb-3 dark:text-gray-400" id="contacts-error-detail"></p>
+        <div class="flex justify-center gap-2">
+            <button type="button" data-action="retryContacts" class="btn btn-secondary text-xs">Réessayer</button>
+            <button type="button" data-action="reportContactsError" class="btn btn-secondary text-xs">Signaler</button>
+        </div>
+    </div>
+    <!-- Content -->
+    <div id="contacts-content">
+    <!-- Stats (aria-live pour lecture par screen readers à chaque mise à jour) -->
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6" aria-live="polite" aria-atomic="false">
+        <div class="card text-center py-4">
+            <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100" id="stat-total" aria-label="Total contacts">-</p>
+            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Total contacts</p>
+        </div>
+        <div class="card text-center py-4">
+            <p class="text-2xl font-semibold text-gray-700 dark:text-gray-300" id="stat-active">-</p>
+            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Actifs</p>
+        </div>
+        <div class="card text-center py-4">
+            <p class="text-2xl font-semibold text-gray-500 dark:text-gray-400" id="stat-inactive">-</p>
+            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Inactifs</p>
+        </div>
+    </div>
+
+    <!-- Filters & Table -->
+    <div class="card p-5">
+        <div class="flex flex-wrap items-center gap-3 mb-4 pb-4 border-b border-gray-200 dark:border-gray-800">
+            <label class="sr-only" for="search-input">Rechercher</label>
+            <input type="text" id="search-input" placeholder="Rechercher email, nom ou société…" maxlength="200"
+                class="input w-full sm:w-64" aria-label="Rechercher dans les contacts">
+            <label class="sr-only" for="filter-status">Filtre statut</label>
+            <select id="filter-status" class="input w-full sm:w-40" aria-label="Filtre par statut">
+                <option value="all">Tous statuts</option>
+                <option value="active">Actifs</option>
+                <option value="inactive">Inactifs</option>
+            </select>
+            <span id="filter-summary" class="text-xs text-gray-500 dark:text-gray-400 ml-auto"></span>
+            <button type="button" id="btn-clear-filters" class="hidden btn btn-secondary text-xs">
+                Effacer les filtres
+            </button>
+        </div>
+
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm" aria-label="Liste des contacts">
+                <thead>
+                    <tr class="border-b border-gray-200 dark:border-gray-800">
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="email">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortContacts" data-sort-key="email">
+                                Email
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="last_name">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortContacts" data-sort-key="last_name">
+                                Nom
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="company">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortContacts" data-sort-key="company">
+                                Société
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
+                        <th scope="col" class="table-header text-left">Téléphone</th>
+                        <th scope="col" class="table-header text-left">Statut</th>
+                        <th scope="col" class="table-header text-left">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="contacts-body" class="divide-y divide-gray-100 dark:divide-gray-800" aria-busy="false">
+                </tbody>
+            </table>
+        </div>
+
+        <div id="empty-state" class="hidden text-center py-16">
+            <svg class="w-16 h-16 mx-auto text-gray-300 dark:text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.25" d="M16 12a4 4 0 10-8 0 4 4 0 008 0zm0 0v1.5a2.5 2.5 0 005 0V12a9 9 0 10-9 9m4.5-1.206a8.959 8.959 0 01-4.5 1.207"/>
+            </svg>
+            <h3 class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200" id="empty-state-message">Aucun contact pour l'instant</h3>
+            <p class="text-sm text-gray-500 mb-1 dark:text-gray-400 max-w-md mx-auto">Importez vos contacts pour pouvoir envoyer rapports et relances automatiques par email.</p>
+            <p class="text-xs text-gray-400 mb-4 dark:text-gray-500">Format CSV attendu : colonnes <code class="font-mono text-xs">email</code>, <code class="font-mono text-xs">nom</code>, <code class="font-mono text-xs">prénom</code> (séparateur virgule ou point-virgule).</p>
+            <div class="flex justify-center gap-3 flex-wrap">
+                <button type="button" data-action="openImportModal" class="btn btn-primary text-sm">Importer un CSV</button>
+                <button type="button" data-action="openCreateModal" class="text-sm text-gray-600 hover:text-gray-900 hover:underline focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-400 rounded px-1 dark:text-gray-400 dark:hover:text-gray-100 dark:focus:ring-gray-600">Ou ajouter un contact manuellement →</button>
+            </div>
+        </div>
+
+        <nav id="pagination" class="flex items-center justify-center gap-1 pt-4 mt-4 border-t border-gray-200 dark:border-gray-800" aria-label="Pagination des contacts">
+        </nav>
+    </div>
+    </div>
+</div>
+
+<!-- ══════════════════════ TAB: Listes de diffusion ══════════════════════ -->
+<div id="panel-lists" class="hidden" role="tabpanel" aria-labelledby="tab-lists">
+    <!-- Stats -->
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6" aria-live="polite" aria-atomic="false">
+        <div class="card text-center py-4">
+            <p class="text-2xl font-semibold text-gray-900 dark:text-gray-100" id="stat-lists-total">-</p>
+            {# F9 (review loop) : ancien bouton « i » cliquable mort+invisible
+               (mauvaise classe info-tooltip / attribut data-tooltip-text non
+               câblés) retiré. Conformément à la doctrine anti-« i », l'aide
+               passe par un tooltip natif au survol différé (title) + curseur
+               d'aide. Texte corrigé : l'envoi groupé se fait depuis /contacts. #}
+            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400"><abbr class="no-underline cursor-help" title="Une liste de diffusion regroupe des contacts pour leur envoyer un email groupé. Utilisez l'action « Envoyer un email » directement sur la liste (ou réutilisez-la dans une automation ou un rapport).">Total listes</abbr></p>
+        </div>
+        <div class="card text-center py-4">
+            <p class="text-2xl font-semibold text-gray-700 dark:text-gray-300" id="stat-lists-active">-</p>
+            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Actives</p>
+        </div>
+        <div class="card text-center py-4">
+            <p class="text-2xl font-semibold text-gray-700 dark:text-gray-300" id="stat-lists-contacts">-</p>
+            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Total membres</p>
+        </div>
+    </div>
+
+    <!-- Lists Table -->
+    <div class="card p-5">
+        <!-- Search bar -->
+        <div class="flex flex-wrap items-center gap-3 mb-4 pb-4 border-b border-gray-200 dark:border-gray-800">
+            <label class="sr-only" for="search-lists">Rechercher une liste</label>
+            <input type="text" id="search-lists" placeholder="Rechercher une liste…" maxlength="200"
+                class="input w-full sm:w-64" aria-label="Rechercher dans les listes">
+            <label class="sr-only" for="filter-lists-status">Filtre statut listes</label>
+            <select id="filter-lists-status" class="input w-full sm:w-40" aria-label="Filtre par statut">
+                <option value="all">Toutes</option>
+                <option value="active">Actives</option>
+                <option value="inactive">Inactives</option>
+            </select>
+        </div>
+
+        <!-- Loading state (parité avec l'onglet Contacts) -->
+        <div id="lists-loading" class="hidden text-center py-12" role="status" aria-live="polite">
+            <svg class="animate-spin h-8 w-8 text-brand-600 mx-auto mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+            </svg>
+            <p class="text-sm text-gray-500 dark:text-gray-400">Chargement des listes…</p>
+        </div>
+        <!-- Error state -->
+        <div id="lists-error" class="hidden text-center py-12" role="alert">
+            <p class="text-sm text-red-600 mb-1 dark:text-red-400" id="lists-error-message">Impossible de charger les listes</p>
+            <p class="text-xs text-gray-500 mb-3 dark:text-gray-400" id="lists-error-detail"></p>
+            <div class="flex justify-center gap-2">
+                <button type="button" data-action="retryLists" class="btn btn-secondary text-xs">Réessayer</button>
+                <button type="button" data-action="reportListsError" class="btn btn-secondary text-xs">Signaler</button>
+            </div>
+        </div>
+
+        <div id="lists-content" class="overflow-x-auto">
+            <table class="w-full text-sm" aria-label="Liste des listes de diffusion">
+                <thead>
+                    <tr class="border-b border-gray-200 dark:border-gray-800">
+                        <th scope="col" class="table-header text-left">Nom</th>
+                        <th scope="col" class="table-header text-left">Description</th>
+                        <th scope="col" class="table-header text-left">Membres</th>
+                        <th scope="col" class="table-header text-left">Statut</th>
+                        <th scope="col" class="table-header text-left">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="lists-body" class="divide-y divide-gray-100 dark:divide-gray-800" aria-busy="false">
+                </tbody>
+            </table>
+        </div>
+
+        <div id="lists-empty" class="hidden text-center py-16">
+            <svg class="w-16 h-16 mx-auto text-gray-300 dark:text-gray-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.25" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
+            </svg>
+            <h3 class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200">Aucune liste de diffusion</h3>
+            <p class="text-sm text-gray-500 mb-4 dark:text-gray-400 max-w-md mx-auto">Regroupez vos contacts en listes pour les destinataires récurrents de vos rapports automatiques.</p>
+            <button type="button" data-action="openListModal" class="btn btn-primary text-sm">Créer une liste</button>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════════════════ MODALS ══════════════════════ -->
+
+<!-- Create/Edit Contact Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="contactModal"
+     role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-lg w-full sm:max-w-md max-w-full mx-0 sm:mx-4 sm:rounded-lg rounded-none dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="modalTitle">Nouveau contact</h3>
+            <button type="button" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeModal" aria-label="Fermer la fenêtre">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="contactForm" class="p-4" novalidate>
+            <input type="hidden" id="contactId" value="">
+
+            <div class="mb-4">
+                <label class="label" for="contactEmail">Email <span class="text-red-500" aria-hidden="true">*</span></label>
+                <input type="email" id="contactEmail" class="input w-full" required maxlength="254" autocomplete="email" placeholder="contact@exemple.fr" aria-required="true">
+                <p id="contactEmail-error" class="text-xs text-red-600 dark:text-red-400 mt-1 hidden" role="alert"></p>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label class="label" for="contactFirstName">Prénom</label>
+                    <input type="text" id="contactFirstName" class="input w-full" placeholder="Jean">
+                </div>
+                <div>
+                    <label class="label" for="contactLastName">Nom</label>
+                    <input type="text" id="contactLastName" class="input w-full" placeholder="Dupont">
+                </div>
+            </div>
+            
+            <div class="mb-4">
+                <label class="label" for="contactCompany">Société</label>
+                <input type="text" id="contactCompany" class="input w-full" placeholder="ACME Corp">
+            </div>
+            
+            <div class="mb-4">
+                <label class="label" for="contactPhone">Téléphone</label>
+                <input type="text" id="contactPhone" class="input w-full" placeholder="01 23 45 67 89">
+            </div>
+            
+            <div class="mb-4">
+                <label class="label" for="contactNotes">Notes</label>
+                <textarea id="contactNotes" class="input w-full" rows="2" placeholder="Notes optionnelles"></textarea>
+            </div>
+            
+            <div class="flex justify-end gap-2 mt-6">
+                <button type="button" class="btn btn-secondary" data-action="closeModal">Annuler</button>
+                <button type="submit" class="btn btn-primary">Enregistrer</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Import CSV Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="importModal"
+     role="dialog" aria-modal="true" aria-labelledby="importModalTitle" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-lg w-full sm:max-w-md max-w-full mx-0 sm:mx-4 sm:rounded-lg rounded-none dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="importModalTitle">Importer des contacts</h3>
+            <button type="button" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeImportModal" aria-label="Fermer la fenêtre">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="importForm" class="p-4">
+            <div class="mb-4 text-sm text-gray-600 dark:text-gray-400">
+                <p class="mb-1">Fichier CSV avec une colonne <strong>email</strong> obligatoire.</p>
+                <p class="text-xs">
+                    Colonnes optionnelles reconnues (FR ou EN) :
+                    <code class="text-xs">first_name</code>/<code class="text-xs">prenom</code>,
+                    <code class="text-xs">last_name</code>/<code class="text-xs">nom</code>,
+                    <code class="text-xs">company</code>/<code class="text-xs">entreprise</code>,
+                    <code class="text-xs">phone</code>/<code class="text-xs">telephone</code>,
+                    <code class="text-xs">notes</code>.
+                    Séparateurs <code class="text-xs">,</code> ou <code class="text-xs">;</code> détectés automatiquement.
+                </p>
+            </div>
+            <div class="mb-4">
+                <label class="label" for="csvFile">Fichier CSV <span class="text-red-500" aria-hidden="true">*</span></label>
+                <input type="file" id="csvFile" name="file" accept=".csv,text/csv,application/vnd.ms-excel" class="input w-full" required aria-required="true" aria-describedby="csvFile-hint">
+                <p id="csvFile-hint" class="text-xs text-gray-500 dark:text-gray-400 mt-1">Taille maximum : 5 Mo, 10 000 lignes max.</p>
+            </div>
+            <div class="flex justify-end gap-2">
+                <button type="button" class="btn btn-secondary" data-action="closeImportModal">Annuler</button>
+                <button type="submit" class="btn btn-primary">Importer</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Create/Edit List Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="listModal"
+     role="dialog" aria-modal="true" aria-labelledby="listModalTitle" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-lg w-full sm:max-w-2xl max-w-full mx-0 sm:mx-4 max-h-screen sm:max-h-[85vh] flex flex-col sm:rounded-lg rounded-none dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="listModalTitle">Nouvelle liste</h3>
+            <button type="button" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeListModal" aria-label="Fermer la fenêtre">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="listForm" class="p-4 overflow-y-auto flex-1" novalidate>
+            <div class="mb-4">
+                <label class="label" for="listName">Nom de la liste <span class="text-red-500" aria-hidden="true">*</span></label>
+                <input type="text" id="listName" class="input w-full" required maxlength="100" placeholder="Ex : Clients VIP" aria-required="true">
+            </div>
+            <div class="mb-4">
+                <label class="label" for="listDescription">Description</label>
+                <textarea id="listDescription" class="input w-full" rows="2" maxlength="1000" placeholder="Description optionnelle"></textarea>
+            </div>
+
+            <!-- Add initial members (only visible when creating) -->
+            <div id="initialMembersSection" class="hidden mt-6 pt-6 border-t border-gray-200 dark:border-gray-800">
+                <label class="label mb-3" for="searchInitialContact">Ajouter des membres (optionnel)</label>
+
+                <!-- Search contacts -->
+                <div class="mb-3">
+                    <div class="relative">
+                        <input
+                            type="text"
+                            id="searchInitialContact"
+                            class="input w-full"
+                            placeholder="Rechercher par email, nom ou société…"
+                            autocomplete="off"
+                            aria-label="Rechercher un contact à ajouter à la liste"
+                            aria-describedby="searchInitialContact-hint"
+                            role="combobox"
+                            aria-expanded="false"
+                            aria-controls="initialContactSuggestions">
+                        <div id="initialContactSuggestions" class="hidden absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-60 overflow-y-auto dark:bg-gray-900 dark:border-gray-800" role="listbox">
+                        </div>
+                    </div>
+                    <p id="searchInitialContact-hint" class="text-xs text-gray-500 mt-1 dark:text-gray-400">Tapez au moins 2 caractères pour chercher dans email, nom et société.</p>
+                </div>
+
+                <!-- Selected contacts -->
+                <div id="selectedContactsContainer" class="hidden">
+                    <p class="text-sm font-medium text-gray-700 mb-2 dark:text-gray-300">Contacts sélectionnés (<span id="selectedCount">0</span>)</p>
+                    <div id="selectedContactsList" class="space-y-1 max-h-48 overflow-y-auto border border-gray-100 rounded p-2 bg-gray-50 dark:bg-gray-900 dark:border-gray-800" role="list">
+                    </div>
+                </div>
+            </div>
+        </form>
+        <div class="p-4 border-t border-gray-200 dark:border-gray-800">
+            <div class="flex justify-end gap-2">
+                <button type="button" class="btn btn-secondary" data-action="closeListModal">Annuler</button>
+                <button type="button" id="btnSubmitList" class="btn btn-primary">
+                    <span id="submitListBtnText">Enregistrer</span>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Send Email Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="emailModal"
+     role="dialog" aria-modal="true" aria-labelledby="emailModalTitle" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-lg w-full sm:max-w-2xl max-w-full mx-0 sm:mx-4 max-h-screen sm:max-h-[85vh] flex flex-col sm:rounded-lg rounded-none dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="emailModalTitle">Envoyer un email</h3>
+            <button type="button" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeEmailModal" aria-label="Fermer la fenêtre">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="emailForm" class="p-4 overflow-y-auto flex-1" novalidate>
+            <!-- Destinataires (badges, non éditables — figés au moment d'ouvrir la modale) -->
+            <div class="mb-4">
+                <label class="label">Destinataires</label>
+                <div id="emailRecipientsList" class="flex flex-wrap gap-1.5 p-2 border border-gray-200 rounded bg-gray-50 dark:bg-gray-900 dark:border-gray-800 min-h-[2.5rem]">
+                    <span class="text-xs text-gray-500 dark:text-gray-400">Aucun destinataire</span>
+                </div>
+                <p id="emailRecipientsHint" class="text-xs text-gray-500 mt-1 dark:text-gray-400"></p>
+            </div>
+
+            <div class="mb-4">
+                <label class="label" for="emailSubject">Objet <span class="text-red-500" aria-hidden="true">*</span></label>
+                <input type="text" id="emailSubject" class="input w-full" required maxlength="500" placeholder="Sujet de l'email" aria-required="true">
+            </div>
+
+            <div class="mb-4">
+                <label class="label" for="emailBody">Message <span class="text-red-500" aria-hidden="true">*</span></label>
+                <textarea id="emailBody" class="input w-full" rows="8" required maxlength="10000" placeholder="Bonjour,&#10;..." aria-required="true"></textarea>
+                {# F9 (review loop) : « i » cliquable mort retiré → tooltip natif
+                   au survol différé (title) + curseur d'aide. #}
+                <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">
+                    <abbr class="no-underline cursor-help" title="Le texte est échappé puis envoyé en HTML simple. Aucune mise en forme. Les contacts désabonnés (RGPD) sont exclus automatiquement."><span id="emailBodyCount">0</span> / 10000 caractères</abbr>
+                </p>
+            </div>
+        </form>
+        <div class="p-4 border-t border-gray-200 dark:border-gray-800">
+            <div class="flex justify-end gap-2">
+                <button type="button" class="btn btn-secondary" data-action="closeEmailModal">Annuler</button>
+                <button type="button" id="btnSubmitEmail" class="btn btn-primary">Envoyer</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Members Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="membersModal"
+     role="dialog" aria-modal="true" aria-labelledby="membersModalTitle" aria-hidden="true">
+    <div class="bg-white rounded-lg shadow-lg w-full sm:max-w-2xl max-w-full mx-0 sm:mx-4 max-h-screen sm:max-h-[85vh] flex flex-col sm:rounded-lg rounded-none dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="membersModalTitle">Membres de la liste</h3>
+            <button type="button" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeMembersModal" aria-label="Fermer la fenêtre">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <div class="p-4 overflow-y-auto flex-1">
+            <!-- Add member with search -->
+            <div class="mb-4">
+                <label class="label" for="searchContactToAdd">Ajouter un contact</label>
+                <div class="flex gap-2">
+                    <div class="relative flex-1">
+                        <input
+                            type="text"
+                            id="searchContactToAdd"
+                            class="input w-full"
+                            placeholder="Rechercher par email, nom ou société…"
+                            autocomplete="off"
+                            aria-describedby="searchContactToAdd-hint"
+                            role="combobox"
+                            aria-expanded="false"
+                            aria-controls="contactSuggestions">
+                        <div id="contactSuggestions" class="hidden absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-60 overflow-y-auto dark:bg-gray-900 dark:border-gray-800" role="listbox">
+                        </div>
+                    </div>
+                    <button type="button" id="btnShowAllContacts" class="btn btn-secondary text-sm whitespace-nowrap" aria-label="Voir tous les contacts actifs">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+                        </svg>
+                    </button>
+                </div>
+                <p id="searchContactToAdd-hint" class="text-xs text-gray-500 mt-1 dark:text-gray-400">Au moins 2 caractères. Recherche dans email, nom et société. Désabonnés exclus (RGPD).</p>
+            </div>
+
+            <!-- Current members -->
+            <div>
+                <div class="flex items-center justify-between mb-2 gap-2 flex-wrap">
+                    <p class="label">Membres actuels (<span id="membersCount">0</span>)</p>
+                    <label class="sr-only" for="searchMembers">Filtrer les membres</label>
+                    <input
+                        type="text"
+                        id="searchMembers"
+                        class="input text-xs py-1 px-2 w-full sm:w-48"
+                        placeholder="Filtrer email, nom, société…"
+                        aria-label="Filtrer la liste des membres actuels">
+                </div>
+                <div id="membersList" class="space-y-1 max-h-80 overflow-y-auto border border-gray-100 rounded p-2 dark:border-gray-800" role="list">
+                </div>
+                <div id="membersEmpty" class="hidden text-center py-6 text-sm text-gray-500 dark:text-gray-400">
+                    Aucun membre dans cette liste
+                </div>
+            </div>
+        </div>
+        <div class="p-4 border-t border-gray-200 dark:border-gray-800">
+            <button type="button" class="btn btn-secondary w-full" data-action="closeMembersModal">Fermer</button>
+        </div>
+    </div>
+</div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script src="{{ static_url('js/contacts.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}

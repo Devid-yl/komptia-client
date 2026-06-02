@@ -1,0 +1,885 @@
+{% extends "../base.html" %}
+
+{% block title %}Automatisations | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Automatisations</h1>
+        <div class="flex items-center gap-2">
+            <a href="/automations/templates" class="btn btn-secondary">
+                <i class="bi bi-grid-3x3-gap"></i> Modèles
+            </a>
+            <button class="btn btn-secondary" data-action="showImportModal">
+                <i class="bi bi-upload"></i> Importer
+            </button>
+            <!-- Phase 3b : cree un workflow vide + redirige vers le canvas editor -->
+            <form action="/automations/new" method="post" class="inline-block m-0">
+                {% module xsrf_form_html() %}
+                <button type="submit" class="btn btn-primary">Nouvelle automatisation</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Running Executions Monitor -->
+    <div id="running-monitor" class="mb-4" style="display:none">
+        <div class="card border-l-4 border-l-blue-500">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-gray-100 dark:border-gray-800">
+                <div class="flex items-center gap-2">
+                    <span class="inline-block w-2 h-2 bg-blue-500 rounded-full animate-pulse"></span>
+                    <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Executions en cours</span>
+                    <span id="running-count" class="text-xs text-gray-400 dark:text-gray-500"></span>
+                </div>
+                <span id="running-updated" class="text-xs text-gray-400 dark:text-gray-500"></span>
+            </div>
+            <div id="running-list" class="divide-y divide-gray-50 dark:divide-gray-800"></div>
+        </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="card mb-4">
+        <div class="flex flex-wrap items-center gap-4 px-4 py-3">
+            <div>
+                <select id="filter-status" class="input w-40">
+                    <option value="">Tous statuts</option>
+                    <option value="active" {% if status_filter == 'active' %}selected{% end %}>Actives</option>
+                    <option value="inactive" {% if status_filter == 'inactive' %}selected{% end %}>Inactives</option>
+                </select>
+            </div>
+            {% if status_filter %}
+            <a href="/automations" class="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">Reinitialiser</a>
+            {% end %}
+        </div>
+    </div>
+
+    {% if automations %}
+    <div class="space-y-3">
+        {% for item in automations %}
+        {% set auto = item['automation'] %}
+        <div class="card p-4">
+            <!-- Header : titre + badge + toggle + kebab (a droite du toggle).
+                 Le kebab vit dans le header pour ne PAS dependre du card-flow
+                 (la section actions etant en bas, un menu deroulant collerait
+                 sur la card suivante). Cf. retour utilisateur 2026-05-07. -->
+            <div class="flex items-start justify-between gap-4 mb-3">
+                <div class="min-w-0">
+                    <h3 class="text-sm font-semibold text-gray-900 truncate dark:text-gray-100">{{ auto.name }}</h3>
+                    {% if auto.description %}
+                    <p class="text-sm text-gray-500 mt-0.5 truncate dark:text-gray-400">{{ auto.description }}</p>
+                    {% end %}
+                </div>
+                <div class="flex items-center gap-3 flex-shrink-0">
+                    {# **Phase 2.5.6.ter (#100)** — Badge Inactive enrichi avec la raison
+                       d'auto-pause si présente. ``paused_reason`` est posé par
+                       l'executor (legacy + DAG paths) quand l'auto est mise en
+                       pause automatiquement par une règle ``deny`` data_access. #}
+                    {% if auto.is_active %}
+                    <span class="badge badge-success">Active</span>
+                    {% else %}
+                        {% set _reason = getattr(auto, 'paused_reason', None) %}
+                        {% if _reason == 'data_access_denied' %}
+                    <span class="badge badge-warning" title="Mise en pause automatique : un accès aux données utilisé par cette automatisation a été révoqué par votre administrateur. Contactez-le pour ajuster les droits.">
+                        Inactive · accès retiré
+                    </span>
+                        {% elif _reason %}
+                    <span class="badge badge-error" title="Mise en pause automatique : {{ _reason }}">
+                        Inactive · {{ _reason }}
+                    </span>
+                        {% else %}
+                    <span class="badge badge-error">Inactive</span>
+                        {% end %}
+                    {% end %}
+                    <input type="checkbox" class="w-4 h-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900 cursor-pointer dark:border-gray-700 dark:text-gray-100"
+                           {% if auto.is_active %}checked{% end %}
+                           data-action="toggleAutomation" data-automation-id="{{ auto.id }}"
+                           title="Activer/Desactiver l'automatisation {{ auto.name }}"
+                           aria-label="Activer ou desactiver l'automatisation {{ auto.name }}">
+                    <div class="actions-menu">
+                        <button type="button"
+                                class="actions-menu-trigger"
+                                data-action="toggleAutomationMenu"
+                                data-automation-id="{{ auto.id }}"
+                                aria-haspopup="menu"
+                                aria-expanded="false"
+                                aria-label="Plus d'actions pour {{ auto.name }}"
+                                title="Plus d'actions">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <circle cx="12" cy="5" r="1"></circle>
+                                <circle cx="12" cy="12" r="1"></circle>
+                                <circle cx="12" cy="19" r="1"></circle>
+                            </svg>
+                        </button>
+                        <div class="actions-menu-dropdown hidden" role="menu" aria-label="Actions pour {{ auto.name }}">
+                            <a href="/automations/history/{{ auto.id }}" class="actions-menu-item" role="menuitem">
+                                <i class="bi bi-clock-history" aria-hidden="true"></i> Historique
+                            </a>
+                            <a href="/automations/{{ auto.id }}/edit#schedule" class="actions-menu-item" role="menuitem">
+                                <i class="bi bi-calendar2-event" aria-hidden="true"></i> Planification
+                            </a>
+                            <button type="button" class="actions-menu-item" role="menuitem"
+                                    data-action="duplicateAutomation"
+                                    data-automation-id="{{ auto.id }}">
+                                <i class="bi bi-files" aria-hidden="true"></i> Dupliquer
+                            </button>
+                            <a href="/api/automations/{{ auto.id }}/export" class="actions-menu-item" role="menuitem">
+                                <i class="bi bi-download" aria-hidden="true"></i> Exporter (JSON)
+                            </a>
+                            <hr class="my-1 border-gray-200 dark:border-gray-800" aria-hidden="true">
+                            <button type="button" class="actions-menu-item danger" role="menuitem"
+                                    data-action="deleteAutomation"
+                                    data-automation-id="{{ auto.id }}"
+                                    data-automation-name="{{ auto.name }}">
+                                <i class="bi bi-trash" aria-hidden="true"></i> Supprimer
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Meta -->
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 mb-3 dark:text-gray-400">
+                {% if auto.is_workflow %}
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-brand-100 text-brand-700 font-medium">
+                    <i class="bi bi-diagram-3"></i> Workflow ({{ auto.step_count }} étapes)
+                </span>
+                {% end %}
+                {% if auto.has_webhooks %}
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 font-medium dark:bg-purple-900/30 dark:text-purple-300">
+                    <i class="bi bi-link-45deg"></i> Webhook
+                </span>
+                {% end %}
+                {% if auto.has_notifications %}
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 font-medium dark:bg-amber-900/30 dark:text-amber-300">
+                    <i class="bi bi-bell"></i> Notifications
+                </span>
+                {% end %}
+                <span>{{ (auto.schedule_type or "").title() }}</span>
+                {# Pastille « Sortie » : derivee du DAG (sinks reels) plutot
+                   que de auto.output_format (legacy mono-step, faux pour les
+                   workflows multi-sinks). Cf. AutomationsListHandler.output_summary. #}
+                {% if auto.output_summary %}
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 font-medium dark:bg-emerald-900/30 dark:text-emerald-300">
+                    <i class="bi bi-box-arrow-up-right"></i> {{ auto.output_summary }}
+                </span>
+                {% end %}
+                <span>Creee {{ auto.created_at.strftime('%d/%m/%Y') }}</span>
+            </div>
+
+            <!-- Stats (gauche) + Actions (droite) sur la meme ligne pour
+                 utiliser la largeur de la card. justify-between pousse les
+                 deux blocs aux extremes ; flex-wrap evite le squeeze sur
+                 mobile (les actions descendent sous les stats si pas de place).
+                 Le kebab (3 dots, actions secondaires) reste dans le header
+                 au-dessus, a cote du toggle Actif. -->
+            {# Panel fusionne stats+actions en pattern "card footer" :
+               - `-mx-4 -mb-4` annule le `p-4` du card sur les bords,
+                 etendant le footer jusqu'aux bords (rounded-b-xl pour
+                 conserver l'arrondi du card). Resultat : le contenu est
+                 visuellement centre dans une box dont la hauteur se
+                 termine pile au bord bas du card (pas de p-4 residuel
+                 qui creait l'illusion "trop haut").
+               - `px-4 py-3` : padding symetrique 12px haut/bas → contenu
+                 visuellement centre verticalement dans une box de ~60px.
+               - `mt-4` : espacement clair avec la section meta au-dessus.
+               - `items-center` + `content-center` garantissent le centrage
+                 vertical (1-rang OU multi-rangs en mode wrap mobile).
+               - PAS de bg distinct : le footer reste visuellement uni avec
+                 le card (le `border-t` suffit pour separer des stats+actions
+                 de la zone meta au-dessus). #}
+            <div class="-mx-4 -mb-4 mt-4 px-4 py-3 rounded-b-xl border-t border-gray-100 dark:border-gray-800 flex flex-wrap content-center items-center justify-between gap-x-6 gap-y-3">
+                <div class="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
+                    <div>
+                        <span class="text-gray-500 dark:text-gray-400">Executions</span>
+                        <span class="font-medium text-gray-900 ml-1 dark:text-gray-100">{{ item['total_executions'] }}</span>
+                    </div>
+                    <div>
+                        <span class="text-gray-500 dark:text-gray-400">Succes</span>
+                        <span class="font-medium text-gray-900 ml-1 dark:text-gray-100">{{ item['successful_executions'] }}</span>
+                    </div>
+                    <div>
+                        <span class="text-gray-500 dark:text-gray-400">Taux</span>
+                        <span class="font-medium text-gray-900 ml-1 dark:text-gray-100">{{ "%.0f" % item['success_rate'] }}%</span>
+                    </div>
+                    {% if item.get('next_run_time') %}
+                    <div>
+                        <span class="text-gray-500 dark:text-gray-400">Prochaine</span>
+                        <span class="font-medium text-gray-900 ml-1 dark:text-gray-100">{{ item['next_run_time'].strftime('%d/%m %Hh%M') }}</span>
+                    </div>
+                    {% end %}
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    {# Ordre Modifier → Executer voulu par David (confirme
+                       2026-05-08). Configurer avant de lancer = sequence
+                       naturelle. #}
+                    <a href="/automations/{{ auto.id }}/edit" class="btn btn-secondary">
+                        <i class="bi bi-pencil" aria-hidden="true"></i> Modifier
+                    </a>
+                    <button type="button" class="btn btn-primary" data-action="executeAutomation" data-automation-id="{{ auto.id }}">
+                        <i class="bi bi-play-fill" aria-hidden="true"></i> Executer
+                    </button>
+                </div>
+            </div>
+        </div>
+        {% end %}
+    </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <div class="flex items-center justify-center gap-1 mt-6">
+        {% if page > 1 %}
+        <a href="/automations?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}" class="btn btn-secondary">Precedent</a>
+        {% end %}
+        {% for p in range(1, total_pages + 1) %}
+        <a href="/automations?page={{ p }}{% if status_filter %}&status={{ status_filter }}{% end %}" 
+           class="px-3 py-1.5 text-sm rounded {% if p == page %}bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900{% else %}border border-gray-300 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-800{% end %} dark:border-gray-700">{{ p }}</a>
+        {% end %}
+        {% if page < total_pages %}
+        <a href="/automations?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}" class="btn btn-secondary">Suivant</a>
+        {% end %}
+    </div>
+    {% end %}
+
+    {% else %}
+    <div class="card px-4 py-16 text-center">
+        <svg class="mx-auto w-16 h-16 text-gray-300 mb-4 dark:text-gray-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.25" aria-hidden="true">
+            <circle cx="5" cy="6" r="2"/>
+            <circle cx="5" cy="18" r="2"/>
+            <circle cx="19" cy="12" r="2"/>
+            <path stroke-linecap="round" stroke-linejoin="round" d="M7 6h6a2 2 0 012 2v8a2 2 0 01-2 2H7"/>
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15 12h2"/>
+        </svg>
+        <h3 class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200">Aucune automatisation pour l'instant</h3>
+        <p class="text-sm text-gray-500 mb-1 dark:text-gray-400 max-w-md mx-auto">Une automatisation extrait vos données, les met en forme, génère un rapport et l'envoie par email — sur planification ou déclencheur.</p>
+        <p class="text-xs text-gray-400 mb-4 dark:text-gray-500">Quatre maillons configurables : source, format, rapport, envoi.</p>
+        <div class="flex justify-center items-center gap-3 flex-wrap">
+            {# POST + xsrf : creation = side-effect, pas un GET (idempotence HTTP). #}
+            <form action="/automations/new" method="post" class="inline-block m-0">
+                {% module xsrf_form_html() %}
+                <button type="submit" class="btn btn-primary">Créer ma première automatisation</button>
+            </form>
+            <a href="/automations/templates" class="text-sm text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Voir un exemple →</a>
+        </div>
+    </div>
+    {% end %}
+
+    <!-- Import Modal — U5 axe a11y : role/aria-modal/aria-labelledby + Escape close -->
+    <div id="import-modal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" style="display:none" role="dialog" aria-modal="true" aria-labelledby="import-modal-title">
+        <div class="bg-white rounded-lg shadow-lg max-w-md w-full mx-4 p-6 dark:bg-gray-900">
+            <div class="flex items-center justify-between mb-4">
+                <h3 id="import-modal-title" class="text-sm font-semibold text-gray-900 dark:text-gray-100">Importer une automatisation</h3>
+                <button id="import-modal-close" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" aria-label="Fermer la fenêtre d'import">&times;</button>
+            </div>
+            <p class="text-xs text-gray-500 mb-4 dark:text-gray-400">Sélectionnez un fichier JSON exporté depuis Komptia.</p>
+            <div id="import-drop-zone" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-gray-400 transition-colors dark:border-gray-700 dark:hover:border-gray-500" role="button" tabindex="0" aria-label="Zone de dépôt fichier JSON">
+                <i class="bi bi-file-earmark-arrow-up text-2xl text-gray-400 mb-2 block dark:text-gray-500" aria-hidden="true"></i>
+                <p class="text-sm text-gray-500 dark:text-gray-400">Glissez un fichier ici ou cliquez pour sélectionner</p>
+                <input type="file" id="import-file-input" accept=".json" class="hidden" tabindex="-1" aria-label="Fichier JSON à importer">
+            </div>
+            <div id="import-file-info" class="mt-3 text-sm text-gray-600 dark:text-gray-400" style="display:none" role="status" aria-live="polite"></div>
+            <div class="flex justify-end gap-2 mt-4">
+                <button id="import-cancel" class="btn btn-secondary">Annuler</button>
+                <button id="import-submit" class="btn btn-primary" disabled>Importer</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+function applyFilter(name, value) {
+    var params = new URLSearchParams(window.location.search);
+    if (value) params.set(name, value);
+    else params.delete(name);
+    params.delete('page');
+    window.location.search = params.toString();
+}
+
+async function toggleAutomation(id, active, checkbox) {
+    checkbox.disabled = true;
+    try {
+        // A7-M2 : envoyer l'état CIBLE explicite (`target`) au lieu d'un flip
+        // aveugle. Le backend renvoie 409 si l'auto est déjà dans cet état
+        // (un autre onglet l'a déjà basculée) → anti-désync multi-onglets.
+        var res = await fetch('/automations/' + id + '/toggle', {
+            method: 'POST',
+            headers: { 'X-Xsrftoken': getCookie('_xsrf'), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ target: active })
+        });
+        var data = await res.json();
+        if (data.success) {
+            showToast('Automatisation ' + (active ? 'activee' : 'desactivee'), 'success');
+            setTimeout(function() { location.reload(); }, 600);
+            return;
+        }
+        // A7-M2 : 409 = un autre onglet a déjà mis l'auto dans cet état. On
+        // reflète l'état RÉEL renvoyé par le serveur (pas une erreur bloquante).
+        if (res.status === 409) {
+            showToast(data.error || 'État déjà à jour.', 'info');
+            if (typeof data.is_active === 'boolean') checkbox.checked = data.is_active;
+            checkbox.disabled = false;
+            return;
+        }
+        // Activation refusée : restaurer l'UI et afficher la liste structurée des erreurs.
+        checkbox.checked = !active;
+        checkbox.disabled = false;
+        if (data.errors && data.errors.length && window.appShowErrors) {
+            appShowErrors(
+                data.error || 'Activation refusée',
+                data.errors,
+                {
+                    onErrorClick: function(err) {
+                        // Navigue vers l'éditeur du canvas (le node concerné est sélectionné par fragment).
+                        var nodeId = err && err.context && err.context.node_id;
+                        var url = '/automations/' + id + '/edit';
+                        if (nodeId != null) url += '#step-' + encodeURIComponent(nodeId);
+                        window.location.href = url;
+                    }
+                }
+            );
+        } else {
+            showToast(data.error || 'Activation refusée', 'error');
+        }
+    } catch (err) {
+        checkbox.disabled = false;
+        checkbox.checked = !active;
+        showToast('Erreur réseau : ' + err.message, 'error');
+    }
+}
+
+async function executeAutomation(id, btn) {
+    if (!(await appConfirm('Lancer l\'exécution maintenant ?'))) return;
+    btn.disabled = true;
+    btn.textContent = 'En cours...';
+    try {
+        var res = await fetch('/automations/' + id + '/execute', { method: 'POST', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
+        var data = await res.json();
+        if (data.success) { showToast('Execution lancee', 'success'); setTimeout(function() { location.reload(); }, 1500); }
+        else throw new Error(data.error);
+    } catch (err) { btn.disabled = false; btn.textContent = 'Executer'; showToast('Erreur: ' + err.message, 'error'); }
+}
+
+async function deleteAutomation(id, name) {
+    if (!(await appConfirm('Supprimer l\'automatisation "' + name + '" ?'))) return;
+    try {
+        var res = await fetch('/automations/' + id, { method: 'DELETE', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
+        var data = await res.json();
+        if (data.success) { showToast('Supprimee', 'success'); setTimeout(function() { location.reload(); }, 600); }
+        else throw new Error(data.error);
+    } catch (err) { showToast('Erreur: ' + err.message, 'error'); }
+}
+
+async function duplicateAutomation(id) {
+    if (!(await appConfirm('Dupliquer cette automatisation ?'))) return;
+    try {
+        var res = await fetch('/automations/' + id + '/duplicate', { method: 'POST', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
+        var data = await res.json();
+        if (data.success) { showToast('Dupliquee', 'success'); setTimeout(function() { location.reload(); }, 600); }
+        else throw new Error(data.error);
+    } catch (err) { showToast('Erreur: ' + err.message, 'error'); }
+}
+
+// ── Live Execution Monitor ──
+var _monitorInterval = null;
+var _previousRunning = {};
+
+// Real-review #7 cycle 23 : escapeHtml local. Avant, le code référençait
+// une `escapeHtml` qui n'était définie que dans automation-canvas.js (qui
+// n'est PAS chargé sur /automations) → ReferenceError silencieux qui
+// cassait le live monitor à la première execution running. Anti-XSS
+// défense en profondeur même si automation_name vient de la BDD propre.
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function formatElapsed(sec) {
+    if (sec == null) return '';
+    if (sec < 60) return Math.round(sec) + 's';
+    var m = Math.floor(sec / 60);
+    var s = Math.round(sec % 60);
+    return m + 'min ' + s + 's';
+}
+
+function renderRunningExecution(ex) {
+    var pct = ex.total_steps > 0
+        ? Math.round((ex.completed_steps / ex.total_steps) * 100)
+        : 0;
+    var stepInfo = '';
+    if (ex.current_step_name) {
+        stepInfo = '<span class="text-xs text-blue-600 dark:text-blue-400"><i class="bi bi-arrow-right-short"></i>' +
+            escapeHtml(ex.current_step_name) + '</span>';
+    }
+    var progressBar = '';
+    if (ex.is_workflow && ex.total_steps > 0) {
+        progressBar = '<div class="w-full bg-gray-200 rounded-full h-1.5 mt-1.5 dark:bg-gray-800">' +
+            '<div class="bg-blue-500 h-1.5 rounded-full transition-all duration-500" style="width:' + pct + '%"></div>' +
+            '</div>';
+    }
+    return '<div class="px-4 py-2.5">' +
+        '<div class="flex items-center justify-between gap-3">' +
+            '<div class="min-w-0 flex-1">' +
+                '<div class="flex items-center gap-2">' +
+                    '<span class="text-sm font-medium text-gray-900 truncate dark:text-gray-100">' + escapeHtml(ex.automation_name) + '</span>' +
+                    (ex.is_workflow
+                        ? '<span class="text-xs text-gray-400 dark:text-gray-500">' + ex.completed_steps + '/' + ex.total_steps + ' étapes</span>'
+                        : '<span class="text-xs text-gray-400 dark:text-gray-500">En cours</span>') +
+                '</div>' +
+                stepInfo + progressBar +
+            '</div>' +
+            '<div class="flex items-center gap-3 flex-shrink-0">' +
+                '<span class="text-xs text-gray-400 dark:text-gray-500">' + formatElapsed(ex.elapsed_seconds) + '</span>' +
+                '<a href="/automations/history/' + ex.automation_id + '" class="text-xs text-blue-600 hover:underline dark:text-blue-400">Historique</a>' +
+            '</div>' +
+        '</div>' +
+    '</div>';
+}
+
+async function pollRunningExecutions() {
+    try {
+        var res = await fetch('/api/executions/running');
+        // A7-M3 (vérifié = FAUX finding) : le 401/403 (session expirée) est
+        // DÉJÀ géré globalement par session-status.js (chargé EN HEAD via
+        // base.html, wrap de window.fetch → banner sticky + redirect /login +
+        // anti-loop). Ajouter un handler inline ici serait redondant ET
+        // conflictuel (toast vs banner). La doctrine (session-status.js:24-36)
+        // vise au contraire à SUPPRIMER les handlers 401 inline. Le redirect
+        // global (3s) tue ce poll → pas de martèlement durable. On garde donc
+        // le `if (!res.ok) return` (le 401 est déjà capté en amont).
+        if (!res.ok) return;
+        var data = await res.json();
+        if (!data.success) return;
+
+        var monitor = document.getElementById('running-monitor');
+        var list = document.getElementById('running-list');
+        var count = document.getElementById('running-count');
+        var updated = document.getElementById('running-updated');
+
+        if (data.count > 0) {
+            monitor.style.display = '';
+            count.textContent = '(' + data.count + ')';
+            var now = new Date();
+            updated.textContent = 'MAJ ' + now.getHours().toString().padStart(2, '0') + ':' +
+                now.getMinutes().toString().padStart(2, '0') + ':' +
+                now.getSeconds().toString().padStart(2, '0');
+            list.innerHTML = data.running.map(renderRunningExecution).join('');
+
+            // Detect newly completed executions (were running, now gone)
+            var currentIds = {};
+            data.running.forEach(function(ex) { currentIds[ex.execution_id] = true; });
+            Object.keys(_previousRunning).forEach(function(id) {
+                if (!currentIds[id]) {
+                    showToast('Execution terminee: ' + _previousRunning[id], 'success');
+                }
+            });
+            _previousRunning = {};
+            data.running.forEach(function(ex) {
+                _previousRunning[ex.execution_id] = ex.automation_name;
+            });
+
+            // Poll faster when executions are running
+            if (!_monitorInterval || _monitorInterval._ms !== 3000) {
+                clearInterval(_monitorInterval);
+                _monitorInterval = setInterval(pollRunningExecutions, 3000);
+                _monitorInterval._ms = 3000;
+            }
+        } else {
+            // Check for just-finished executions
+            Object.keys(_previousRunning).forEach(function(id) {
+                showToast('Execution terminee: ' + _previousRunning[id], 'success');
+            });
+            _previousRunning = {};
+
+            monitor.style.display = 'none';
+            list.innerHTML = '';
+
+            // Slow poll when nothing is running
+            if (!_monitorInterval || _monitorInterval._ms !== 15000) {
+                clearInterval(_monitorInterval);
+                _monitorInterval = setInterval(pollRunningExecutions, 15000);
+                _monitorInterval._ms = 15000;
+            }
+        }
+    } catch (err) {
+        // Silent fail — monitor is optional
+    }
+}
+
+// Start polling on page load
+pollRunningExecutions();
+_monitorInterval = setInterval(pollRunningExecutions, 5000);
+_monitorInterval._ms = 5000;
+
+// Cluster-Q 2026-05-26 — Cleanup `_monitorInterval` au pagehide.
+// Sans ça, le polling continue après navigate-away (mini-leak réseau
+// et CPU) jusqu'à ce que le navigateur unload réellement la page.
+// Bonus : compat bfcache (Safari restore depuis bfcache → intervals
+// re-démarrent sans dupliquer si on a nettoyé proprement).
+window.addEventListener('pagehide', function () {
+    if (_monitorInterval) {
+        clearInterval(_monitorInterval);
+        _monitorInterval = null;
+    }
+});
+
+// Anti double-submit du formulaire "Nouvelle automatisation" (#2 2026-05-28).
+// Un double-clic (ou un POST lent) créait 2 automatisations vides. On bloque
+// le 2e submit et on désactive le bouton le temps de la navigation. pageshow
+// (restauration bfcache au bouton "précédent") ré-active pour ne pas laisser
+// un bouton bloqué. addEventListener (CSP-safe, pas d'onclick inline).
+(function guardNewAutomationSubmit() {
+    var newForms = document.querySelectorAll('form[action="/automations/new"]');
+    newForms.forEach(function (form) {
+        form.addEventListener('submit', function (e) {
+            if (form.dataset.submitting === '1') {
+                e.preventDefault();
+                return;
+            }
+            form.dataset.submitting = '1';
+            var btn = form.querySelector('button[type="submit"]');
+            if (btn) btn.disabled = true;
+        });
+    });
+    window.addEventListener('pageshow', function (evt) {
+        if (!evt.persisted) return;
+        newForms.forEach(function (form) {
+            form.dataset.submitting = '';
+            var btn = form.querySelector('button[type="submit"]');
+            if (btn) btn.disabled = false;
+        });
+    });
+})();
+
+// ── Kebab menu (actions secondaires) ────────────────────────
+// Pattern aligne sur /reports : `position: fixed` avec calcul du top/left
+// au moment de l'ouverture (via getBoundingClientRect du trigger). Sans ca,
+// `.card { overflow: hidden }` clip le dropdown qui sort en bas (cf. retour
+// utilisateur 2026-05-07 : "Historique" tronque, items suivants invisibles).
+// Le `position: fixed` echappe a tous les overflows ancetres.
+//
+// Conventions : single-open, click-outside, Esc, navigation clavier
+// (Up/Down/Home/End) — WAI-ARIA Menu Button.
+
+function _closeAllAutomationMenus() {
+    document.querySelectorAll('.actions-menu-dropdown:not(.hidden)').forEach(function(menu) {
+        menu.classList.add('hidden');
+        // Reset des styles inline poses par positionAutomationMenu pour
+        // ne pas garder un pos/visibility errant si le menu est re-render.
+        menu.style.top = '';
+        menu.style.left = '';
+        menu.style.right = '';
+        menu.style.bottom = '';
+        menu.style.position = '';
+        menu.style.visibility = '';
+        var trigger = menu.parentElement && menu.parentElement.querySelector('[data-action="toggleAutomationMenu"]');
+        if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    });
+}
+
+/** Positionne le dropdown en `fixed` au-dessus du flux : aligne sur le
+ *  bord droit du trigger, en dessous, avec flip vertical si pas de place
+ *  en bas + clamp horizontal pour rester dans le viewport. */
+function _positionAutomationMenu(menu, triggerEl) {
+    var triggerRect = triggerEl.getBoundingClientRect();
+    // Render invisible le temps de mesurer pour eviter le flash visuel.
+    menu.style.position = 'fixed';
+    menu.style.visibility = 'hidden';
+    menu.style.top = '0px';
+    menu.style.left = '0px';
+    menu.style.right = 'auto';
+    menu.style.bottom = 'auto';
+    menu.classList.remove('hidden');
+    var menuRect = menu.getBoundingClientRect();
+
+    var GAP = 8;
+    // Bord droit du menu aligne sur le bord droit du trigger
+    var left = triggerRect.right - menuRect.width;
+    var top = triggerRect.bottom + 4;
+
+    // Flip vertical si depasse en bas du viewport
+    if (top + menuRect.height > window.innerHeight - GAP) {
+        var altTop = triggerRect.top - menuRect.height - 4;
+        if (altTop >= GAP) top = altTop;
+    }
+
+    // Clamp horizontal
+    if (left < GAP) left = GAP;
+    if (left + menuRect.width > window.innerWidth - GAP) {
+        left = window.innerWidth - GAP - menuRect.width;
+    }
+
+    menu.style.top = top + 'px';
+    menu.style.left = left + 'px';
+    menu.style.visibility = '';
+}
+
+function toggleAutomationMenu(triggerEl) {
+    var menu = triggerEl.parentElement && triggerEl.parentElement.querySelector('.actions-menu-dropdown');
+    if (!menu) return;
+    var willOpen = menu.classList.contains('hidden');
+    _closeAllAutomationMenus();
+    if (willOpen) {
+        _positionAutomationMenu(menu, triggerEl);
+        triggerEl.setAttribute('aria-expanded', 'true');
+        // ARIA Menu Button : focus auto sur le premier item au mount
+        var first = menu.querySelector('[role="menuitem"]:not([disabled])');
+        if (first) first.focus();
+    }
+}
+
+// Scroll/resize : ferme tous les menus pour eviter qu'ils flottent a une
+// position obsolete (le trigger a bouge avec le scroll, mais le menu en
+// fixed reste fige en viewport coordinates).
+window.addEventListener('scroll', _closeAllAutomationMenus, { capture: true, passive: true });
+window.addEventListener('resize', _closeAllAutomationMenus);
+
+// Event listeners
+document.getElementById('filter-status')?.addEventListener('change', (e) => {
+    applyFilter('status', e.target.value);
+});
+
+// Event delegation for automation actions
+document.addEventListener('change', (e) => {
+    const target = e.target.closest('[data-action="toggleAutomation"]');
+    if (target) {
+        const id = parseInt(target.dataset.automationId);
+        toggleAutomation(id, target.checked, target);
+    }
+});
+
+document.addEventListener('click', (e) => {
+    const target = e.target.closest('[data-action]');
+    if (!target) {
+        // Click hors d'un menu kebab → ferme tous les dropdowns ouverts.
+        // Test "pas dans .actions-menu" pour que cliquer sur le trigger ou
+        // un item ne provoque pas de fermeture immediate.
+        if (!e.target.closest('.actions-menu')) {
+            _closeAllAutomationMenus();
+        }
+        return;
+    }
+
+    const action = target.dataset.action;
+    const id = parseInt(target.dataset.automationId);
+
+    if (action === 'executeAutomation') {
+        executeAutomation(id, target);
+    } else if (action === 'duplicateAutomation') {
+        _closeAllAutomationMenus();
+        duplicateAutomation(id);
+    } else if (action === 'deleteAutomation') {
+        _closeAllAutomationMenus();
+        const name = target.dataset.automationName;
+        deleteAutomation(id, name);
+    } else if (action === 'showImportModal') {
+        openImportModal();
+    } else if (action === 'toggleAutomationMenu') {
+        toggleAutomationMenu(target);
+    }
+});
+
+// Esc ferme le menu kebab ouvert (et refocus son trigger). Ce listener
+// est branche apres celui de la modal d'import — comme on early-return
+// quand aucun menu kebab n'est ouvert, l'Esc reste delegue a la modal.
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    var openMenu = document.querySelector('.actions-menu-dropdown:not(.hidden)');
+    if (!openMenu) return;
+    var trigger = openMenu.parentElement && openMenu.parentElement.querySelector('[data-action="toggleAutomationMenu"]');
+    _closeAllAutomationMenus();
+    if (trigger) trigger.focus();
+});
+
+// Navigation clavier ARIA Menu Button (W3C APG) : Up/Down/Home/End.
+// Pas de wrap (Up depuis premier reste sur premier) — convention APG
+// pour les listes courtes : eviter la confusion sur "ou je suis".
+document.addEventListener('keydown', function(e) {
+    var item = e.target.closest('.actions-menu-dropdown [role="menuitem"]');
+    if (!item) return;
+    var menu = item.closest('.actions-menu-dropdown');
+    if (!menu || menu.classList.contains('hidden')) return;
+    var items = Array.from(menu.querySelectorAll('[role="menuitem"]:not([disabled])'));
+    if (!items.length) return;
+    var idx = items.indexOf(item);
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        items[Math.min(idx + 1, items.length - 1)].focus();
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        items[Math.max(idx - 1, 0)].focus();
+    } else if (e.key === 'Home') {
+        e.preventDefault();
+        items[0].focus();
+    } else if (e.key === 'End') {
+        e.preventDefault();
+        items[items.length - 1].focus();
+    }
+});
+
+// ── Import Modal ──
+var _importFile = null;
+
+function openImportModal() {
+    _importFile = null;
+    var modal = document.getElementById('import-modal');
+    var fileInfo = document.getElementById('import-file-info');
+    var submitBtn = document.getElementById('import-submit');
+    var fileInput = document.getElementById('import-file-input');
+    fileInput.value = '';
+    fileInfo.style.display = 'none';
+    submitBtn.disabled = true;
+    modal.style.display = '';
+    // U8 — trapFocus:true active le piege focus interne (Tab/Shift-Tab
+    // boucle dans le modal, pas vers l'arriere-plan). lockScroll bloque
+    // le scroll du body. layer='modal' positionne dans la stack LIFO
+    // (les futurs overlays par-dessus passeront devant cette modale).
+    if (window.OverlayManager) window.OverlayManager.open(modal, {
+        layer: 'modal',
+        lockScroll: true,
+        trapFocus: true,
+    });
+}
+
+function closeImportModal() {
+    var modal = document.getElementById('import-modal');
+    if (window.OverlayManager) window.OverlayManager.close(modal);
+    modal.style.display = 'none';
+    _importFile = null;
+}
+
+function handleImportFile(file) {
+    if (!file || !file.name.endsWith('.json')) {
+        showToast('Format invalide. Fichier .json attendu.', 'error');
+        return;
+    }
+    if (file.size > 512 * 1024) {
+        showToast('Fichier trop volumineux (max 512 KB)', 'error');
+        return;
+    }
+    _importFile = file;
+    var fileInfo = document.getElementById('import-file-info');
+    fileInfo.textContent = file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    fileInfo.style.display = '';
+    document.getElementById('import-submit').disabled = false;
+}
+
+async function submitImport() {
+    if (!_importFile) return;
+    var submitBtn = document.getElementById('import-submit');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Import en cours...';
+    try {
+        var formData = new FormData();
+        formData.append('file', _importFile);
+        var res = await fetch('/api/automations/import', {
+            method: 'POST',
+            headers: { 'X-Xsrftoken': getCookie('_xsrf') },
+            body: formData,
+        });
+        var data = await res.json();
+        if (data.success) {
+            closeImportModal();
+            var msg = 'Automatisation importee';
+            if (data.step_count > 0) msg += ' (' + data.step_count + ' étapes)';
+            showToast(msg, 'success');
+            setTimeout(function() { location.reload(); }, 800);
+        } else {
+            showToast(data.error || 'Erreur lors de l\'import', 'error');
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Importer';
+        }
+    } catch (err) {
+        showToast('Erreur: ' + err.message, 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Importer';
+    }
+}
+
+// Import modal event listeners
+document.getElementById('import-modal-close')?.addEventListener('click', closeImportModal);
+document.getElementById('import-cancel')?.addEventListener('click', closeImportModal);
+document.getElementById('import-submit')?.addEventListener('click', submitImport);
+
+document.getElementById('import-drop-zone')?.addEventListener('click', function() {
+    document.getElementById('import-file-input').click();
+});
+
+// U5/a11y — keyboard activation (WCAG 2.1.1 Keyboard, level A) : la zone
+// a `role="button" tabindex="0"`, donc Enter et Space DOIVENT déclencher
+// l'action. Sans ça, les utilisateurs clavier sont bloqués.
+document.getElementById('import-drop-zone')?.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault(); // Space scroll par défaut sur certains navigateurs
+        document.getElementById('import-file-input').click();
+    }
+});
+
+// U5/a11y — Escape ferme la modal (axe 17 + a11y). Listener actif uniquement
+// quand la modal est visible pour ne pas interférer avec d'autres modals.
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    var modal = document.getElementById('import-modal');
+    if (modal && modal.style.display !== 'none' && !modal.classList.contains('hidden')) {
+        closeImportModal();
+    }
+});
+
+document.getElementById('import-file-input')?.addEventListener('change', function(e) {
+    if (e.target.files && e.target.files[0]) handleImportFile(e.target.files[0]);
+});
+
+document.getElementById('import-drop-zone')?.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    e.currentTarget.classList.add('border-gray-500', 'bg-gray-50', 'dark:border-gray-400', 'dark:bg-gray-800');
+});
+
+document.getElementById('import-drop-zone')?.addEventListener('dragleave', function(e) {
+    e.currentTarget.classList.remove('border-gray-500', 'bg-gray-50', 'dark:border-gray-400', 'dark:bg-gray-800');
+});
+
+document.getElementById('import-drop-zone')?.addEventListener('drop', function(e) {
+    e.preventDefault();
+    e.currentTarget.classList.remove('border-gray-500', 'bg-gray-50', 'dark:border-gray-400', 'dark:bg-gray-800');
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleImportFile(e.dataTransfer.files[0]);
+});
+
+// Close modal on backdrop click
+document.getElementById('import-modal')?.addEventListener('click', function(e) {
+    if (e.target === this) closeImportModal();
+});
+
+// U2 — Onboarding tour (premier user, pas que admin). Pas de force.
+// Le user peut Passer/X. localStorage memorise (key automations_list_v1).
+if (window.KomptiaOnboarding && typeof window.KomptiaOnboarding.start === 'function') {
+    window.KomptiaOnboarding.start({
+        key: 'automations_list_v1',
+        title: 'Bienvenue sur les Automatisations',
+        steps: [
+            {
+                icon: 'sparkle',
+                title: 'Automatiser une tâche récurrente',
+                text: 'Une automatisation enchaîne plusieurs étapes : extraire des données, transformer un classeur, générer un rapport PDF, l\'envoyer par email. Le tout se déclenche tout seul, à l\'heure que vous choisissez.',
+            },
+            {
+                icon: 'zap',
+                title: 'Démarrer avec un modèle',
+                text: 'Le bouton « Modèles » propose des automatisations toutes prêtes pour les besoins courants (rapport hebdomadaire, alerte mensuelle). En un clic, vous obtenez un brouillon que vous adaptez à votre cas.',
+            },
+            {
+                icon: 'shield',
+                title: 'Activer en toute confiance',
+                text: 'Avant d\'activer, Komptia vérifie automatiquement que l\'automatisation est complète : chaque étape est configurée, les étapes sont bien reliées, il n\'y a pas de double envoi. En cas de problème, le message vous dit précisément quoi corriger.',
+            },
+        ],
+    });
+}
+</script>
+{% end %}

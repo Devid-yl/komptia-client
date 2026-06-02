@@ -1,0 +1,932 @@
+/* ============================================================
+   Iris Floating Widget — iris-widget.css
+   All classes prefixed .jw- to avoid conflicts with app styles.
+   z-index scale: panel=100, fab=101, toasts should be >101
+   ============================================================ */
+
+/* --- FAB (Floating Action Button) --- */
+.jw-fab {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--brand) 0%, var(--brand-light) 100%);
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    z-index: 101;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 14px rgb(var(--brand-rgb) / 0.4);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+.jw-fab:hover {
+    transform: scale(1.08);
+    box-shadow: 0 6px 20px rgb(var(--brand-rgb) / 0.5);
+}
+.jw-fab:active {
+    transform: scale(0.95);
+}
+.jw-fab:focus-visible {
+    outline: 2px solid var(--brand-light);
+    outline-offset: 2px;
+}
+.jw-fab svg {
+    width: 26px;
+    height: 26px;
+    transition: transform 0.2s;
+}
+.jw-fab.jw-open svg {
+    transform: rotate(90deg);
+}
+
+/* Badge (unread count) */
+.jw-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    min-width: 20px;
+    height: 20px;
+    border-radius: 10px;
+    background: #ef4444;
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 600;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 0 5px;
+    line-height: 1;
+    font-family: 'DM Sans', sans-serif;
+}
+.jw-badge.jw-visible {
+    display: flex;
+}
+
+/* --- Panel --- */
+.jw-panel {
+    position: fixed;
+    bottom: 5.5rem;
+    right: 1.5rem;
+    width: 400px;
+    height: 560px;
+    max-height: calc(100vh - 7rem);
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(0, 0, 0, 0.05);
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    opacity: 0;
+    transform: translateY(16px) scale(0.96);
+    pointer-events: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.jw-panel.jw-visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+}
+
+/* --- Plein écran (toggle via .jw-fullscreen) ---
+   Le panel passe de 400×560 ancré en bas-droite à pleine fenêtre. Le toggle
+   est déclenché depuis ``iris-widget.js`` ``toggleFullscreen`` — il NE
+   navigue PAS vers /iris (la conv courante reste, l'input garde sa valeur,
+   le scroll est préservé).
+
+   z-index : on s'aligne sur le token ``--z-iris-grid-fullscreen`` (1900)
+   déclaré dans ``overlay-layers.css``. Ce niveau est SOUS :
+     - OverlayManager.modal (2000) — modals applicatives
+     - system-modal (9999) — appConfirmModal, syncModal de base.html
+     - toast (10000) — toast global de base.html
+   → confirms / sync / toasts / bug-reports restent visibles au-dessus du
+   panel en plein écran (sinon une confirmation déclenchée pendant l'usage
+   serait masquée → blocage UX bug).
+
+   ``transform: none`` écrase le ``translateY(0) scale(1)`` du ``.jw-visible``
+   au-dessus, sinon le ``transform`` poserait un containing block qui
+   limiterait ``position: fixed`` (subtilité spec CSS3 transforms).
+
+   ``height: 100dvh`` (dynamic viewport, Safari 15.4+ / Chrome 108+) =
+   prend en compte les barres de navigation mobiles qui apparaissent /
+   disparaissent. Fallback ``vh`` via le ``height: 100vh`` précédent serait
+   tronqué sur mobile mais on hide le bouton sur ≤640px (cf. plus bas) donc
+   ``dvh`` n'a pas à jouer en pratique. */
+.jw-panel.jw-fullscreen {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    /* Fallback ``vh`` puis override ``dvh`` (Safari 15.0-15.3 ignore dvh
+       et tombent sur vh). Sans le fallback, le panel collapse à ``auto``
+       sur les iPads non maintenus à jour (adversarial #7). */
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
+    border-radius: 0;
+    z-index: var(--z-iris-grid-fullscreen, 1900);
+    /* Reset transform : .jw-visible pose ``translateY(0) scale(1)``, on
+       repart à ``none`` pour éviter qu'un containing-block transformé
+       casse ``position: fixed`` (spec CSS3 transforms). */
+    transform: none;
+    /* Box-shadow inutile en plein écran (pas d'espace autour) — la garde
+       claire ``0 0 0 1px`` du dark mode dessinerait un liseré au bord du
+       viewport sur HiDPI (adversarial #6). */
+    box-shadow: none;
+}
+
+/* En plein écran, le FAB est masqué par le panel (z 101 vs 1900). On le
+   désactive aussi côté événements pour éviter qu'un :hover fantôme ou un
+   tap multi-touch ne le re-déclenche sous la couche fullscreen
+   (adversarial #2 défensif). */
+.jw-panel.jw-fullscreen ~ .jw-fab {
+    pointer-events: none;
+    opacity: 0;
+}
+
+/* Welcome state recalibré en plein écran : sans contrainte, le bloc
+   bienvenue (vertical-center sur height: 100%) flotte au milieu d'une
+   immense zone vide → impression d'abandon (adversarial #1b). Cap à
+   640px de large + offset top pour rester équilibré sur grand écran. */
+.jw-panel.jw-fullscreen .jw-welcome {
+    max-width: 640px;
+    margin: 0 auto;
+    padding-top: 12vh;
+}
+
+/* Reduced motion : la transition par défaut ``opacity .25s, transform .25s``
+   du .jw-panel interpolerait le passage transform → none au moment du
+   toggle fullscreen → animation involontaire. WCAG SC 2.3.3 demande de
+   couper les animations interactives quand l'OS le signale
+   (adversarial #14). On désactive aussi la rotation du FAB svg, sinon
+   open/close anime quand même. */
+@media (prefers-reduced-motion: reduce) {
+    .jw-panel {
+        transition: none;
+    }
+    .jw-fab svg {
+        transition: none;
+    }
+}
+
+/* --- Header --- */
+.jw-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+    background: #f8fafc;
+    flex-shrink: 0;
+}
+.jw-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.jw-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--brand-strong) 0%, var(--brand-light) 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+    color: #fff;
+    flex-shrink: 0;
+}
+.jw-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: #1e293b;
+    font-family: 'DM Sans', sans-serif;
+}
+.jw-status {
+    font-size: 0.7rem;
+    color: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.jw-ws-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #94a3b8;
+    display: inline-block;
+    transition: background 0.3s;
+}
+.jw-ws-dot.jw-connected {
+    background: #22c55e;
+}
+.jw-ws-dot.jw-error {
+    background: #ef4444;
+}
+.jw-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+.jw-header-btn {
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    color: #64748b;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s;
+}
+.jw-header-btn:hover {
+    background: rgba(0, 0, 0, 0.06);
+    color: #1e293b;
+}
+.jw-header-btn:focus-visible {
+    outline: 2px solid var(--brand-light);
+    outline-offset: 2px;
+}
+.jw-header-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
+/* --- Messages Area --- */
+.jw-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    scroll-behavior: smooth;
+}
+
+/* Welcome state */
+.jw-welcome {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    text-align: center;
+    padding: 1.5rem;
+    gap: 0.75rem;
+    color: rgba(0, 0, 0, 0.45);
+}
+.jw-welcome-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--brand-strong) 0%, var(--brand-light) 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.3rem;
+    color: #fff;
+    margin-bottom: 0.25rem;
+}
+.jw-welcome-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #1e293b;
+}
+.jw-welcome-sub {
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+/* Chips de suggestions dans le welcome state (task #11). Réutilise les
+   styles ``.jw-suggestion-chip`` existants — ici juste le container qui
+   prend une marge supérieure pour séparer du sous-titre. */
+.jw-welcome-chips {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.375rem;
+    margin-top: 0.75rem;
+}
+
+/* Bouton "Signaler" dans .jw-error (task #10). Compact, secondaire,
+   ne masque pas le message d'erreur. */
+.jw-error-report-btn {
+    margin-left: 0.5rem;
+    padding: 0.2rem 0.55rem;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 6px;
+    background: rgba(239, 68, 68, 0.04);
+    color: #dc2626;
+    font-size: 0.75rem;
+    font-family: 'DM Sans', sans-serif;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+.jw-error-report-btn:hover {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.5);
+}
+.jw-error-report-btn:focus-visible {
+    outline: 2px solid var(--brand-light);
+    outline-offset: 2px;
+}
+.dark .jw-error-report-btn {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.35);
+    color: #fca5a5;
+}
+.dark .jw-error-report-btn:hover {
+    background: rgba(239, 68, 68, 0.22);
+    border-color: rgba(239, 68, 68, 0.55);
+}
+
+/* Message bubbles */
+.jw-msg {
+    display: flex;
+}
+.jw-msg-user {
+    justify-content: flex-end;
+}
+.jw-msg-assistant {
+    justify-content: flex-start;
+}
+.jw-bubble {
+    max-width: 82%;
+    padding: 0.625rem 0.875rem;
+    border-radius: 12px;
+    font-size: 0.825rem;
+    line-height: 1.55;
+    word-break: break-word;
+    font-family: 'DM Sans', sans-serif;
+}
+.jw-bubble-user {
+    background: linear-gradient(135deg, var(--brand) 0%, var(--brand-light) 100%);
+    color: #fff;
+    border-bottom-right-radius: 3px;
+}
+.jw-bubble-assistant {
+    background: #f1f5f9;
+    color: #334155;
+    border-bottom-left-radius: 3px;
+}
+
+/* Inline code in bubbles */
+.jw-bubble code {
+    background: rgba(0, 0, 0, 0.08);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+    font-size: 0.8em;
+    font-family: 'Fira Code', 'Cascadia Code', monospace;
+}
+.jw-bubble-user code {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+/* Code blocks */
+.jw-bubble pre {
+    background: #1e293b;
+    color: #e2e8f0;
+    padding: 0.625rem 0.75rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.775rem;
+    margin: 0.5rem 0;
+    line-height: 1.5;
+}
+.jw-bubble pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+    color: inherit;
+}
+
+/* --- SQL Results Table --- */
+.jw-sql-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 0.5rem 0;
+    border-radius: 8px;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+}
+.jw-sql-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.75rem;
+    font-family: 'DM Sans', sans-serif;
+}
+.jw-sql-table th {
+    background: #f1f5f9;
+    padding: 0.375rem 0.5rem;
+    text-align: left;
+    font-weight: 600;
+    color: #475569;
+    white-space: nowrap;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+.jw-sql-table td {
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+    color: #334155;
+    white-space: nowrap;
+}
+.jw-sql-table tr:last-child td {
+    border-bottom: none;
+}
+.jw-sql-info {
+    font-size: 0.7rem;
+    color: rgba(0, 0, 0, 0.4);
+    margin-top: 0.25rem;
+    text-align: right;
+}
+
+/* --- Clarification & Suggestions --- */
+.jw-clarification {
+    margin: 0.5rem 0;
+}
+.jw-clarification-q {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #1e293b;
+    margin-bottom: 0.375rem;
+}
+.jw-option-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.25rem;
+    border: 1px solid rgba(99, 102, 241, 0.25);
+    border-radius: 8px;
+    background: rgba(99, 102, 241, 0.04);
+    color: var(--brand);
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    font-family: 'DM Sans', sans-serif;
+}
+.jw-option-btn:hover {
+    background: rgba(99, 102, 241, 0.1);
+    border-color: rgba(99, 102, 241, 0.4);
+}
+.jw-option-btn:focus-visible {
+    outline: 2px solid var(--brand-light);
+    outline-offset: 2px;
+}
+.jw-suggestion-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-top: 0.5rem;
+}
+.jw-suggestion-chip {
+    padding: 0.35rem 0.65rem;
+    border-radius: 16px;
+    border: 1px solid rgba(0, 0, 0, 0.1);
+    background: #fff;
+    color: #475569;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    font-family: 'DM Sans', sans-serif;
+    /* Anti layout overflow : un label trop long (cap front à 80 chars + cap
+       backend à 80 chars, mais defense-in-depth CSS) est tronqué avec
+       ellipsis. Cap à 100% du container welcome (= largeur panel). */
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.jw-suggestion-chip:hover {
+    background: #f1f5f9;
+    border-color: rgba(99, 102, 241, 0.3);
+    color: var(--brand);
+}
+.jw-suggestion-chip:focus-visible {
+    outline: 2px solid var(--brand-light);
+    outline-offset: 2px;
+}
+
+/* --- Tool indicator --- */
+.jw-tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.3rem 0.65rem;
+    border-radius: 16px;
+    background: rgba(245, 158, 11, 0.1);
+    color: #d97706;
+    font-size: 0.725rem;
+    font-weight: 500;
+    font-family: 'DM Sans', sans-serif;
+    margin: 0.25rem 0;
+}
+
+/* --- Error message --- */
+.jw-error {
+    padding: 0.5rem 0.75rem;
+    border-radius: 8px;
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    color: #dc2626;
+    font-size: 0.8rem;
+    font-family: 'DM Sans', sans-serif;
+}
+
+/* --- Error detail panel (P4.1 audit 2026-05-26) --- */
+/* Panel <details> expandable affiché sous le chip tool en erreur
+   ou sous un message d'erreur global. Permet à l'user de voir le
+   détail technique (SQL fautif, SQLSTATE, prochaines actions) sans
+   alourdir l'UI compacte du widget. */
+.jw-tool-error-detail,
+.jw-error-detail {
+    margin-top: 0.25rem;
+    margin-left: 1.5rem;
+    font-size: 0.75rem;
+    font-family: 'DM Sans', sans-serif;
+}
+.jw-tool-error-detail summary,
+.jw-error-detail summary {
+    cursor: pointer;
+    color: #b91c1c;
+    user-select: none;
+    padding: 0.15rem 0;
+}
+.jw-tool-error-detail summary:hover,
+.jw-error-detail summary:hover {
+    text-decoration: underline;
+}
+.jw-tool-error-detail-body,
+.jw-error-detail-body {
+    margin-top: 0.25rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(239, 68, 68, 0.06);
+    border-left: 2px solid rgba(239, 68, 68, 0.4);
+    border-radius: 4px;
+    color: #7f1d1d;
+}
+.jw-error-detail-meta {
+    font-family: 'JetBrains Mono', 'Menlo', monospace;
+    font-size: 0.7rem;
+    color: #991b1b;
+    margin-bottom: 0.25rem;
+}
+.jw-tool-error-sql,
+.jw-error-sql {
+    margin: 0.4rem 0 0 0;
+    padding: 0.4rem 0.6rem;
+    background: rgba(0, 0, 0, 0.04);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', 'Menlo', monospace;
+    font-size: 0.7rem;
+    color: #1f2937;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 8rem;
+    overflow-y: auto;
+}
+.jw-tool-error-actions {
+    margin: 0.4rem 0 0 1rem;
+    padding: 0;
+    color: #7f1d1d;
+}
+.dark .jw-tool-error-detail summary,
+.dark .jw-error-detail summary {
+    color: #fca5a5;
+}
+.dark .jw-tool-error-detail-body,
+.dark .jw-error-detail-body {
+    background: rgba(239, 68, 68, 0.12);
+    color: #fecaca;
+}
+.dark .jw-error-detail-meta {
+    color: #fda4af;
+}
+.dark .jw-tool-error-sql,
+.dark .jw-error-sql {
+    background: rgba(255, 255, 255, 0.06);
+    color: #e5e7eb;
+}
+
+/* --- Typing indicator --- */
+.jw-typing {
+    display: none;
+    align-items: center;
+    gap: 4px;
+    padding: 0.5rem 0.75rem;
+}
+.jw-typing.jw-visible {
+    display: flex;
+}
+.jw-typing-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #94a3b8;
+}
+.jw-typing-dot:nth-child(2) { animation-delay: 0.15s; }
+.jw-typing-dot:nth-child(3) { animation-delay: 0.3s; }
+
+/* --- Input Area --- */
+.jw-input-area {
+    padding: 0.625rem;
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    background: #fff;
+    flex-shrink: 0;
+}
+.jw-input-wrap {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.5rem;
+    background: #f1f5f9;
+    border-radius: 12px;
+    padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+    transition: box-shadow 0.2s;
+}
+.jw-input-wrap:focus-within {
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+}
+.jw-input-wrap.jw-processing {
+    position: relative;
+    background: repeating-linear-gradient(
+        -45deg,
+        #f1f5f9,
+        #f1f5f9 6px,
+        rgb(var(--brand-rgb) / 0.04) 6px,
+        rgb(var(--brand-rgb) / 0.04) 12px
+    );
+    pointer-events: none;
+    opacity: 0.7;
+}
+.jw-textarea {
+    flex: 1;
+    border: none;
+    background: transparent;
+    resize: none;
+    font-size: 0.825rem;
+    font-family: 'DM Sans', sans-serif;
+    color: #1e293b;
+    line-height: 1.45;
+    max-height: 80px;
+    outline: none;
+    padding: 0;
+}
+.jw-textarea:focus-visible {
+    outline: none;
+}
+.jw-textarea::placeholder {
+    color: #94a3b8;
+}
+.jw-send-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    border: none;
+    background: linear-gradient(135deg, var(--brand) 0%, var(--brand-light) 100%);
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: opacity 0.15s, transform 0.15s;
+}
+.jw-send-btn:hover {
+    opacity: 0.9;
+}
+.jw-send-btn:active {
+    transform: scale(0.92);
+}
+.jw-send-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.jw-send-btn:focus-visible {
+    outline: 2px solid var(--brand-light);
+    outline-offset: 2px;
+}
+.jw-send-btn svg {
+    width: 16px;
+    height: 16px;
+}
+.jw-send-btn.jw-stop-mode {
+    background: linear-gradient(135deg, #dc2626 0%, #ef4444 100%);
+    opacity: 1;
+    cursor: pointer;
+    animation: jw-stop-pulse 2s ease-in-out infinite;
+}
+.jw-send-btn.jw-stop-mode:hover {
+    opacity: 0.9;
+}
+@keyframes jw-stop-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.4); }
+    50% { box-shadow: 0 0 0 4px rgba(220, 38, 38, 0); }
+}
+.jw-system-msg {
+    text-align: center;
+    padding: 4px 8px;
+    margin: 4px 0;
+    color: rgba(0,0,0,0.45);
+    font-size: 11px;
+    font-style: italic;
+}
+
+/* --- Animations (respect reduced motion) --- */
+@media (prefers-reduced-motion: no-preference) {
+    .jw-msg {
+        animation: jw-msgIn 0.2s ease;
+    }
+    .jw-typing-dot {
+        animation: jw-bounce 1s ease-in-out infinite;
+    }
+}
+
+@keyframes jw-msgIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes jw-bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30%           { transform: translateY(-4px); }
+}
+
+/* --- Mobile: full screen --- */
+@media (max-width: 640px) {
+    .jw-panel {
+        bottom: 0;
+        right: 0;
+        width: 100%;
+        height: 100dvh;
+        max-height: 100dvh;
+        border-radius: 0;
+    }
+    .jw-input-area {
+        padding-bottom: calc(0.625rem + env(safe-area-inset-bottom));
+    }
+    .jw-fab {
+        bottom: 1rem;
+        right: 1rem;
+    }
+    /* Le panel est déjà plein écran sur mobile (règles ci-dessus). Le bouton
+       "Plein écran" du header n'a donc rien à basculer — on le masque pour
+       éviter une affordance no-op (cliquer ne change rien visuellement →
+       l'user pense que c'est cassé). Le JS reste branché, mais le bouton
+       n'est pas atteignable au clavier (display:none retire du flow). */
+    #jw-fullscreen-btn {
+        display: none;
+    }
+}
+
+/* ============================================================== */
+/* DARK MODE OVERRIDES                                             */
+/* Activé via la classe `.dark` sur <html> (voir settings → thème) */
+/* ============================================================== */
+
+.dark .jw-panel {
+    background: #0f172a;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.04);
+}
+
+.dark .jw-header {
+    background: #111827;
+    border-bottom-color: rgba(255, 255, 255, 0.06);
+}
+.dark .jw-title { color: #f1f5f9; }
+.dark .jw-status { color: rgba(255, 255, 255, 0.45); }
+
+.dark .jw-header-btn { color: #94a3b8; }
+.dark .jw-header-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: #f1f5f9;
+}
+
+.dark .jw-welcome { color: rgba(255, 255, 255, 0.45); }
+.dark .jw-welcome-title { color: #f1f5f9; }
+
+.dark .jw-bubble-assistant {
+    background: #1e293b;
+    color: #e2e8f0;
+    border-color: rgba(255, 255, 255, 0.06);
+}
+
+.dark .jw-bubble-assistant code {
+    background: rgba(255, 255, 255, 0.1);
+    color: #e2e8f0;
+}
+.dark .jw-bubble pre {
+    background: #020617;
+    color: #e2e8f0;
+}
+
+.dark .jw-sql-table {
+    color: #cbd5e1;
+}
+.dark .jw-sql-table th {
+    background: #111827;
+    color: #cbd5e1;
+    border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+.dark .jw-sql-table td {
+    color: #cbd5e1;
+    border-bottom-color: rgba(255, 255, 255, 0.04);
+}
+
+.dark .jw-suggestion-chip {
+    background: rgba(255, 255, 255, 0.04);
+    color: #cbd5e1;
+    border-color: rgba(255, 255, 255, 0.08);
+}
+.dark .jw-suggestion-chip:hover {
+    background: rgb(var(--brand-light-rgb) / 0.1);
+    border-color: rgb(var(--brand-light-rgb) / 0.4);
+    color: #f1f5f9;
+}
+
+.dark .jw-input-area {
+    background: #0f172a;
+    border-top-color: rgba(255, 255, 255, 0.06);
+}
+.dark .jw-input-wrap {
+    background: #1e293b;
+}
+.dark .jw-textarea {
+    color: #f1f5f9;
+}
+.dark .jw-textarea::placeholder { color: #64748b; }
+
+.dark .jw-system-msg { color: rgba(255, 255, 255, 0.45); }
+.dark .jw-typing-dot { background: #64748b; }
+
+.dark .jw-error {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+}
+
+.dark .jw-clarification,
+.dark .jw-option-btn {
+    background: rgb(var(--brand-light-rgb) / 0.08);
+    border-color: rgb(var(--brand-light-rgb) / 0.3);
+    color: #fca5a5;
+}
+.dark .jw-clarification:hover,
+.dark .jw-option-btn:hover {
+    background: rgb(var(--brand-light-rgb) / 0.18);
+    border-color: rgb(var(--brand-light-rgb) / 0.5);
+}
+
+/* Compléments dark : éléments restants */
+.dark .jw-clarification-q { color: #f1f5f9; }
+.dark .jw-welcome-sub { color: #cbd5e1; }
+.dark .jw-bubble code {
+    background: rgba(255, 255, 255, 0.08);
+}
+.dark .jw-bubble-user code {
+    background: rgba(0, 0, 0, 0.25);
+}
+.dark .jw-sql-wrap {
+    border-color: rgba(255, 255, 255, 0.08);
+}
+.dark .jw-sql-info { color: rgba(255, 255, 255, 0.4); }
+.dark .jw-tool {
+    background: rgba(245, 158, 11, 0.15);
+    color: #fcd34d;
+}
+.dark .jw-input-wrap:focus-within {
+    box-shadow: 0 0 0 3px rgb(var(--brand-light-rgb) / 0.2);
+}
+.dark .jw-input-wrap.jw-processing {
+    background: repeating-linear-gradient(
+        -45deg,
+        #1e293b,
+        #1e293b 6px,
+        rgb(var(--brand-light-rgb) / 0.18) 6px,
+        rgb(var(--brand-light-rgb) / 0.18) 12px
+    );
+}
+.dark .jw-fab {
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5),
+                0 4px 14px rgb(var(--brand-rgb) / 0.35);
+}
+.dark .jw-fab:hover {
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6),
+                0 6px 20px rgb(var(--brand-rgb) / 0.45);
+}
+
+/* Pass exhaustif — éléments restants du widget */
+.dark .jw-sql-table td { color: var(--text-secondary); }
+.dark .jw-clarification-q { color: var(--text-primary); }
+.dark .jw-suggestion-chip {
+    background: rgba(255,255,255,0.04);
+    color: var(--text-secondary);
+    border-color: rgba(255,255,255,0.08);
+}
+.dark .jw-suggestion-chip:hover {
+    background: rgb(var(--brand-rgb) / 0.18);
+    color: var(--text-primary);
+}

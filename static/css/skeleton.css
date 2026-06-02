@@ -1,0 +1,174 @@
+/* =======================================================================
+ * skeleton.css — Loading-skeleton réutilisable (Komptia)
+ * -----------------------------------------------------------------------
+ *
+ * Utility CSS pour les placeholders animés pendant un chargement réseau /
+ * disque. Couvre l'axe 15 du contrat qualité Komptia (« loading states »
+ * pour empty states + loading + error).
+ *
+ * Inclus dans templates/base.html → disponible sur TOUTES les pages auth
+ * et publiques. Aucun JS, aucun nonce CSP, pas de dépendance Tailwind.
+ *
+ * USAGE BASIQUE
+ * -------------
+ *   <div class="skeleton-shimmer h-4 w-32 rounded"></div>
+ *
+ * La classe pose un fond animé (shimmer en dégradé). Le dev fixe lui-même
+ * la taille (Tailwind utility, style inline, ou CSS dédié). Combinable
+ * avec Tailwind `rounded`, `rounded-full`, etc.
+ *
+ * EXEMPLES
+ * --------
+ *   Ligne de texte placeholder :
+ *     <span class="skeleton-shimmer inline-block h-3 w-40 rounded"></span>
+ *
+ *   Bloc paragraphe (3 lignes) :
+ *     <div class="space-y-2" role="status" aria-busy="true" aria-live="polite">
+ *       <span class="sr-only">Chargement…</span>
+ *       <div class="skeleton-shimmer h-3 w-full rounded"></div>
+ *       <div class="skeleton-shimmer h-3 w-5/6 rounded"></div>
+ *       <div class="skeleton-shimmer h-3 w-2/3 rounded"></div>
+ *     </div>
+ *
+ *   Avatar circulaire :
+ *     <div class="skeleton-shimmer w-10 h-10 rounded-full"></div>
+ *
+ *   Carte avec image + texte :
+ *     <div class="space-y-3">
+ *       <div class="skeleton-shimmer h-32 w-full rounded-lg"></div>
+ *       <div class="skeleton-shimmer h-4 w-3/4 rounded"></div>
+ *       <div class="skeleton-shimmer h-3 w-1/2 rounded"></div>
+ *     </div>
+ *
+ * CUSTOMISATION
+ * -------------
+ * Trois custom properties exposées (override possible sur n'importe quel
+ * ancêtre, y compris `:root` pour un override global). Le préfixe
+ * `--komptia-*` évite tout conflit avec une future lib tierce.
+ *
+ *   --komptia-skeleton-base       Couleur de fond (par défaut gris clair)
+ *   --komptia-skeleton-highlight  Couleur du flash qui glisse (par défaut blanc semi)
+ *   --komptia-skeleton-duration   Durée d'un cycle d'animation (par défaut 1.6s)
+ *
+ * Exemple — skeleton sur fond coloré (warning) :
+ *   <div class="skeleton-shimmer h-4 w-24 rounded"
+ *        style="--komptia-skeleton-base:#fde68a;--komptia-skeleton-highlight:#fef3c7;"></div>
+ *
+ * RÈGLES IMPORTANTES
+ * ------------------
+ * - NE PAS appliquer sur du contenu visible (texte, image) — le shimmer
+ *   recouvre le contenu et le rend illisible. Le pattern attendu est :
+ *   afficher le skeleton À LA PLACE du contenu, le retirer du DOM (ou
+ *   toggle `hidden`) quand les données arrivent.
+ * - TOUJOURS envelopper d'un conteneur `role="status" aria-busy="true"
+ *   aria-live="polite"` + un `<span class="sr-only">Chargement…</span>`
+ *   pour les screen-readers (WCAG 4.1.3 Status Messages).
+ * - Une fois les données chargées, mettre `aria-busy="false"` puis remplacer
+ *   les skeletons par le contenu réel.
+ *
+ * ACCESSIBILITÉ
+ * -------------
+ * - `prefers-reduced-motion: reduce` désactive l'animation et affiche un
+ *   fond statique légèrement contrasté (WCAG 2.3.3 Animation from
+ *   Interactions).
+ * - Print : animation supprimée et fond clair pour éviter de gaspiller
+ *   l'encre.
+ * - Dark mode : custom props automatiquement re-définies via `.dark`
+ *   (cf. bootstrap thème dans base.html).
+ *
+ * COEXISTENCE AVEC `motion-safe:animate-pulse` (Tailwind)
+ * -------------------------------------------------------
+ * Tailwind expose déjà un `animate-pulse` (variation d'opacité, sans
+ * shimmer). Les deux peuvent cohabiter : `.skeleton-shimmer` pour un effet
+ * « premium » plus dynamique, `animate-pulse` pour un placeholder simple.
+ * Ne PAS combiner les deux sur le même élément (les animations entrent
+ * en conflit visuel).
+ * ======================================================================= */
+
+:root {
+    /* Light mode — neutre gris discret, le highlight blanc-semi imite la
+     * lumière qui glisse sur la surface. Préfixe `--komptia-*` pour éviter
+     * toute collision avec une lib tierce qui définirait `--skeleton-*`
+     * (cf. axe 7 contrat qualité — single source of truth). */
+    --komptia-skeleton-base: #e5e7eb;        /* gray-200 (Tailwind) */
+    --komptia-skeleton-highlight: rgba(255, 255, 255, 0.65);
+    --komptia-skeleton-duration: 1.6s;
+}
+
+/* Dark mode — l'application bascule via la classe `.dark` sur <html>
+ * (bootstrap dans base.html). On redéfinit les custom props pour conserver
+ * un contraste WCAG AA sur fond sombre. */
+.dark {
+    --komptia-skeleton-base: #1f2937;        /* gray-800 */
+    --komptia-skeleton-highlight: rgba(255, 255, 255, 0.08);
+}
+
+/* Classe principale. Pose un fond dégradé qui glisse de droite à gauche
+ * en boucle infinie. Le conteneur DOIT avoir une taille (dev responsibility).
+ *
+ * AVERTISSEMENT D'USAGE — NE PAS APPLIQUER SUR :
+ *   - Un conteneur (carte, wrapper) qui contient des éléments interactifs :
+ *     `pointer-events: none` ci-dessous les rendrait MORTS silencieusement.
+ *     Pattern correct : appliquer la classe SEULEMENT sur des nœuds
+ *     placeholder dédiés (`<div class="skeleton-shimmer h-4 w-32"></div>`),
+ *     pas sur le wrapper qui inclut un bouton ou un input réel.
+ *   - Un élément contenant du texte visible : le `color: transparent` masque
+ *     visuellement le texte, mais les screen-readers continuent de le lire
+ *     (divergence visuel/AT, WCAG 1.3.1). Si vous gardez du texte interne
+ *     pour debug/fallback, ajouter `aria-hidden="true"` sur l'élément
+ *     shimmer et laisser un `<span class="sr-only">Chargement…</span>` chez
+ *     le parent `role="status" aria-busy="true"`. */
+.skeleton-shimmer {
+    background-color: var(--komptia-skeleton-base);
+    background-image: linear-gradient(
+        90deg,
+        var(--komptia-skeleton-base) 0%,
+        var(--komptia-skeleton-highlight) 50%,
+        var(--komptia-skeleton-base) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    background-position: 200% 0;
+    animation: komptia-skeleton-shimmer var(--komptia-skeleton-duration) ease-in-out infinite;
+    /* `will-change` est volontairement omis : sur un long écran avec
+     * beaucoup de skeletons, le compositor préserve les layers GPU et
+     * peut exploser la mémoire. `background-position` est un repaint
+     * léger, c'est suffisant. */
+    color: transparent;              /* sécurité si du texte est laissé */
+    user-select: none;
+    pointer-events: none;
+}
+
+@keyframes komptia-skeleton-shimmer {
+    0%   { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* Accessibilité : utilisateur a demandé à réduire les animations OS.
+ * On garde un fond statique LÉGÈREMENT PLUS CONTRASTÉ que le base pour
+ * rester visible comme placeholder, y compris sur fond `bg-gray-50` (le
+ * fond par défaut de `<body>` dans Komptia — cf. base.html). En light
+ * mode, le base est `#e5e7eb` (gray-200) et le fond body `#f9fafb`
+ * (gray-50/0.5) ; sans renforcement, le contraste descendrait sous le
+ * seuil WCAG 1.4.11 (3:1 pour composants UI). On force `gray-300` pour
+ * light et garde un override naturel via `.dark`. */
+@media (prefers-reduced-motion: reduce) {
+    .skeleton-shimmer {
+        animation: none;
+        background-image: none;
+        background-color: #d1d5db;   /* gray-300 — contraste OK sur gray-50 */
+    }
+    .dark .skeleton-shimmer {
+        background-color: #374151;   /* gray-700 — contraste OK sur gray-900 */
+    }
+}
+
+/* Impression : animation et dégradé inutiles à l'impression — fond uni
+ * très clair pour éviter d'imprimer de l'encre sur des placeholders. */
+@media print {
+    .skeleton-shimmer {
+        animation: none;
+        background-image: none;
+        background-color: #f3f4f6;   /* gray-100 */
+    }
+}

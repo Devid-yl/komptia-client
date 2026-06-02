@@ -1,0 +1,343 @@
+/* ============================================================
+ * Komptia — Preview d'étape sur /automations/N/edit
+ *
+ * Result area en bas du canvas, simple et sobre. Pas de drag-handle
+ * fancy : un panel pliable qui montre les résultats du step preview
+ * (workbook via GridTabManager, ou bouton "Ouvrir le PDF" pour les
+ * sinks, ou récap recipients pour le dry-run email).
+ *
+ * Réutilise les classes ``komptia-status-*`` déjà définies dans
+ * automation-canvas.css pour le badge sur le node.
+ * ============================================================ */
+
+#komptia-preview-area {
+    position: relative;
+    border-top: 1px solid #e5e7eb;
+    background: #ffffff;
+    transition: max-height 0.18s ease-out;
+    overflow: hidden;
+    max-height: 360px;
+}
+
+.dark #komptia-preview-area {
+        background: #0f172a;
+        border-top-color: #1f2937;
+    }
+
+#komptia-preview-area[hidden] {
+    display: none !important;
+}
+
+#komptia-preview-area.komptia-preview-collapsed {
+    max-height: 36px;
+}
+
+.komptia-preview-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    font-size: 0.8125rem;
+    color: #374151;
+    user-select: none;
+}
+
+.dark .komptia-preview-bar {
+        background: #111827;
+        border-bottom-color: #1f2937;
+        color: #d1d5db;
+    }
+
+.komptia-preview-bar .komptia-preview-title {
+    font-weight: 600;
+    flex: 0 0 auto;
+}
+
+.komptia-preview-bar .komptia-preview-meta {
+    flex: 1 1 auto;
+    color: #6b7280;
+    font-size: 0.75rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.dark .komptia-preview-bar .komptia-preview-meta {
+        color: #9ca3af;
+    }
+
+.komptia-preview-bar button {
+    flex: 0 0 auto;
+    padding: 0.25rem 0.5rem;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    border-radius: 0.25rem;
+    cursor: pointer;
+    font-size: 0.75rem;
+    color: #374151;
+}
+
+.komptia-preview-bar button:hover {
+    background: #f3f4f6;
+}
+
+.komptia-preview-bar button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.dark .komptia-preview-bar button {
+        background: #1f2937;
+        border-color: #374151;
+        color: #e5e7eb;
+    }
+
+.dark .komptia-preview-bar button:hover {
+        background: #374151;
+    }
+
+.komptia-preview-body {
+    padding: 0.75rem;
+    height: calc(360px - 36px);
+    overflow: auto;
+}
+
+#komptia-preview-area.komptia-preview-collapsed .komptia-preview-body {
+    display: none;
+}
+
+/* ── Bouton ▶ Preview dans le panel config ────────────────── */
+
+.komptia-panel-preview-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.75rem;
+    border: 1px solid #2563eb;
+    background: #2563eb;
+    color: #fff;
+    border-radius: 0.375rem;
+    font-size: 0.8125rem;
+    cursor: pointer;
+    transition: background 0.12s ease-out;
+}
+
+.komptia-panel-preview-btn:hover:not(:disabled) {
+    background: #1d4ed8;
+}
+
+.komptia-panel-preview-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.komptia-panel-preview-btn .komptia-preview-icon {
+    width: 12px;
+    height: 12px;
+    display: inline-block;
+}
+
+/* ── États du body : empty / loading / error / success ───── */
+
+.komptia-preview-empty,
+.komptia-preview-loading,
+.komptia-preview-error {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 1.5rem 1rem;
+    color: #6b7280;
+    font-size: 0.875rem;
+}
+
+.dark .komptia-preview-empty, .dark .komptia-preview-loading, .dark .komptia-preview-error {
+        color: #9ca3af;
+    }
+
+.komptia-preview-loading .komptia-spinner {
+    width: 18px;
+    height: 18px;
+    border: 2px solid #e5e7eb;
+    border-top-color: #2563eb;
+    border-radius: 50%;
+    animation: komptia-preview-spin 0.7s linear infinite;
+    margin-bottom: 0.5rem;
+}
+
+@keyframes komptia-preview-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.komptia-preview-error {
+    color: #b91c1c;
+}
+
+.komptia-preview-error.komptia-preview-error-validation {
+    color: #b45309;
+}
+
+.komptia-preview-error .komptia-preview-error-actions {
+    margin-top: 0.5rem;
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* ── Vue email dry-run ────────────────────────────────────── */
+
+.komptia-preview-email {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 0.875rem;
+}
+
+.komptia-preview-email-banner {
+    padding: 0.5rem 0.75rem;
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 0.375rem;
+    font-size: 0.8125rem;
+}
+
+.dark .komptia-preview-email-banner {
+        background: #78350f;
+        color: #fef3c7;
+    }
+
+.komptia-preview-email-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+.komptia-preview-email-row strong {
+    flex: 0 0 90px;
+    color: #6b7280;
+    font-weight: 500;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+}
+
+.dark .komptia-preview-email-row strong {
+        color: #9ca3af;
+    }
+
+.komptia-preview-email-recipients {
+    flex: 1 1 auto;
+    word-break: break-word;
+}
+
+.komptia-preview-email-body {
+    margin-top: 0.5rem;
+    padding: 0.5rem;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 0.375rem;
+    max-height: 180px;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+}
+
+.dark .komptia-preview-email-body {
+        background: #111827;
+        border-color: #1f2937;
+    }
+
+/* ── Vue file (PDF/Excel/CSV) — bouton "Ouvrir / Télécharger" ── */
+
+.komptia-preview-file {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 1rem;
+}
+
+.komptia-preview-file-meta {
+    color: #6b7280;
+    font-size: 0.8125rem;
+    text-align: center;
+}
+
+.dark .komptia-preview-file-meta {
+        color: #9ca3af;
+    }
+
+.komptia-preview-file-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.komptia-preview-file-actions a,
+.komptia-preview-file-actions button {
+    padding: 0.5rem 1rem;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    text-decoration: none;
+    border: 1px solid #2563eb;
+    background: #2563eb;
+    color: #fff;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.komptia-preview-file-actions a:hover {
+    background: #1d4ed8;
+}
+
+.komptia-preview-file-actions a.komptia-preview-file-secondary {
+    background: #fff;
+    color: #2563eb;
+}
+
+.dark .komptia-preview-file-actions a.komptia-preview-file-secondary {
+        background: #1f2937;
+        color: #60a5fa;
+        border-color: #374151;
+    }
+
+/* ── Truncation badge ──────────────────────────────────────── */
+
+.komptia-preview-truncated {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.45rem;
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 0.2rem;
+    font-size: 0.7rem;
+    font-weight: 500;
+}
+
+.dark .komptia-preview-truncated {
+        background: #78350f;
+        color: #fef3c7;
+    }
+
+.komptia-preview-cache-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.45rem;
+    background: #dbeafe;
+    color: #1e40af;
+    border-radius: 0.2rem;
+    font-size: 0.7rem;
+    font-weight: 500;
+}
+
+.dark .komptia-preview-cache-badge {
+        background: #1e3a8a;
+        color: #dbeafe;
+    }

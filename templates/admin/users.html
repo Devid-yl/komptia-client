@@ -1,0 +1,902 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<!-- Header -->
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+    <div class="flex items-center gap-3">
+        <a href="/dashboard" class="bg-white border border-gray-300 text-gray-700 text-sm rounded px-3 py-1.5 hover:bg-gray-50 no-underline dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300">Tableau de bord</a>
+        <button id="btn-create-user" class="bg-gray-900 text-white text-sm font-medium rounded px-3 py-1.5 hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Nouvel utilisateur</button>
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="grid grid-cols-3 gap-4 mb-6">
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100">{{ total_all_users }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Utilisateurs total</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100">{{ total_active }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Actifs</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100">{{ total_admins }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Administrateurs</div>
+    </div>
+</div>
+
+<!-- Main card -->
+<div class="bg-white border border-gray-200 rounded-md dark:bg-gray-900 dark:border-gray-800">
+    <!-- Search + Filters -->
+    <div class="p-4 border-b border-gray-200 dark:border-gray-800">
+        <div class="flex items-center gap-3">
+            <div class="flex-1 flex items-center gap-0 border border-gray-300 rounded overflow-hidden focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500 bg-white dark:bg-gray-800 dark:border-gray-700">
+                <input
+                    type="text"
+                    id="search-input"
+                    class="flex-1 px-3 py-2 text-sm outline-none border-none bg-transparent text-gray-900 placeholder-gray-400 dark:text-gray-100 dark:placeholder-gray-500"
+                    placeholder="Rechercher par nom ou email..."
+                    value="{{ search }}"
+                />
+                {% if search %}
+                <button id="btn-clear-search" class="px-2 text-gray-400 hover:text-gray-600 text-lg leading-none dark:text-gray-500 dark:hover:text-gray-300" title="Effacer">&times;</button>
+                {% end %}
+            </div>
+            <select id="filter-role" class="px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-blue-400 dark:focus:ring-blue-400">
+                <option value="">Tous les roles</option>
+                <option value="admin" {% if role_filter == 'admin' %}selected{% end %}>Admin</option>
+                <option value="user" {% if role_filter == 'user' %}selected{% end %}>Utilisateur</option>
+            </select>
+            <select id="filter-status" class="px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-blue-400 dark:focus:ring-blue-400">
+                <option value="">Tous les statuts</option>
+                <option value="active" {% if status_filter == 'active' %}selected{% end %}>Actif</option>
+                <option value="inactive" {% if status_filter == 'inactive' %}selected{% end %}>Inactif</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Bulk actions bar (hidden by default) -->
+    <div id="bulk-bar" class="hidden px-4 py-2 bg-blue-50 border-b border-blue-200 flex items-center justify-between dark:bg-blue-900/20 dark:border-blue-800/60">
+        <span class="text-sm text-blue-700 dark:text-blue-300"><strong id="bulk-count">0</strong> utilisateur(s) selectionne(s)</span>
+        <div class="flex items-center gap-2">
+            {# Boutons compacts de la bulk-bar : on garde la taille courte
+               (px-3 py-1) — `.btn` (px-4 py-2) doublerait la hauteur de la
+               barre. Contraste validé (red-600 + white = 4.83:1 WCAG AA).
+               Focus ring ajouté pour a11y (manquant dans la version raw). #}
+            <button class="text-sm px-3 py-1 bg-white border border-gray-300 rounded hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-brand-500/30 dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700" data-action="bulkDeactivate">Désactiver</button>
+            <button class="text-sm px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/40 dark:bg-red-800 dark:hover:bg-red-700" data-action="bulkDelete">Supprimer</button>
+            <button class="text-sm px-3 py-1 text-gray-500 hover:text-gray-700 focus:outline-none focus:ring-2 focus:ring-brand-500/30 rounded dark:text-gray-400 dark:hover:text-gray-200" data-action="bulkClear">Annuler</button>
+        </div>
+    </div>
+
+    <!-- Table -->
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="bg-gray-50 border-b border-gray-200 dark:bg-gray-900 dark:border-gray-800">
+                    <th class="px-4 py-3 text-left w-8">
+                        <input type="checkbox" id="select-all" class="rounded border-gray-300 dark:border-gray-700" />
+                    </th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none dark:text-gray-400 dark:hover:text-gray-200" data-action="sortColumn" data-sort="username">
+                        Nom d'utilisateur
+                        {% if sort_by == 'username' %}
+                        <span class="ml-1">{% if sort_order == 'asc' %}&#9650;{% else %}&#9660;{% end %}</span>
+                        {% end %}
+                    </th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none dark:text-gray-400 dark:hover:text-gray-200" data-action="sortColumn" data-sort="email">
+                        Email
+                        {% if sort_by == 'email' %}
+                        <span class="ml-1">{% if sort_order == 'asc' %}&#9650;{% else %}&#9660;{% end %}</span>
+                        {% end %}
+                    </th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none dark:text-gray-400 dark:hover:text-gray-200" data-action="sortColumn" data-sort="role">
+                        Role
+                        {% if sort_by == 'role' %}
+                        <span class="ml-1">{% if sort_order == 'asc' %}&#9650;{% else %}&#9660;{% end %}</span>
+                        {% end %}
+                    </th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none dark:text-gray-400 dark:hover:text-gray-200" data-action="sortColumn" data-sort="is_active">
+                        Statut
+                        {% if sort_by == 'is_active' %}
+                        <span class="ml-1">{% if sort_order == 'asc' %}&#9650;{% else %}&#9660;{% end %}</span>
+                        {% end %}
+                    </th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:text-gray-700 select-none dark:text-gray-400 dark:hover:text-gray-200" data-action="sortColumn" data-sort="last_login">
+                        Derniere connexion
+                        {% if sort_by == 'last_login' %}
+                        <span class="ml-1">{% if sort_order == 'asc' %}&#9650;{% else %}&#9660;{% end %}</span>
+                        {% end %}
+                    </th>
+                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider dark:text-gray-400">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+                {% for u in users %}
+                <tr class="hover:bg-gray-50 dark:hover:bg-gray-800">
+                    <td class="px-4 py-3">
+                        {% if u.id != user.id %}
+                        <input type="checkbox" class="user-checkbox rounded border-gray-300 dark:border-gray-700" value="{{ u.id }}" data-username="{{ u.username }}" />
+                        {% end %}
+                    </td>
+                    <td class="px-4 py-3 font-medium text-gray-900 dark:text-gray-100">{{ u.username }}</td>
+                    <td class="px-4 py-3 text-gray-700 dark:text-gray-300">{{ u.email }}</td>
+                    <td class="px-4 py-3">
+                        {# F7 2026-05-26 : badges déplacés en SSoT (cf.
+                           ``_partials/user_role_badge.html``). Avant : palette
+                           amber/blue inconsistante avec dashboard_users_table.
+                           Après : palette sober uniforme emerald/gray. #}
+                        {% set role_is_admin = (u.role == UserRole.ADMIN) %}
+                        {% include "../_partials/user_role_badge.html" %}
+                    </td>
+                    <td class="px-4 py-3">
+                        {% set user_is_active = bool(u.is_active) %}
+                        {% include "../_partials/user_status_badge.html" %}
+                    </td>
+                    <td class="px-4 py-3 text-gray-500 dark:text-gray-400">
+                        {% if u.last_login %}
+                        {# ``ensure_utc`` est appliqué côté handler ; ``isoformat`` donne
+                           un ``+00:00`` que ``static/js/local-datetime.js`` convertit en
+                           heure locale via ``toLocaleString``. Fallback sans-JS = SSR
+                           strftime SUFFIXÉ ``UTC`` pour ne pas tromper le user (review
+                           adversariale 2026-04-30). #}
+                        <time datetime="{{ u.last_login.isoformat() }}" data-fmt-local="datetime">{{ u.last_login.strftime('%d/%m/%Y %H:%M') }} UTC</time>
+                        {% else %}
+                        <span class="text-gray-400 dark:text-gray-500">Jamais</span>
+                        {% end %}
+                    </td>
+                    <td class="px-4 py-3">
+                        <div class="flex items-center gap-1.5 flex-wrap">
+                            <button class="bg-white border border-gray-300 text-gray-700 text-xs rounded px-2 py-1 hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300" data-action="openEditModal" data-user-id="{{ u.id }}" data-username="{{ u.username }}" data-email="{{ u.email }}" data-role="{{ u.role.value }}" data-is-active="{{ 'true' if u.is_active else 'false' }}">Modifier</button>
+                            <button class="bg-white border border-gray-300 text-gray-700 text-xs rounded px-2 py-1 hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300" data-action="viewSessions" data-user-id="{{ u.id }}">Sessions</button>
+                            {% if u.id != user.id %}
+                                {% if u.is_active %}
+                                {# Boutons compacts table-row (text-xs px-2 py-1) — `.btn` (px-4 py-2)
+                                   casserait le layout de la cellule. Contrastes validés
+                                   (red-700 sur white = 5.74:1, red-600 + white = 4.83:1).
+                                   Focus rings ajoutés pour a11y. #}
+                                <button class="bg-white border border-red-300 text-red-700 text-xs rounded px-2 py-1 hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-red-500/30 dark:bg-gray-900 dark:text-red-300 dark:hover:bg-red-900/20" data-action="disableUser" data-user-id="{{ u.id }}" data-username="{{ u.username }}">Désactiver</button>
+                                {% else %}
+                                {# green-700 + white = 5.0:1 (passe WCAG AA). green-600 + white
+                                   = 3.27:1 échouait. Pas de variant .btn-success dans le design
+                                   system → utilities raw mais contraste validé. #}
+                                <button class="bg-green-700 text-white text-xs rounded px-2 py-1 hover:bg-green-800 dark:bg-green-800 dark:hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500/40" data-action="reactivateUser" data-user-id="{{ u.id }}" data-username="{{ u.username }}">Reactiver</button>
+                                {% end %}
+                                <button class="bg-red-600 text-white text-xs rounded px-2 py-1 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/40 dark:bg-red-800 dark:hover:bg-red-700" data-action="deleteUser" data-user-id="{{ u.id }}" data-username="{{ u.username }}">Supprimer</button>
+                            {% end %}
+                        </div>
+                    </td>
+                </tr>
+                {% end %}
+                {% if not users %}
+                <tr>
+                    <td colspan="7" class="px-4 py-8 text-center text-sm text-gray-500 dark:text-gray-400">Aucun utilisateur trouve</td>
+                </tr>
+                {% end %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <div class="flex items-center justify-center gap-2 px-4 py-3 border-t border-gray-200 dark:border-gray-800">
+        <button
+            class="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed dark:hover:bg-gray-800 dark:border-gray-700"
+            data-action="goToPage" data-page="{{ current_page - 1 }}"
+            {% if current_page <= 1 %}disabled{% end %}
+        >Precedent</button>
+
+        {% for p in range(1, total_pages + 1) %}
+            {% if p == current_page %}
+            <button class="px-3 py-1.5 text-sm rounded bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900">{{ p }}</button>
+            {% elif p == 1 or p == total_pages or (p >= current_page - 2 and p <= current_page + 2) %}
+            <button class="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-700" data-action="goToPage" data-page="{{ p }}">{{ p }}</button>
+            {% elif p == current_page - 3 or p == current_page + 3 %}
+            <span class="text-gray-400 text-sm dark:text-gray-500">...</span>
+            {% end %}
+        {% end %}
+
+        <button
+            class="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed dark:hover:bg-gray-800 dark:border-gray-700"
+            data-action="goToPage" data-page="{{ current_page + 1 }}"
+            {% if current_page >= total_pages %}disabled{% end %}
+        >Suivant</button>
+    </div>
+    {% end %}
+</div>
+
+<!-- Modal Creer utilisateur — aria-modal (Bug 2026-05-26 Agent 2 F5) -->
+<div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center hidden"
+     id="createModal" role="dialog" aria-modal="true" aria-labelledby="createModalTitle">
+    <div class="bg-white rounded-md w-full max-w-md p-6 dark:bg-gray-900">
+        <h2 id="createModalTitle" class="text-base font-semibold text-gray-900 mb-4 dark:text-gray-100">Creer un nouvel utilisateur</h2>
+        <div id="createAlert"></div>
+        <form id="createForm">
+            <div class="mb-4">
+                <label class="inline-flex items-center gap-1 text-sm font-medium text-gray-700 mb-1 dark:text-gray-300" data-tooltip="Nom d'affichage dans l'application (sidebar, listes, audit). Ce n'est PAS l'identifiant de connexion — l'utilisateur se connecte avec son email. 3 à 50 caractères, lettres, chiffres et . _ - autorisés.">
+                    Nom d'utilisateur *
+                </label>
+                <input type="text" name="username" required minlength="3" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400" />
+            </div>
+            <div class="mb-4">
+                <label class="inline-flex items-center gap-1 text-sm font-medium text-gray-700 mb-1 dark:text-gray-300" data-tooltip="Identifiant de connexion de l'utilisateur. Doit être unique (la casse n'a pas d'importance : alice@x.fr et Alice@x.fr sont considérés comme le même compte). 254 caractères max.">
+                    Email *
+                </label>
+                <input type="email" name="email" required maxlength="254" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400" />
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Mot de passe *</label>
+                <input type="password" name="password" required minlength="8" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none password-input bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400" />
+                <div class="mt-1.5" id="create-password-strength"></div>
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Role</label>
+                <select name="role" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400">
+                    <option value="user">Utilisateur</option>
+                    <option value="admin">Administrateur</option>
+                </select>
+            </div>
+            <div class="mb-4">
+                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <input type="checkbox" name="is_active" checked class="rounded border-gray-300 dark:border-gray-700" /> Compte actif
+                </label>
+            </div>
+            <div class="flex items-center justify-end gap-2 pt-2">
+                <button type="button" class="bg-white border border-gray-300 text-gray-700 text-sm rounded px-3 py-1.5 hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300" data-action="closeCreateModal">Annuler</button>
+                <button type="submit" class="bg-gray-900 text-white text-sm font-medium rounded px-3 py-1.5 hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Creer</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal Sessions utilisateur — aria-modal (Bug 2026-05-26 F5) -->
+<div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center hidden"
+     id="sessionsModal" role="dialog" aria-modal="true" aria-labelledby="sessionsTitle">
+    <div class="bg-white rounded-md w-full max-w-lg p-6 dark:bg-gray-900">
+        <div class="flex items-center justify-between mb-4">
+            <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100" id="sessionsTitle">Sessions</h2>
+            <button class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300" data-action="closeSessionsModal">&times;</button>
+        </div>
+        <div class="flex justify-end mb-3">
+            <button class="text-sm px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 dark:bg-red-800 dark:hover:bg-red-700" id="btn-revoke-all" data-action="revokeAllSessions">Revoquer toutes les sessions</button>
+        </div>
+        <div id="sessionsContent" class="max-h-80 overflow-y-auto">
+            <p class="text-sm text-gray-500 dark:text-gray-400">Chargement...</p>
+        </div>
+        <div class="flex justify-end mt-4">
+            <button class="bg-white border border-gray-300 text-gray-700 text-sm rounded px-3 py-1.5 hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300" data-action="closeSessionsModal">Fermer</button>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Modifier utilisateur — aria-modal (Bug 2026-05-26 F5) -->
+<div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center hidden"
+     id="editModal" role="dialog" aria-modal="true" aria-labelledby="editModalTitle">
+    <div class="bg-white rounded-md w-full max-w-md p-6 dark:bg-gray-900">
+        <h2 id="editModalTitle" class="text-base font-semibold text-gray-900 mb-4 dark:text-gray-100">Modifier l'utilisateur</h2>
+        <div id="editAlert"></div>
+        <form id="editForm">
+            <input type="hidden" name="user_id" />
+            <div class="mb-4">
+                <label class="inline-flex items-center gap-1 text-sm font-medium text-gray-700 mb-1 dark:text-gray-300" data-tooltip="Nom d'affichage non modifiable. Pour changer l'identifiant de connexion, modifiez plutôt l'email.">
+                    Nom d'utilisateur
+                </label>
+                <input type="text" name="username" disabled class="w-full px-3 py-2 text-sm border border-gray-300 rounded bg-gray-50 text-gray-500 outline-none dark:bg-gray-900 dark:border-gray-700 dark:text-gray-400" />
+            </div>
+            <div class="mb-4">
+                <label class="inline-flex items-center gap-1 text-sm font-medium text-gray-700 mb-1 dark:text-gray-300" data-tooltip="Identifiant de connexion de l'utilisateur. Le modifier change l'email avec lequel cet utilisateur se connecte — communiquez-lui le nouveau.">
+                    Email *
+                </label>
+                <input type="email" name="email" required maxlength="254" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400" />
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Nouveau mot de passe (optionnel)</label>
+                <input type="password" name="password" minlength="8" placeholder="Laisser vide pour ne pas changer" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none password-input bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400" />
+                <div class="mt-1.5" id="edit-password-strength"></div>
+            </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Role</label>
+                <select name="role" class="w-full px-3 py-2 text-sm border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-400 dark:focus:ring-blue-400">
+                    <option value="user">Utilisateur</option>
+                    <option value="admin">Administrateur</option>
+                </select>
+            </div>
+            <div class="mb-4">
+                <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
+                    <input type="checkbox" name="is_active" class="rounded border-gray-300 dark:border-gray-700" /> Compte actif
+                </label>
+            </div>
+            <div class="flex items-center justify-end gap-2 pt-2">
+                <button type="button" class="bg-white border border-gray-300 text-gray-700 text-sm rounded px-3 py-1.5 hover:bg-gray-50 dark:bg-gray-900 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300" data-action="closeEditModal">Annuler</button>
+                <button type="submit" class="bg-gray-900 text-white text-sm font-medium rounded px-3 py-1.5 hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Enregistrer</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+    // ADV-10 (2026-05-26) : helper unifié pour les CRUD admin/users — notifie
+    // les autres onglets via BroadcastChannel (F15) ET préserve la scroll
+    // position au reload (AT-M4). Évite la duplication de pattern :
+    //     komptiaAdminBroadcast.notify(...);
+    //     komptiaReload.preservingScroll();
+    // sur chaque success path (create, edit, status toggle, password reset).
+    function _reloadAfterUserMutation(kind) {
+        try {
+            if (window.komptiaAdminBroadcast) {
+                window.komptiaAdminBroadcast.notify(kind || 'user_changed');
+            }
+        } catch (_e) { /* defensive */ }
+        if (window.komptiaReload && window.komptiaReload.preservingScroll) {
+            window.komptiaReload.preservingScroll();
+        } else {
+            window.location.reload();
+        }
+    }
+
+    // ── State ──
+    var currentSessionUserId = null;
+    var currentSort = {% raw json_encode(sort_by) %};
+    var currentOrder = {% raw json_encode(sort_order) %};
+
+    // ── URL builder (preserves all filters) ──
+    function buildUrl(overrides) {
+        var params = {
+            search: document.getElementById('search-input').value,
+            role: document.getElementById('filter-role').value,
+            status: document.getElementById('filter-status').value,
+            sort: currentSort,
+            order: currentOrder,
+            page: 1
+        };
+        Object.keys(overrides || {}).forEach(function(k) { params[k] = overrides[k]; });
+        var qs = Object.keys(params).filter(function(k) { return params[k]; }).map(function(k) {
+            return k + '=' + encodeURIComponent(params[k]);
+        }).join('&');
+        return '/admin' + (qs ? '?' + qs : '');
+    }
+
+    function navigateWithFilters(overrides) {
+        window.location.href = buildUrl(overrides);
+    }
+
+    // ── Navigation ──
+    function goToPage(page) {
+        navigateWithFilters({ page: page });
+    }
+
+    // ── Sorting ──
+    function sortColumn(col) {
+        var newOrder = (currentSort === col && currentOrder === 'asc') ? 'desc' : 'asc';
+        navigateWithFilters({ sort: col, order: newOrder });
+    }
+
+    // ── Search (Enter to search) ──
+    var searchInput = document.getElementById('search-input');
+    var clearBtn = document.getElementById('btn-clear-search');
+
+    searchInput.addEventListener('keyup', function(e) {
+        if (e.key === 'Enter') {
+            navigateWithFilters({ search: searchInput.value });
+        }
+    });
+
+    if (clearBtn) {
+        clearBtn.addEventListener('click', function() {
+            searchInput.value = '';
+            navigateWithFilters({ search: '' });
+        });
+    }
+
+    // ── Filters ──
+    document.getElementById('filter-role').addEventListener('change', function() {
+        navigateWithFilters({ role: this.value });
+    });
+    document.getElementById('filter-status').addEventListener('change', function() {
+        navigateWithFilters({ status: this.value });
+    });
+
+    // ── Password strength indicator ──
+    function getPasswordStrength(pw) {
+        if (!pw) return { score: 0, label: '', color: '' };
+        var score = 0;
+        if (pw.length >= 8) score++;
+        if (pw.length >= 12) score++;
+        if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) score++;
+        if (/\d/.test(pw)) score++;
+        if (/[^a-zA-Z0-9]/.test(pw)) score++;
+
+        var labels = ['', 'Faible', 'Moyen', 'Bon', 'Fort', 'Excellent'];
+        var colors = ['', 'bg-red-500', 'bg-orange-500', 'bg-yellow-500', 'bg-green-500', 'bg-emerald-500'];
+        return { score: score, label: labels[score] || '', color: colors[score] || '' };
+    }
+
+    function renderStrengthBar(containerId, pw) {
+        var container = document.getElementById(containerId);
+        if (!container) return;
+        if (!pw) { container.innerHTML = ''; return; }
+        var s = getPasswordStrength(pw);
+        container.innerHTML =
+            '<div class="flex items-center gap-2">' +
+                '<div class="flex-1 h-1.5 bg-gray-200 rounded-full overflow-hidden dark:bg-gray-800">' +
+                    '<div class="h-full rounded-full transition-all ' + s.color + '" style="width:' + (s.score * 20) + '%"></div>' +
+                '</div>' +
+                '<span class="text-xs text-gray-500 dark:text-gray-400">' + escapeHtml(s.label) + '</span>' +
+            '</div>';
+    }
+
+    document.querySelectorAll('.password-input').forEach(function(input) {
+        var containerId = input.closest('form').id === 'createForm' ? 'create-password-strength' : 'edit-password-strength';
+        input.addEventListener('input', function() {
+            renderStrengthBar(containerId, this.value);
+        });
+    });
+
+    // ── Modal Creer ──
+    function openCreateModal() {
+        var el = document.getElementById('createModal');
+        el.classList.remove('hidden');
+        document.getElementById('createAlert').innerHTML = '';
+        document.getElementById('createForm').reset();
+        document.getElementById('create-password-strength').innerHTML = '';
+        if (window.OverlayManager) window.OverlayManager.open(el, { layer: 'modal', lockScroll: true });
+    }
+
+    function closeCreateModal() {
+        var el = document.getElementById('createModal');
+        if (window.OverlayManager) window.OverlayManager.close(el);
+        el.classList.add('hidden');
+    }
+
+    document.getElementById('createForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        var formData = new FormData(e.target);
+        var data = {
+            username: formData.get('username'),
+            email: formData.get('email'),
+            password: formData.get('password'),
+            role: formData.get('role'),
+            is_active: formData.get('is_active') === 'on'
+        };
+
+        try {
+            var response = await fetch('/api/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Xsrftoken': getCookie('_xsrf') },
+                body: JSON.stringify(data)
+            });
+            var result = await response.json();
+            if (response.ok) {
+                document.getElementById('createAlert').innerHTML =
+                    '<div class="text-sm text-green-700 bg-green-50 border border-green-200 rounded px-3 py-2 mb-4 dark:bg-green-900/20 dark:border-green-800/60 dark:text-green-300">' + escapeHtml(result.message) + '</div>';
+                setTimeout(function() { _reloadAfterUserMutation('user_created'); }, 1500);
+            } else {
+                document.getElementById('createAlert').innerHTML =
+                    '<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded px-3 py-2 mb-4 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-300">' + escapeHtml(result.message || 'Erreur') + '</div>';
+            }
+        } catch (error) {
+            document.getElementById('createAlert').innerHTML =
+                '<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded px-3 py-2 mb-4 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-300">Erreur de connexion</div>';
+        }
+    });
+
+    // ── Modal Modifier ──
+    function openEditModal(id, username, email, role, isActive) {
+        var el = document.getElementById('editModal');
+        el.classList.remove('hidden');
+        document.getElementById('editAlert').innerHTML = '';
+        document.getElementById('edit-password-strength').innerHTML = '';
+        var form = document.getElementById('editForm');
+        form.user_id.value = id;
+        form.username.value = username;
+        form.email.value = email;
+        form.role.value = role;
+        form.is_active.checked = isActive;
+        form.password.value = '';
+        if (window.OverlayManager) window.OverlayManager.open(el, { layer: 'modal', lockScroll: true });
+    }
+
+    function closeEditModal() {
+        var el = document.getElementById('editModal');
+        if (window.OverlayManager) window.OverlayManager.close(el);
+        el.classList.add('hidden');
+    }
+
+    document.getElementById('editForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        var formData = new FormData(e.target);
+        var userId = formData.get('user_id');
+        var data = {
+            email: formData.get('email'),
+            role: formData.get('role'),
+            is_active: formData.get('is_active') === 'on'
+        };
+        if (formData.get('password')) {
+            data.password = formData.get('password');
+        }
+
+        try {
+            var response = await fetch('/api/users/' + userId, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'X-Xsrftoken': getCookie('_xsrf') },
+                body: JSON.stringify(data)
+            });
+            var result = await response.json();
+            if (response.ok) {
+                document.getElementById('editAlert').innerHTML =
+                    '<div class="text-sm text-green-700 bg-green-50 border border-green-200 rounded px-3 py-2 mb-4 dark:bg-green-900/20 dark:border-green-800/60 dark:text-green-300">' + escapeHtml(result.message) + '</div>';
+                setTimeout(function() { _reloadAfterUserMutation('user_updated'); }, 1500);
+            } else {
+                document.getElementById('editAlert').innerHTML =
+                    '<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded px-3 py-2 mb-4 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-300">' + escapeHtml(result.message || 'Erreur') + '</div>';
+            }
+        } catch (error) {
+            document.getElementById('editAlert').innerHTML =
+                '<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded px-3 py-2 mb-4 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-300">Erreur de connexion</div>';
+        }
+    });
+
+    // ── User action helper (DRY) ──
+    async function userAction(url, method, body, successMsg) {
+        try {
+            var headers = { 'X-Xsrftoken': getCookie('_xsrf') };
+            var opts = { method: method, headers: headers };
+            if (body) {
+                headers['Content-Type'] = 'application/json';
+                opts.body = JSON.stringify(body);
+            }
+            var response = await fetch(url, opts);
+            var result = await response.json();
+            if (response.ok) {
+                showToast(successMsg || result.message, 'success');
+                setTimeout(function() { _reloadAfterUserMutation('user_changed'); }, 1000);
+            } else {
+                showToast(result.message || 'Erreur', 'error');
+            }
+        } catch (error) {
+            showToast('Erreur de connexion', 'error');
+        }
+    }
+
+    // ── Desactiver utilisateur ──
+    async function disableUser(userId, username) {
+        if (!(await appConfirm('Voulez-vous vraiment desactiver l\'utilisateur "' + username + '" ?', 'Desactiver l\'utilisateur'))) return;
+        userAction('/api/users/' + userId, 'DELETE', null, null);
+    }
+
+    // ── Reactiver utilisateur ──
+    async function reactivateUser(userId, username) {
+        if (!(await appConfirm('Reactiver l\'utilisateur "' + username + '" ?', 'Reactiver'))) return;
+        userAction('/api/users/' + userId, 'PUT', { is_active: true }, 'Utilisateur reactive');
+    }
+
+    // ── Supprimer utilisateur (hard delete) ──
+    async function deleteUser(userId, username) {
+        if (!(await appConfirm(
+            'ATTENTION : Supprimer définitivement l\'utilisateur "' + username + '" ?\n\nCette action est irréversible. Toutes les sessions et données associées seront supprimées.',
+            'Supprimer définitivement'
+        ))) return;
+        if (!(await appConfirm(
+            'Confirmez-vous la suppression définitive de "' + username + '" ?',
+            'Confirmer la suppression'
+        ))) return;
+        userAction('/api/users/' + userId + '?permanent=true', 'DELETE', null, null);
+    }
+
+    // ── Sessions modal ──
+    function closeSessionsModal() {
+        var el = document.getElementById('sessionsModal');
+        if (window.OverlayManager) window.OverlayManager.close(el);
+        el.classList.add('hidden');
+        currentSessionUserId = null;
+    }
+
+    async function viewSessions(userId) {
+        currentSessionUserId = userId;
+        var modal = document.getElementById('sessionsModal');
+        var content = document.getElementById('sessionsContent');
+        content.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400">Chargement...</p>';
+        modal.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+
+        try {
+            var response = await fetch('/api/users/' + userId + '/sessions', {
+                headers: { 'X-Xsrftoken': getCookie('_xsrf') }
+            });
+            var result = await response.json();
+
+            if (response.ok) {
+                document.getElementById('sessionsTitle').textContent =
+                    'Historique des ' + result.total + ' sessions';
+                document.getElementById('btn-revoke-all').dataset.userId = userId;
+
+                if (!result.sessions || result.sessions.length === 0) {
+                    content.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400">Aucune session trouvee.</p>';
+                    return;
+                }
+                var html = '<table class="w-full text-sm"><thead><tr class="border-b border-gray-200 dark:border-gray-800">' +
+                    '<th class="text-left py-2 px-2 text-xs font-medium text-gray-500 dark:text-gray-400">#</th>' +
+                    '<th class="text-left py-2 px-2 text-xs font-medium text-gray-500 dark:text-gray-400">Date</th>' +
+                    '<th class="text-left py-2 px-2 text-xs font-medium text-gray-500 dark:text-gray-400">IP</th>' +
+                    '<th class="text-left py-2 px-2 text-xs font-medium text-gray-500 dark:text-gray-400">Statut</th>' +
+                    '<th class="text-left py-2 px-2 text-xs font-medium text-gray-500 dark:text-gray-400">Action</th>' +
+                    '</tr></thead><tbody>';
+                result.sessions.forEach(function(s, i) {
+                    var date = new Date(s.created_at).toLocaleString('fr-FR');
+                    var ip = escapeHtml(s.ip_address || 'N/A');
+                    var statusClass, statusText;
+                    if (s.is_expired) {
+                        statusClass = 'bg-gray-100 text-gray-600';
+                        statusText = 'Expiree';
+                    } else if (s.is_active) {
+                        statusClass = 'bg-green-50 text-green-700';
+                        statusText = 'Active';
+                    } else {
+                        statusClass = 'bg-red-50 text-red-700';
+                        statusText = 'Revoquee';
+                    }
+                    var revokeBtn = '';
+                    if (s.is_active && !s.is_expired) {
+                        revokeBtn = '<button class="text-xs text-red-600 hover:text-red-800 underline dark:text-red-400" data-action="revokeSession" data-session-id="' + escapeHtml(s.id) + '" data-user-id="' + userId + '">Revoquer</button>';
+                    }
+                    html += '<tr class="border-b border-gray-100 dark:border-gray-800">' +
+                        '<td class="py-2 px-2 text-gray-500 dark:text-gray-400">' + (i + 1) + '</td>' +
+                        '<td class="py-2 px-2 text-gray-700 dark:text-gray-300">' + escapeHtml(date) + '</td>' +
+                        '<td class="py-2 px-2 text-gray-500 dark:text-gray-400">' + ip + '</td>' +
+                        '<td class="py-2 px-2"><span class="text-xs font-medium px-2 py-0.5 rounded ' + statusClass + '">' + statusText + '</span></td>' +
+                        '<td class="py-2 px-2">' + revokeBtn + '</td>' +
+                        '</tr>';
+                });
+                html += '</tbody></table>';
+                content.innerHTML = html;
+            } else {
+                content.innerHTML = '<p class="text-sm text-red-600 dark:text-red-400">' + escapeHtml(result.message || 'Erreur') + '</p>';
+            }
+        } catch (error) {
+            content.innerHTML = '<p class="text-sm text-red-600 dark:text-red-400">Erreur de connexion</p>';
+        }
+    }
+
+    // ── Revoke session ──
+    async function revokeSession(userId, sessionId) {
+        try {
+            var response = await fetch('/api/users/' + userId + '/sessions?session_id=' + encodeURIComponent(sessionId), {
+                method: 'DELETE',
+                headers: { 'X-Xsrftoken': getCookie('_xsrf') }
+            });
+            var result = await response.json();
+            if (response.ok) {
+                showToast(result.message, 'success');
+                viewSessions(userId);
+            } else {
+                showToast(result.message || 'Erreur', 'error');
+            }
+        } catch (error) {
+            showToast('Erreur de connexion', 'error');
+        }
+    }
+
+    async function revokeAllSessions() {
+        if (!currentSessionUserId) return;
+        if (!(await appConfirm('Revoquer toutes les sessions actives de cet utilisateur ?'))) return;
+        try {
+            var response = await fetch('/api/users/' + currentSessionUserId + '/sessions', {
+                method: 'DELETE',
+                headers: { 'X-Xsrftoken': getCookie('_xsrf') }
+            });
+            var result = await response.json();
+            if (response.ok) {
+                showToast(result.message, 'success');
+                viewSessions(currentSessionUserId);
+            } else {
+                showToast(result.message || 'Erreur', 'error');
+            }
+        } catch (error) {
+            showToast('Erreur de connexion', 'error');
+        }
+    }
+
+    // F15 (2026-05-26) : enregistre l'écouteur des messages cross-tab AU LOAD.
+    // Quand un autre onglet poste un changement (CRUD user), on reload pour
+    // afficher les données fraîches. Throttle 1s côté helper évite F5-storm.
+    try {
+        if (window.komptiaAdminBroadcast) {
+            window.komptiaAdminBroadcast.reloadOnRemoteChange();
+        }
+    } catch (_e) { /* defensive */ }
+
+    // ── Bulk actions ──
+    var selectAll = document.getElementById('select-all');
+    var bulkBar = document.getElementById('bulk-bar');
+    var bulkCount = document.getElementById('bulk-count');
+
+    function getSelectedIds() {
+        return Array.from(document.querySelectorAll('.user-checkbox:checked')).map(function(cb) {
+            return parseInt(cb.value);
+        });
+    }
+
+    function updateBulkBar() {
+        var selected = getSelectedIds();
+        if (selected.length > 0) {
+            bulkBar.classList.remove('hidden');
+            bulkCount.textContent = selected.length;
+        } else {
+            bulkBar.classList.add('hidden');
+        }
+    }
+
+    selectAll.addEventListener('change', function() {
+        document.querySelectorAll('.user-checkbox').forEach(function(cb) {
+            cb.checked = selectAll.checked;
+        });
+        updateBulkBar();
+    });
+
+    document.querySelectorAll('.user-checkbox').forEach(function(cb) {
+        cb.addEventListener('change', updateBulkBar);
+    });
+
+    // Bug 2026-05-26 (F3 CRITIQUE) : avant ce fix, le bulk action bouclait
+    // sur N appels DELETE séparés, sans transaction. Si l'appel 5/10 plantait,
+    // les 4 premiers étaient committés et l'admin se retrouvait avec un état
+    // partiel impossible à rollback. Maintenant : un seul POST atomique vers
+    // /api/users/bulk qui applique tout dans une transaction ou rien.
+    async function bulkAction(ids, action, permanent, successLabel) {
+        try {
+            var res = await fetch('/api/users/bulk', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Xsrftoken': getCookie('_xsrf')
+                },
+                body: JSON.stringify({
+                    action: action,
+                    user_ids: ids,
+                    permanent: !!permanent
+                })
+            });
+            var bulkSuccess = false;
+            if (res.ok) {
+                var data = await res.json();
+                var n = (data && data.affected_count) || ids.length;
+                showToast(n + ' utilisateur(s) ' + successLabel, 'success');
+                bulkSuccess = true;
+            } else {
+                var err = {};
+                try { err = await res.json(); } catch (e) { /* corps non JSON */ }
+                var msg = (err && err.message)
+                    ? err.message
+                    : ('Erreur ' + res.status + ' lors du batch.');
+                showToast(msg + ' Aucune modification appliquée.', 'error');
+            }
+        } catch (e) {
+            // Cas (d) — réseau frontend / fetch failed. Pas de rollback nécessaire :
+            // si la requête n'est jamais arrivée, rien n'a bougé serveur-side.
+            showToast(
+                'Erreur réseau. Vérifiez votre connexion puis réessayez.',
+                'error'
+            );
+        }
+        // ADV-10 (2026-05-26) : utilise le helper unifié — F15 broadcast +
+        // AT-M4 scroll-preserve. ``bulkSuccess`` détermine la kind du
+        // broadcast (sur erreur on reload quand même pour reset l'UI mais
+        // sans notifier les autres onglets — rien n'a changé serveur).
+        setTimeout(function() {
+            if (bulkSuccess) {
+                _reloadAfterUserMutation('users_bulk_' + action);
+            } else {
+                if (window.komptiaReload && window.komptiaReload.preservingScroll) {
+                    window.komptiaReload.preservingScroll();
+                } else {
+                    window.location.reload();
+                }
+            }
+        }, 1000);
+    }
+
+    async function bulkDeactivate() {
+        var ids = getSelectedIds();
+        if (ids.length === 0) return;
+        if (!(await appConfirm('Désactiver ' + ids.length + ' utilisateur(s) ?'))) return;
+        bulkAction(ids, 'deactivate', false, 'désactivé(s)');
+    }
+
+    async function bulkDelete() {
+        var ids = getSelectedIds();
+        if (ids.length === 0) return;
+        if (!(await appConfirm('ATTENTION : Supprimer définitivement ' + ids.length + ' utilisateur(s) ? Cette action est irréversible.'))) return;
+        if (!(await appConfirm('Confirmez-vous la suppression définitive ?'))) return;
+        bulkAction(ids, 'delete', true, 'supprimé(s)');
+    }
+
+    function bulkClear() {
+        selectAll.checked = false;
+        document.querySelectorAll('.user-checkbox').forEach(function(cb) { cb.checked = false; });
+        updateBulkBar();
+    }
+
+    // ── Fermer modals en cliquant a l'exterieur ──
+    window.addEventListener('click', function(event) {
+        if (event.target.id === 'createModal') closeCreateModal();
+        if (event.target.id === 'editModal') closeEditModal();
+        if (event.target.id === 'sessionsModal') closeSessionsModal();
+    });
+
+    // ── Event listeners ──
+    document.getElementById('btn-create-user').addEventListener('click', openCreateModal);
+
+    // ── Event delegation ──
+    document.addEventListener('click', function(e) {
+        var target = e.target.closest('[data-action]');
+        if (!target) return;
+
+        var action = target.dataset.action;
+
+        if (action === 'closeCreateModal') closeCreateModal();
+        else if (action === 'closeEditModal') closeEditModal();
+        else if (action === 'closeSessionsModal') closeSessionsModal();
+        else if (action === 'goToPage') goToPage(parseInt(target.dataset.page));
+        else if (action === 'sortColumn') sortColumn(target.dataset.sort);
+        else if (action === 'openEditModal') {
+            openEditModal(
+                parseInt(target.dataset.userId),
+                target.dataset.username,
+                target.dataset.email,
+                target.dataset.role,
+                target.dataset.isActive === 'true'
+            );
+        }
+        else if (action === 'viewSessions') viewSessions(parseInt(target.dataset.userId));
+        else if (action === 'disableUser') disableUser(parseInt(target.dataset.userId), target.dataset.username);
+        else if (action === 'reactivateUser') reactivateUser(parseInt(target.dataset.userId), target.dataset.username);
+        else if (action === 'deleteUser') deleteUser(parseInt(target.dataset.userId), target.dataset.username);
+        else if (action === 'revokeSession') revokeSession(parseInt(target.dataset.userId), target.dataset.sessionId);
+        else if (action === 'revokeAllSessions') revokeAllSessions();
+        else if (action === 'bulkDeactivate') bulkDeactivate();
+        else if (action === 'bulkDelete') bulkDelete();
+        else if (action === 'bulkClear') bulkClear();
+    });
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/users. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_users_v1',
+                title: 'Gérer les utilisateurs Komptia',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Créer un compte',
+                        text: 'Le bouton « Nouvel utilisateur » en haut à droite ouvre un formulaire : identifiant, email, mot de passe initial, rôle (administrateur ou utilisateur standard). L\'utilisateur sera invité à changer son mot de passe à la première connexion.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Choisir le bon rôle',
+                        text: 'Un administrateur accède à toute la configuration (IA, base de données, autres utilisateurs, SMTP). Un utilisateur standard n\'a accès qu\'à Iris, ses classeurs et ses automatisations. Donnez le rôle administrateur uniquement aux personnes qui en ont vraiment besoin.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Filtrer, trier, désactiver',
+                        text: 'Utilisez les filtres en haut (rôle, statut) et les flèches de tri pour retrouver rapidement un utilisateur. La case à cocher en début de ligne permet une action groupée (désactiver ou supprimer plusieurs comptes en une fois) avec confirmation.'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Désactiver plutôt que supprimer',
+                        text: 'La désactivation bloque l\'accès mais conserve les données et l\'historique (utile en cas de retour). La suppression est définitive et irréversible : sessions, classeurs et automatisations associés disparaissent. Réservez la suppression aux comptes vraiment obsolètes.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+</div>
+{% end %}

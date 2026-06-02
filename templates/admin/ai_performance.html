@@ -1,0 +1,510 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block head %}
+{# Chart.js self-hosté (Bug 2026-05-26 P-8 MOYEN). Voir
+   ``static/vendor/chartjs/README.md`` pour la version + politique. #}
+<script src="/static/vendor/chartjs/chart.umd.min.js" nonce="{{ handler.csp_nonce }}"></script>
+{% end %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-start justify-between mb-6 flex-wrap gap-3">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Métriques, coûts, santé des fournisseurs LLM et feedback utilisateurs.</p>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+            {# Bug 2026-05-26 (AI-10) : ticker "Dernière mise à jour" — l'admin
+               sait à quel moment les données ont été chargées. Identique au
+               pattern /admin/performance::last-updated-ticker (cf. P-3). Le
+               JS du dashboard met à jour la chaîne relative ("il y a Xs"). #}
+            <span class="text-xs text-gray-500 dark:text-gray-400"
+                  id="last-updated-ticker" data-ts="{{ last_updated_iso }}">à l'instant</span>
+            <!-- Sélecteur de période -->
+            <div class="inline-flex rounded-md border border-gray-200 bg-white p-0.5 dark:bg-gray-900 dark:border-gray-800" role="group" aria-label="Période d'analyse">
+                {% for p in allowed_periods %}
+                <a href="?days={{ p }}"
+                   class="px-3 py-1 text-xs font-medium rounded {% if p == current_days %}bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900{% else %}text-gray-600 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-800{% end %}"
+                   aria-current="{% if p == current_days %}page{% else %}false{% end %}">
+                    {{ p }} jours
+                </a>
+                {% end %}
+            </div>
+            <a href="/api/ai/feedback/export"
+               class="btn btn-secondary text-sm"
+               title="Exporte tous les feedbacks utilisateurs (toutes périodes confondues, max 10 000 lignes)">
+                Exporter CSV
+            </a>
+        </div>
+    </div>
+
+    <!-- KPIs principaux -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Requêtes totales</p>
+            <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100" id="total-queries">{{ stats.total_queries or 0 }}</p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">sur {{ current_days }} jours</p>
+        </div>
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Taux de réussite</p>
+            <p class="text-2xl font-semibold {{ stats.success_rate_class }} mt-1">
+                {% if (stats.total_queries or 0) == 0 %}—{% else %}{{ "%.1f" % (stats.success_rate or 0) }}%{% end %}
+            </p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">{{ stats.successful_queries or 0 }} succès</p>
+        </div>
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Satisfaction</p>
+            <p class="text-2xl font-semibold {% if stats.fb_total == 0 %}text-gray-400{% else %}text-emerald-600{% end %} mt-1">
+                {% if stats.fb_total == 0 %}—{% else %}{{ "%.1f" % (stats.satisfaction_rate or 0) }}%{% end %}
+            </p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">{{ stats.positive_feedback or 0 }} positifs / {{ stats.negative_feedback or 0 }} négatifs</p>
+        </div>
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Temps moyen</p>
+            <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ "%.2f" % (stats.avg_generation_time or 0) }}s</p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">génération LLM</p>
+        </div>
+    </div>
+
+    <!-- KPIs secondaires : coûts / tokens / cache / RAG -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Coût estimé</p>
+            <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ pricing_currency_symbol }}{{ "%.2f" % (usage_stats.estimated_total_cost_usd or 0) }}</p>
+            {# Bug 2026-05-26 (Agent 3 AI-5 critique — denial-of-wallet caché) :
+               si des modèles consommés n'ont PAS de pricing configuré, le
+               coût recompute est silencieusement sous-estimé. On surface
+               l'info dans le sous-titre EXISTANT du KPI (pas d'ajout visuel
+               nouveau) avec lien direct vers ``/admin/ai-models`` pour
+               configurer le tarif manquant. #}
+            {% set _unknown = usage_stats.unknown_pricing_models or [] %}
+            {% if _unknown %}
+            <p class="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
+                ⚠️ Coût sous-estimé — <a href="/admin/ai-models" class="underline">{{ len(_unknown) }} modèle{% if len(_unknown) > 1 %}s{% end %} sans tarif</a>
+            </p>
+            {% else %}
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">tarifs providers</p>
+            {% end %}
+        </div>
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Tokens consommés</p>
+            <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ "{:,}".format(stats.total_tokens or 0).replace(",", " ") }}</p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">prompt + completion</p>
+        </div>
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Cache hits</p>
+            <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ "%.1f" % (stats.cache_rate or 0) }}%</p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">{{ stats.cache_hits or 0 }} réponses ré-utilisées</p>
+        </div>
+        <div class="card p-4">
+            <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Utilisation RAG</p>
+            <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ "%.1f" % (stats.rag_usage_rate or 0) }}%</p>
+            <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">requêtes avec contexte</p>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Évolution ({{ current_days }} jours)</h2>
+            </div>
+            <div class="p-4">
+                <div class="h-64">
+                    <canvas id="evolutionChart"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Tendances feedback</h2>
+            </div>
+            <div class="p-4">
+                <div class="h-64">
+                    <canvas id="feedbackChart"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Impact du RAG</h2>
+            </div>
+            <div class="p-4">
+                <div class="h-64">
+                    <canvas id="ragChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Comparaison des modèles -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Comparaison des modèles LLM</h2>
+            <span class="text-xs text-gray-500 dark:text-gray-400">Hors cache · {{ current_days }} jours</span>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-gray-200 dark:border-gray-800">
+                        <th class="table-header">Provider</th>
+                        <th class="table-header">Modèle</th>
+                        <th class="table-header text-right">Requêtes</th>
+                        <th class="table-header text-right">Taux de réussite</th>
+                        <th class="table-header text-right hidden md:table-cell">Satisfaction</th>
+                        <th class="table-header text-right hidden md:table-cell">Temps moyen</th>
+                        <th class="table-header text-right hidden lg:table-cell">Tokens / req.</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% if model_comparison %}
+                    {% for m in model_comparison %}
+                    <tr class="hover:bg-gray-50 dark:hover:bg-gray-800">
+                        <td class="table-cell">
+                            <span class="badge badge-neutral">{{ m.provider or '-' }}</span>
+                        </td>
+                        <td class="table-cell font-mono text-xs text-gray-700 dark:text-gray-300">{{ m.model or '-' }}</td>
+                        <td class="table-cell text-right text-gray-700 dark:text-gray-300">{{ m.total_queries or 0 }}</td>
+                        <td class="table-cell text-right">
+                            {% if (m.total_queries or 0) == 0 %}
+                            <span class="text-gray-400 dark:text-gray-500">—</span>
+                            {% else %}
+                            <span class="{{ m.success_rate_class }} font-medium">{{ "%.1f" % (m.success_rate or 0) }}%</span>
+                            {% end %}
+                        </td>
+                        <td class="table-cell text-right text-gray-700 hidden md:table-cell dark:text-gray-300">
+                            {% if m.fb_total == 0 %}
+                            <span class="text-gray-400 dark:text-gray-500">—</span>
+                            {% else %}
+                            {{ "%.1f" % (m.satisfaction_rate or 0) }}%
+                            <span class="text-xs text-gray-400 dark:text-gray-500">({{ m.positive_feedback or 0 }}/{{ m.fb_total }})</span>
+                            {% end %}
+                        </td>
+                        <td class="table-cell text-right text-gray-700 hidden md:table-cell dark:text-gray-300">{{ "%.2f" % (m.avg_generation_time or 0) }}s</td>
+                        <td class="table-cell text-right text-gray-700 hidden lg:table-cell dark:text-gray-300">{{ m.avg_tokens or 0 }}</td>
+                    </tr>
+                    {% end %}
+                    {% else %}
+                    <tr>
+                        <td colspan="7" class="px-4 py-8 text-center text-sm text-gray-500 dark:text-gray-400">Aucune requête loggée sur cette période.</td>
+                    </tr>
+                    {% end %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Coûts par modèle + Santé providers + Répartition erreurs -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+
+        <!-- Coûts par modèle -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Coûts estimés par modèle</h2>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-gray-200 dark:border-gray-800">
+                            <th class="table-header">Modèle</th>
+                            <th class="table-header text-right">Tokens</th>
+                            <th class="table-header text-right">Coût</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
+                        {% if usage_stats.by_model %}
+                        {% for m in usage_stats.by_model %}
+                        <tr>
+                            <td class="table-cell font-mono text-xs text-gray-700 dark:text-gray-300">{{ m.model or '-' }}</td>
+                            <td class="table-cell text-right text-gray-700 dark:text-gray-300">{{ "{:,}".format(m.total_tokens or 0).replace(",", " ") }}</td>
+                            <td class="table-cell text-right text-gray-900 font-medium dark:text-gray-100">{{ pricing_currency_symbol }}{{ "%.4f" % (m.estimated_cost_usd or 0) }}</td>
+                        </tr>
+                        {% end %}
+                        {% else %}
+                        <tr>
+                            <td colspan="3" class="px-4 py-6 text-center text-sm text-gray-500 dark:text-gray-400">Aucun token consommé.</td>
+                        </tr>
+                        {% end %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Santé des fournisseurs LLM -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Santé des fournisseurs</h2>
+                <a href="/admin/ai-config" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Configurer</a>
+            </div>
+            <div class="p-4 space-y-2">
+                {# Bug 2026-05-26 (AI-8 vérifié partiel — finding faux positif
+                   sur le filtrage, mais affichage brut à améliorer) : les
+                   providers nommés ``<name>_fallback`` (cf. health_check_all)
+                   correspondent au LLM local fallback. On affiche un libellé
+                   lisible et un badge "Fallback" distinct du primary pour que
+                   l'admin sache immédiatement si Ollama est down. #}
+                {% if providers_list %}
+                {% for p in providers_list %}
+                {% set _is_fb = p.name.endswith('_fallback') %}
+                {% set _label = (p.name[:-len('_fallback')] + ' (fallback)') if _is_fb else p.name %}
+                <div class="flex items-center justify-between px-3 py-2 rounded border border-gray-100 bg-gray-50 dark:bg-gray-900 dark:border-gray-800">
+                    <span class="text-sm font-medium text-gray-900 capitalize dark:text-gray-100">{{ _label }}</span>
+                    {% if p.ok %}
+                    <span class="badge badge-success">Opérationnel</span>
+                    {% else %}
+                    <span class="badge badge-error">Indisponible</span>
+                    {% end %}
+                </div>
+                {% end %}
+                {% else %}
+                <p class="text-sm text-gray-500 text-center py-6 dark:text-gray-400">Aucun fournisseur LLM configuré.</p>
+                {% end %}
+                <p class="text-xs text-gray-400 pt-2 dark:text-gray-500">État mis en cache 5 min. Rechargez pour rafraîchir.</p>
+            </div>
+        </div>
+
+        <!-- Répartition des erreurs -->
+        <div class="card">
+            <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Répartition des erreurs</h2>
+            </div>
+            <div class="p-4">
+                {% if error_breakdown %}
+                <ul class="space-y-2">
+                    {% for e in error_breakdown %}
+                    <li class="flex items-center justify-between">
+                        <span class="badge badge-error text-xs">{{ e.status }}</span>
+                        <span class="text-sm font-semibold text-gray-900 dark:text-gray-100">{{ e.count or 0 }}</span>
+                    </li>
+                    {% end %}
+                </ul>
+                {% else %}
+                <p class="text-sm text-gray-500 text-center py-6 dark:text-gray-400">Aucune erreur sur cette période.</p>
+                {% end %}
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Base de connaissances (RAG) -->
+    <div class="card mb-6">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Base de connaissances Iris (RAG)</h2>
+            <a href="/admin/ai-training" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">Gérer</a>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-0 divide-x divide-gray-100 dark:divide-gray-800">
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Tables</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ training_stats.tables_count or 0 }}</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Vues</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ training_stats.views_count or 0 }}</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Documentation</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ training_stats.documentation_count or 0 }}</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Paires Q/SQL</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ training_stats.question_sql_count or 0 }}</p>
+            </div>
+            <div class="p-4 text-center">
+                <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Contexte métier</p>
+                <p class="text-xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ training_stats.business_context_count or 0 }}</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Queries -->
+    <div class="card">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Requêtes récentes</h2>
+            <span class="text-xs text-gray-500 dark:text-gray-400">20 dernières · toutes périodes</span>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-gray-200 dark:border-gray-800">
+                        <th class="table-header">Question</th>
+                        <th class="table-header">Statut</th>
+                        <th class="table-header">Feedback</th>
+                        <th class="table-header">Temps</th>
+                        <th class="table-header">RAG</th>
+                        <th class="table-header">Date</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
+                    {% if recent_queries %}
+                    {% for q in recent_queries %}
+                    <tr class="hover:bg-gray-50 dark:hover:bg-gray-800">
+                        <td class="table-cell max-w-xs truncate" title="{{ q.question }}">{{ q.question }}</td>
+                        <td class="table-cell">
+                            <span class="badge {% if q.success %}badge-success{% else %}badge-error{% end %}">
+                                {{ 'Succès' if q.success else 'Échec' }}
+                            </span>
+                        </td>
+                        <td class="table-cell">
+                            {% if q.user_feedback == 'positive' %}
+                            <span class="badge badge-success" title="{{ q.feedback_comment or '' }}">Positif</span>
+                            {% elif q.user_feedback == 'negative' %}
+                            <span class="badge badge-error" title="{{ q.feedback_comment or '' }}">Négatif</span>
+                            {% else %}
+                            <span class="text-gray-400 dark:text-gray-500">-</span>
+                            {% end %}
+                        </td>
+                        <td class="table-cell text-gray-500 dark:text-gray-400">{{ ("%.2f s" % q.generation_time) if q.generation_time else '-' }}</td>
+                        <td class="table-cell text-gray-500 dark:text-gray-400">{{ 'Oui' if q.rag_used else 'Non' }}</td>
+                        <td class="table-cell text-gray-500 dark:text-gray-400">{{ q.created_at_formatted }}</td>
+                    </tr>
+                    {% end %}
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="px-4 py-8 text-center text-sm text-gray-500 dark:text-gray-400">Aucune requête récente</td>
+                    </tr>
+                    {% end %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+var evolutionData = {% raw evolution_data %};
+var feedbackTrends = {% raw feedback_trends %};
+var ragStats = {% raw rag_stats %};
+
+// Bug 2026-05-26 (Agent 3 P-9 + AI-14) : lit dynamiquement la font de
+// marque depuis ``<body>`` (Tailwind/design system). Idem
+// ``templates/admin/performance.html``.
+try {
+    var _bodyFont = window.getComputedStyle(document.body).getPropertyValue('font-family');
+    Chart.defaults.font.family = (_bodyFont || '').trim()
+        || '-apple-system, BlinkMacSystemFont, DM Sans, Segoe UI, Roboto, sans-serif';
+} catch (_e) {
+    Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, DM Sans, Segoe UI, Roboto, sans-serif';
+}
+Chart.defaults.font.size = 12;
+
+// Couleurs adaptatives au thème
+function _aip_isDark() { return document.documentElement.classList.contains('dark'); }
+function _aip_grid() { return _aip_isDark() ? 'rgba(255,255,255,0.06)' : '#f3f4f6'; }
+function _aip_tick() { return _aip_isDark() ? '#94a3b8' : '#64748b'; }
+function _aip_ragColors() { return _aip_isDark() ? ['#f1f5f9', '#374151'] : ['#111827', '#e5e7eb']; }
+Chart.defaults.color = _aip_tick();
+var _aipCharts = [];
+
+window.addEventListener('komptia:themechange', function() {
+    Chart.defaults.color = _aip_tick();
+    var ragColors = _aip_ragColors();
+    _aipCharts.forEach(function(c) {
+        try {
+            if (c.options.scales) {
+                Object.keys(c.options.scales).forEach(function(k) {
+                    if (c.options.scales[k].grid && c.options.scales[k].grid.color !== false && c.options.scales[k].grid.display !== false) {
+                        c.options.scales[k].grid.color = _aip_grid();
+                    }
+                    if (c.options.scales[k].ticks) c.options.scales[k].ticks.color = _aip_tick();
+                });
+            }
+            if (c._isRagChart) {
+                c.data.datasets[0].backgroundColor = ragColors;
+            }
+            c.update('none');
+        } catch (e) {}
+    });
+});
+
+_aipCharts.push(new Chart(document.getElementById('evolutionChart'), {
+    type: 'line',
+    data: {
+        labels: evolutionData.map(function(d) { return d.date; }),
+        datasets: [
+            { label: 'Succès', data: evolutionData.map(function(d) { return d.success; }), borderColor: '#059669', backgroundColor: 'rgba(5,150,105,0.08)', fill: true, tension: 0.3, borderWidth: 2 },
+            { label: 'Échecs', data: evolutionData.map(function(d) { return d.failed; }), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true, tension: 0.3, borderWidth: 2 }
+        ]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 16 } } },
+        scales: { y: { beginAtZero: true, grid: { color: _aip_grid() }, ticks: { color: _aip_tick() } }, x: { grid: { display: false }, ticks: { color: _aip_tick() } } }
+    }
+}));
+
+_aipCharts.push(new Chart(document.getElementById('feedbackChart'), {
+    type: 'line',
+    data: {
+        labels: feedbackTrends.map(function(d) { return d.date; }),
+        datasets: [
+            { label: 'Positifs', data: feedbackTrends.map(function(d) { return d.positive; }), borderColor: '#059669', backgroundColor: 'rgba(5,150,105,0.08)', fill: true, tension: 0.3, borderWidth: 2 },
+            { label: 'Négatifs', data: feedbackTrends.map(function(d) { return d.negative; }), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true, tension: 0.3, borderWidth: 2 }
+        ]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 16 } } },
+        scales: { y: { beginAtZero: true, grid: { color: _aip_grid() }, ticks: { color: _aip_tick() } }, x: { grid: { display: false }, ticks: { color: _aip_tick() } } }
+    }
+}));
+
+var _ragChart = new Chart(document.getElementById('ragChart'), {
+    type: 'doughnut',
+    data: {
+        labels: ['Avec RAG', 'Sans RAG'],
+        datasets: [{ data: [ragStats.with_rag || 0, ragStats.without_rag || 0], backgroundColor: _aip_ragColors(), borderWidth: 0 }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, padding: 16 } } },
+        cutout: '60%'
+    }
+});
+_ragChart._isRagChart = true;
+_aipCharts.push(_ragChart);
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/ai-performance. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_ai_performance_v1',
+                title: 'Surveiller les performances d\'Iris',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'L\'état d\'Iris en un coup d\'œil',
+                        text: 'Cette page rassemble toutes les métriques utiles pour piloter Iris : volume d\'utilisation, satisfaction des utilisateurs, coûts par modèle, pannes externes. À consulter régulièrement (une fois par semaine) pour anticiper les problèmes avant qu\'ils touchent vos utilisateurs.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Comparer les modèles',
+                        text: 'Le tableau « Comparaison des modèles » montre, pour chaque modèle utilisé, le volume de requêtes, le taux de satisfaction et le coût moyen. Utile pour décider s\'il vaut mieux basculer sur un modèle moins cher ou plus performant.'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Suivre le budget',
+                        text: 'Le graphique « Coûts estimés par modèle » affiche les dépenses sur la période sélectionnée. Si vous avez configuré un budget mensuel, un bandeau d\'alerte apparaît automatiquement quand vous approchez de la limite.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Détecter les pannes externes',
+                        text: 'La carte « Santé des fournisseurs » teste régulièrement la disponibilité des fournisseurs IA. Un statut rouge signifie que les utilisateurs vont avoir des erreurs côté Iris — pensez à vérifier la page d\'état du fournisseur et à prévenir si nécessaire.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+{% end %}

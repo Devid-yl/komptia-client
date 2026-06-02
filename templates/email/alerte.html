@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}{{ alert_title | default('Alerte') }} - {{ company_name }}{% endblock %}
+
+{% block content %}
+<h2>{{ alert_title | default('Alerte') }}</h2>
+
+<p>Bonjour {{ recipient_name | default('Cher client') }},</p>
+
+{% if alert_level == 'error' %}
+<div class="alert-box error">
+    <p><strong>Alerte critique</strong></p>
+    <p>{{ alert_message }}</p>
+</div>
+{% elif alert_level == 'warning' %}
+<div class="alert-box">
+    <p><strong>Avertissement</strong></p>
+    <p>{{ alert_message }}</p>
+</div>
+{% elif alert_level == 'success' %}
+<div class="alert-box success">
+    <p><strong>Confirmation</strong></p>
+    <p>{{ alert_message }}</p>
+</div>
+{% else %}
+<div class="info-box">
+    <p><strong>Information</strong></p>
+    <p>{{ alert_message }}</p>
+</div>
+{% endif %}
+
+{% if details %}
+<p><strong>Détails :</strong></p>
+<p>{{ details }}</p>
+{% endif %}
+
+{% if action_required %}
+<div class="info-box">
+    <p><strong>Action requise :</strong></p>
+    <p>{{ action_required }}</p>
+</div>
+{% endif %}
+
+{% if cta_url %}
+<p style="text-align: center;">
+    <a href="{{ cta_url }}" class="button-cta">{{ cta_text | default('Prendre des mesures') }}</a>
+</p>
+{% endif %}
+
+<p>Si vous avez des questions ou besoin d'assistance, notre équipe est à votre disposition.</p>
+
+<p>Cordialement,<br>
+<strong>{{ sender_name | default("L'équipe de " ~ company_name) }}</strong></p>
+{% endblock %}

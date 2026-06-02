@@ -1,0 +1,1613 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="mb-6">
+    <div class="flex items-start justify-between gap-4">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+            <p class="mt-1 text-sm text-gray-600 dark:text-gray-400">
+                Définissez, par utilisateur, les tables, colonnes et lignes de la base de données qu'il a le droit de consulter.
+                Les règles s'appliquent à toute requête générée par Iris ou exécutée via Komptia.
+            </p>
+        </div>
+        {# **P1 (#133)** — Bouton "Revoir le tour" (le tour onboarding ne
+           se déclenche qu'une fois par clé localStorage ; l'admin qui l'a
+           fermé trop vite ne peut plus le rejouer sans ce bouton).
+           NOTE : pas de lien doc inline car aucune route ``/docs/`` n'existe
+           encore en prod. La doc vit dans ``docs/data_access_rules.md`` du
+           repo. À ajouter quand une route ``DocsHandler`` sera créée. #}
+        <div class="flex items-center gap-3 text-xs whitespace-nowrap">
+            <button type="button" id="btn-replay-tour"
+                    class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-200 underline-offset-2 hover:underline">
+                ↺ Revoir le tour
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Carte 1 : Sélection user -->
+<div class="bg-white border border-gray-200 rounded-lg p-6 mb-4 dark:bg-gray-900 dark:border-gray-800">
+    <div class="flex items-center justify-between gap-4">
+        <div class="flex-1">
+            <label for="user-select" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Utilisateur cible</label>
+            <select id="user-select" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+                <option value="">— Choisir un utilisateur —</option>
+            </select>
+        </div>
+        <div class="text-xs text-gray-500 dark:text-gray-400">
+            Les administrateurs ne sont pas filtrés (accès total).
+        </div>
+    </div>
+</div>
+
+<!-- Carte 2 : Liste des règles -->
+<div id="rules-card" class="bg-white border border-gray-200 rounded-lg p-6 mb-4 dark:bg-gray-900 dark:border-gray-800 hidden">
+    <div class="flex items-center justify-between mb-4">
+        <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100">
+            Règles configurées <span id="rules-count" class="text-xs text-gray-500 ml-1"></span>
+        </h2>
+        <div class="flex items-center gap-2">
+            {# **P1 (#134)** — ``btn-add-rule`` disabled tant que pas d'user
+               sélectionné. Avant : click silencieux (early-return JS sans
+               feedback). ``rules-card`` est ``hidden`` jusqu'à sélection
+               user mais le bouton serait actif → désactivé par cohérence
+               défensive. #}
+            <button type="button" id="btn-copy-rules" class="btn btn-secondary" disabled title="Aucune règle à dupliquer">
+                Dupliquer vers…
+            </button>
+            <button type="button" id="btn-add-rule" class="btn btn-primary" disabled title="Choisir d'abord un utilisateur">
+                + Ajouter une règle
+            </button>
+        </div>
+    </div>
+
+    {# **P2 (#30) — Modal Dupliquer les règles vers un autre utilisateur.** #}
+    <div id="copy-rules-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+        <div class="bg-white dark:bg-gray-900 rounded-lg max-w-md w-full">
+            <div class="p-5">
+                <div class="flex items-center justify-between mb-3">
+                    <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">Dupliquer les règles</h3>
+                    <button type="button" id="btn-close-copy-modal" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                    </button>
+                </div>
+                <p class="text-xs text-gray-600 dark:text-gray-400 mb-3">
+                    Copier les règles de l'utilisateur courant vers un autre utilisateur. Les administrateurs ne sont pas filtrés (la copie est inutile pour eux).
+                </p>
+                <form id="copy-rules-form" class="space-y-3">
+                    <div>
+                        <label for="copy-target-user" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Utilisateur destinataire *</label>
+                        <select id="copy-target-user" required class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+                            <option value="">— Choisir —</option>
+                        </select>
+                    </div>
+                    <fieldset class="space-y-1.5">
+                        <legend class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Mode de copie *</legend>
+                        <label class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+                            <input type="radio" name="copy-mode" value="merge" checked class="mt-0.5">
+                            <span>
+                                <span class="font-medium">Ajouter</span> aux règles existantes du destinataire (recommandé).
+                            </span>
+                        </label>
+                        <label class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+                            <input type="radio" name="copy-mode" value="replace" class="mt-0.5">
+                            <span>
+                                <span class="font-medium">Remplacer</span> toutes les règles existantes du destinataire.
+                            </span>
+                        </label>
+                    </fieldset>
+                    <div id="copy-form-error" class="text-sm text-red-600 dark:text-red-400 hidden"></div>
+                    <div class="flex justify-end gap-2 pt-2 border-t border-gray-200 dark:border-gray-800">
+                        <button type="button" id="btn-cancel-copy" class="btn btn-secondary">Annuler</button>
+                        <button type="submit" id="btn-submit-copy" class="btn btn-primary">Dupliquer</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    {# Filtre/recherche + bulk-action bar — visible uniquement si >=1 règle existe (toggle JS). #}
+    <div id="rules-toolbar" class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3 hidden">
+        <div class="flex-1 max-w-md">
+            <input
+                type="search"
+                id="rules-filter"
+                placeholder="Filtrer (table, colonne, note, portée…)"
+                class="w-full px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500"
+                aria-label="Filtrer les règles"
+            >
+        </div>
+        <div id="bulk-action-bar" class="flex items-center gap-2 hidden">
+            <span id="bulk-count-label" class="text-xs text-gray-600 dark:text-gray-400" aria-live="polite"></span>
+            <button type="button" id="btn-bulk-delete" class="text-xs px-3 py-1.5 rounded border border-red-300 text-red-700 hover:bg-red-50 dark:border-red-700 dark:text-red-300 dark:hover:bg-red-900/20">
+                Supprimer la sélection
+            </button>
+        </div>
+    </div>
+
+    <div id="rules-empty" class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center hidden">
+        Aucune règle configurée pour cet utilisateur. Utilisez "Ajouter une règle" pour démarrer.
+    </div>
+
+    {# État "filtre actif mais 0 résultat" — distinct de "0 règle au total". #}
+    <div id="rules-no-match" class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center hidden">
+        Aucune règle ne correspond au filtre.
+    </div>
+
+    <div id="rules-list" class="overflow-x-auto hidden">
+        <table class="min-w-full text-sm">
+            <thead class="text-xs text-gray-500 uppercase tracking-wider border-b border-gray-200 dark:border-gray-800 dark:text-gray-400">
+                <tr>
+                    <th class="text-left py-2 px-2 w-8">
+                        <input type="checkbox" id="rules-select-all" aria-label="Tout sélectionner" class="rounded">
+                    </th>
+                    <th class="text-left py-2 px-2">Portée</th>
+                    <th class="text-left py-2 px-2">Table</th>
+                    <th class="text-left py-2 px-2">Colonne</th>
+                    <th class="text-left py-2 px-2">Effet</th>
+                    <th class="text-left py-2 px-2">Valeurs / Note</th>
+                    <th class="text-right py-2 px-2">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="rules-tbody" class="divide-y divide-gray-200 dark:divide-gray-800"></tbody>
+        </table>
+    </div>
+
+    <div id="status-msg" class="text-sm mt-3"></div>
+</div>
+
+<!-- **P2 (#29) — Vue d'ensemble matrice (users × tables denied).** Section
+     pliable, fermée par défaut. Affichée en bas de page pour donner à l'admin
+     une vision globale "qui a quoi" sans devoir parcourir user par user. -->
+<div id="matrix-card" class="bg-white border border-gray-200 rounded-lg p-6 mb-4 dark:bg-gray-900 dark:border-gray-800">
+    <button type="button" id="btn-toggle-matrix" class="w-full flex items-center justify-between text-left" aria-expanded="false">
+        <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100">
+            Vue d'ensemble (matrice)
+            <span id="matrix-stats" class="text-xs font-normal text-gray-500 dark:text-gray-400 ml-2"></span>
+        </h2>
+        <span id="matrix-chevron" class="text-gray-400 text-sm">▶</span>
+    </button>
+
+    <div id="matrix-body" class="hidden mt-4">
+        <p class="text-xs text-gray-600 dark:text-gray-400 mb-3">
+            Cette grille montre les tables interdites (deny scope=table) pour chaque utilisateur non-admin. Les règles de colonne/lignes sont visibles uniquement dans la liste détaillée. Cliquez sur un nom d'utilisateur pour le sélectionner dans le menu en haut de page.
+        </p>
+        <div id="matrix-empty" class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center hidden">
+            Aucune règle deny scope=table n'est configurée pour le moment.
+        </div>
+        <div id="matrix-loading" class="text-sm text-gray-500 dark:text-gray-400 py-3 hidden">Chargement…</div>
+        <div id="matrix-error" class="text-sm text-red-600 dark:text-red-400 py-3 hidden"></div>
+        <div id="matrix-grid-wrap" class="overflow-x-auto hidden">
+            <table id="matrix-grid" class="min-w-full text-xs">
+                <thead class="text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-800">
+                    <tr id="matrix-thead-row"></tr>
+                </thead>
+                <tbody id="matrix-tbody" class="divide-y divide-gray-200 dark:divide-gray-800"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Modal : Ajouter une règle -->
+<div id="rule-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-gray-900 rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+        <div class="p-6">
+            <div class="flex items-center justify-between mb-4">
+                <h3 id="rule-modal-title" class="text-base font-semibold text-gray-900 dark:text-gray-100">Nouvelle règle d'accès</h3>
+                <button type="button" id="btn-close-rule-modal" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <form id="rule-form" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        {# Aide au survol (≥800 ms) via ``data-tooltip`` sur le
+                           label — plus de « i » cliquable (directive user :
+                           info au survol, pas de bouton visible). ``info-tooltip.js``
+                           s'attache automatiquement à tout ``[data-tooltip]``. #}
+                        <label for="rule-scope" data-tooltip="Choisissez ce que la règle restreint :&#10;• Table entière — cache toute la table (mode invisible total)&#10;• Colonne d'une table — cache une colonne spécifique, la table reste visible&#10;• Lignes filtrées — n'autorise QUE les lignes dont une colonne prend les valeurs listées" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">
+                            Portée *
+                        </label>
+                        <select id="rule-scope" required class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+                            <option value="table">Table entière</option>
+                            <option value="column">Colonne d'une table</option>
+                            <option value="row">Lignes filtrées (par valeurs)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="rule-effect" data-tooltip="• Refuser l'accès (deny) — l'utilisateur ne voit plus la table/colonne. C'est l'option qui active le mode invisible.&#10;• Autoriser explicitement (allow) — réservé aux 'Lignes filtrées' : l'utilisateur ne voit QUE les lignes listées.&#10;Pour 'Table entière' et 'Colonne', seul 'Refuser' a du sens (l'option 'Autoriser' est désactivée automatiquement)." class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">
+                            Effet *
+                        </label>
+                        <select id="rule-effect" required class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+                            <option value="deny">Refuser l'accès</option>
+                            <option value="allow">Autoriser explicitement</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div>
+                    <label for="rule-table" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Table *</label>
+                    <input type="text" id="rule-table" required list="tables-datalist" placeholder="Ex: F_DOSSIER" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500">
+                    <datalist id="tables-datalist"></datalist>
+                </div>
+
+                <div id="rule-column-block">
+                    <label for="rule-column" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Colonne <span id="rule-column-required" class="text-red-500 hidden">*</span></label>
+                    <input type="text" id="rule-column" list="columns-datalist" placeholder="Ex: CodeDossier" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500">
+                    <datalist id="columns-datalist"></datalist>
+                </div>
+
+                <div id="rule-values-block" class="hidden">
+                    <label for="rule-values" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Valeurs autorisées * (une par ligne ou séparées par virgules)</label>
+                    <textarea id="rule-values" rows="4" placeholder="D001&#10;D002&#10;D003" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 font-mono text-xs"></textarea>
+                </div>
+
+                <div>
+                    <label for="rule-note" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Note (optionnelle)</label>
+                    <input type="text" id="rule-note" maxlength="500" placeholder="Justification ou contexte" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500">
+                </div>
+
+                {# Bug 2026-05-26 (DA-M1 MOYEN) : checkbox UI pour exposer le
+                   paramètre ``force_create`` (backend existant data_access_admin.py).
+                   Sans cette checkbox, l'admin doit utiliser curl pour créer une
+                   règle sur une table « à venir » (non encore synchronisée).
+                   Hidden par défaut — visible uniquement après une réponse 422
+                   ``code: table_not_found`` ou ``code: column_not_found`` (cf.
+                   le bloc ``rule-form-error``). UX progressive : pas de clutter
+                   tant que l'admin n'est pas dans le cas exotique. #}
+                <div id="rule-force-create-block" class="hidden">
+                    <label class="inline-flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
+                        <input type="checkbox" id="rule-force-create" class="rounded border-gray-300 dark:border-gray-700">
+                        <span>Forcer la création (table/colonne sera créée plus tard)</span>
+                    </label>
+                </div>
+
+                <div id="rule-form-error" class="text-sm text-red-600 dark:text-red-400 hidden"></div>
+
+                {# **P2 (#117) — Aperçu d'impact avant pose/modification.**
+                   L'endpoint /preview-impact existe depuis #73 mais n'était
+                   pas exposé côté UI. Bouton optionnel cliquable par l'admin
+                   pour voir combien d'autos / dashboards / Q-SQL pairs seront
+                   affectés AVANT de confirmer. #}
+                <div class="flex items-center justify-between gap-2 pt-2 border-t border-gray-200 dark:border-gray-800">
+                    <button type="button" id="btn-preview-impact" class="text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-200 underline-offset-2 hover:underline" disabled>
+                        👁 Voir l'impact
+                    </button>
+                    <div class="flex gap-2">
+                        <button type="button" id="btn-cancel-rule" class="btn btn-secondary">Annuler</button>
+                        <button type="submit" id="btn-submit-rule" class="btn btn-primary">Créer la règle</button>
+                    </div>
+                </div>
+
+                {# Zone d'affichage du résultat preview-impact. Hidden par défaut. #}
+                <div id="rule-impact-result" class="hidden mt-3 p-3 rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
+                    <div id="rule-impact-loading" class="text-sm text-gray-500 dark:text-gray-400 hidden">Calcul de l'impact…</div>
+                    <div id="rule-impact-error" class="text-sm text-red-600 dark:text-red-400 hidden"></div>
+                    <div id="rule-impact-summary" class="text-sm text-gray-700 dark:text-gray-300 hidden"></div>
+                    <ul id="rule-impact-details" class="mt-2 text-xs text-gray-600 dark:text-gray-400 list-disc pl-5 hidden"></ul>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+"use strict";
+
+// ────────────────────────────────────────────────────────────
+// État global
+// ────────────────────────────────────────────────────────────
+const state = {
+    users: [],
+    tables: [],          // [{table_name, columns}]
+    columnsByTable: {},  // {TABLE_UP: [col, col, ...]}
+    currentUserId: null,
+    currentRules: [],
+    // **P2 (#34/#35/#31) — UI state.**
+    filterText: '',          // texte filtre courant (lowercased)
+    selectedRuleIds: new Set(), // règles cochées pour bulk-delete
+    editingRuleId: null,     // si !== null → modal en mode UPDATE pour cet ID
+};
+
+// ────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────
+function showStatus(elId, message, type) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    el.textContent = message;
+    if (type === 'success') {
+        el.className = 'text-sm mt-3 text-green-600 dark:text-green-400';
+    } else if (type === 'error') {
+        el.className = 'text-sm mt-3 text-red-600 dark:text-red-400';
+    } else if (type === 'loading') {
+        el.className = 'text-sm mt-3 text-gray-500 dark:text-gray-400';
+    } else {
+        el.className = 'text-sm mt-3 text-gray-700 dark:text-gray-300';
+    }
+    if (type !== 'loading') {
+        setTimeout(() => { if (el.textContent === message) el.textContent = ''; }, 5000);
+    }
+}
+
+/**
+ * **#139** — Toast undo : affiche un toast bottom-right avec un bouton
+ * « Annuler » qui rappelle ``onUndo`` si cliqué dans la fenêtre
+ * ``durationMs`` (default 8000ms). Auto-dismiss à expiration.
+ *
+ * Pourquoi un toast custom plutôt que ``window.showToast`` shared :
+ *   - showToast n'expose pas d'action button (juste le close ×).
+ *   - Étendre toast.js pour 1 cas isolé = sur-engineering. Composant
+ *     local 30 lignes, scope contenu.
+ *
+ * Args :
+ *   - message : libellé court ("Règle supprimée").
+ *   - onUndo : async () => boolean — callback. Si retourne true, succès
+ *     (affiche un mini status). Si false, affiche un msg d'erreur.
+ *   - durationMs : default 8000.
+ */
+function showUndoToast(message, onUndo, durationMs) {
+    durationMs = durationMs || 8000;
+    // Stack id partagé avec window.showToast pour ne pas créer 2 colonnes
+    // verticales en parallèle.
+    let stack = document.getElementById('toast-stack');
+    if (!stack) {
+        stack = document.createElement('div');
+        stack.id = 'toast-stack';
+        stack.className = 'fixed bottom-4 right-4 flex flex-col-reverse gap-2 pointer-events-none';
+        stack.style.zIndex = '10001';
+        stack.style.bottom = '5rem';
+        stack.setAttribute('role', 'region');
+        stack.setAttribute('aria-label', 'Notifications');
+        document.body.appendChild(stack);
+    }
+    const el = document.createElement('div');
+    el.className = 'flex items-center gap-3 pl-4 pr-2 py-2.5 rounded-lg ' +
+        'text-sm font-medium shadow-lg pointer-events-auto max-w-md ' +
+        'bg-gray-800 dark:bg-gray-900 text-white';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    const msgSpan = document.createElement('span');
+    msgSpan.className = 'flex-1';
+    msgSpan.textContent = message;
+    el.appendChild(msgSpan);
+
+    const undoBtn = document.createElement('button');
+    undoBtn.type = 'button';
+    undoBtn.className = 'text-amber-300 hover:text-amber-200 font-semibold underline-offset-2 hover:underline px-2 py-1 focus:outline-none focus:ring-2 focus:ring-amber-300 rounded';
+    undoBtn.textContent = 'Annuler';
+    undoBtn.setAttribute('aria-label', 'Annuler la dernière suppression');
+    el.appendChild(undoBtn);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'ml-1 inline-flex items-center justify-center text-white text-lg leading-none opacity-70 hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-white/40 rounded';
+    closeBtn.style.minWidth = '44px';
+    closeBtn.style.minHeight = '44px';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', 'Fermer la notification');
+    el.appendChild(closeBtn);
+
+    stack.appendChild(el);
+
+    let dismissed = false;
+    function dismiss() {
+        if (dismissed) return;
+        dismissed = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        if (el.parentNode) el.parentNode.removeChild(el);
+    }
+    let timer = setTimeout(dismiss, durationMs);
+
+    closeBtn.addEventListener('click', dismiss);
+    undoBtn.addEventListener('click', async () => {
+        undoBtn.disabled = true;
+        undoBtn.textContent = '…';
+        try {
+            const ok = await onUndo();
+            dismiss();
+            if (ok) {
+                showStatus('status-msg', '↩ Suppression annulée', 'success');
+            } else {
+                showStatus('status-msg', 'Échec de la restauration.', 'error');
+            }
+        } catch (e) {
+            dismiss();
+            showStatus('status-msg', 'Erreur réseau pendant la restauration.', 'error');
+        }
+    });
+}
+
+function escapeHtml(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+async function fetchJson(url, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    if (options.method && options.method !== 'GET') {
+        options.headers['Content-Type'] = 'application/json';
+        options.headers['X-XSRFToken'] = getCookie('_xsrf');
+    }
+    const res = await fetch(url, options);
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* fallback */ }
+    return { res, data };
+}
+
+// ────────────────────────────────────────────────────────────
+// Bootstrap : charge users, tables
+// ────────────────────────────────────────────────────────────
+// 2026-05-18 : décision produit (David) — les règles définies ici sont
+// TOUJOURS appliquées au runtime. Plus de toggle gate dans /admin/ai-config.
+// 2026-05-20 : bandeau d'état retiré à la demande (l'info est implicite —
+// l'admin n'a pas besoin d'un badge "ACTIVÉ" pour comprendre que la page
+// fait ce qu'elle dit qu'elle fait).
+
+async function loadUsers() {
+    const { res, data } = await fetchJson('/api/admin/data-access/users');
+    if (!res.ok || !data || !Array.isArray(data.users)) {
+        showStatus('status-msg', 'Erreur de chargement des utilisateurs.', 'error');
+        return;
+    }
+    state.users = data.users;
+    const select = document.getElementById('user-select');
+    select.innerHTML = '<option value="">— Choisir un utilisateur —</option>';
+    state.users.forEach(u => {
+        const opt = document.createElement('option');
+        opt.value = String(u.id);
+        const adminTag = u.role === 'admin' ? ' [admin]' : '';
+        opt.textContent = `${u.username} (${u.email})${adminTag}`;
+        select.appendChild(opt);
+    });
+}
+
+async function loadTables() {
+    const { res, data } = await fetchJson('/api/admin/data-access/tables');
+    if (!res.ok || !data || !Array.isArray(data.tables)) return;
+    state.tables = data.tables;
+    state.columnsByTable = {};
+    const datalist = document.getElementById('tables-datalist');
+    datalist.innerHTML = '';
+    data.tables.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.table_name;
+        datalist.appendChild(opt);
+        state.columnsByTable[t.table_name.toUpperCase()] = t.columns || [];
+    });
+}
+
+// ────────────────────────────────────────────────────────────
+// Render rules table
+// ────────────────────────────────────────────────────────────
+
+// **P2 (#34) — Filtre texte client-side.**
+// Match insensible à la casse sur table_name, column_name, scope_type
+// label FR, effect, note, et valeurs autorisées (row).
+// L'admin tape un fragment quelconque et la liste se filtre à la volée.
+function ruleMatchesFilter(rule, filterText) {
+    if (!filterText) return true;
+    const needle = filterText.toLowerCase();
+    const scopeLabel = ({ table: 'table', column: 'colonne', row: 'lignes' }[rule.scope_type] || rule.scope_type || '').toLowerCase();
+    const fields = [
+        rule.table_name,
+        rule.column_name,
+        scopeLabel,
+        rule.effect,
+        rule.note,
+    ];
+    if (Array.isArray(rule.allowed_values)) {
+        for (const v of rule.allowed_values) {
+            fields.push(String(v));
+        }
+    }
+    return fields.some(f => f && String(f).toLowerCase().includes(needle));
+}
+
+function updateBulkActionBar() {
+    const bar = document.getElementById('bulk-action-bar');
+    const label = document.getElementById('bulk-count-label');
+    const n = state.selectedRuleIds.size;
+    if (!bar || !label) return;
+    if (n === 0) {
+        bar.classList.add('hidden');
+        label.textContent = '';
+    } else {
+        bar.classList.remove('hidden');
+        label.textContent = `${n} sélectionnée${n > 1 ? 's' : ''}`;
+    }
+    // Master checkbox tri-state cohérent
+    const master = document.getElementById('rules-select-all');
+    if (master) {
+        const visibleIds = (state.currentRules || [])
+            .filter(r => ruleMatchesFilter(r, state.filterText))
+            .map(r => r.id);
+        const visibleSelected = visibleIds.filter(id => state.selectedRuleIds.has(id));
+        master.checked = visibleIds.length > 0 && visibleSelected.length === visibleIds.length;
+        master.indeterminate = visibleSelected.length > 0 && visibleSelected.length < visibleIds.length;
+    }
+}
+
+function renderRules() {
+    const card = document.getElementById('rules-card');
+    const empty = document.getElementById('rules-empty');
+    const noMatch = document.getElementById('rules-no-match');
+    const list = document.getElementById('rules-list');
+    const toolbar = document.getElementById('rules-toolbar');
+    const tbody = document.getElementById('rules-tbody');
+    const count = document.getElementById('rules-count');
+
+    if (state.currentUserId === null) {
+        card.classList.add('hidden');
+        return;
+    }
+    card.classList.remove('hidden');
+
+    const rules = state.currentRules || [];
+    count.textContent = rules.length === 0 ? '' : `(${rules.length})`;
+
+    // **P1 (#135)** — Purge propre des sélections obsolètes (sans tout
+    // effacer). Avant : ``state.selectedRuleIds.clear()`` au filter empty
+    // → admin coche 5 règles, tape "azerty" pour vérifier doublons, efface
+    // → sélections perdues. Maintenant : on retire UNIQUEMENT les ids qui
+    // n'existent plus dans ``rules`` (suppression réelle). Les sélections
+    // sur règles existantes survivent aux filtres.
+    const existingIds = new Set(rules.map(r => r.id));
+    for (const id of Array.from(state.selectedRuleIds)) {
+        if (!existingIds.has(id)) {
+            state.selectedRuleIds.delete(id);
+        }
+    }
+
+    // 0 règle au total → empty state, toolbar et tableau masqués.
+    if (rules.length === 0) {
+        empty.classList.remove('hidden');
+        noMatch.classList.add('hidden');
+        list.classList.add('hidden');
+        toolbar.classList.add('hidden');
+        tbody.innerHTML = '';
+        // Aucune règle existante → la purge ci-dessus a déjà vidé le Set.
+        updateBulkActionBar();
+        return;
+    }
+
+    // >=1 règle au total → toolbar (filtre + bulk) visible.
+    empty.classList.add('hidden');
+    toolbar.classList.remove('hidden');
+
+    const visible = rules.filter(r => ruleMatchesFilter(r, state.filterText));
+
+    if (visible.length === 0) {
+        // Filtre actif mais aucun match — toolbar reste visible pour reset.
+        noMatch.classList.remove('hidden');
+        list.classList.add('hidden');
+        tbody.innerHTML = '';
+        // **P1 (#135)** : NE PAS purger ``selectedRuleIds`` ici. Les
+        // règles sélectionnées EXISTENT toujours en BDD, juste cachées
+        // par le filtre actif. Si l'admin efface le filtre, elles
+        // ré-apparaissent cochées (UX naturelle).
+        updateBulkActionBar();
+        return;
+    }
+
+    noMatch.classList.add('hidden');
+    list.classList.remove('hidden');
+    tbody.innerHTML = '';
+    visible.forEach(r => {
+        const tr = document.createElement('tr');
+        const valuesText = (r.scope_type === 'row' && Array.isArray(r.allowed_values))
+            ? `[${r.allowed_values.length}] ${r.allowed_values.slice(0, 3).map(v => escapeHtml(String(v))).join(', ')}${r.allowed_values.length > 3 ? '…' : ''}`
+            : (r.note ? escapeHtml(r.note) : '—');
+        const effectClass = r.effect === 'deny'
+            ? 'inline-block px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+            : 'inline-block px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300';
+        const scopeLabel = { table: 'Table', column: 'Colonne', row: 'Lignes' }[r.scope_type] || r.scope_type;
+        // **P0 (#127)** — FR labels pour effect. Inconsistance précédente :
+        // le dropdown de la modal d'ajout est en FR ("Refuser l'accès /
+        // Autoriser explicitement") mais la pastille de la liste affichait
+        // r.effect brut ("deny" / "allow") en anglais → confusion admin
+        // novice. On garde le data-effect= sur le span pour le styling CSS
+        // (déjà appliqué via effectClass).
+        const effectLabel = { deny: 'Refuser', allow: 'Autoriser' }[r.effect] || r.effect;
+        const isChecked = state.selectedRuleIds.has(r.id) ? 'checked' : '';
+        tr.innerHTML = `
+            <td class="py-2 px-2 align-middle">
+                <input type="checkbox" class="rule-select-checkbox rounded" data-rule-id="${r.id}" ${isChecked} aria-label="Sélectionner la règle ${r.id}">
+            </td>
+            <td class="py-2 px-2"><span class="text-xs font-medium text-gray-700 dark:text-gray-300">${escapeHtml(scopeLabel)}</span></td>
+            <td class="py-2 px-2 font-mono text-xs">${escapeHtml(r.table_name)}</td>
+            <td class="py-2 px-2 font-mono text-xs">${escapeHtml(r.column_name || '—')}</td>
+            <td class="py-2 px-2"><span class="${effectClass}" data-effect="${escapeHtml(r.effect)}">${escapeHtml(effectLabel)}</span></td>
+            <td class="py-2 px-2 text-xs text-gray-600 dark:text-gray-400">${valuesText}</td>
+            <td class="py-2 px-2 text-right whitespace-nowrap">
+                <button type="button" class="btn-edit-rule text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-200 mr-3" data-rule-id="${r.id}">
+                    Éditer
+                </button>
+                <button type="button" class="btn-delete-rule text-xs text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-200" data-rule-id="${r.id}">
+                    Supprimer
+                </button>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    // Listeners delete (CSP : pas d'onclick inline)
+    tbody.querySelectorAll('.btn-delete-rule').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            const ruleId = e.currentTarget.getAttribute('data-rule-id');
+            // **#142** — Modal brandée Komptia (window.appConfirm) au lieu de
+            // confirm() natif. Style cohérent avec les autres pages, ESC/click
+            // backdrop pour fermer, OverlayManager z-index propre.
+            const ok = window.appConfirm
+                ? await window.appConfirm('Supprimer cette règle ?', 'Supprimer la règle')
+                : window.confirm('Supprimer cette règle ?');
+            if (!ok) return;
+            const { res, data } = await fetchJson(`/api/admin/data-access/rules/${ruleId}`, { method: 'DELETE' });
+            if (res.ok && data && data.success) {
+                state.selectedRuleIds.delete(parseInt(ruleId, 10));
+                await loadCurrentUserRules();
+                // **#139** — Toast undo 8s : POST /restore si user clique.
+                showUndoToast('Règle supprimée', async () => {
+                    const r = await fetchJson(
+                        `/api/admin/data-access/rules/${ruleId}/restore`,
+                        { method: 'POST', body: JSON.stringify({}) }
+                    );
+                    if (r.res.ok && r.data && r.data.success) {
+                        await loadCurrentUserRules();
+                        return true;
+                    }
+                    return false;
+                });
+            } else {
+                showStatus('status-msg', (data && data.error) || 'Erreur de suppression', 'error');
+            }
+        });
+    });
+
+    // **P2 (#31) — Edit inline** : bouton ouvre le modal pré-rempli en mode UPDATE.
+    tbody.querySelectorAll('.btn-edit-rule').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const ruleId = parseInt(e.currentTarget.getAttribute('data-rule-id'), 10);
+            const rule = state.currentRules.find(r => r.id === ruleId);
+            if (!rule) {
+                showStatus('status-msg', 'Règle introuvable (rechargez la page).', 'error');
+                return;
+            }
+            openRuleModal(rule);
+        });
+    });
+
+    // **P2 (#35) — Bulk-select** : checkbox par ligne.
+    tbody.querySelectorAll('.rule-select-checkbox').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+            const id = parseInt(e.currentTarget.getAttribute('data-rule-id'), 10);
+            if (e.currentTarget.checked) {
+                state.selectedRuleIds.add(id);
+            } else {
+                state.selectedRuleIds.delete(id);
+            }
+            updateBulkActionBar();
+        });
+    });
+
+    updateBulkActionBar();
+}
+
+async function loadCurrentUserRules() {
+    if (state.currentUserId === null) return;
+    const { res, data } = await fetchJson(`/api/admin/data-access/users/${state.currentUserId}/rules`);
+    if (!res.ok || !data || !data.success) {
+        showStatus('status-msg', 'Erreur de chargement des règles.', 'error');
+        state.currentRules = [];
+    } else {
+        state.currentRules = data.rules || [];
+    }
+    renderRules();
+    updateCopyButtonState();
+    // **#29** : la matrice peut être obsolète après modification des règles.
+    // Si elle a déjà été chargée et est actuellement déployée, on la rafraîchit
+    // en arrière-plan ; sinon on marque _matrixLoaded=false pour forcer le
+    // re-load à la prochaine ouverture.
+    const matrixBody = document.getElementById('matrix-body');
+    if (_matrixLoaded) {
+        if (matrixBody && !matrixBody.classList.contains('hidden')) {
+            loadMatrix().catch(console.error);
+        } else {
+            _matrixLoaded = false;
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// Modal "Add rule" / "Edit rule" (#31 — modal dual-mode)
+// ────────────────────────────────────────────────────────────
+// Si ``existingRule`` fourni → mode UPDATE (PUT) avec champs pré-remplis.
+// Sinon → mode CREATE (POST). Le mode est tracké via ``state.editingRuleId``.
+// **P1 (#130)** — Draft localStorage pour rule-form.
+// Ne s'applique qu'au mode CREATE (pas EDIT — l'EDIT a la règle en BDD).
+// Namespace : komptia_data_access_rule_draft_<target_user_id>.
+const _DRAFT_KEY_PREFIX = 'komptia_data_access_rule_draft_';
+
+function _draftKey() {
+    if (state.currentUserId === null) return null;
+    return _DRAFT_KEY_PREFIX + state.currentUserId;
+}
+
+function saveDraft() {
+    // Ne pas saver en mode EDIT (la règle persistée a priorité).
+    if (state.editingRuleId !== null) return;
+    const key = _draftKey();
+    if (!key) return;
+    const draft = {
+        scope: document.getElementById('rule-scope').value,
+        effect: document.getElementById('rule-effect').value,
+        table: document.getElementById('rule-table').value,
+        column: document.getElementById('rule-column').value,
+        values: document.getElementById('rule-values').value,
+        note: document.getElementById('rule-note').value,
+        ts: Date.now(),
+    };
+    // Si tous les champs métier sont vides, retirer le draft (état propre).
+    const hasContent = draft.table || draft.column || draft.values || draft.note;
+    if (!hasContent) {
+        try { window.localStorage.removeItem(key); } catch (e) { /* ignore */ }
+        return;
+    }
+    try {
+        window.localStorage.setItem(key, JSON.stringify(draft));
+    } catch (e) { /* QuotaExceeded — best-effort, on perd le draft */ }
+}
+
+function restoreDraft() {
+    const key = _draftKey();
+    if (!key) return false;
+    let draft;
+    try {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) return false;
+        draft = JSON.parse(raw);
+    } catch (e) { return false; }
+    if (!draft || typeof draft !== 'object') return false;
+
+    document.getElementById('rule-scope').value = draft.scope || 'table';
+    document.getElementById('rule-effect').value = draft.effect || 'deny';
+    document.getElementById('rule-table').value = draft.table || '';
+    document.getElementById('rule-column').value = draft.column || '';
+    document.getElementById('rule-values').value = draft.values || '';
+    document.getElementById('rule-note').value = draft.note || '';
+    return true;
+}
+
+function clearDraft() {
+    const key = _draftKey();
+    if (!key) return;
+    try { window.localStorage.removeItem(key); } catch (e) { /* ignore */ }
+}
+
+function _ruleFormIsDirty() {
+    return !!(
+        document.getElementById('rule-table').value ||
+        document.getElementById('rule-column').value ||
+        document.getElementById('rule-values').value ||
+        document.getElementById('rule-note').value
+    );
+}
+
+function openRuleModal(existingRule) {
+    if (state.currentUserId === null) return;
+    document.getElementById('rule-modal').classList.remove('hidden');
+    document.getElementById('rule-form').reset();
+    document.getElementById('rule-form-error').classList.add('hidden');
+
+    const title = document.getElementById('rule-modal-title');
+    const submitBtn = document.getElementById('btn-submit-rule');
+
+    if (existingRule && existingRule.id != null) {
+        state.editingRuleId = existingRule.id;
+        title.textContent = `Modifier la règle #${existingRule.id}`;
+        submitBtn.textContent = 'Enregistrer';
+        // Pré-remplir les champs.
+        document.getElementById('rule-scope').value = existingRule.scope_type || 'table';
+        document.getElementById('rule-effect').value = existingRule.effect || 'deny';
+        document.getElementById('rule-table').value = existingRule.table_name || '';
+        document.getElementById('rule-column').value = existingRule.column_name || '';
+        document.getElementById('rule-note').value = existingRule.note || '';
+        if (existingRule.scope_type === 'row' && Array.isArray(existingRule.allowed_values)) {
+            document.getElementById('rule-values').value = existingRule.allowed_values.join('\n');
+        }
+    } else {
+        state.editingRuleId = null;
+        title.textContent = "Nouvelle règle d'accès";
+        submitBtn.textContent = 'Créer la règle';
+        // **P1 (#130)** — Restore draft si l'admin avait commencé à taper.
+        if (restoreDraft()) {
+            showStatus('status-msg', '↩ Brouillon restauré (champs précédents)', 'success');
+        }
+    }
+    onScopeChange();
+    // **#117** — Init état du bouton preview-impact selon le form.
+    updatePreviewImpactButtonState();
+}
+
+function closeRuleModal() {
+    document.getElementById('rule-modal').classList.add('hidden');
+    state.editingRuleId = null;
+    // **#117** — Reset le résultat preview-impact pour que la prochaine
+    // ouverture du modal n'affiche pas un cache de l'ancien calcul.
+    const impactResult = document.getElementById('rule-impact-result');
+    if (impactResult) impactResult.classList.add('hidden');
+    // DA-M1 (2026-05-26) : reset checkbox force_create + cache son bloc.
+    // Sinon une session de modale ouverte avec une 422 garde le bloc
+    // visible et la checkbox cochée pour la règle suivante.
+    const fcBlock = document.getElementById('rule-force-create-block');
+    const fcInput = document.getElementById('rule-force-create');
+    if (fcBlock) fcBlock.classList.add('hidden');
+    if (fcInput) fcInput.checked = false;
+}
+
+function onScopeChange() {
+    const scope = document.getElementById('rule-scope').value;
+    const colBlock = document.getElementById('rule-column-block');
+    const colRequired = document.getElementById('rule-column-required');
+    const valBlock = document.getElementById('rule-values-block');
+    const effectSel = document.getElementById('rule-effect');
+
+    if (scope === 'table') {
+        colBlock.classList.add('hidden');
+        valBlock.classList.add('hidden');
+        colRequired.classList.add('hidden');
+        // V1 : seul deny est appliqué au runtime (cf. enforcer.py).
+        // Un allow sur table est stocké mais ignoré → on force deny.
+        for (const opt of effectSel.options) opt.disabled = (opt.value === 'allow');
+        effectSel.value = 'deny';
+    } else if (scope === 'column') {
+        colBlock.classList.remove('hidden');
+        colRequired.classList.remove('hidden');
+        valBlock.classList.add('hidden');
+        // V1 : seul deny masque vraiment la colonne. Allow stocké inopérant.
+        for (const opt of effectSel.options) opt.disabled = (opt.value === 'allow');
+        effectSel.value = 'deny';
+    } else if (scope === 'row') {
+        colBlock.classList.remove('hidden');
+        colRequired.classList.remove('hidden');
+        valBlock.classList.remove('hidden');
+        // pour scope=row, seul "allow" est supporté V1
+        for (const opt of effectSel.options) opt.disabled = (opt.value === 'deny');
+        effectSel.value = 'allow';
+    }
+
+    // Mise à jour autocomplete colonnes selon table
+    updateColumnsDatalist();
+}
+
+function updateColumnsDatalist() {
+    const tableName = (document.getElementById('rule-table').value || '').toUpperCase();
+    const datalist = document.getElementById('columns-datalist');
+    datalist.innerHTML = '';
+    const cols = state.columnsByTable[tableName] || [];
+    cols.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        datalist.appendChild(opt);
+    });
+}
+
+function parseAllowedValues(text) {
+    // Accepte : valeurs sur une ligne séparées par virgule, OU une par ligne
+    if (!text) return [];
+    return text.split(/[\n,]+/).map(s => s.trim()).filter(s => s.length > 0);
+}
+
+async function submitRule(e) {
+    e.preventDefault();
+    const errBox = document.getElementById('rule-form-error');
+    errBox.classList.add('hidden');
+    const scope = document.getElementById('rule-scope').value;
+    const effect = document.getElementById('rule-effect').value;
+    const table = document.getElementById('rule-table').value.trim();
+    const column = document.getElementById('rule-column').value.trim();
+    const note = document.getElementById('rule-note').value.trim();
+    const valuesText = document.getElementById('rule-values').value;
+
+    const payload = {
+        scope_type: scope,
+        effect: effect,
+        table_name: table,
+        column_name: column || null,
+    };
+    if (note) payload.note = note;
+    if (scope === 'row') {
+        payload.allowed_values = parseAllowedValues(valuesText);
+    }
+    // DA-M1 (2026-05-26) : si l'admin a coché « Forcer la création »
+    // (après un 422 table/colonne non trouvée), on propage le flag.
+    const forceCreateEl = document.getElementById('rule-force-create');
+    if (forceCreateEl && forceCreateEl.checked) {
+        payload.force_create = true;
+    }
+
+    // **#31 — Dual-mode POST (create) / PUT (edit).** Le mode est tracké
+    // par ``state.editingRuleId`` qui est posé par ``openRuleModal(existingRule)``.
+    const isEdit = state.editingRuleId !== null;
+    const url = isEdit
+        ? `/api/admin/data-access/rules/${state.editingRuleId}`
+        : `/api/admin/data-access/users/${state.currentUserId}/rules/single`;
+    const method = isEdit ? 'PUT' : 'POST';
+    const { res, data } = await fetchJson(url, { method, body: JSON.stringify(payload) });
+    if (res.ok && data && data.success) {
+        const action = isEdit ? 'mise à jour' : 'créée';
+        // **P1 (#130)** — Submit réussi : on jette le draft local (la
+        // règle est persistée en BDD, plus besoin de filet local).
+        clearDraft();
+        closeRuleModal();
+        showStatus('status-msg', `✓ Règle ${action}`, 'success');
+        await loadCurrentUserRules();
+    } else {
+        let msg = (data && data.error) || (isEdit ? 'Erreur de mise à jour' : 'Erreur de création');
+        if (data && data.validation_errors) {
+            msg += ' — ' + (Array.isArray(data.validation_errors)
+                ? data.validation_errors.join(' ; ')
+                : JSON.stringify(data.validation_errors));
+        }
+        errBox.textContent = msg;
+        errBox.classList.remove('hidden');
+        // DA-M1 (2026-05-26) : si le backend a renvoyé ``table_not_found`` ou
+        // ``column_not_found``, on RÉVÈLE la checkbox « Forcer la création »
+        // (cachée par défaut). L'admin la coche puis re-soumet — pas besoin
+        // de curl pour les tables « à venir ».
+        const code = data && data.code;
+        if (code === 'table_not_found' || code === 'column_not_found') {
+            const fcBlock = document.getElementById('rule-force-create-block');
+            if (fcBlock) fcBlock.classList.remove('hidden');
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// Bulk delete (#35) + filter input (#34) — listeners DOMContentLoaded
+// ────────────────────────────────────────────────────────────
+async function bulkDeleteSelected() {
+    const ids = Array.from(state.selectedRuleIds);
+    if (ids.length === 0) return;
+    // **#142** — Modal brandée Komptia. Compte au pluriel dans le titre
+    // ET dans le message pour rappeler la sévérité du bulk-delete.
+    const bulkMsg = `Supprimer ${ids.length} règle${ids.length > 1 ? 's' : ''} ?`;
+    const okBulk = window.appConfirm
+        ? await window.appConfirm(bulkMsg, `Supprimer ${ids.length} règle${ids.length > 1 ? 's' : ''}`)
+        : window.confirm(bulkMsg);
+    if (!okBulk) return;
+
+    // **Adversarial review #35 MEDIUM fix** — UX bulk-delete sûre :
+    // 1. Désactiver le bouton pendant la boucle (anti double-clic).
+    // 2. Afficher la progression i/total en temps réel.
+    // 3. Concurrence bornée (chunks de 8 en parallèle via Promise.all)
+    //    pour éviter le freeze UI sur N grand, sans saturer le serveur.
+    // Tradeoff assumé : un échec partiel laisse N supprimées et K intactes
+    // (visibles au refresh). Pas de rollback global (acceptable pour V1).
+    const btn = document.getElementById('btn-bulk-delete');
+    const label = document.getElementById('bulk-count-label');
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Suppression…';
+
+    const CHUNK_SIZE = 8;
+    let ok = 0;
+    let failed = 0;
+
+    async function deleteOne(id) {
+        try {
+            const { res, data } = await fetchJson(`/api/admin/data-access/rules/${id}`, { method: 'DELETE' });
+            if (res.ok && data && data.success) {
+                ok += 1;
+            } else {
+                failed += 1;
+            }
+        } catch (e) {
+            failed += 1;
+        }
+        if (label) {
+            label.textContent = `${ok + failed}/${ids.length} traitée${(ok + failed) > 1 ? 's' : ''}…`;
+        }
+    }
+
+    for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+        const chunk = ids.slice(i, i + CHUNK_SIZE);
+        await Promise.all(chunk.map(deleteOne));
+    }
+
+    state.selectedRuleIds.clear();
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    if (failed === 0) {
+        showStatus('status-msg', `✓ ${ok} règle${ok > 1 ? 's' : ''} supprimée${ok > 1 ? 's' : ''}`, 'success');
+    } else if (ok === 0) {
+        showStatus('status-msg', `Échec de la suppression (${failed}).`, 'error');
+    } else {
+        showStatus('status-msg', `${ok} supprimée${ok > 1 ? 's' : ''}, ${failed} en échec.`, 'error');
+    }
+    await loadCurrentUserRules();
+}
+
+// ────────────────────────────────────────────────────────────
+// Preview impact (#117 — P2 follow-up)
+// ────────────────────────────────────────────────────────────
+// Appelle /api/admin/data-access/users/{user_id}/preview-impact avec
+// les valeurs courantes du form et affiche le nombre d'automations /
+// dashboards / Q-SQL pairs / conversations affectés. Disponible AUSSI
+// en mode édition (#117), pas seulement en création.
+
+function updatePreviewImpactButtonState() {
+    const btn = document.getElementById('btn-preview-impact');
+    if (!btn) return;
+    const scope = document.getElementById('rule-scope').value;
+    const table = document.getElementById('rule-table').value.trim();
+    const column = document.getElementById('rule-column').value.trim();
+    // Le preview a besoin AU MINIMUM de scope + table. Pour scope=column/row,
+    // on demande aussi column.
+    const needsColumn = (scope === 'column' || scope === 'row');
+    const ready = !!table && (!needsColumn || !!column);
+    btn.disabled = !ready;
+    btn.title = ready
+        ? "Voir combien d'automations / dashboards / requêtes seront affectés"
+        : (needsColumn
+            ? 'Renseignez table et colonne pour voir l\'impact'
+            : 'Renseignez la table pour voir l\'impact');
+}
+
+async function previewImpactClicked() {
+    if (state.currentUserId === null) return;
+    const scope = document.getElementById('rule-scope').value;
+    const table = document.getElementById('rule-table').value.trim();
+    const column = document.getElementById('rule-column').value.trim();
+    if (!table) return;
+
+    const wrap = document.getElementById('rule-impact-result');
+    const loading = document.getElementById('rule-impact-loading');
+    const errBox = document.getElementById('rule-impact-error');
+    const summary = document.getElementById('rule-impact-summary');
+    const details = document.getElementById('rule-impact-details');
+
+    wrap.classList.remove('hidden');
+    loading.classList.remove('hidden');
+    errBox.classList.add('hidden');
+    summary.classList.add('hidden');
+    details.classList.add('hidden');
+
+    const payload = { scope: scope, table_name: table };
+    if (column) payload.column_name = column;
+
+    const { res, data } = await fetchJson(
+        `/api/admin/data-access/users/${state.currentUserId}/preview-impact`,
+        { method: 'POST', body: JSON.stringify(payload) }
+    );
+    loading.classList.add('hidden');
+
+    if (!res.ok || !data || !data.success) {
+        errBox.textContent = (data && data.error) || 'Erreur de calcul d\'impact.';
+        errBox.classList.remove('hidden');
+        return;
+    }
+
+    const impact = data.impact || {};
+    const autos = impact.automations || [];
+    const dashes = impact.dashboards || [];
+    const pairs = impact.training_pairs || [];
+    const convCount = impact.conversation_count || 0;
+
+    // Summary FR fourni par le backend (résumé textuel des chiffres).
+    summary.textContent = impact.summary_fr || `${autos.length} automatisation(s), ${dashes.length} dashboard(s), ${pairs.length} requête(s) historique(s), ${convCount} conversation(s) affecté(s).`;
+    summary.classList.remove('hidden');
+
+    // Détails par catégorie (max 5 items par catégorie pour ne pas exploser le modal).
+    details.innerHTML = '';
+    const items = [];
+    autos.slice(0, 5).forEach(a => {
+        items.push(`Automation « ${escapeHtml(a.name)} »${a.is_active ? '' : ' (désactivée)'} — ${a.matching_step_count} étape(s) touchée(s)`);
+    });
+    if (autos.length > 5) items.push(`… et ${autos.length - 5} autre(s) automation(s)`);
+    dashes.slice(0, 5).forEach(d => {
+        items.push(`Dashboard « ${escapeHtml(d.name)} » — ${d.matching_widget_count} widget(s) touché(s)`);
+    });
+    if (dashes.length > 5) items.push(`… et ${dashes.length - 5} autre(s) dashboard(s)`);
+    if (pairs.length > 0) {
+        items.push(`${pairs.length} requête(s) en historique d'apprentissage touchent cette table`);
+    }
+    if (convCount > 0) {
+        items.push(`${convCount} conversation(s) Iris contiennent des références à cette table`);
+    }
+    // **P1 (#131)** — Closure transitive : afficher les objets dérivés
+    // (vues/fonctions/synonymes) qui seront aussi cachés. Critical pour
+    // que l'admin ne soit pas surpris ("j'ai posé deny F_SALAIRES et 5
+    // vues ont disparu sans que je le sache").
+    const closureExtra = impact.closure_extra || [];
+    if (closureExtra.length > 0) {
+        const preview = closureExtra.slice(0, 10).map(escapeHtml).join(', ');
+        const more = closureExtra.length > 10 ? ` … et ${closureExtra.length - 10} autre(s)` : '';
+        items.push(
+            `<strong class="text-orange-700 dark:text-orange-300">Closure transitive</strong> : ` +
+            `${closureExtra.length} objet(s) dérivé(s) seront aussi cachés (vue/fonction/synonyme) — ${preview}${more}`
+        );
+    }
+
+    if (items.length === 0) {
+        const li = document.createElement('li');
+        li.textContent = 'Aucun impact détecté.';
+        details.appendChild(li);
+    } else {
+        items.forEach(text => {
+            const li = document.createElement('li');
+            li.innerHTML = text;  // text déjà escapé via escapeHtml pour les valeurs dynamiques
+            details.appendChild(li);
+        });
+    }
+    details.classList.remove('hidden');
+}
+
+// ────────────────────────────────────────────────────────────
+// Copy rules to another user (#30 — P2)
+// ────────────────────────────────────────────────────────────
+
+function openCopyRulesModal() {
+    if (state.currentUserId === null || state.currentRules.length === 0) return;
+    const modal = document.getElementById('copy-rules-modal');
+    const select = document.getElementById('copy-target-user');
+    const errBox = document.getElementById('copy-form-error');
+    select.innerHTML = '<option value="">— Choisir —</option>';
+    // Peuple le dropdown avec TOUS les autres users (les admins inclus,
+    // avec tag explicite ; ne pas filtrer car parfois la copie vers un
+    // admin sert juste à initialiser un profil — l'enforcer bypass de
+    // toute façon, donc c'est inopérant mais pas dangereux).
+    state.users.forEach(u => {
+        if (u.id === state.currentUserId) return;
+        const opt = document.createElement('option');
+        opt.value = String(u.id);
+        const adminTag = u.role === 'admin' ? ' [admin — règles inopérantes]' : '';
+        opt.textContent = `${u.username} (${u.email})${adminTag}`;
+        select.appendChild(opt);
+    });
+    // Reset radio à "merge" par défaut.
+    const mergeRadio = document.querySelector('input[name="copy-mode"][value="merge"]');
+    if (mergeRadio) mergeRadio.checked = true;
+    errBox.classList.add('hidden');
+    modal.classList.remove('hidden');
+}
+
+function closeCopyRulesModal() {
+    document.getElementById('copy-rules-modal').classList.add('hidden');
+}
+
+async function submitCopyRules(e) {
+    e.preventDefault();
+    const errBox = document.getElementById('copy-form-error');
+    errBox.classList.add('hidden');
+    const targetIdStr = document.getElementById('copy-target-user').value;
+    const targetId = parseInt(targetIdStr, 10);
+    if (!targetId || Number.isNaN(targetId) || targetId === state.currentUserId) {
+        errBox.textContent = 'Choisissez un utilisateur destinataire différent.';
+        errBox.classList.remove('hidden');
+        return;
+    }
+    const mode = document.querySelector('input[name="copy-mode"]:checked').value;
+    const nbSrc = state.currentRules.length;
+    const targetUser = state.users.find(u => u.id === targetId);
+    const targetLabel = targetUser ? `${targetUser.username}` : `#${targetId}`;
+    const confirmMsg = mode === 'replace'
+        ? `Remplacer TOUTES les règles existantes de ${targetLabel} par ${nbSrc} règle${nbSrc > 1 ? 's' : ''} ?`
+        : `Ajouter ${nbSrc} règle${nbSrc > 1 ? 's' : ''} aux règles existantes de ${targetLabel} ?`;
+    // **#142** — Modal brandée Komptia. Le titre différencie clairement
+    // « Remplacer » (destructive, écrase) de « Ajouter » (additive).
+    const copyTitle = mode === 'replace' ? `Remplacer les règles de ${targetLabel}` : `Ajouter à ${targetLabel}`;
+    const okCopy = window.appConfirm
+        ? await window.appConfirm(confirmMsg, copyTitle)
+        : window.confirm(confirmMsg);
+    if (!okCopy) return;
+
+    const btn = document.getElementById('btn-submit-copy');
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Duplication…';
+    try {
+        const { res, data } = await fetchJson(
+            `/api/admin/data-access/users/${state.currentUserId}/copy-rules-to/${targetId}`,
+            { method: 'POST', body: JSON.stringify({ mode }) }
+        );
+        if (res.ok && data && data.success) {
+            closeCopyRulesModal();
+            const inserted = data.inserted || 0;
+            const deleted = data.deleted || 0;
+            let msg = `✓ ${inserted} règle${inserted > 1 ? 's' : ''} copiée${inserted > 1 ? 's' : ''} vers ${targetLabel}`;
+            if (mode === 'replace' && deleted > 0) {
+                msg += ` (${deleted} ancienne${deleted > 1 ? 's' : ''} supprimée${deleted > 1 ? 's' : ''})`;
+            }
+            showStatus('status-msg', msg, 'success');
+        } else {
+            errBox.textContent = (data && data.error) || 'Erreur de duplication';
+            errBox.classList.remove('hidden');
+        }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+    }
+}
+
+function updateCopyButtonState() {
+    const btn = document.getElementById('btn-copy-rules');
+    if (!btn) return;
+    const n = state.currentRules.length;
+    if (n === 0) {
+        btn.disabled = true;
+        btn.title = 'Aucune règle à dupliquer';
+    } else {
+        btn.disabled = false;
+        btn.title = `Dupliquer ${n} règle${n > 1 ? 's' : ''} vers un autre utilisateur`;
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// Vue matrice users × tables (#29 — P2)
+// ────────────────────────────────────────────────────────────
+
+let _matrixLoaded = false;
+
+async function loadMatrix() {
+    const loading = document.getElementById('matrix-loading');
+    const errBox = document.getElementById('matrix-error');
+    const empty = document.getElementById('matrix-empty');
+    const wrap = document.getElementById('matrix-grid-wrap');
+    const stats = document.getElementById('matrix-stats');
+
+    loading.classList.remove('hidden');
+    errBox.classList.add('hidden');
+    empty.classList.add('hidden');
+    wrap.classList.add('hidden');
+
+    const { res, data } = await fetchJson('/api/admin/data-access/matrix');
+    loading.classList.add('hidden');
+
+    if (!res.ok || !data || !data.success) {
+        errBox.textContent = (data && data.error) || 'Erreur de chargement de la matrice.';
+        errBox.classList.remove('hidden');
+        return;
+    }
+
+    const tables = data.tables || [];
+    const users = data.users || [];
+    const denied = data.denied || {};
+    const s = data.stats || {};
+    stats.textContent = `— ${s.user_count || 0} utilisateurs, ${s.total_denies || 0} table${(s.total_denies || 0) > 1 ? 's' : ''} interdite${(s.total_denies || 0) > 1 ? 's' : ''}`;
+
+    if (tables.length === 0 || users.length === 0) {
+        empty.classList.remove('hidden');
+        return;
+    }
+
+    // Header : 1ère colonne = "Utilisateur", puis 1 col par table.
+    const theadRow = document.getElementById('matrix-thead-row');
+    theadRow.innerHTML = '';
+    const thUser = document.createElement('th');
+    thUser.className = 'text-left py-2 px-2 uppercase tracking-wider sticky left-0 bg-white dark:bg-gray-900';
+    thUser.textContent = 'Utilisateur';
+    theadRow.appendChild(thUser);
+    tables.forEach(t => {
+        const th = document.createElement('th');
+        th.className = 'py-2 px-2 font-mono whitespace-nowrap text-gray-700 dark:text-gray-300';
+        th.textContent = t;
+        // Tooltip natif pour les noms longs.
+        th.title = t;
+        theadRow.appendChild(th);
+    });
+
+    // Body : 1 ligne par user.
+    const tbody = document.getElementById('matrix-tbody');
+    tbody.innerHTML = '';
+    users.forEach(u => {
+        const tr = document.createElement('tr');
+        const userKey = String(u.id);
+        const userDeniedSet = new Set(denied[userKey] || []);
+
+        const tdUser = document.createElement('td');
+        tdUser.className = 'py-1.5 px-2 sticky left-0 bg-white dark:bg-gray-900';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'text-left text-xs text-blue-600 hover:underline dark:text-blue-400';
+        btn.textContent = u.username || `#${u.id}`;
+        btn.title = u.email || '';
+        btn.setAttribute('data-user-id', String(u.id));
+        btn.addEventListener('click', (e) => {
+            const uid = e.currentTarget.getAttribute('data-user-id');
+            const sel = document.getElementById('user-select');
+            sel.value = uid;
+            // Déclencher l'event 'change' pour recharger les règles.
+            sel.dispatchEvent(new Event('change'));
+            // Scroll smooth vers la carte rules-card pour feedback visuel.
+            const card = document.getElementById('rules-card');
+            if (card) {
+                card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        });
+        tdUser.appendChild(btn);
+        tr.appendChild(tdUser);
+
+        tables.forEach(t => {
+            const td = document.createElement('td');
+            td.className = 'py-1.5 px-2 text-center';
+            if (userDeniedSet.has(t)) {
+                // Cellule rouge "interdit" — case marquée.
+                td.innerHTML = '<span class="inline-block w-4 h-4 rounded bg-red-500 text-white text-[10px] leading-4 font-bold" title="Interdit">✕</span>';
+            } else {
+                td.innerHTML = '<span class="text-gray-300 dark:text-gray-700">·</span>';
+            }
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+
+    wrap.classList.remove('hidden');
+    _matrixLoaded = true;
+}
+
+function toggleMatrix() {
+    const body = document.getElementById('matrix-body');
+    const chevron = document.getElementById('matrix-chevron');
+    const btn = document.getElementById('btn-toggle-matrix');
+    const isHidden = body.classList.contains('hidden');
+    if (isHidden) {
+        body.classList.remove('hidden');
+        chevron.textContent = '▼';
+        btn.setAttribute('aria-expanded', 'true');
+        // Lazy-load : ne charger la matrice qu'à la 1ère ouverture.
+        if (!_matrixLoaded) {
+            loadMatrix().catch(console.error);
+        }
+    } else {
+        body.classList.add('hidden');
+        chevron.textContent = '▶';
+        btn.setAttribute('aria-expanded', 'false');
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// Init
+// ────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    Promise.all([loadUsers(), loadTables()]).catch(console.error);
+
+    document.getElementById('user-select').addEventListener('change', async (e) => {
+        const v = e.target.value;
+        state.currentUserId = v ? parseInt(v, 10) : null;
+        // **P1 (#134)** — Activer/désactiver le bouton "+ Ajouter une règle"
+        // selon l'état de sélection user. Avant : click silencieux si pas
+        // de user sélectionné (early-return JS sans feedback).
+        const addBtn = document.getElementById('btn-add-rule');
+        if (state.currentUserId !== null) {
+            addBtn.disabled = false;
+            addBtn.removeAttribute('title');
+            await loadCurrentUserRules();
+        } else {
+            addBtn.disabled = true;
+            addBtn.title = 'Choisir d\'abord un utilisateur';
+            renderRules();
+        }
+    });
+
+    document.getElementById('btn-add-rule').addEventListener('click', () => openRuleModal(null));
+    document.getElementById('btn-close-rule-modal').addEventListener('click', closeRuleModal);
+    document.getElementById('btn-cancel-rule').addEventListener('click', closeRuleModal);
+    document.getElementById('rule-form').addEventListener('submit', submitRule);
+    document.getElementById('rule-scope').addEventListener('change', () => {
+        onScopeChange();
+        updatePreviewImpactButtonState();  // #117
+    });
+    document.getElementById('rule-table').addEventListener('input', () => {
+        updateColumnsDatalist();
+        updatePreviewImpactButtonState();  // #117
+    });
+    document.getElementById('rule-column').addEventListener('input', updatePreviewImpactButtonState);  // #117
+
+    // **P1 (#130)** — Auto-save draft sur chaque modification de champ
+    // du rule-form. saveDraft() est cheap (localStorage sync < 1ms +
+    // court-circuit si vide). Pas de debounce nécessaire à cette
+    // fréquence d'événements.
+    ['rule-scope', 'rule-effect', 'rule-table', 'rule-column', 'rule-values', 'rule-note'].forEach(function(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
+        el.addEventListener(evt, saveDraft);
+    });
+
+    // **P1 (#130)** — Warning avant refresh/close si la modal est
+    // ouverte avec des champs dirty (mode CREATE uniquement).
+    window.addEventListener('beforeunload', function(e) {
+        const modal = document.getElementById('rule-modal');
+        if (!modal || modal.classList.contains('hidden')) return;
+        if (state.editingRuleId !== null) return;  // EDIT mode, draft inutile
+        if (!_ruleFormIsDirty()) return;
+        // Beforeunload : le draft est déjà sauvegardé en localStorage à
+        // chaque keystroke (via saveDraft). On warne tout de même pour
+        // que l'admin sache qu'il quittera la modal — la restauration au
+        // prochain openRuleModal le rassure ensuite.
+        e.preventDefault();
+        e.returnValue = '';
+    });
+
+    // **#117** — Bouton preview-impact dans le modal.
+    const previewBtn = document.getElementById('btn-preview-impact');
+    if (previewBtn) previewBtn.addEventListener('click', previewImpactClicked);
+
+    // **#34 — Filtre input.** Re-render à chaque keystroke (liste typiquement
+    // courte, < 100 règles, filter en mémoire est instantané).
+    const filterInput = document.getElementById('rules-filter');
+    if (filterInput) {
+        filterInput.addEventListener('input', (e) => {
+            state.filterText = (e.currentTarget.value || '').trim();
+            renderRules();
+        });
+    }
+
+    // **#35 — Bulk-select master checkbox.** Toggle toutes les règles VISIBLES
+    // (filtre appliqué) — cohérent avec l'UX habituelle des tables data.
+    const masterCb = document.getElementById('rules-select-all');
+    if (masterCb) {
+        masterCb.addEventListener('change', (e) => {
+            const checked = e.currentTarget.checked;
+            const visible = (state.currentRules || [])
+                .filter(r => ruleMatchesFilter(r, state.filterText));
+            if (checked) {
+                visible.forEach(r => state.selectedRuleIds.add(r.id));
+            } else {
+                visible.forEach(r => state.selectedRuleIds.delete(r.id));
+            }
+            renderRules();
+        });
+    }
+
+    // **#35 — Bouton bulk-delete.**
+    const bulkBtn = document.getElementById('btn-bulk-delete');
+    if (bulkBtn) {
+        bulkBtn.addEventListener('click', bulkDeleteSelected);
+    }
+
+    // **#30 — Bouton "Dupliquer vers..." + modal.**
+    const copyBtn = document.getElementById('btn-copy-rules');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', openCopyRulesModal);
+    }
+    const copyClose = document.getElementById('btn-close-copy-modal');
+    const copyCancel = document.getElementById('btn-cancel-copy');
+    if (copyClose) copyClose.addEventListener('click', closeCopyRulesModal);
+    if (copyCancel) copyCancel.addEventListener('click', closeCopyRulesModal);
+    const copyForm = document.getElementById('copy-rules-form');
+    if (copyForm) copyForm.addEventListener('submit', submitCopyRules);
+
+    // **#29 — Toggle matrice users × tables (lazy load).**
+    const matrixToggleBtn = document.getElementById('btn-toggle-matrix');
+    if (matrixToggleBtn) {
+        matrixToggleBtn.addEventListener('click', toggleMatrix);
+    }
+});
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/data-access. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    // **P1 (#133)** — Tour réutilisable (auto au 1er passage + replay
+    // manuel via bouton "↺ Revoir le tour"). ``forceReplay=true`` réinit
+    // le localStorage du tour pour permettre la rejouer.
+    function _startDataAccessTour(forceReplay) {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            if (forceReplay) {
+                // KomptiaOnboarding utilise localStorage avec clé
+                // ``komptia_onboarding_<key>`` ou similaire. On nettoie
+                // toute clé qui contient notre key pour permettre le replay.
+                Object.keys(window.localStorage).forEach(function(k) {
+                    if (k.indexOf('admin_data_access_v') !== -1) {
+                        window.localStorage.removeItem(k);
+                    }
+                });
+            }
+            window.KomptiaOnboarding.start({
+                key: 'admin_data_access_v2',
+                title: 'Restreindre l\'accès aux données par utilisateur',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'À quoi sert cette page',
+                        text: 'Vous décidez ici, utilisateur par utilisateur, à quelles tables, colonnes ou lignes de la base de données il a le droit d\'accéder. Toute requête générée par Iris ou exécutée via Komptia respecte ces règles. Les administrateurs ne sont jamais filtrés (accès total).'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Choisir un utilisateur',
+                        // **P0 (#128)** — référence au "bandeau d'état" retirée :
+                        // le bandeau a été retiré le 2026-05-20 (cf. commentaire
+                        // ligne 325). Le tour faisait mention d'un élément
+                        // inexistant — confusion pour l'admin novice.
+                        text: 'Sélectionnez la personne concernée dans la liste « Utilisateur cible ». Les règles existantes apparaissent. Sans règle configurée, l\'utilisateur a un accès total par défaut (les administrateurs ne sont jamais filtrés).'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Ajouter une règle',
+                        text: 'Cliquez sur « + Ajouter une règle ». Vous choisissez la portée (table entière, colonne précise, valeurs filtrées), puis l\'effet (autoriser, refuser, limiter à certaines valeurs). Exemple : « autoriser la table CLIENTS uniquement pour les comptes commençant par 411 ».'
+                    },
+                    {
+                        icon: 'sparkle',
+                        title: 'Mode invisible : « refuser » cache vraiment',
+                        text: 'Une règle « refuser » ne se contente pas de bloquer l\'accès — elle rend la table totalement invisible pour l\'utilisateur. Elle disparaît d\'Iris, des dashboards, des rapports PDF et de l\'historique de conversation. Si une vue ou une fonction dépend d\'une table refusée, elle est cachée aussi (closure transitive). L\'utilisateur ne voit pas un message « accès refusé » : la table n\'existe simplement plus pour lui.'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Tester avant de diffuser',
+                        text: 'Après avoir ajouté des règles, demandez à l\'utilisateur de tester une requête Iris habituelle. S\'il voit « Accès refusé » ou un résultat inattendu, ajustez la règle. Pour révoquer entièrement l\'accès, supprimez la règle (elle ne sera plus appliquée).'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    }
+
+    // Auto-start au 1er passage (KomptiaOnboarding skip si déjà vu).
+    _startDataAccessTour(false);
+
+    // **P1 (#133)** — Handler bouton "Revoir le tour".
+    var _replayBtn = document.getElementById('btn-replay-tour');
+    if (_replayBtn) {
+        _replayBtn.addEventListener('click', function() {
+            _startDataAccessTour(true);
+        });
+    }
+
+    // **P1 (#132)** — Escape + click-backdrop sur les 2 modals.
+    // Conformité au contrat overlay Komptia (cf.
+    // `feedback_onboarding_overlay_non_bloquant.md`). Avant : l'admin
+    // devait cliquer le X ou le bouton "Annuler" — pattern non standard.
+    function _closeOpenDataAccessModal() {
+        var ruleModal = document.getElementById('rule-modal');
+        var copyModal = document.getElementById('copy-rules-modal');
+        if (ruleModal && !ruleModal.classList.contains('hidden')) {
+            ruleModal.classList.add('hidden');
+            return true;
+        }
+        if (copyModal && !copyModal.classList.contains('hidden')) {
+            copyModal.classList.add('hidden');
+            return true;
+        }
+        return false;
+    }
+
+    // Escape key handler global (capture-phase pour passer avant les
+    // handlers natifs de form).
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            if (_closeOpenDataAccessModal()) {
+                e.preventDefault();
+            }
+        }
+    });
+
+    // Click-on-backdrop pour les 2 modals. La modal a une div parente
+    // avec class ``fixed inset-0 bg-black bg-opacity-50``. Si le click
+    // landed sur cette div (et PAS sur un enfant), on ferme.
+    ['rule-modal', 'copy-rules-modal'].forEach(function(id) {
+        var modal = document.getElementById(id);
+        if (modal) {
+            modal.addEventListener('click', function(e) {
+                if (e.target === modal) {
+                    modal.classList.add('hidden');
+                }
+            });
+        }
+    });
+</script>
+{% end %}

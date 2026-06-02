@@ -1,0 +1,1916 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block head %}
+<style>
+    /* Menu d'actions par rapport (kebab ⋮) */
+    .report-actions { position: relative; display: inline-block; }
+    .report-actions-trigger {
+        background: none;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        padding: 4px 6px;
+        color: #6b7280;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: all .15s;
+    }
+    .report-actions-trigger:hover {
+        background: #f3f4f6;
+        color: #374151;
+        border-color: #e5e7eb;
+    }
+    .report-actions-menu {
+        /* ``position: fixed`` (pas absolute) pour s'echapper du
+           overflow:hidden du conteneur de la liste de rapports. Sans
+           ca, le menu d'un rapport en bas de page etait clippe au
+           dernier pixel visible (cf. screenshot user 2026-05-04).
+           Les coordonnees ``top``/``left`` sont posees inline par
+           ``toggleReportMenu`` au moment de l'ouverture, calculees
+           sur ``getBoundingClientRect()`` du trigger. */
+        position: fixed;
+        background: var(--bg-surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,.08);
+        min-width: 180px;
+        padding: 4px;
+        z-index: 1000;
+    }
+    .report-actions-menu.hidden { display: none; }
+    .report-actions-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        padding: 6px 10px;
+        background: none;
+        border: none;
+        color: #374151;
+        font-size: 0.8125rem;
+        cursor: pointer;
+        border-radius: 4px;
+        text-align: left;
+        transition: background .1s;
+    }
+    .report-actions-menu-item:hover { background: #f3f4f6; }
+    .report-actions-menu-item.danger { color: #dc2626; }
+    .report-actions-menu-item.danger:hover { background: #fef2f2; }
+    .report-actions-menu-item svg {
+        width: 15px;
+        height: 15px;
+        flex-shrink: 0;
+    }
+
+    /* ── Dark mode ─────────────────────────────────────────── */
+    .dark .report-actions-trigger { color: var(--text-faint); }
+    .dark .report-actions-trigger:hover {
+        background: rgba(255,255,255,0.06);
+        color: #e2e8f0;
+        border-color: rgba(255,255,255,0.12);
+    }
+    .dark .report-actions-menu {
+        background: #0f172a;
+        border-color: rgba(255,255,255,0.08);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    .dark .report-actions-menu-item { color: #e2e8f0; }
+    .dark .report-actions-menu-item:hover { background: rgba(255,255,255,0.06); }
+    .dark .report-actions-menu-item.danger { color: #fca5a5; }
+    .dark .report-actions-menu-item.danger:hover { background: rgba(239,68,68,0.15); }
+</style>
+{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+        <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Consultez et gerez les rapports generes</p>
+    </div>
+    <div class="flex items-center gap-2">
+        <button id="btn-open-generate" class="btn btn-primary">Generer un rapport IA</button>
+        <button id="btn-open-upload" class="btn btn-secondary">Importer un rapport</button>
+    </div>
+</div>
+
+<!-- Stats Cards -->
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100" id="stat-total">{{ stats.total_reports }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Rapports</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100" id="stat-size">{{ stats.total_size_human }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Taille totale</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100" id="stat-shared">{{ stats.shared_reports }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Partages</div>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-md px-4 py-3 text-center dark:bg-gray-900 dark:border-gray-800">
+        <div class="text-xl font-semibold text-gray-900 dark:text-gray-100" id="stat-archived">{{ stats.archived_reports }}</div>
+        <div class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">Archives</div>
+    </div>
+</div>
+
+<!-- Filters & Table -->
+<div class="card">
+    <!-- Bulk Actions Toolbar -->
+    <div id="bulk-toolbar" class="hidden bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between dark:bg-blue-900/20 dark:border-blue-800/60">
+        <div class="text-sm text-blue-900 dark:text-blue-200">
+            <span id="selected-count" class="font-semibold">0</span> rapport(s) selectionne(s)
+        </div>
+        <div class="flex items-center gap-2">
+            <button id="btn-bulk-archive" class="btn btn-secondary text-xs py-1 px-3">Archiver</button>
+            <button id="btn-bulk-email" class="btn btn-primary text-xs py-1 px-3">Envoyer par email</button>
+            <button id="btn-bulk-delete" class="btn btn-danger text-xs py-1 px-3">Supprimer</button>
+        </div>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-3 mb-4 p-4 border-b border-gray-200 dark:border-gray-800">
+        <input type="text" id="search-input" placeholder="Rechercher..."
+            class="input w-full sm:w-64 min-w-0">
+        <select id="filter-type" class="input w-full sm:w-40 min-w-0">
+            <option value="">Tous les types</option>
+            <option value="pdf">PDF</option>
+            <option value="csv">CSV</option>
+            <option value="xlsx">Excel</option>
+        </select>
+        <select id="filter-status" class="input w-full sm:w-40 min-w-0">
+            <option value="all">Tous</option>
+            <option value="active">Actifs</option>
+            <option value="archived">Archives</option>
+        </select>
+    </div>
+
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="border-b border-gray-200 dark:border-gray-800">
+                    <th class="table-header text-left w-12">
+                        <input type="checkbox" id="select-all" class="rounded border-gray-300 dark:border-gray-700">
+                    </th>
+                    <th class="table-header text-left cursor-pointer hover:text-gray-700 select-none dark:hover:text-gray-200" data-action="sort" data-sort="title">
+                        Nom <span id="sort-icon-title"></span>
+                    </th>
+                    <th class="table-header text-left cursor-pointer hover:text-gray-700 select-none dark:hover:text-gray-200" data-action="sort" data-sort="file_format">
+                        Type <span id="sort-icon-file_format"></span>
+                    </th>
+                    <th class="table-header text-left cursor-pointer hover:text-gray-700 select-none dark:hover:text-gray-200" data-action="sort" data-sort="file_size">
+                        Taille <span id="sort-icon-file_size"></span>
+                    </th>
+                    <th class="table-header text-left cursor-pointer hover:text-gray-700 select-none dark:hover:text-gray-200" data-action="sort" data-sort="created_at">
+                        Cree le <span id="sort-icon-created_at"></span>
+                    </th>
+                    <th class="table-header text-left">Statut</th>
+                    <th class="table-header text-left">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="reports-body" class="divide-y divide-gray-100 dark:divide-gray-800">
+            </tbody>
+        </table>
+    </div>
+
+    <div id="empty-state" class="hidden text-center py-16">
+        <svg id="empty-state-icon" class="mx-auto w-16 h-16 text-gray-300 mb-4 dark:text-gray-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+        <h3 id="empty-state-title" class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200">Aucun rapport généré</h3>
+        <p id="empty-state-message" class="text-sm text-gray-500 mb-1 dark:text-gray-400 max-w-md mx-auto">Les rapports apparaissent ici quand vous demandez une analyse à Iris ou quand une automatisation se déclenche.</p>
+        <p id="empty-state-hint" class="text-xs text-gray-400 mb-4 dark:text-gray-500">Formats supportés : PDF (analyse IA), CSV, Excel.</p>
+        <a id="empty-state-cta" href="/iris" class="btn btn-primary">Demander une analyse à Iris</a>
+        <button id="empty-state-retry" type="button" class="hidden btn btn-secondary">Réessayer</button>
+    </div>
+
+    <div id="pagination" class="flex items-center justify-center gap-1 pt-4 mt-4 border-t border-gray-200 dark:border-gray-800">
+    </div>
+</div>
+
+<!-- Generate Report (LLM-driven) Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="generateModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <div>
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Générer un rapport IA</h3>
+                <p class="text-xs text-gray-500 mt-0.5 dark:text-gray-400">L'IA analyse les feuilles sélectionnées et produit un rapport professionnel</p>
+            </div>
+            <button class="text-gray-400 hover:text-gray-600 text-xl leading-none dark:text-gray-500 dark:hover:text-gray-300" data-action="closeGenerateModal">&times;</button>
+        </div>
+
+        <div class="p-4 overflow-y-auto flex-1">
+            <!-- Title (optional) -->
+            <div class="mb-4">
+                <label class="label" for="gen-title">Titre du rapport <span class="text-xs text-gray-400 dark:text-gray-500">(optionnel)</span></label>
+                <input type="text" id="gen-title" class="input w-full" placeholder="Laissez vide — l'IA propose un titre adapté">
+            </div>
+
+            <!-- User prompt (optional) -->
+            <div class="mb-4">
+                <label class="label" for="gen-user-prompt">Instructions pour l'IA <span class="text-xs text-gray-400 dark:text-gray-500">(optionnel)</span></label>
+                <textarea id="gen-user-prompt" class="input w-full" rows="3" placeholder="Ex: Fais un focus sur l'évolution mensuelle du chiffre d'affaires par collaborateur..."></textarea>
+                <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Si vide, l'IA analyse librement les données.</p>
+            </div>
+
+            <!-- Tree of classeurs & sheets -->
+            <div class="mb-4">
+                <div class="flex items-center justify-between mb-2">
+                    <label class="label mb-0">Données à analyser *</label>
+                    <div class="flex items-center gap-3">
+                        <button type="button" id="btn-gen-add-external"
+                                class="text-xs px-2 py-1 border border-gray-300 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300">
+                            + Feuilles externes
+                        </button>
+                        <span class="text-xs text-gray-500 dark:text-gray-400"><span id="gen-selected-count">0</span> élément(s)</span>
+                    </div>
+                </div>
+                <div id="gen-tree" class="border border-gray-200 rounded-md max-h-80 overflow-y-auto divide-y divide-gray-100 dark:border-gray-800 dark:divide-gray-800">
+                    <div class="p-4 text-sm text-gray-500 text-center dark:text-gray-400">Chargement des classeurs...</div>
+                </div>
+
+                <!-- External sources (Excel/CSV/autres classeurs ajoutés via le picker) -->
+                <div id="gen-external-list" class="hidden mt-2 space-y-1"></div>
+
+                <!-- Token budget bar -->
+                <div class="mt-2">
+                    <div class="flex items-center justify-between text-xs text-gray-600 mb-1 dark:text-gray-400">
+                        <span id="gen-token-label">Budget tokens : <span id="gen-token-current">0</span> / <span id="gen-token-max">—</span></span>
+                        <span id="gen-token-model" class="text-gray-400 dark:text-gray-500"></span>
+                    </div>
+                    <div class="h-1.5 bg-gray-200 rounded-full overflow-hidden dark:bg-gray-800">
+                        <div id="gen-token-bar" class="h-full bg-emerald-500 transition-all" style="width: 0%"></div>
+                    </div>
+                    <p id="gen-token-warning" class="text-xs text-red-600 mt-1 hidden dark:text-red-400">⚠ Dépassement du budget — retirez des éléments</p>
+                    <!-- Badge "Mode étendu" (visible quand on dépasse agent_mode_threshold) -->
+                    <div id="gen-mode-badge" data-tooltip="Quand la sélection dépasse la fenêtre du modèle IA, on bascule sur un mode où l'IA navigue les données pas-à-pas (lecture par tranches, agrégations à la demande) au lieu de tout charger d'un coup. Résultat : ça marche sur des classeurs très volumineux, mais la génération prend plusieurs minutes au lieu de 30-60 secondes." class="hidden mt-2 inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-900/30 dark:text-blue-200 dark:border-blue-800/60">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                        <span>Mode étendu</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Info box -->
+            <div class="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-800 dark:bg-blue-900/20 dark:border-blue-800/60 dark:text-blue-200">
+                <strong>Note :</strong> les données sélectionnées sont envoyées au modèle IA actif pour générer le rapport. L'IA décide de la structure (titre, sections, graphiques) et rédige l'analyse.
+            </div>
+        </div>
+
+        <div class="flex justify-end gap-2 p-4 border-t border-gray-200 dark:border-gray-800">
+            <button type="button" class="btn btn-secondary" data-action="closeGenerateModal">Annuler</button>
+            <button type="button" id="btn-gen-submit" class="btn btn-primary">
+                <span id="gen-btn-text">Générer</span>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Upload Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="uploadModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-md mx-4 dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Importer un rapport</h3>
+            <button class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeUploadModal">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="uploadForm" class="p-4">
+            <div class="mb-4">
+                <label class="label" for="reportName">Nom du rapport</label>
+                <input type="text" id="reportName" class="input w-full" required placeholder="Rapport mensuel">
+            </div>
+            <div class="mb-4">
+                <label class="label" for="reportDescription">Description (optionnel)</label>
+                <textarea id="reportDescription" class="input w-full" rows="2" placeholder="Description du rapport..."></textarea>
+            </div>
+            <div class="mb-4">
+                <label class="label">Fichier (PDF, CSV, XLSX)</label>
+                <!-- Drop zone -->
+                <div id="drop-zone" class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50/50 transition-colors dark:border-gray-700">
+                    <svg class="w-8 h-8 mx-auto text-gray-400 mb-2 dark:text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                    </svg>
+                    <p class="text-sm text-gray-600 dark:text-gray-400" id="drop-zone-text">Glissez un fichier ici ou <span class="text-blue-600 underline dark:text-blue-400">parcourir</span></p>
+                    <p class="text-xs text-gray-400 mt-1 dark:text-gray-500">PDF, CSV, XLSX - Max {{ max_upload_mo }} Mo</p>
+                    <input type="file" id="reportFile" class="hidden" accept=".pdf,.csv,.xlsx">
+                </div>
+            </div>
+            <div class="flex justify-end gap-2">
+                <button type="button" class="btn btn-secondary" data-action="closeUploadModal">Annuler</button>
+                <button type="submit" class="btn btn-primary">Importer</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Share Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="shareModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-md mx-4 dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Partager le rapport</h3>
+            <button class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeShareModal">&times;</button>
+        </div>
+        <div class="p-4">
+            <div id="share-content">
+                <p class="text-sm text-gray-600 mb-3 dark:text-gray-400">Generez un lien de partage temporaire. Le lien expire automatiquement.</p>
+                <div class="mb-4">
+                    <label class="label">Duree de validite</label>
+                    <select id="share-expiry" class="input w-full">
+                        <option value="24">24 heures</option>
+                        <option value="72" selected>72 heures (3 jours)</option>
+                        <option value="168">7 jours</option>
+                        <option value="720">30 jours</option>
+                    </select>
+                </div>
+                <button id="btn-generate-link" class="btn btn-primary w-full" data-action="generateShareLink">Generer le lien</button>
+            </div>
+            <div id="share-result" class="hidden">
+                <p class="text-sm text-gray-600 mb-2 dark:text-gray-400">Lien de partage :</p>
+                <div class="flex items-center gap-2 mb-3">
+                    <input type="text" id="share-url" class="input flex-1 text-sm" readonly>
+                    <button class="btn btn-primary text-xs py-1.5 px-3" data-action="copyShareLink">Copier</button>
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400" id="share-info"></p>
+                <div class="flex gap-2 mt-4">
+                    <button class="btn btn-danger text-xs flex-1" data-action="revokeShareLink">Revoquer le lien</button>
+                    <button class="btn btn-secondary text-xs flex-1" data-action="closeShareModal">Fermer</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Email Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="emailModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-2xl mx-4 max-h-[90vh] flex flex-col dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Envoyer par email</h3>
+            <button class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeEmailModal">&times;</button>
+        </div>
+        <div class="p-4 overflow-y-auto flex-1">
+            <!-- Contact/List Selection Tabs -->
+            <div class="flex gap-2 mb-4 border-b border-gray-200 dark:border-gray-800">
+                <button id="tab-contacts" class="px-4 py-2 text-sm font-medium border-b-2 border-blue-500 text-blue-600 dark:text-blue-400" data-action="switchTab" data-tab="contacts">Contacts</button>
+                <button id="tab-lists" class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200" data-action="switchTab" data-tab="lists">Listes de distribution</button>
+            </div>
+
+            <!-- Contacts Tab -->
+            <div id="email-tab-contacts">
+                <div class="mb-3">
+                    <input type="text" id="contact-search" placeholder="Rechercher un contact..."
+                        class="input w-full">
+                </div>
+                <div id="contact-results" class="space-y-1 max-h-64 overflow-y-auto">
+                    <div class="text-sm text-gray-500 py-4 text-center dark:text-gray-400">Recherchez un contact...</div>
+                </div>
+            </div>
+
+            <!-- Lists Tab -->
+            <div id="email-tab-lists" class="hidden">
+                <div class="space-y-2 max-h-64 overflow-y-auto" id="list-results">
+                    <div class="text-sm text-gray-500 py-4 text-center dark:text-gray-400">Chargement...</div>
+                </div>
+            </div>
+
+            <!-- Selected Recipients -->
+            <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-800">
+                <label class="label">Destinataires selectionnes</label>
+                <div id="selected-recipients" class="flex flex-wrap gap-2 min-h-[2rem] p-2 bg-gray-50 rounded border border-gray-200 dark:bg-gray-900 dark:border-gray-800">
+                    <span class="text-xs text-gray-500 dark:text-gray-400">Aucun destinataire selectionne</span>
+                </div>
+            </div>
+
+            <!-- Email Subject & Message -->
+            <div class="mt-4">
+                <label class="label" for="email-subject">Objet</label>
+                <input type="text" id="email-subject" class="input w-full" value="Rapport {{ app_name }}">
+            </div>
+            <div class="mt-3">
+                <label class="label" for="email-message">Message</label>
+                <textarea id="email-message" class="input w-full" rows="6" placeholder="Message..."></textarea>
+            </div>
+        </div>
+        <div class="flex justify-end gap-2 p-4 border-t border-gray-200 dark:border-gray-800">
+            <button type="button" class="btn btn-secondary" data-action="closeEmailModal">Annuler</button>
+            <button type="button" id="btn-send-email" class="btn btn-primary" data-action="sendEmail">
+                <span id="email-btn-text">Envoyer</span>
+            </button>
+        </div>
+    </div>
+</div>
+{% include "../partials/external_sheets_modal.html" %}
+{% end %}
+
+{% block scripts %}
+<script src="{{ static_url('js/components/external_sheets_picker.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+// ── State ──
+var currentPage = 1;
+var currentSortBy = 'created_at';
+var currentSortOrder = 'desc';
+var searchTimer = null;
+var contactSearchTimer = null;
+var selectedRecipients = { contacts: [], lists: [] };
+var currentShareReportId = null;
+var allReports = [];
+
+// ── Helpers ──
+function escapeAttr(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function updateSortIcons() {
+    ['title', 'file_format', 'file_size', 'created_at'].forEach(function(col) {
+        var el = document.getElementById('sort-icon-' + col);
+        if (!el) return;
+        // A3-F5 : refléter l'état de tri dans aria-sort (annoncé aux lecteurs d'écran).
+        var th = document.querySelector('th[data-sort="' + col + '"]');
+        if (col === currentSortBy) {
+            el.innerHTML = currentSortOrder === 'asc' ? '&#9650;' : '&#9660;';
+            if (th) th.setAttribute('aria-sort', currentSortOrder === 'asc' ? 'ascending' : 'descending');
+        } else {
+            el.innerHTML = '';
+            if (th) th.setAttribute('aria-sort', 'none');
+        }
+    });
+}
+
+function expiresInDays(createdAt, retentionDays) {
+    if (!createdAt || !retentionDays) return null;
+    var created = new Date(createdAt);
+    var expires = new Date(created.getTime() + retentionDays * 86400000);
+    var now = new Date();
+    var diff = Math.ceil((expires - now) / 86400000);
+    return diff;
+}
+
+// ── Load Reports ──
+function debounceSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function() { currentPage = 1; loadReports(); }, 300);
+}
+
+async function loadReports(page) {
+    if (page) currentPage = page;
+    var q = document.getElementById('search-input').value;
+    var format = document.getElementById('filter-type').value;
+    var status = document.getElementById('filter-status').value;
+    var params = new URLSearchParams({
+        q: q, format: format, status: status,
+        page: currentPage, per_page: 20,
+        sort_by: currentSortBy, sort_order: currentSortOrder
+    });
+
+    var tbody = document.getElementById('reports-body');
+    var empty = document.getElementById('empty-state');
+    var emptyTitle = document.getElementById('empty-state-title');
+    var emptyMessage = document.getElementById('empty-state-message');
+    var emptyHint = document.getElementById('empty-state-hint');
+    var emptyCta = document.getElementById('empty-state-cta');
+    var emptyRetry = document.getElementById('empty-state-retry');
+    // Mémorise les libellés initiaux (cas « 0 rapport ») pour pouvoir les
+    // restaurer après affichage d'une erreur transitoire.
+    var defaultEmptyTitle = emptyTitle ? emptyTitle.textContent : '';
+    var defaultEmptyMessage = emptyMessage ? emptyMessage.textContent : '';
+
+    function setEmptyState(title, message, mode) {
+        // Mise à jour ciblée des sous-éléments sans toucher au SVG :
+        // ``empty.textContent = ...`` réinitialiserait toute la structure
+        // empty state (illustration + bouton) en un simple nœud texte.
+        // ``mode`` peut être 'default' (vide normal) ou 'error' (réseau/serveur).
+        // En mode error, on bascule du CTA Iris vers un bouton « Réessayer »
+        // — un user qui voit une erreur réseau ne devrait pas être renvoyé
+        // vers Iris pour la résoudre.
+        if (emptyTitle) emptyTitle.textContent = title;
+        if (emptyMessage) emptyMessage.textContent = message;
+        var isError = mode === 'error';
+        if (emptyHint) emptyHint.classList.toggle('hidden', isError);
+        if (emptyCta) emptyCta.classList.toggle('hidden', isError);
+        if (emptyRetry) emptyRetry.classList.toggle('hidden', !isError);
+    }
+
+    empty.classList.add('hidden');
+    tbody.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-sm text-gray-400 dark:text-gray-500">Chargement...</td></tr>';
+
+    var res;
+    // Timeout client (AbortController) : sans lui, un serveur « hung » (qui
+    // accepte la connexion mais ne répond jamais) laisserait le spinner
+    // « Chargement... » indéfiniment — le try/catch ne capte PAS un hang (aucune
+    // exception levée). À l'expiration, ``abort()`` → AbortError → le catch
+    // ci-dessous affiche l'état d'erreur + « Réessayer ». 30 s aligné sur
+    // ``FETCH_TIMEOUT_MS`` de contacts.js (safeFetch) — cohérence inter-pages.
+    var _ctrl = new AbortController();
+    var _timer = setTimeout(function () { _ctrl.abort(); }, 30000);
+    try {
+        res = await fetch('/api/reports?' + params, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+            signal: _ctrl.signal
+        });
+    } catch (e) {
+        clearTimeout(_timer);
+        tbody.innerHTML = '';
+        setEmptyState('Erreur réseau', 'Impossible de joindre le serveur. Vérifiez votre connexion.', 'error');
+        empty.classList.remove('hidden');
+        return;
+    }
+    clearTimeout(_timer);
+    if (res.status === 401) {
+        // Session expirée (logout autre onglet, restart serveur, cookie purge) :
+        // rediriger vers /login plutôt que d'afficher « Erreur de chargement »
+        // (trompeur — un « Réessayer » ne résout pas une session expirée).
+        // Pattern repris de dashboard-charts.js / contacts safeFetch. ``next``
+        // pour revenir sur /reports après re-login.
+        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+        return;
+    }
+    if (!res.ok) {
+        tbody.innerHTML = '';
+        setEmptyState('Erreur de chargement', 'Le serveur a renvoyé une erreur. Réessayez dans quelques instants.', 'error');
+        empty.classList.remove('hidden');
+        return;
+    }
+    var data = await res.json();
+    allReports = data.reports || [];
+
+    if (allReports.length === 0) {
+        // Page AU-DELÀ du total (ex: suppression du dernier rapport d'une
+        // page N>1, ou nav obsolète après expiration/suppression en
+        // multi-onglets) : des rapports EXISTENT mais pas sur cette page.
+        // Afficher « Aucun rapport » serait trompeur, et vider la pagination
+        // crée un cul-de-sac. On re-clamp à la dernière page valide et on
+        // recharge (auto-récupération). Cohérent avec le clamp server-side de
+        // /email-history (axe 15).
+        // ⚠️ Terminaison STRUCTURELLE (adversarial review) : on ne recharge que
+        // si la cible est STRICTEMENT < page courante → ``currentPage`` décroît
+        // à chaque récursion, donc borné même si le serveur renvoie un
+        // ``total``/``total_pages`` incohérent avec le contenu réel de la page
+        // (off-by-one, count ≠ rows filtrées). Sinon : on tombe sur l'empty
+        // state (dégradé, jamais de boucle).
+        var clampTarget = Math.max(1, data.total_pages || 1);
+        if ((data.total || 0) > 0 && clampTarget < currentPage) {
+            currentPage = clampTarget;
+            return loadReports();
+        }
+        tbody.innerHTML = '';
+        // Restaure le libellé par défaut pour le cas « aucun rapport » —
+        // garantit que les CTA et l'illustration restent visibles même si
+        // une erreur transitoire a été affichée juste avant.
+        setEmptyState(defaultEmptyTitle, defaultEmptyMessage, 'default');
+        empty.classList.remove('hidden');
+        document.getElementById('pagination').innerHTML = '';
+        return;
+    }
+    empty.classList.add('hidden');
+    updateSortIcons();
+
+    tbody.innerHTML = allReports.map(function(r) {
+        var date = r.created_at ? new Date(r.created_at).toLocaleDateString('fr-FR') : '-';
+        var desc = r.description ? ' title="' + escapeAttr(r.description) + '"' : '';
+
+        // Retention badge
+        var retentionBadge = '';
+        if (!r.is_archived && r.retention_days) {
+            var daysLeft = expiresInDays(r.created_at, r.retention_days);
+            if (daysLeft !== null && daysLeft <= 7) {
+                if (daysLeft <= 0) {
+                    retentionBadge = '<span class="text-xs font-medium px-1.5 py-0.5 rounded bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-300">Expire</span> ';
+                } else {
+                    retentionBadge = '<span class="text-xs font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 dark:bg-amber-900/20 dark:text-amber-300">' + daysLeft + 'j restant' + (daysLeft > 1 ? 's' : '') + '</span> ';
+                }
+            }
+        }
+
+        // Status badges
+        var statusHtml = retentionBadge;
+        if (r.is_archived) statusHtml += '<span class="badge">Archive</span> ';
+        if (r.share_token && r.is_share_valid) statusHtml += '<span class="badge badge-success">Partage</span> ';
+        if (!statusHtml) statusHtml = '<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">Actif</span>';
+
+        return '<tr class="hover:bg-gray-50 dark:hover:bg-gray-800">' +
+            '<td class="table-cell"><input type="checkbox" class="report-checkbox rounded border-gray-300 dark:border-gray-700" value="' + r.id + '"></td>' +
+            '<td class="table-cell font-medium text-gray-900 dark:text-gray-100"' + desc + '>' + escapeHtml(r.title) +
+                (r.description ? '<p class="text-xs text-gray-400 font-normal truncate max-w-xs mt-0.5 dark:text-gray-500">' + escapeHtml(r.description.substring(0, 60)) + '</p>' : '') +
+            '</td>' +
+            '<td class="table-cell"><span class="badge">' + (r.file_format ? r.file_format.toUpperCase() : '-') + '</span></td>' +
+            '<td class="table-cell text-gray-600 dark:text-gray-400">' + (r.file_size_human || '-') + '</td>' +
+            '<td class="table-cell text-gray-500 dark:text-gray-400">' + date + '</td>' +
+            '<td class="table-cell">' + statusHtml + '</td>' +
+            '<td class="table-cell"><div class="report-actions">' +
+                '<button type="button" class="report-actions-trigger" data-action="toggleReportMenu" aria-label="Actions" title="Actions">' +
+                    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+                        '<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>' +
+                    '</svg>' +
+                '</button>' +
+                '<div class="report-actions-menu hidden" role="menu">' +
+                    (r.file_format === 'pdf' ? '<button data-action="preview" data-id="' + r.id + '" class="report-actions-menu-item" role="menuitem">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>' +
+                        'Voir</button>' : '') +
+                    '<button data-action="download" data-id="' + r.id + '" data-filename="' + escapeAttr(r.file_name) + '" class="report-actions-menu-item" role="menuitem">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>' +
+                        'Télécharger</button>' +
+                    '<button data-action="share" data-id="' + r.id + '" class="report-actions-menu-item" role="menuitem">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M7.217 10.907a2.25 2.25 0 100 2.186m0-2.186c.18.324.283.696.283 1.093s-.103.77-.283 1.093m0-2.186l9.566-5.314m-9.566 7.5l9.566 5.314m0 0a2.25 2.25 0 103.935 2.186 2.25 2.25 0 00-3.935-2.186zm0-12.814a2.25 2.25 0 103.933-2.185 2.25 2.25 0 00-3.933 2.185z"/></svg>' +
+                        'Partager</button>' +
+                    '<button data-action="email" data-id="' + r.id + '" class="report-actions-menu-item" role="menuitem">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75"/></svg>' +
+                        'Email</button>' +
+                    '<button data-action="archive" data-id="' + r.id + '" data-archived="' + r.is_archived + '" class="report-actions-menu-item" role="menuitem">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M20.25 7.5l-.625 10.632a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z"/></svg>' +
+                        (r.is_archived ? 'Restaurer' : 'Archiver') + '</button>' +
+                    '<button data-action="deleteReport" data-id="' + r.id + '" class="report-actions-menu-item danger" role="menuitem">' +
+                        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>' +
+                        'Supprimer</button>' +
+                '</div>' +
+            '</div></td>' +
+        '</tr>';
+    }).join('');
+
+    // Attach checkbox listeners
+    tbody.querySelectorAll('.report-checkbox').forEach(function(cb) {
+        cb.addEventListener('change', updateBulkActions);
+    });
+
+    renderPagination(data.page, data.total_pages, data.total);
+}
+
+// ── Pagination ──
+function renderPagination(page, totalPages, total) {
+    var html = '';
+    if (totalPages > 1) {
+        html += '<button class="btn btn-secondary text-xs py-1 px-2" data-action="goToPage" data-page="' + (page - 1) + '" ' + (page === 1 ? 'disabled' : '') + '>Prec.</button>';
+        for (var i = 1; i <= totalPages; i++) {
+            if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
+                html += '<button class="btn ' + (i === page ? 'btn-primary' : 'btn-secondary') + ' text-xs py-1 px-2" data-action="goToPage" data-page="' + i + '">' + i + '</button>';
+            } else if (Math.abs(i - page) === 3) {
+                html += '<span class="text-gray-400 text-xs px-1 dark:text-gray-500">...</span>';
+            }
+        }
+        html += '<button class="btn btn-secondary text-xs py-1 px-2" data-action="goToPage" data-page="' + (page + 1) + '" ' + (page === totalPages ? 'disabled' : '') + '>Suiv.</button>';
+        html += '<span class="text-xs text-gray-500 ml-2 dark:text-gray-400">' + total + ' rapports</span>';
+    }
+    document.getElementById('pagination').innerHTML = html;
+}
+
+// ── Sort ──
+function sortBy(col) {
+    if (currentSortBy === col) {
+        currentSortOrder = currentSortOrder === 'asc' ? 'desc' : 'asc';
+    } else {
+        currentSortBy = col;
+        currentSortOrder = 'asc';
+    }
+    currentPage = 1;
+    loadReports();
+}
+
+// Bouton « Réessayer » de l'empty state (visible uniquement après erreur
+// réseau/serveur) — relance simplement loadReports() avec la page courante.
+document.getElementById('empty-state-retry')?.addEventListener('click', function () {
+    loadReports();
+});
+
+// ── Upload ──
+var uploadModal = document.getElementById('uploadModal');
+
+function openUploadModal() {
+    document.getElementById('uploadForm').reset();
+    document.getElementById('drop-zone-text').innerHTML = 'Glissez un fichier ici ou <span class="text-blue-600 underline dark:text-blue-400">parcourir</span>';
+    uploadModal.classList.remove('hidden');
+    uploadModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(uploadModal, { layer: 'modal', lockScroll: true });
+}
+
+function closeUploadModal() {
+    if (window.OverlayManager) window.OverlayManager.close(uploadModal);
+    uploadModal.classList.add('hidden');
+    uploadModal.classList.remove('flex');
+}
+
+// Drag & drop
+var dropZone = document.getElementById('drop-zone');
+var fileInput = document.getElementById('reportFile');
+
+dropZone.addEventListener('click', function() { fileInput.click(); });
+
+dropZone.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    dropZone.classList.add('border-blue-400', 'bg-blue-50');
+});
+
+dropZone.addEventListener('dragleave', function() {
+    dropZone.classList.remove('border-blue-400', 'bg-blue-50');
+});
+
+var allowedExts = ['pdf', 'csv', 'xlsx'];
+
+function validateFileExt(file) {
+    var ext = file.name.split('.').pop().toLowerCase();
+    return allowedExts.indexOf(ext) >= 0;
+}
+
+dropZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    dropZone.classList.remove('border-blue-400', 'bg-blue-50');
+    if (e.dataTransfer.files.length > 0) {
+        var file = e.dataTransfer.files[0];
+        if (!validateFileExt(file)) {
+            showToast('Format non autorise. Seuls PDF, CSV et XLSX sont acceptes.', 'error');
+            return;
+        }
+        fileInput.files = e.dataTransfer.files;
+        document.getElementById('drop-zone-text').textContent = file.name;
+    }
+});
+
+fileInput.addEventListener('change', function() {
+    if (fileInput.files.length > 0) {
+        var file = fileInput.files[0];
+        if (!validateFileExt(file)) {
+            showToast('Format non autorise. Seuls PDF, CSV et XLSX sont acceptes.', 'error');
+            fileInput.value = '';
+            return;
+        }
+        document.getElementById('drop-zone-text').textContent = file.name;
+    }
+});
+
+document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var file = document.getElementById('reportFile').files[0];
+    if (!file) { showToast('Sélectionnez un fichier', 'error'); return; }
+
+    var formData = new FormData();
+    formData.append('title', document.getElementById('reportName').value);
+    formData.append('description', document.getElementById('reportDescription').value);
+    formData.append('file', file);
+
+    try {
+        var res = await fetch('/api/reports', {
+            method: 'POST',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') },
+            body: formData
+        });
+        if (res.ok) {
+            showToast('Rapport importé', 'success');
+            closeUploadModal();
+            loadReports();
+        } else {
+            var data = await res.json();
+            showToast(data.error || 'Erreur', 'error');
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    }
+});
+
+// ── Download ──
+async function downloadReport(id, filename) {
+    try {
+        var res = await fetch('/api/reports/' + id + '/download', {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        if (!res.ok) { showToast('Erreur de téléchargement', 'error'); return; }
+        var blob = await res.blob();
+        var url = window.URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+// ── Preview (PDF inline in new tab) ──
+function previewReport(id) {
+    window.open('/api/reports/' + id + '/download?inline=true', '_blank');
+}
+
+// ── Share ──
+var shareModal = document.getElementById('shareModal');
+
+function openShareModal(id) {
+    currentShareReportId = id;
+    document.getElementById('share-content').classList.remove('hidden');
+    document.getElementById('share-result').classList.add('hidden');
+
+    // Check if already shared
+    var report = allReports.find(function(r) { return r.id === id; });
+    if (report && report.share_token && report.is_share_valid) {
+        var shareUrl = window.location.origin + '/share/report/' + report.share_token;
+        showShareResult(shareUrl, report.share_download_count || 0);
+    }
+
+    shareModal.classList.remove('hidden');
+    shareModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(shareModal, { layer: 'modal', lockScroll: true });
+}
+
+function closeShareModal() {
+    if (window.OverlayManager) window.OverlayManager.close(shareModal);
+    shareModal.classList.add('hidden');
+    shareModal.classList.remove('flex');
+    currentShareReportId = null;
+}
+
+function showShareResult(url, downloadCount) {
+    document.getElementById('share-content').classList.add('hidden');
+    document.getElementById('share-result').classList.remove('hidden');
+    document.getElementById('share-url').value = url;
+    document.getElementById('share-info').textContent = downloadCount + ' téléchargement(s) via ce lien';
+}
+
+async function generateShareLink() {
+    if (!currentShareReportId) return;
+    var expiry = document.getElementById('share-expiry').value;
+    try {
+        var res = await fetch('/api/reports/' + currentShareReportId + '/share?expires_hours=' + expiry, {
+            method: 'POST',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        var data = await res.json();
+        if (res.ok) {
+            showShareResult(data.share_url, 0);
+            showToast('Lien de partage genere', 'success');
+            loadReports();
+        } else {
+            showToast(data.error || 'Erreur', 'error');
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+async function revokeShareLink() {
+    if (!currentShareReportId) return;
+    if (!(await appConfirm('Revoquer le lien de partage ?'))) return;
+    try {
+        var res = await fetch('/api/reports/' + currentShareReportId + '/share', {
+            method: 'DELETE',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        if (res.ok) {
+            showToast('Lien revoque', 'success');
+            closeShareModal();
+            loadReports();
+        } else {
+            // Sans ce else, un 4xx/5xx (ou 401 session expirée) ne donnait
+            // AUCUN retour : l'utilisateur croyait le lien révoqué alors qu'il
+            // restait actif (axe #5 / consequences Q5). On garde la modale
+            // ouverte pour permettre une nouvelle tentative.
+            var data = await res.json().catch(function() { return {}; });
+            showToast(data.error || data.message || 'Erreur lors de la révocation', 'error');
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+function copyShareLink() {
+    var input = document.getElementById('share-url');
+    input.select();
+    navigator.clipboard.writeText(input.value).then(function() {
+        showToast('Lien copie', 'success');
+    });
+}
+
+// ── Archive ──
+async function archiveReport(id, archive) {
+    try {
+        var res = await fetch('/api/reports/' + id + '/archive', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+            body: JSON.stringify({ archive: archive })
+        });
+        if (res.ok) {
+            showToast(archive ? 'Rapport archive' : 'Rapport restaure', 'success');
+            loadReports();
+        } else {
+            // Sans else : échec serveur silencieux → l'utilisateur croyait le
+            // rapport (dés)archivé alors que rien n'a bougé (axe #5 / Q5).
+            var data = await res.json().catch(function() { return {}; });
+            showToast(
+                data.error || data.message
+                    || (archive ? "Erreur lors de l'archivage" : 'Erreur lors de la restauration'),
+                'error'
+            );
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+// ── Delete ──
+async function deleteReport(id) {
+    if (!(await appConfirm('Supprimer ce rapport ?'))) return;
+    try {
+        var res = await fetch('/api/reports/' + id, {
+            method: 'DELETE',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        if (res.ok) {
+            showToast('Rapport supprimé', 'success');
+            loadReports();
+        } else {
+            // Sans else : suppression échouée en silence → l'utilisateur croit
+            // le rapport supprimé alors qu'il existe toujours (axe #5 / Q5).
+            var data = await res.json().catch(function() { return {}; });
+            showToast(data.error || data.message || 'Erreur lors de la suppression', 'error');
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+// ── Bulk Actions ──
+function getSelectedReportIds() {
+    return Array.from(document.querySelectorAll('.report-checkbox:checked')).map(function(cb) { return parseInt(cb.value); });
+}
+
+function updateBulkActions() {
+    var selected = getSelectedReportIds();
+    var toolbar = document.getElementById('bulk-toolbar');
+    document.getElementById('selected-count').textContent = selected.length;
+    if (selected.length > 0) { toolbar.classList.remove('hidden'); } else { toolbar.classList.add('hidden'); }
+
+    var checkboxes = document.querySelectorAll('.report-checkbox');
+    var selectAllCb = document.getElementById('select-all');
+    selectAllCb.checked = checkboxes.length > 0 && selected.length === checkboxes.length;
+    selectAllCb.indeterminate = selected.length > 0 && selected.length < checkboxes.length;
+}
+
+async function bulkArchive() {
+    var ids = getSelectedReportIds();
+    if (ids.length === 0) return;
+    if (!(await appConfirm('Archiver ' + ids.length + ' rapport(s) ?'))) return;
+    var success = 0;
+    for (var i = 0; i < ids.length; i++) {
+        try {
+            var res = await fetch('/api/reports/' + ids[i] + '/archive', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+                body: JSON.stringify({ archive: true })
+            });
+            if (res.ok) success++;
+        } catch (err) { /* continue */ }
+    }
+    // Le toast doit refléter le résultat réel. Avant : toujours 'success', donc
+    // « 0 rapport(s) archivé(s) » s'affichait en VERT quand tout échouait
+    // (session expirée, 5xx…) et les échecs partiels passaient inaperçus
+    // (axe #5 / consequences Q5 : faux succès silencieux).
+    var failed = ids.length - success;
+    if (failed === 0) {
+        showToast(success + ' rapport(s) archivé(s)', 'success');
+    } else if (success === 0) {
+        showToast('Échec de l\'archivage (' + failed + ' rapport(s))', 'error');
+    } else {
+        showToast(success + ' archivé(s), ' + failed + ' en échec', 'warning');
+    }
+    loadReports();
+}
+
+async function bulkDelete() {
+    var ids = getSelectedReportIds();
+    if (ids.length === 0) return;
+    if (!(await appConfirm('Supprimer définitivement ' + ids.length + ' rapport(s) ?'))) return;
+    var success = 0;
+    for (var i = 0; i < ids.length; i++) {
+        try {
+            var res = await fetch('/api/reports/' + ids[i], {
+                method: 'DELETE',
+                headers: { 'X-XSRFToken': getCookie('_xsrf') }
+            });
+            if (res.ok) success++;
+        } catch (err) { /* continue */ }
+    }
+    // Idem bulkArchive : le type de toast suit le résultat réel pour ne pas
+    // afficher « 0 supprimé(s) » en vert ni masquer un échec partiel.
+    var failed = ids.length - success;
+    if (failed === 0) {
+        showToast(success + ' rapport(s) supprimé(s)', 'success');
+    } else if (success === 0) {
+        showToast('Échec de la suppression (' + failed + ' rapport(s))', 'error');
+    } else {
+        showToast(success + ' supprimé(s), ' + failed + ' en échec', 'warning');
+    }
+    loadReports();
+}
+
+// ── Email ──
+var emailModal = document.getElementById('emailModal');
+
+function emailSingleReport(id) {
+    window.selectedReportIds = [id];
+    openEmailModal();
+}
+
+function bulkEmail() {
+    var ids = getSelectedReportIds();
+    if (ids.length === 0) return;
+    window.selectedReportIds = ids;
+    openEmailModal();
+}
+
+function openEmailModal() {
+    selectedRecipients = { contacts: [], lists: [] };
+    updateSelectedRecipientsUI();
+
+    var reportIds = window.selectedReportIds || [];
+    var selectedReports = allReports.filter(function(r) { return reportIds.indexOf(r.id) >= 0; });
+
+    var reportList = selectedReports.map(function(r) {
+        return r.title + ' (' + (r.file_format ? r.file_format.toUpperCase() : 'PDF') + ')';
+    }).join('\n');
+
+    document.getElementById('email-message').value = 'Veuillez trouver ci-joint les rapports suivants :\n\n' + reportList + '\n\nCordialement,\nL\'equipe ' + {% raw json_encode(app_name) %};
+
+    emailModal.classList.remove('hidden');
+    emailModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(emailModal, { layer: 'modal', lockScroll: true });
+    loadDistributionLists();
+}
+
+function closeEmailModal() {
+    if (window.OverlayManager) window.OverlayManager.close(emailModal);
+    emailModal.classList.add('hidden');
+    emailModal.classList.remove('flex');
+    document.getElementById('contact-search').value = '';
+    document.getElementById('contact-results').innerHTML = '<div class="text-sm text-gray-500 py-4 text-center dark:text-gray-400">Recherchez un contact...</div>';
+}
+
+function switchEmailTab(tab) {
+    // A3-F4 : conserver les variantes dark: dans les 2 branches (le markup
+    // initial les a, mais réécrire className en entier les effaçait → contraste
+    // WCAG cassé en dark mode après un changement d'onglet).
+    var ACTIVE = 'px-4 py-2 text-sm font-medium border-b-2 border-blue-500 text-blue-600 dark:text-blue-400';
+    var INACTIVE = 'px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200';
+    document.getElementById('tab-contacts').className = tab === 'contacts' ? ACTIVE : INACTIVE;
+    document.getElementById('tab-lists').className = tab === 'lists' ? ACTIVE : INACTIVE;
+    document.getElementById('email-tab-contacts').classList.toggle('hidden', tab !== 'contacts');
+    document.getElementById('email-tab-lists').classList.toggle('hidden', tab !== 'lists');
+}
+
+async function searchEmailContacts() {
+    clearTimeout(contactSearchTimer);
+    contactSearchTimer = setTimeout(async function() {
+        var query = document.getElementById('contact-search').value.trim();
+        if (query.length < 2) {
+            document.getElementById('contact-results').innerHTML = '<div class="text-sm text-gray-500 py-4 text-center dark:text-gray-400">Saisissez au moins 2 caracteres...</div>';
+            return;
+        }
+        try {
+            var res = await fetch('/api/contacts?q=' + encodeURIComponent(query) + '&per_page=50', {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            });
+            var data = await res.json();
+            if (!data.contacts || data.contacts.length === 0) {
+                document.getElementById('contact-results').innerHTML = '<div class="text-sm text-gray-500 py-4 text-center dark:text-gray-400">Aucun contact trouve</div>';
+                return;
+            }
+            document.getElementById('contact-results').innerHTML = data.contacts.map(function(c) {
+                var isSelected = selectedRecipients.contacts.some(function(sc) { return sc.id === c.id; });
+                return '<div class="flex items-center justify-between p-2 hover:bg-gray-50 rounded cursor-pointer dark:hover:bg-gray-800" data-action="toggleRecipient" data-type="contact" data-recipient-id="' + c.id + '" data-name="' + escapeAttr(c.company_name || c.email) + '">' +
+                    '<div class="flex-1"><div class="text-sm font-medium text-gray-900 dark:text-gray-100">' + escapeHtml(c.company_name || 'Sans nom') + '</div>' +
+                    '<div class="text-xs text-gray-500 dark:text-gray-400">' + escapeHtml(c.email) + '</div></div>' +
+                    '<input type="checkbox" ' + (isSelected ? 'checked' : '') + ' class="rounded border-gray-300 pointer-events-none dark:border-gray-700"></div>';
+            }).join('');
+        } catch (err) {
+            document.getElementById('contact-results').innerHTML = '<div class="text-sm text-red-500 py-4 text-center dark:text-red-400">Erreur de chargement</div>';
+        }
+    }, 300);
+}
+
+async function loadDistributionLists() {
+    try {
+        var res = await fetch('/api/distribution-lists?per_page=100', {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        var data = await res.json();
+        if (!data.lists || data.lists.length === 0) {
+            document.getElementById('list-results').innerHTML = '<div class="text-sm text-gray-500 py-4 text-center dark:text-gray-400">Aucune liste de distribution</div>';
+            return;
+        }
+        document.getElementById('list-results').innerHTML = data.lists.map(function(l) {
+            var isSelected = selectedRecipients.lists.some(function(sl) { return sl.id === l.id; });
+            return '<div class="flex items-center justify-between p-2 hover:bg-gray-50 rounded cursor-pointer dark:hover:bg-gray-800" data-action="toggleRecipient" data-type="list" data-recipient-id="' + l.id + '" data-name="' + escapeAttr(l.name) + '">' +
+                '<div class="flex-1"><div class="text-sm font-medium text-gray-900 dark:text-gray-100">' + escapeHtml(l.name) + '</div>' +
+                '<div class="text-xs text-gray-500 dark:text-gray-400">' + (l.contact_count || 0) + ' contact(s)</div></div>' +
+                '<input type="checkbox" ' + (isSelected ? 'checked' : '') + ' class="rounded border-gray-300 pointer-events-none dark:border-gray-700"></div>';
+        }).join('');
+    } catch (err) {
+        document.getElementById('list-results').innerHTML = '<div class="text-sm text-red-500 py-4 text-center dark:text-red-400">Erreur de chargement</div>';
+    }
+}
+
+function toggleRecipient(type, id, name) {
+    var list = type === 'contact' ? selectedRecipients.contacts : selectedRecipients.lists;
+    var index = list.findIndex(function(r) { return r.id === id; });
+    if (index >= 0) { list.splice(index, 1); } else { list.push({ id: id, name: name }); }
+    updateSelectedRecipientsUI();
+    if (type === 'contact') { searchEmailContacts(); } else { loadDistributionLists(); }
+}
+
+function updateSelectedRecipientsUI() {
+    var container = document.getElementById('selected-recipients');
+    var total = selectedRecipients.contacts.length + selectedRecipients.lists.length;
+    if (total === 0) {
+        container.innerHTML = '<span class="text-xs text-gray-500 dark:text-gray-400">Aucun destinataire selectionne</span>';
+        return;
+    }
+    var html = selectedRecipients.contacts.map(function(c) {
+        return '<span class="inline-flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded dark:bg-blue-900/30 dark:text-blue-200">' +
+            escapeHtml(c.name) +
+            '<button data-action="removeRecipient" data-type="contact" data-recipient-id="' + c.id + '" data-name="' + escapeAttr(c.name) + '" class="hover:text-blue-900">&times;</button></span>';
+    }).concat(selectedRecipients.lists.map(function(l) {
+        return '<span class="inline-flex items-center gap-1 px-2 py-1 bg-green-100 text-green-800 text-xs rounded dark:bg-green-900/30 dark:text-green-200">' +
+            escapeHtml(l.name) +
+            '<button data-action="removeRecipient" data-type="list" data-recipient-id="' + l.id + '" data-name="' + escapeAttr(l.name) + '" class="hover:text-green-900">&times;</button></span>';
+    })).join('');
+    container.innerHTML = html;
+}
+
+async function sendReportsByEmail() {
+    var reportIds = window.selectedReportIds || [];
+    var subject = document.getElementById('email-subject').value;
+    var message = document.getElementById('email-message').value;
+
+    if (reportIds.length === 0) { showToast('Aucun rapport à envoyer', 'error'); return; }
+    if (selectedRecipients.contacts.length === 0 && selectedRecipients.lists.length === 0) {
+        showToast('Sélectionnez au moins un destinataire', 'error'); return;
+    }
+
+    var btn = document.getElementById('btn-send-email');
+    var btnText = document.getElementById('email-btn-text');
+    if (btn.disabled) return;  // garde anti double-submit (clic rapide / 2 clics)
+    btn.disabled = true;
+    btnText.textContent = 'Envoi en cours...';
+
+    try {
+        var res = await fetch('/api/reports/send-email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+            body: JSON.stringify({
+                report_ids: reportIds,
+                contact_ids: selectedRecipients.contacts.map(function(c) { return c.id; }),
+                list_ids: selectedRecipients.lists.map(function(l) { return l.id; }),
+                subject: subject,
+                message: message
+            })
+        });
+        var data;
+        try { data = await res.json(); } catch (err) {
+            showToast('Erreur de reponse du serveur', 'error');
+            return;
+        }
+        if (res.ok) {
+            // ``data.message`` porte les infos calculées serveur (destinataires
+            // exclus car désabonnés, refusés SMTP) — on l'affiche plutôt qu'un
+            // message statique qui masquerait ces exclusions.
+            showToast(data.message || 'Email(s) envoyé(s) avec succès', 'success');
+            closeEmailModal();
+        } else {
+            var errorMsg = data.message || data.error || '';
+            if (errorMsg.indexOf('SMTP') >= 0 || errorMsg.indexOf('configur') >= 0) {
+                showToast('Configuration SMTP requise. Voir Administration > SMTP.', 'error');
+            } else {
+                showToast(errorMsg || 'Erreur lors de l\'envoi', 'error');
+            }
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    } finally {
+        btn.disabled = false;
+        btnText.textContent = 'Envoyer';
+    }
+}
+
+// ── Generate Report (LLM-driven) Modal ──
+var generateModal = document.getElementById('generateModal');
+// Selected sources: [{classeur, tab_index, cell_key?}] with per-source token estimates
+// Keyed by "classeur|tab_index|cell_key" → {src, tokens}
+var selectedSources = new Map();
+// Tree data: {classeur_filename: {meta, tabs?}} — tabs loaded lazily
+var classeurData = {};
+// LLM limits (loaded once per modal open)
+// max_input_tokens : seuil oneshot (au-delà → bascule mode agent côté backend)
+// absolute_max_tokens : vrai cap dur (au-delà même le mode agent ne tient pas)
+// agent_mode_threshold : seuil informatif (au-delà → mode agent → plus lent)
+var llmLimits = {
+    max_input_tokens: null,
+    absolute_max_tokens: null,
+    agent_mode_threshold: null,
+    model: '—'
+};
+
+function openGenerateModal() {
+    selectedSources.clear();
+    classeurData = {};
+    document.getElementById('gen-title').value = '';
+    document.getElementById('gen-user-prompt').value = '';
+    updateSelectionUI();
+    renderExternalList();
+    generateModal.classList.remove('hidden');
+    generateModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(generateModal, { layer: 'modal', lockScroll: true });
+    loadLLMLimits();
+    loadClasseurTree();
+}
+
+// Re-fetch des limits LLM quand l'onglet revient en foreground OU quand
+// la fenêtre reprend le focus, AU CAS où l'admin aurait configuré le
+// modèle dans un autre onglet pendant que le modal restait ouvert. Sans
+// ça, le bouton « Générer » resterait désactivé jusqu'à fermeture/réouverture
+// du modal (review adversariale 2026-04-30).
+document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' &&
+        generateModal && !generateModal.classList.contains('hidden')) {
+        loadLLMLimits();
+    }
+});
+window.addEventListener('focus', function () {
+    if (generateModal && !generateModal.classList.contains('hidden')) {
+        loadLLMLimits();
+    }
+});
+
+function closeGenerateModal() {
+    if (window.OverlayManager) window.OverlayManager.close(generateModal);
+    generateModal.classList.add('hidden');
+    generateModal.classList.remove('flex');
+}
+
+async function loadLLMLimits() {
+    try {
+        var res = await fetch('/api/reports/llm-limits', {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        var data = await res.json();
+        if (data && data.success) {
+            llmLimits = data;
+            document.getElementById('gen-token-max').textContent = formatNumber(data.max_input_tokens);
+            var modelEl = document.getElementById('gen-token-model');
+            var submitBtn = document.getElementById('btn-gen-submit');
+            // Fail-closed côté UI : pas de provider chargé OU modèle
+            // déprécié → on indique le message exact (deprecation_reason
+            // arrive du backend pour les modèles dépréciés, sinon message
+            // générique « Aucun modèle configuré »).
+            if (data.configured === false || !data.model) {
+                var reason = data.deprecation_reason
+                    || 'Aucun modèle configuré — voir /admin/ai-config';
+                modelEl.textContent = reason;
+                modelEl.className = 'text-red-600 dark:text-red-400';
+                if (submitBtn) {
+                    submitBtn.disabled = true;
+                    submitBtn.title = data.deprecation_reason
+                        ? 'Modèle déprécié — choisir un autre dans /admin/ai-models'
+                        : 'Configurez un modèle IA dans /admin/ai-config';
+                }
+            } else {
+                modelEl.textContent = 'Modèle : ' + data.model;
+                modelEl.className = 'text-gray-400 dark:text-gray-500';
+                if (submitBtn) {
+                    submitBtn.disabled = false;
+                    submitBtn.removeAttribute('title');
+                }
+            }
+            updateSelectionUI();
+        }
+    } catch (err) {
+        // Silent — the bar will just show "—"
+    }
+}
+
+function formatNumber(n) {
+    if (n == null) return '—';
+    if (n >= 1000) return (n / 1000).toFixed(1).replace('.0', '') + 'k';
+    return String(n);
+}
+
+function computeSelectedTokens() {
+    var total = 0;
+    selectedSources.forEach(function(entry) { total += entry.tokens || 0; });
+    return total;
+}
+
+function updateSelectionUI() {
+    var count = selectedSources.size;
+    var tokens = computeSelectedTokens();
+    var max = llmLimits.max_input_tokens;
+
+    document.getElementById('gen-selected-count').textContent = count;
+    document.getElementById('gen-token-current').textContent = formatNumber(tokens);
+
+    var bar = document.getElementById('gen-token-bar');
+    var warning = document.getElementById('gen-token-warning');
+    var modeBadge = document.getElementById('gen-mode-badge');
+    var hardCap = llmLimits.absolute_max_tokens;
+    var agentThreshold = llmLimits.agent_mode_threshold;
+    if (max) {
+        var pct = Math.min(100, (tokens / max) * 100);
+        bar.style.width = pct + '%';
+        // Trois zones : normale (<= max), mode étendu (max < t <= absolute),
+        // bloquant (> absolute). Le bouton submit n'est désactivé qu'en
+        // zone bloquante — le mode étendu prend le relais entre les deux.
+        if (hardCap && tokens > hardCap) {
+            bar.className = 'h-full bg-red-500 transition-all';
+            warning.textContent = '⚠ Volume trop important — réduisez la sélection';
+            warning.className = 'text-xs text-red-600 mt-1 dark:text-red-400';
+            warning.classList.remove('hidden');
+            if (modeBadge) modeBadge.classList.add('hidden');
+        } else if (tokens > max) {
+            bar.className = 'h-full bg-blue-500 transition-all';
+            warning.classList.add('hidden');
+            // Badge cliquable explicatif (info-tooltip se charge des détails)
+            if (modeBadge) modeBadge.classList.remove('hidden');
+        } else if (agentThreshold && tokens > agentThreshold) {
+            // Zone d'avertissement préventif : on n'est pas encore en mode
+            // étendu mais on s'en rapproche (>= 70% du seuil de bascule).
+            bar.className = 'h-full bg-amber-500 transition-all';
+            warning.classList.add('hidden');
+            if (modeBadge) modeBadge.classList.add('hidden');
+        } else if (pct > 70) {
+            bar.className = 'h-full bg-amber-500 transition-all';
+            warning.classList.add('hidden');
+            if (modeBadge) modeBadge.classList.add('hidden');
+        } else {
+            bar.className = 'h-full bg-emerald-500 transition-all';
+            warning.classList.add('hidden');
+            if (modeBadge) modeBadge.classList.add('hidden');
+        }
+    } else {
+        bar.style.width = '0%';
+        if (modeBadge) modeBadge.classList.add('hidden');
+    }
+}
+
+function sourceKey(classeur, tabIndex, cellKey) {
+    return classeur + '|' + tabIndex + '|' + (cellKey || '');
+}
+
+async function loadClasseurTree() {
+    var tree = document.getElementById('gen-tree');
+    tree.innerHTML = '<div class="p-4 text-sm text-gray-500 text-center dark:text-gray-400">Chargement des classeurs...</div>';
+    try {
+        var res = await fetch('/api/reports/classeurs', {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        var data = await res.json();
+        if (!data.success || !data.classeurs || data.classeurs.length === 0) {
+            tree.innerHTML = '<div class="p-4 text-sm text-gray-500 text-center dark:text-gray-400">Aucun classeur dans votre datastore</div>';
+            return;
+        }
+        data.classeurs.forEach(function(c) {
+            classeurData[c.filename] = { meta: c, tabs: null, expanded: false };
+        });
+        renderClasseurTree();
+    } catch (err) {
+        tree.innerHTML = '<div class="p-4 text-sm text-red-600 text-center dark:text-red-400">Erreur de chargement</div>';
+    }
+}
+
+function renderClasseurTree() {
+    var tree = document.getElementById('gen-tree');
+    var classeurs = Object.keys(classeurData);
+    // Render HTML
+    tree.innerHTML = renderClasseurTreeHTML(classeurs);
+    // Sync les checkboxes "tout" avec selectedSources actuel
+    classeurs.forEach(function(filename) { syncClasseurAllCheckbox(filename); });
+}
+
+function renderClasseurTreeHTML(classeurs) {
+    return classeurs.map(function(filename) {
+        var entry = classeurData[filename];
+        var meta = entry.meta;
+        var expanded = entry.expanded;
+        var tabsHtml = '';
+        if (expanded) {
+            if (entry.tabs === null) {
+                tabsHtml = '<div class="pl-8 py-2 text-xs text-gray-500 dark:text-gray-400">Chargement...</div>';
+            } else {
+                var rendered = entry.tabs.map(function(t) {
+                    return renderTabOptions(filename, t);
+                }).join('');
+                tabsHtml = rendered || '<div class="pl-8 py-2 text-xs text-gray-500 dark:text-gray-400">Aucune feuille exploitable</div>';
+            }
+        }
+        return '<div class="classeur-entry">' +
+            '<div class="w-full px-3 py-2 hover:bg-gray-50 flex items-center gap-2 dark:hover:bg-gray-800">' +
+                '<input type="checkbox" class="classeur-all-checkbox rounded border-gray-300 dark:border-gray-700" ' +
+                    'data-action="toggleAllTabs" data-filename="' + escapeAttr(filename) + '" ' +
+                    'aria-label="Sélectionner toutes les feuilles">' +
+                '<button type="button" class="text-left flex items-center gap-2 flex-1 cursor-pointer bg-transparent border-0 p-0" data-action="toggleClasseur" data-filename="' + escapeAttr(filename) + '">' +
+                    '<span class="text-gray-400 text-xs w-3 dark:text-gray-500">' + (expanded ? '▼' : '▶') + '</span>' +
+                    '<span class="text-sm font-medium text-gray-900 flex-1 dark:text-gray-100">' + escapeHtml(meta.name) + '</span>' +
+                '</button>' +
+            '</div>' +
+            tabsHtml +
+        '</div>';
+    }).join('');
+}
+
+function renderTabOptions(filename, tab) {
+    var hasRows = tab.row_count > 0;
+    var cells = tab.cells || [];
+    var hasCells = cells.length > 0;
+
+    // Truly empty sheet → hide completely
+    if (!hasRows && !hasCells) return '';
+
+    // Single checkbox per sheet — selecting it includes BOTH:
+    //   - the tab-level rows (if any)
+    //   - all drill-down tables (if any)
+    // The backend auto-expands to send everything to the LLM.
+    var tokenTotal = (tab.estimated_tokens || 0);
+    var cellTokens = 0;
+    cells.forEach(function(c) { cellTokens += (c.estimated_tokens || 0); });
+    tokenTotal += cellTokens;
+
+    var countParts = [];
+    if (hasRows) countParts.push(tab.row_count + ' lignes');
+    if (hasCells) countParts.push(cells.length + ' tableau(x) drill-down');
+
+    var tabKey = sourceKey(filename, tab.index, '');
+    var tabChecked = selectedSources.has(tabKey);
+    var tabLabel = tab.label + ' · ' + countParts.join(' + ') +
+        ' · ~' + formatNumber(tokenTotal) + ' tokens';
+
+    return '<label class="pl-10 pr-3 py-1.5 flex items-center gap-2 hover:bg-gray-50 cursor-pointer dark:hover:bg-gray-800">' +
+        '<input type="checkbox" class="source-checkbox rounded border-gray-300 dark:border-gray-700" ' +
+            (tabChecked ? 'checked' : '') + ' ' +
+            'data-classeur="' + escapeAttr(filename) + '" ' +
+            'data-tab-index="' + tab.index + '" ' +
+            'data-tokens="' + tokenTotal + '">' +
+        '<span class="text-sm text-gray-700 dark:text-gray-300"><i class="bi bi-file-earmark-text"></i> ' + escapeHtml(tabLabel) + '</span>' +
+    '</label>';
+}
+
+async function toggleClasseur(filename) {
+    var entry = classeurData[filename];
+    if (!entry) return;
+    entry.expanded = !entry.expanded;
+
+    if (entry.expanded && entry.tabs === null) {
+        renderClasseurTree();
+        try {
+            var res = await fetch('/api/reports/classeurs/tabs?filename=' + encodeURIComponent(filename), {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            });
+            var data = await res.json();
+            entry.tabs = (data.success && data.tabs) ? data.tabs : [];
+        } catch (err) {
+            entry.tabs = [];
+        }
+    }
+    renderClasseurTree();
+}
+
+function onSourceCheckboxChange(cb) {
+    var classeur = cb.dataset.classeur;
+    var tabIndex = parseInt(cb.dataset.tabIndex);
+    var cellKey = cb.dataset.cellKey || '';
+    var tokens = parseInt(cb.dataset.tokens) || 0;
+    var key = sourceKey(classeur, tabIndex, cellKey);
+
+    if (cb.checked) {
+        // Cap absolu seulement (le mode agent prend le relais entre
+        // max_input_tokens et absolute_max_tokens — l'utilisateur est
+        // averti via la barre de budget qui passe en bleu).
+        var projected = computeSelectedTokens() + tokens;
+        var hardCap = llmLimits.absolute_max_tokens;
+        if (hardCap && projected > hardCap) {
+            cb.checked = false;
+            showToast('Volume trop important — réduisez la sélection ou pré-agrégez les données', 'error');
+            return;
+        }
+        var src = { classeur: classeur, tab_index: tabIndex };
+        if (cellKey) src.cell_key = cellKey;
+        selectedSources.set(key, { src: src, tokens: tokens });
+    } else {
+        selectedSources.delete(key);
+    }
+    syncClasseurAllCheckbox(classeur);
+    updateSelectionUI();
+}
+
+// Met a jour la checkbox "tout" du header avec l'etat des feuilles
+// individuelles : cochee si toutes selectionnees, indeterminate si
+// certaines, decochee si aucune.
+function syncClasseurAllCheckbox(filename) {
+    var allCb = document.querySelector(
+        '.classeur-all-checkbox[data-filename="' + window.CSS.escape(filename) + '"]'
+    );
+    if (!allCb) return;
+    var entry = classeurData[filename];
+    if (!entry || !entry.tabs || !entry.tabs.length) {
+        allCb.checked = false;
+        allCb.indeterminate = false;
+        return;
+    }
+    var total = 0;
+    var checked = 0;
+    entry.tabs.forEach(function(t) {
+        var hasRows = t.row_count > 0;
+        var hasCells = (t.cells || []).length > 0;
+        if (!hasRows && !hasCells) return;  // sheet skippe au rendu
+        total += 1;
+        if (selectedSources.has(sourceKey(filename, t.index, ''))) checked += 1;
+    });
+    if (total === 0) {
+        allCb.checked = false;
+        allCb.indeterminate = false;
+    } else if (checked === 0) {
+        allCb.checked = false;
+        allCb.indeterminate = false;
+    } else if (checked === total) {
+        allCb.checked = true;
+        allCb.indeterminate = false;
+    } else {
+        allCb.checked = false;
+        allCb.indeterminate = true;
+    }
+}
+
+// Coche/decoche TOUTES les feuilles utilisables d'un classeur. Charge
+// les tabs au besoin, respecte le budget tokens (skip les feuilles qui
+// ne tiendraient pas dans la limite).
+async function toggleAllTabs(filename, shouldCheck) {
+    var entry = classeurData[filename];
+    if (!entry) return;
+    // Charger les tabs si pas encore fait (cas user clique "tout" sans expand)
+    if (entry.tabs === null) {
+        try {
+            var res = await fetch('/api/reports/classeurs/tabs?filename='
+                + encodeURIComponent(filename), {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' }
+                });
+            var data = await res.json();
+            entry.tabs = (data.success && data.tabs) ? data.tabs : [];
+            entry.expanded = true;
+            renderClasseurTree();
+        } catch (err) {
+            entry.tabs = [];
+        }
+    }
+    if (!entry.tabs.length) return;
+
+    var skippedBudget = 0;
+    entry.tabs.forEach(function(t) {
+        var hasRows = t.row_count > 0;
+        var hasCells = (t.cells || []).length > 0;
+        if (!hasRows && !hasCells) return;
+        var key = sourceKey(filename, t.index, '');
+        var tokenTotal = (t.estimated_tokens || 0);
+        (t.cells || []).forEach(function(c) { tokenTotal += (c.estimated_tokens || 0); });
+        if (shouldCheck) {
+            if (selectedSources.has(key)) return;
+            // Skip uniquement quand on dépasse le cap dur — au-delà du seuil
+            // oneshot mais sous le cap dur, le mode agent tient le coup.
+            var projected = computeSelectedTokens() + tokenTotal;
+            var hardCap = llmLimits.absolute_max_tokens;
+            if (hardCap && projected > hardCap) {
+                skippedBudget += 1;
+                return;
+            }
+            selectedSources.set(key, {
+                src: { classeur: filename, tab_index: t.index },
+                tokens: tokenTotal
+            });
+        } else {
+            selectedSources.delete(key);
+        }
+    });
+    if (skippedBudget > 0) {
+        showToast(skippedBudget + ' feuille(s) ignorée(s) : volume trop important même en mode étendu', 'error');
+    }
+    // Re-render pour refléter l'etat des checkboxes individuelles
+    renderClasseurTree();
+    updateSelectionUI();
+}
+
+async function submitGenerate() {
+    if (selectedSources.size === 0) {
+        showToast('Sélectionnez au moins un élément', 'error');
+        return;
+    }
+    // Final cap check : on bloque uniquement sur le cap dur (le mode agent
+    // gère tout ce qui est entre max_input_tokens et absolute_max_tokens).
+    var tokens = computeSelectedTokens();
+    var hardCap = llmLimits.absolute_max_tokens;
+    if (hardCap && tokens > hardCap) {
+        showToast('Volume trop important — réduisez la sélection', 'error');
+        return;
+    }
+
+    var title = document.getElementById('gen-title').value.trim();
+    var userPrompt = document.getElementById('gen-user-prompt').value.trim();
+
+    // Si on bascule en mode étendu, prévenir que la génération sera plus longue
+    var willUseAgentMode = llmLimits.max_input_tokens && tokens > llmLimits.max_input_tokens;
+
+    var btnText = document.getElementById('gen-btn-text');
+    var btnBtn = document.getElementById('btn-gen-submit');
+    btnText.textContent = willUseAgentMode
+        ? 'Mode étendu — analyse pas-à-pas en cours (plusieurs minutes)...'
+        : 'Génération en cours (peut prendre 30-60s)...';
+    btnBtn.disabled = true;
+
+    try {
+        var body = {
+            sources: Array.from(selectedSources.values()).map(function(e) { return e.src; }),
+        };
+        if (title) body.title = title;
+        if (userPrompt) body.user_prompt = userPrompt;
+
+        var res = await fetch('/api/reports/generate-llm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+            body: JSON.stringify(body)
+        });
+        var data;
+        try { data = await res.json(); } catch (err) { data = null; }
+
+        if (res.ok && data && data.success) {
+            // A3-F1/F2 : avertissements qualité des sources (troncature / décodage
+            // fallback) émis AVANT le toast de succès (adversarial) pour ne pas
+            // être chassés sous le succès — que l'utilisateur ne prenne pas un
+            // agrégat partiel pour exhaustif. Protection durable = le caveat
+            // injecté dans le texte du rapport (consigne LLM) ; ceci est le
+            // signal immédiat à l'écran.
+            if (Array.isArray(data.warnings)) {
+                data.warnings.forEach(function(w) { showToast(w, 'warning'); });
+            }
+            showToast('Rapport généré : ' + escapeHtml(data.report.title), 'success');
+            closeGenerateModal();
+            loadReports();
+        } else {
+            var msg = (data && (data.message || data.error)) || 'Erreur lors de la génération';
+            // Taxonomie 4-cas (axe 5) : sur un 5xx (échec LLM/serveur sur une
+            // opération coûteuse) on propose « Signaler » via le helper
+            // centralisé (un seul toast + overlay + détail serveur).
+            if (res.status >= 500 && window.komptiaReportError) {
+                window.komptiaReportError({ status: res.status }, { context: 'Génération de rapport', serverMsg: msg });
+            } else {
+                showToast(msg, 'error');
+            }
+        }
+    } catch (err) {
+        showToast('Erreur réseau', 'error');
+    } finally {
+        btnText.textContent = 'Générer';
+        btnBtn.disabled = false;
+    }
+}
+
+document.getElementById('gen-tree').addEventListener('change', function(e) {
+    if (e.target.classList.contains('source-checkbox')) {
+        onSourceCheckboxChange(e.target);
+    }
+});
+
+function openExternalSheetsForReport() {
+    if (!window.ExternalSheetsPicker) {
+        showToast('Sélecteur indisponible', 'error');
+        return;
+    }
+    window.ExternalSheetsPicker.open({
+        mode: 'source',
+        onSelect: function(items) {
+            if (!items || !items.length) return;
+            items.forEach(function(item) {
+                var key, src;
+                if (item.type === 'workbook') {
+                    key = 'wb:' + item.classeur + '#' + item.tab_index;
+                    src = { type: 'workbook', classeur: item.classeur, tab_index: item.tab_index };
+                    if (item.cell_key) src.cell_key = item.cell_key;
+                } else if (item.type === 'excel') {
+                    key = 'xl:' + item.path + '#' + (item.sheet_name || '');
+                    src = { type: 'excel', path: item.path, sheet_name: item.sheet_name };
+                    if (item.first_row_as_header) src.first_row_as_header = true;
+                } else if (item.type === 'csv') {
+                    key = 'csv:' + item.path;
+                    src = { type: 'csv', path: item.path };
+                } else {
+                    return;
+                }
+                if (selectedSources.has(key)) return;
+                selectedSources.set(key, {
+                    src: src,
+                    tokens: item.estimated_tokens || 0,
+                    external: true,
+                    label: item.label || key
+                });
+            });
+            updateSelectionUI();
+            renderExternalList();
+        }
+    });
+}
+
+function renderExternalList() {
+    var wrap = document.getElementById('gen-external-list');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    var externals = [];
+    selectedSources.forEach(function(entry, key) {
+        if (entry.external) externals.push({ key: key, entry: entry });
+    });
+    if (externals.length === 0) {
+        wrap.classList.add('hidden');
+        return;
+    }
+    wrap.classList.remove('hidden');
+    externals.forEach(function(item) {
+        var row = document.createElement('div');
+        row.className = 'flex items-center justify-between bg-blue-50 border border-blue-200 rounded px-2 py-1 text-xs dark:bg-blue-900/20 dark:border-blue-800/60';
+        var badge = item.entry.src.type === 'excel' ? 'Excel' : item.entry.src.type === 'csv' ? 'CSV' : 'Classeur';
+        row.innerHTML = '<span class="flex items-center gap-2 min-w-0"><span class="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-[10px] font-semibold dark:bg-blue-900/30 dark:text-blue-300">' + badge + '</span><span class="truncate">' + escapeHtml(item.entry.label) + '</span></span>';
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'text-red-600 hover:text-red-800 ml-2';
+        btn.textContent = 'Retirer';
+        btn.addEventListener('click', function() {
+            selectedSources.delete(item.key);
+            updateSelectionUI();
+            renderExternalList();
+        });
+        row.appendChild(btn);
+        wrap.appendChild(row);
+    });
+}
+
+document.getElementById('btn-gen-add-external').addEventListener('click', openExternalSheetsForReport);
+
+// ── Modal close on backdrop click ──
+[uploadModal, shareModal, emailModal, generateModal].forEach(function(m) {
+    m.addEventListener('click', function(e) {
+        if (e.target === m) { m.classList.add('hidden'); m.classList.remove('flex'); }
+    });
+});
+
+// ── Static event listeners ──
+document.getElementById('btn-open-generate').addEventListener('click', openGenerateModal);
+document.getElementById('btn-gen-submit').addEventListener('click', submitGenerate);
+document.getElementById('btn-open-upload').addEventListener('click', openUploadModal);
+document.getElementById('search-input').addEventListener('input', debounceSearch);
+document.getElementById('filter-type').addEventListener('change', function() { currentPage = 1; loadReports(); });
+document.getElementById('filter-status').addEventListener('change', function() { currentPage = 1; loadReports(); });
+document.getElementById('select-all').addEventListener('change', function() {
+    var checked = this.checked;
+    document.querySelectorAll('.report-checkbox').forEach(function(cb) { cb.checked = checked; });
+    updateBulkActions();
+});
+document.getElementById('btn-bulk-archive').addEventListener('click', bulkArchive);
+document.getElementById('btn-bulk-email').addEventListener('click', bulkEmail);
+document.getElementById('btn-bulk-delete').addEventListener('click', bulkDelete);
+document.getElementById('contact-search').addEventListener('input', searchEmailContacts);
+
+// ── Report actions menu (kebab ⋮) ──
+//
+// Le menu utilise ``position: fixed`` pour s'echapper du overflow:hidden
+// du conteneur de liste. On le positionne au moment du toggle via
+// ``getBoundingClientRect()`` du trigger : ancre top-right par defaut,
+// avec flip vers le haut si on deborde du viewport (cas du dernier
+// rapport en bas de page).
+//
+// Limite documentee : si l'utilisateur scrolle / redimensionne pendant
+// que le menu est ouvert, le menu reste fige a sa position d'ouverture.
+// On ferme alors automatiquement (resize/scroll listeners ci-dessous).
+function closeAllReportMenus() {
+    document.querySelectorAll('.report-actions-menu').forEach(function(m) {
+        m.classList.add('hidden');
+        // Reset des styles inline pour ne pas garder une position morte
+        // entre deux ouvertures (premier menu pourrait reapparaitre au
+        // mauvais endroit si on n'efface pas).
+        m.style.top = '';
+        m.style.left = '';
+        m.style.right = '';
+        m.style.bottom = '';
+    });
+}
+
+function positionReportMenu(menu, trigger) {
+    // Affiche transparent pour mesurer sans flash
+    menu.style.visibility = 'hidden';
+    menu.classList.remove('hidden');
+    var triggerRect = trigger.getBoundingClientRect();
+    var menuRect = menu.getBoundingClientRect();
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var GAP = 4;
+
+    // Ancre par defaut : sous le trigger, aligne sur son bord droit.
+    var top = triggerRect.bottom + GAP;
+    var left = triggerRect.right - menuRect.width;
+
+    // Flip vertical si pas la place en bas
+    if (top + menuRect.height > vh - GAP) {
+        top = Math.max(GAP, triggerRect.top - menuRect.height - GAP);
+    }
+    // Clamp horizontal pour ne pas sortir a gauche du viewport
+    if (left < GAP) left = GAP;
+    // Clamp horizontal pour ne pas sortir a droite (cas trigger en bord
+    // gauche d'un viewport tres etroit)
+    if (left + menuRect.width > vw - GAP) {
+        left = Math.max(GAP, vw - menuRect.width - GAP);
+    }
+
+    menu.style.top = top + 'px';
+    menu.style.left = left + 'px';
+    menu.style.visibility = '';
+}
+
+function toggleReportMenu(trigger) {
+    var menu = trigger.parentElement.querySelector('.report-actions-menu');
+    if (!menu) return;
+    var wasOpen = !menu.classList.contains('hidden');
+    closeAllReportMenus();
+    if (!wasOpen) {
+        positionReportMenu(menu, trigger);
+    }
+}
+
+// Si l'utilisateur scrolle / redimensionne pendant que le menu est
+// ouvert, le menu (position:fixed) reste en place mais le trigger
+// bouge — desync visuelle. On ferme dans ce cas plutot que de
+// reculer/reposition (UX simple, pas de jitter).
+window.addEventListener('scroll', closeAllReportMenus, true);
+window.addEventListener('resize', closeAllReportMenus);
+
+// ── Global event delegation ──
+document.addEventListener('click', function(e) {
+    var target = e.target.closest('[data-action]');
+    if (!target) return;
+    var action = target.dataset.action;
+
+    if (action === 'closeUploadModal') closeUploadModal();
+    else if (action === 'closeShareModal') closeShareModal();
+    else if (action === 'closeEmailModal') closeEmailModal();
+    else if (action === 'closeGenerateModal') closeGenerateModal();
+    else if (action === 'toggleClasseur') toggleClasseur(target.dataset.filename);
+    else if (action === 'toggleAllTabs') {
+        // Le data-action est sur l'<input> checkbox lui-même : on lit
+        // l'état après le click (event delegation sur 'click' bubble).
+        e.stopPropagation();  // évite de déclencher toggleClasseur du parent
+        toggleAllTabs(target.dataset.filename, target.checked);
+    }
+    else if (action === 'goToPage') loadReports(parseInt(target.dataset.page));
+    else if (action === 'sort') sortBy(target.dataset.sort);
+    else if (action === 'toggleReportMenu') { e.stopPropagation(); toggleReportMenu(target); }
+    else if (action === 'download') downloadReport(parseInt(target.dataset.id), target.dataset.filename);
+    else if (action === 'preview') previewReport(parseInt(target.dataset.id));
+    else if (action === 'share') openShareModal(parseInt(target.dataset.id));
+    else if (action === 'email') emailSingleReport(parseInt(target.dataset.id));
+    else if (action === 'archive') archiveReport(parseInt(target.dataset.id), target.dataset.archived !== 'true');
+    else if (action === 'deleteReport') deleteReport(parseInt(target.dataset.id));
+    else if (action === 'generateShareLink') generateShareLink();
+    else if (action === 'copyShareLink') copyShareLink();
+    else if (action === 'revokeShareLink') revokeShareLink();
+    else if (action === 'sendEmail') sendReportsByEmail();
+    else if (action === 'switchTab') switchEmailTab(target.dataset.tab);
+    else if (action === 'toggleRecipient') toggleRecipient(target.dataset.type, parseInt(target.dataset.recipientId), target.dataset.name);
+    else if (action === 'removeRecipient') {
+        e.stopPropagation();
+        toggleRecipient(target.dataset.type, parseInt(target.dataset.recipientId), target.dataset.name);
+    }
+});
+
+// Ferme les menus au clic hors d'un trigger (menu items ferment aussi après action)
+document.addEventListener('click', function(e) {
+    if (e.target.closest('.report-actions-trigger')) return;
+    closeAllReportMenus();
+});
+
+// Ferme les menus avec Échap
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeAllReportMenus();
+});
+
+// A3-F5 : en-têtes de tri accessibles au clavier — les <th data-action=sort>
+// n'étaient ni focusables ni opérables au clavier (souris uniquement). On les
+// rend focusables (tabindex), annonçables (role=button + aria-sort), et
+// Enter/Espace déclenche le même tri que le clic.
+document.querySelectorAll('th[data-action="sort"]').forEach(function(th) {
+    th.setAttribute('tabindex', '0');
+    // A3-F5 (adversarial) : PAS de role="button" — le <th> est un columnheader
+    // natif qui supporte aria-sort (role=button l'invaliderait). tabindex + le
+    // keydown Enter/Espace ci-dessous suffisent à l'opérabilité clavier.
+    if (!th.hasAttribute('aria-sort')) th.setAttribute('aria-sort', 'none');
+    th.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            sortBy(th.getAttribute('data-sort'));
+        }
+    });
+});
+
+// ── Init ──
+loadReports();
+</script>
+</div>
+{% end %}

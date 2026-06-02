@@ -1,0 +1,874 @@
+/* ============================================================
+ * Komptia automation canvas — surcharges Drawflow (Phase 3b).
+ *
+ * Drawflow fournit un rendu par defaut basique. On surcharge ici
+ * pour s'aligner avec le theme Tailwind du projet (brand colors,
+ * dark mode, typographie DM Sans).
+ * ============================================================ */
+
+/* Conteneur canvas : grille de points style n8n. Utilise un radial-gradient
+ * repete tres subtil + une couleur de fond chaude. Le pan/zoom Drawflow est
+ * gere par transform sur .drawflow > nodes — le fond reste fixe (les points
+ * ne se deplacent pas avec le canvas, ce qui est l'ergonomie attendue d'un
+ * editeur de DAG : la grille est un repere stable, pas un sol qui glisse).
+ */
+#komptia-canvas {
+    background-color: #fafbfc;
+    background-image: radial-gradient(circle at 1px 1px, rgba(15, 23, 42, 0.10) 1px, transparent 0);
+    background-size: 22px 22px;
+    background-position: 0 0;
+}
+
+.dark #komptia-canvas {
+    background-color: #0b1220;
+    background-image: radial-gradient(circle at 1px 1px, rgba(148, 163, 184, 0.18) 1px, transparent 0);
+}
+
+#komptia-canvas .drawflow {
+    background: transparent;
+}
+
+#komptia-canvas .drawflow .drawflow-node {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 0;
+    min-width: 180px;
+    color: #111827;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.dark #komptia-canvas .drawflow .drawflow-node {
+    background: #1f2937;
+    border-color: #374151;
+    color: #f3f4f6;
+}
+
+#komptia-canvas .drawflow .drawflow-node.selected {
+    border-color: #f97316; /* brand-500 */
+    box-shadow: 0 0 0 2px rgba(249, 115, 22, 0.2);
+}
+
+#komptia-canvas .komptia-node-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    font-weight: 600;
+    font-size: 13px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.dark #komptia-canvas .komptia-node-header {
+    border-bottom-color: #374151;
+}
+
+/* Identite visuelle par categorie : pastille coloree + icone blanche, en
+ * coherence directe avec la palette (.komptia-palette-icon a le meme
+ * pattern). L'utilisateur reconnait immediatement un node "extraction"
+ * (bleu) vs "transformation" (violet) vs "sortie" (rouge), aussi bien
+ * dans la palette que sur le canvas — meme code couleur partout. */
+#komptia-canvas .komptia-node-icon {
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    border-radius: 6px;
+    color: white;
+    background: #6b7280;  /* fallback neutre si categorie inconnue */
+}
+
+#komptia-canvas .komptia-node-body {
+    padding: 8px 12px 10px;
+    font-size: 12px;
+    color: #6b7280;
+}
+
+.dark #komptia-canvas .komptia-node-body {
+    color: #9ca3af;
+}
+
+/* Pastille + border-left par categorie. Les noms matchent EXACTEMENT
+ * STEP_CATEGORIES dans `app/models/automation_step.py` (source / format /
+ * conversion / sortie). Les autres (extraction, transformation, etc.)
+ * sont des aliases legacy gardes pour ne pas casser des templates
+ * exportes anciens. */
+
+/* === Categories canoniques (source / format / conversion / sortie) === */
+#komptia-canvas .komptia-node-category-source {
+    border-left: 3px solid #3b82f6;
+}
+#komptia-canvas .komptia-node-category-source .komptia-node-icon {
+    background: #3b82f6;  /* bleu — recuperation de donnees */
+}
+
+#komptia-canvas .komptia-node-category-format {
+    border-left: 3px solid #8b5cf6;
+}
+#komptia-canvas .komptia-node-category-format .komptia-node-icon {
+    background: #8b5cf6;  /* violet — transformation IA */
+}
+
+#komptia-canvas .komptia-node-category-conversion {
+    border-left: 3px solid #f97316;
+}
+#komptia-canvas .komptia-node-category-conversion .komptia-node-icon {
+    background: #f97316;  /* orange — conversion en livrable typé (PDF, Excel, CSV) */
+}
+
+/* === Aliases legacy === */
+#komptia-canvas .komptia-node-category-extraction {
+    border-left: 3px solid #3b82f6;
+}
+#komptia-canvas .komptia-node-category-extraction .komptia-node-icon {
+    background: #3b82f6;  /* bleu */
+}
+
+#komptia-canvas .komptia-node-category-transformation {
+    border-left: 3px solid #8b5cf6;
+}
+#komptia-canvas .komptia-node-category-transformation .komptia-node-icon {
+    background: #8b5cf6;  /* violet */
+}
+
+#komptia-canvas .komptia-node-category-validation {
+    border-left: 3px solid #10b981;
+}
+#komptia-canvas .komptia-node-category-validation .komptia-node-icon {
+    background: #10b981;  /* vert */
+}
+
+#komptia-canvas .komptia-node-category-analyse {
+    border-left: 3px solid #14b8a6;
+}
+#komptia-canvas .komptia-node-category-analyse .komptia-node-icon {
+    background: #14b8a6;  /* teal — distinct de validation pour eviter la
+                             confusion vert-pour-deux-choses-differentes */
+}
+
+#komptia-canvas .komptia-node-category-controle {
+    border-left: 3px solid #f59e0b;
+}
+#komptia-canvas .komptia-node-category-controle .komptia-node-icon {
+    background: #f59e0b;  /* orange */
+}
+
+#komptia-canvas .komptia-node-category-integration {
+    border-left: 3px solid #6366f1;
+}
+#komptia-canvas .komptia-node-category-integration .komptia-node-icon {
+    background: #6366f1;  /* indigo */
+}
+
+#komptia-canvas .komptia-node-category-sortie {
+    border-left: 3px solid #ef4444;
+}
+#komptia-canvas .komptia-node-category-sortie .komptia-node-icon {
+    background: #ef4444;  /* rouge */
+}
+
+/* Dark mode : on assombrit legerement les fonds couleur pour qu'ils
+ * ressortent moins agressivement sur le fond sombre du canvas. Pas de
+ * changement par categorie individuelle — opacite globale via filter. */
+.dark #komptia-canvas .komptia-node-icon {
+    /* Pas de modification de la background couleur (l'icone garde son
+     * identite visuelle), juste un leger ajustement de la luminosite
+     * pour eviter l'effet "neon" sur fond tres sombre. */
+    filter: brightness(0.92);
+}
+
+/* Connections */
+#komptia-canvas .drawflow .connection .main-path {
+    stroke: #9ca3af;
+    stroke-width: 2px;
+}
+
+.dark #komptia-canvas .drawflow .connection .main-path {
+    stroke: #6b7280;
+}
+
+/* Node status pour le DAG viewer (readonly, coloration par statut) */
+#komptia-canvas .drawflow-node.komptia-status-success {
+    border-left-color: #10b981;
+    border-left-width: 4px;
+}
+
+#komptia-canvas .drawflow-node.komptia-status-failed {
+    border-left-color: #ef4444;
+    border-left-width: 4px;
+}
+
+#komptia-canvas .drawflow-node.komptia-status-skipped {
+    opacity: 0.5;
+    border-left-color: #9ca3af;
+}
+
+#komptia-canvas .drawflow-node.komptia-status-running {
+    border-left-color: #3b82f6;
+    border-left-width: 4px;
+    animation: komptia-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes komptia-pulse {
+    0%, 100% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+    }
+    50% {
+        box-shadow: 0 0 0 6px rgba(59, 130, 246, 0);
+    }
+}
+
+/* ============================================================
+ * Edge toggles — fleches uniques au bord externe des panels.
+ *
+ * Pattern : un seul bouton fleche par panel. Position absolue dans le
+ * wrapper flex `#komptia-edit-main`. Au bord externe du panel quand il
+ * est ouvert ; dans le coin du canvas quand il est ferme. L'icone
+ * pivote selon l'etat via CSS pur (pas de JS qui flip l'icone).
+ *
+ * Largeurs des panels :
+ * - Palette gauche : w-60 = 15rem = 240px
+ * - Panel droit    : w-96 = 24rem = 384px
+ * ============================================================ */
+
+.komptia-edge-toggle {
+    position: absolute;
+    top: 0;
+    z-index: 5;
+    width: 22px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 0 4px 4px 0;
+    cursor: pointer;
+    color: #6b7280;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+    font-size: 12px;
+    transition: top 0.15s ease, left 0.15s ease, right 0.15s ease,
+                background-color 0.12s;
+    border-top-width: 0;
+}
+
+/* Fix priorite : `.komptia-edge-toggle` definit display: inline-flex et
+ * override le `.hidden { display: none }` de Tailwind (meme specificite,
+ * mon CSS charge apres). Sans ce override explicite, la fleche reste
+ * visible au load alors qu'elle a `class="hidden"`. */
+.komptia-edge-toggle.hidden {
+    display: none !important;
+}
+
+.komptia-edge-toggle:hover {
+    background: #f9fafb;
+    color: #111827;
+}
+
+.dark .komptia-edge-toggle {
+    background: #1f2937;
+    border-color: #374151;
+    color: #9ca3af;
+}
+
+.dark .komptia-edge-toggle:hover {
+    background: #111827;
+    color: #f3f4f6;
+}
+
+/* Position au bord externe du panel quand il est ouvert.
+ * Edge gauche → suit le bord droit du panel (w-60 = 240px).
+ * Edge droit  → suit le bord gauche du panel (w-96 = 384px). */
+.komptia-edge-toggle-left { left: 240px; }
+.komptia-edge-toggle-right { right: 384px; }
+
+/* Quand le panel est ferme : le bouton glisse PILE dans le coin et
+ * inverse les border-radius (puisqu'il est colle au bord du canvas
+ * cote oppose maintenant). Edge gauche : radius cote droit. Edge
+ * droit : radius cote gauche. */
+#komptia-edit-main.palette-collapsed .komptia-edge-toggle-left {
+    left: 0;
+    border-left-width: 0;
+    /* Border-radius par defaut deja correct (right side rounded) */
+}
+#komptia-edit-main.panel-collapsed .komptia-edge-toggle-right {
+    right: 0;
+    border-right-width: 0;
+    border-radius: 4px 0 0 4px;
+}
+
+/* Edge droit ouvert : radius cote gauche (oppose au panel). */
+.komptia-edge-toggle-right {
+    border-radius: 4px 0 0 4px;
+}
+
+/* Icones flip selon etat. Default = panel ouvert. La classe
+ * `.palette-collapsed` ou `.panel-collapsed` sur le parent flip l'icone
+ * affichee. Pas de JS necessaire pour le toggle visuel. */
+.komptia-edge-toggle .komptia-edge-icon-open { display: inline-block; }
+.komptia-edge-toggle .komptia-edge-icon-closed { display: none; }
+
+#komptia-edit-main.palette-collapsed #komptia-palette-toggle .komptia-edge-icon-open {
+    display: none;
+}
+#komptia-edit-main.palette-collapsed #komptia-palette-toggle .komptia-edge-icon-closed {
+    display: inline-block;
+}
+
+#komptia-edit-main.panel-collapsed #komptia-panel-toggle .komptia-edge-icon-open {
+    display: none;
+}
+#komptia-edit-main.panel-collapsed #komptia-panel-toggle .komptia-edge-icon-closed {
+    display: inline-block;
+}
+
+/* ============================================================
+ * Zoom controls : position fixed bas-droite, sous le jw-fab Iris. Tailwind
+ * pre-compile ne contient pas `fixed bottom-6 right-6` → on definit ici.
+ * z-index 100 pour passer au-dessus des nodes Drawflow (z-index par defaut
+ * autour de 5-10) tout en restant SOUS les modals globaux (z >=999).
+ * ============================================================ */
+/* Zoom controls : a GAUCHE du jw-fab Iris. jw-fab fait 56px width et
+ * right: 24px (= 1.5rem). Pour les placer a sa gauche avec un gap visuel
+ * : right = 24 + 56 + 12 = ~92px = 5.75rem. On arrondit a 6rem pour un
+ * gap propre. Meme `bottom: 1.5rem` que jw-fab pour aligner verticalement. */
+.komptia-canvas-zoom-controls {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 6rem;
+    z-index: 100;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px;
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.10);
+}
+
+/* Boutons zoom : centrage strict (line-height: 1, box carree, flex). Sans
+ * ca, le `+` (bi-plus-lg) traine en bas car le glyph a plus d'espace
+ * blanc en-dessous que `bi-dash-lg`. */
+.komptia-zoom-btn {
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    color: #374151;
+}
+.dark .komptia-zoom-btn { color: #d1d5db; }
+
+.komptia-zoom-btn i {
+    font-size: 14px;
+    line-height: 1;
+}
+
+/* Niveau de zoom (centre des controls) : "100%" cliquable, reset zoom. */
+.komptia-zoom-level {
+    min-width: 44px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 8px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #374151;
+    line-height: 1;
+}
+.dark .komptia-zoom-level { color: #d1d5db; }
+
+/* Error overlay : reutilise l'empty state mais visible au-dessus du canvas
+ * avec pointer-events actif pour que le bouton Reessayer soit cliquable. */
+#komptia-canvas-empty.komptia-canvas-error-overlay {
+    background: rgba(249, 250, 251, 0.9);
+}
+
+.dark #komptia-canvas-empty.komptia-canvas-error-overlay {
+    background: rgba(17, 24, 39, 0.9);
+}
+
+/* ============================================================
+ * Palette : items draggables, groupes par categorie
+ * ============================================================ */
+
+.komptia-palette-category {
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #9ca3af;
+    margin-top: 4px;
+}
+
+.dark .komptia-palette-category {
+    color: #6b7280;
+}
+
+.komptia-palette-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    margin: 2px 6px;
+    background: white;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: grab;
+    user-select: none;
+    transition: border-color 0.12s, background-color 0.12s;
+}
+
+.komptia-palette-item:hover {
+    border-color: #e5e7eb;
+    background: #f9fafb;
+}
+
+.komptia-palette-item:active {
+    cursor: grabbing;
+    opacity: 0.6;
+}
+
+/* Phase 3d : step type non-disponible (ex: format_copilot stub).
+   Visuellement grise, non-draggable, info-bulle "bientot". */
+.komptia-palette-item-disabled {
+    opacity: 0.5;
+    cursor: not-allowed !important;
+    background: #f9fafb;
+}
+
+.komptia-palette-item-disabled .komptia-palette-icon {
+    filter: grayscale(0.7);
+}
+
+.dark .komptia-palette-item-disabled {
+    background: #111827;
+}
+
+.dark .komptia-palette-item {
+    background: #1f2937;
+    color: #e5e7eb;
+}
+
+.dark .komptia-palette-item:hover {
+    border-color: #374151;
+    background: #111827;
+}
+
+/* Palette icons : pastille coloree par categorie + icone blanche.
+ * Renforce vs version initiale : font-size 14 → 16 (icones plus
+ * lisibles), border-radius 4 → 6 (coherent avec les icones du canvas),
+ * box-shadow leger pour donner du relief sur le fond sombre, et
+ * font-weight bold pour que les glyphes Bootstrap-Icons paraissent
+ * pleins, pas filaires. */
+.komptia-palette-icon {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    border-radius: 6px;
+    color: white;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+}
+
+.komptia-palette-icon i {
+    /* Bootstrap Icons : `font-weight: 600` rend les glyphes plus pleins
+     * que le defaut (qui peut paraitre fin sur petit format). */
+    font-weight: 600;
+}
+
+/* Couleurs par categorie. Les noms matchent EXACTEMENT
+ * `STEP_CATEGORIES` dans `app/models/automation_step.py` :
+ * source / format / conversion / sortie. Les autres entrees (extraction,
+ * transformation, etc.) sont des aliases historiques laisses pour
+ * compat retro avec d'anciens templates exportes. */
+.komptia-palette-icon.komptia-cat-source { background: #3b82f6; }       /* bleu — recuperation de donnees */
+.komptia-palette-icon.komptia-cat-format { background: #8b5cf6; }       /* violet — transformation IA */
+.komptia-palette-icon.komptia-cat-conversion { background: #f97316; }   /* orange — conversion en livrable typé */
+.komptia-palette-icon.komptia-cat-sortie { background: #ef4444; }       /* rouge — output utilisateur */
+/* Aliases legacy (gardes pour ne pas casser les exports anterieurs) */
+.komptia-palette-icon.komptia-cat-extraction { background: #3b82f6; }
+.komptia-palette-icon.komptia-cat-transformation { background: #8b5cf6; }
+.komptia-palette-icon.komptia-cat-validation { background: #10b981; }
+.komptia-palette-icon.komptia-cat-analyse { background: #14b8a6; }
+.komptia-palette-icon.komptia-cat-controle { background: #f59e0b; }
+.komptia-palette-icon.komptia-cat-integration { background: #6366f1; }
+.komptia-palette-icon.komptia-cat-autre { background: #9ca3af; }
+
+.komptia-palette-label {
+    flex: 1;
+    font-size: 12px;
+    font-weight: 500;
+    color: #374151;
+    line-height: 1.3;
+}
+
+.dark .komptia-palette-label {
+    color: #d1d5db;
+}
+
+/* Drop zone highlight quand un drag survole le canvas */
+#komptia-canvas.komptia-drop-active {
+    outline: 2px dashed #3b82f6;
+    outline-offset: -4px;
+    background: rgba(59, 130, 246, 0.03);
+}
+
+/* ============================================================
+ * Save indicator : 4 etats avec transition fluide
+ * ============================================================ */
+
+.komptia-save-indicator {
+    min-width: 110px;
+    text-align: right;
+    transition: color 0.2s;
+}
+
+.komptia-save-indicator[data-state="idle"] {
+    color: var(--text-muted, #9ca3af);
+}
+
+.komptia-save-indicator[data-state="saving"] {
+    color: var(--status-info, #3b82f6);
+}
+
+.komptia-save-indicator[data-state="saved"] {
+    color: var(--status-success, #10b981);
+}
+
+.komptia-save-indicator[data-state="error"] {
+    color: var(--status-error, #ef4444);
+    font-weight: 600;
+}
+
+.komptia-save-indicator[data-state="saving"]::before {
+    content: "● ";
+    animation: komptia-save-pulse 0.8s ease-in-out infinite;
+}
+
+@keyframes komptia-save-pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+}
+
+/* ============================================================
+ * Panel config : form widgets
+ * ============================================================ */
+
+.komptia-field {
+    display: block;
+}
+
+.komptia-field-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 4px;
+}
+
+.dark .komptia-field-label {
+    color: #d1d5db;
+}
+
+.komptia-field-required::after {
+    content: " *";
+    color: #ef4444;
+}
+
+.komptia-field-help {
+    font-size: 11px;
+    color: #9ca3af;
+    margin-top: 3px;
+    line-height: 1.3;
+}
+
+.komptia-input,
+.komptia-select,
+.komptia-textarea {
+    width: 100%;
+    padding: 6px 10px;
+    font-size: 13px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    background: white;
+    color: #111827;
+    transition: border-color 0.12s;
+}
+
+.komptia-checkbox-wrapper {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    color: #374151;
+}
+.dark .komptia-checkbox-wrapper { color: #d1d5db; }
+.komptia-checkbox {
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+    accent-color: #2563eb;
+}
+.komptia-checkbox-label-inline {
+    font-size: 12px;
+    color: #6b7280;
+}
+.dark .komptia-checkbox-label-inline { color: #9ca3af; }
+
+.dark .komptia-input,
+.dark .komptia-select,
+.dark .komptia-textarea {
+    background: #111827;
+    border-color: #374151;
+    color: #f3f4f6;
+}
+
+.komptia-input:focus,
+.komptia-select:focus,
+.komptia-textarea:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.komptia-textarea {
+    min-height: 64px;
+    font-family: 'DM Mono', 'Menlo', monospace;
+    font-size: 12px;
+    resize: vertical;
+}
+
+.komptia-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    min-height: 32px;
+    background: white;
+    cursor: text;
+}
+
+.dark .komptia-chips {
+    border-color: #374151;
+    background: #111827;
+}
+
+.komptia-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    background: #e5e7eb;
+    border-radius: 12px;
+    font-size: 11px;
+    color: #374151;
+}
+
+.dark .komptia-chip {
+    background: #374151;
+    color: #e5e7eb;
+}
+
+.komptia-chip-remove {
+    cursor: pointer;
+    opacity: 0.6;
+    font-weight: bold;
+}
+
+.komptia-chip-remove:hover {
+    opacity: 1;
+}
+
+.komptia-chips-input {
+    flex: 1;
+    min-width: 80px;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    font-size: 12px;
+    padding: 2px 4px;
+    color: #111827;
+}
+
+.dark .komptia-chips-input {
+    color: #f3f4f6;
+}
+
+.komptia-kv-row {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.komptia-kv-row .komptia-input {
+    flex: 1;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+.komptia-row-remove,
+.komptia-btn-add {
+    flex-shrink: 0;
+    padding: 4px 8px;
+    font-size: 11px;
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    cursor: pointer;
+    color: #6b7280;
+}
+
+.dark .komptia-row-remove,
+.dark .komptia-btn-add {
+    background: #1f2937;
+    border-color: #374151;
+    color: #9ca3af;
+}
+
+.komptia-btn-add:hover,
+.komptia-row-remove:hover {
+    background: #e5e7eb;
+    color: #111827;
+}
+
+.dark .komptia-btn-add:hover,
+.dark .komptia-row-remove:hover {
+    background: #374151;
+    color: #f3f4f6;
+}
+
+.komptia-field-error {
+    font-size: 11px;
+    color: #ef4444;
+    margin-top: 3px;
+}
+
+/* ============================================================
+ * Compléments dark mode : icônes, focus, états divers
+ * ============================================================ */
+
+/* Note : `.dark .komptia-node-icon` est defini plus haut avec un filter
+ * brightness(0.92) sur les pastilles colorees. La couleur de l'icone
+ * elle-meme reste `white` (definie dans la regle non-dark), pas besoin
+ * d'override ici. */
+
+.dark #komptia-canvas .drawflow-node.komptia-status-skipped {
+    border-left-color: #6b7280;
+}
+
+.dark .komptia-field-help {
+    color: #6b7280;
+}
+
+.dark .komptia-field-error {
+    color: #fca5a5;
+}
+
+.dark .komptia-chip-remove {
+    color: #d1d5db;
+}
+
+.dark .komptia-input:focus,
+.dark .komptia-select:focus,
+.dark .komptia-textarea:focus {
+    border-color: #60a5fa;
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.25);
+}
+
+.dark .komptia-save-indicator[data-state="idle"] {
+    color: #6b7280;
+}
+.dark .komptia-save-indicator[data-state="saving"] {
+    color: #60a5fa;
+}
+.dark .komptia-save-indicator[data-state="saved"] {
+    color: #34d399;
+}
+.dark .komptia-save-indicator[data-state="error"] {
+    color: #fca5a5;
+}
+
+.dark #komptia-canvas.komptia-drop-active {
+    outline-color: #60a5fa;
+    background: rgba(96, 165, 250, 0.06);
+}
+
+/* Pass exhaustif — éléments restants du canvas automation */
+.dark .komptia-palette-item-disabled {
+    background: rgba(255,255,255,0.02);
+}
+
+/* Task #37 — Exemples cliquables sous un champ de consigne (step « Iris décide »).
+   Puces brand-blue qui préremplissent le champ. Cohérent avec la palette
+   Komptia + dark mode WCAG. */
+.komptia-examples {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+}
+.komptia-examples-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #6b7280;
+    margin-right: 2px;
+}
+.komptia-example-btn {
+    padding: 0.3rem 0.7rem;
+    background: rgba(59, 130, 246, 0.07);
+    border: 1px solid rgba(59, 130, 246, 0.22);
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.3;
+    color: #1d4ed8;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    /* Le label (texte visible principal) ne doit JAMAIS être tronqué : on
+       laisse wrapper plutôt que ellipsis (sinon un label long comme « Verdict
+       OUI/NON pour interpolation aval » serait coupé et inaccessible au clavier
+       /tactile). max-width borne la puce à la largeur du panneau. */
+    max-width: 100%;
+    text-align: left;
+    white-space: normal;
+    word-break: break-word;
+}
+.komptia-example-btn:hover {
+    background: rgba(59, 130, 246, 0.14);
+    border-color: rgba(59, 130, 246, 0.45);
+    color: #1e3a8a;
+}
+.komptia-example-btn:active {
+    transform: scale(0.98);
+}
+.komptia-example-btn:focus-visible {
+    outline: 2px solid #3b82f6;
+    outline-offset: 1px;
+}
+.dark .komptia-examples-label {
+    color: #9ca3af;
+}
+.dark .komptia-example-btn {
+    background: rgba(96, 165, 250, 0.10);
+    border-color: rgba(96, 165, 250, 0.28);
+    color: #93c5fd;
+}
+.dark .komptia-example-btn:hover {
+    background: rgba(96, 165, 250, 0.18);
+    border-color: rgba(96, 165, 250, 0.5);
+    color: #bfdbfe;
+}

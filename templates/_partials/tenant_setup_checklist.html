@@ -1,0 +1,15 @@
+{# Bandeau de checklist setup admin (T2.1).
+
+   Conteneur vide hydraté par ``static/js/tenant-setup-checklist.js`` :
+
+   - GET /api/admin/tenant-setup au load
+   - Affiche les 5 jalons + leur état
+   - Bouton "Marquer comme fait" par jalon non franchi
+   - Bouton "Masquer" (dismiss) si l'admin sait ce qu'il fait
+   - Le JS gère POST /milestone, /dismiss, /resume
+
+   Le partial est inclus en haut de la page /admin (admin/users.html).
+   Le JS s'exécute uniquement si l'utilisateur courant est admin (le check
+   est fait côté serveur via les endpoints @admin_required — un user non-
+   admin recevra 403 et le JS ne rendra rien). #}
+<div id="tenant-setup-checklist-container" class="mb-6" aria-live="polite"></div>

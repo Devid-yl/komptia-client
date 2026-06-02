@@ -1,0 +1,39 @@
+{% extends "email/base.txt" %}
+
+{{ summary_title | default('Résumé de vos activités') }}
+
+Bonjour {{ recipient_name | default('Cher client') }},
+
+Voici un résumé de vos activités pour la période du {{ period_start }} 
+au {{ period_end }}.
+
+{% if statistics %}
+STATISTIQUES :
+{% for stat in statistics %}
+• {{ stat.label }}: {{ stat.value }}
+{% endfor %}
+{% endif %}
+
+{% if highlights %}
+POINTS SAILLANTS :
+{% for highlight in highlights %}
+• {{ highlight }}
+{% endfor %}
+{% endif %}
+
+{% if upcoming_events %}
+ÉVÉNEMENTS À VENIR :
+{% for event in upcoming_events %}
+• {{ event.date }}: {{ event.description }}
+{% endfor %}
+{% endif %}
+
+{% if recommendations %}
+RECOMMANDATIONS :
+{{ recommendations }}
+{% endif %}
+
+Nous restons à votre disposition pour toute question ou clarification.
+
+Cordialement,
+{{ sender_name | default("L'équipe de " ~ company_name) }}

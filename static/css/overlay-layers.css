@@ -1,0 +1,75 @@
+/*
+ * overlay-layers.css — Tokens z-index cohérents + scroll-lock pour OverlayManager.
+ *
+ * Les valeurs respectent l'existant pour ne pas régresser visuellement :
+ *   - system-modal = 9999 : matche `appConfirmModal` / `syncModal` de base.html
+ *   - toast        = 10000 : matche le toast global de base.html
+ *
+ * Les layers "dropdown" et "popover" sont sous les modals — c'est l'ordre
+ * logique d'empilement. Une modal ouverte doit masquer les dropdowns ouverts
+ * avant elle (sauf ceux créés DANS la modal, qui vivent dans son stacking
+ * context local).
+ *
+ * ⚠️ Les tokens ci-dessous sont DOCUMENTAIRES. Le JS `overlay-manager.js`
+ * duplique ces valeurs dans la constante `LAYERS` et écrit directement
+ * `element.style.zIndex` à l'ouverture — il ne lit PAS ces variables CSS.
+ * Si tu changes une valeur ici, change aussi le JS (grep `LAYERS =` dans
+ * overlay-manager.js). Tu peux aussi les consommer depuis d'autres CSS
+ * (ex: `z-index: var(--z-overlay-modal)`) pour rester cohérent avec le
+ * manager.
+ */
+:root {
+    --z-overlay-dropdown: 1000;
+    --z-overlay-popover: 1500;
+    --z-overlay-modal: 2000;
+    --z-overlay-system: 9999;
+    --z-overlay-toast: 10000;
+
+    /*
+     * Tokens iris-grid — sous les overlays globaux OverlayManager.
+     *
+     * Historique : iris-grid utilisait 10002-10004 (popups intra-grille) et
+     * 99999 / 10001 (mode fullscreen). Conséquence : tout overlay ouvert via
+     * `OverlayManager.open({layer:'modal'})` à z=2000 atterrissait DERRIÈRE
+     * la grille. Comportement bugué — l'utilisateur ne voyait pas la modale
+     * ouverte, mais le backdrop bloquait les clics → blocage complet.
+     *
+     * Règle : tout overlay tracé par OverlayManager DOIT pouvoir passer
+     * au-dessus de n'importe quel composant iris-grid. Donc :
+     *   - popups iris-grid (filter, context menu, search dropdown) <
+     *     OverlayManager.popover (1500)
+     *   - mode fullscreen iris-grid < OverlayManager.modal (2000)
+     *
+     * Les popups iris-grid restent au-dessus des sticky headers de la table
+     * (z 1-100) — la grille fonctionne normalement en isolation.
+     */
+    --z-iris-grid-popup: 1100;
+    --z-iris-grid-fullscreen: 1900;
+    /* Drop overlay drag&drop fichier (Task #20) — doit être au-dessus
+       des popups et fullscreen iris-grid pour que l'user puisse drop
+       même si une grille est affichée. Aligné sur le niveau modal
+       OverlayManager pour cohérence. */
+    --z-iris-drop-overlay: 2000;
+}
+
+/*
+ * Appliqué par OverlayManager quand au moins un overlay avec lockScroll=true
+ * est ouvert. Désactivé dès que le compteur retombe à 0.
+ * Note : sur iOS Safari, `overflow: hidden` seul ne bloque pas le rubber
+ * scrolling — c'est une dette documentée, acceptable pour une app desktop.
+ */
+body.overlay-lock {
+    overflow: hidden;
+}
+
+/*
+ * L'élévation contextuelle des dropdowns/popovers ouverts depuis un
+ * overlay parent (``.grid-fullscreen``, modal-workbook OverlayManager
+ * ``modal``, etc.) est désormais gérée intégralement par
+ * ``overlay-manager.js`` via ``_getMaxZIndexInOpenOverlays`` (le
+ * computeZIndex retourne ``max(layerBase, topOfStack + 10)``). Plus
+ * besoin de règle CSS contextuelle ``body:has(.grid-fullscreen)`` qui
+ * créait un conflit avec l'inline élevé par le manager. Cf. bug
+ * 2026-05-22 (David) — sous-overlay caché par modal parent sur
+ * /datastore + /iris.
+ */

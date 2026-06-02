@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}{{ summary_title | default('Résumé') }} - {{ company_name }}{% endblock %}
+
+{% block content %}
+<h2>{{ summary_title | default('Résumé de vos activités') }}</h2>
+
+<p>Bonjour {{ recipient_name | default('Cher client') }},</p>
+
+<p>Voici un résumé de vos activités pour la période du <strong>{{ period_start }}</strong> au <strong>{{ period_end }}</strong>.</p>
+
+{% if statistics %}
+<div class="info-box">
+    <p><strong>Statistiques</strong></p>
+    {% for stat in statistics %}
+    <p>{{ stat.label }} : {{ stat.value }}</p>
+    {% endfor %}
+</div>
+{% endif %}
+
+{% if highlights %}
+<p><strong>Points saillants</strong></p>
+<ul style="margin-left: 20px; color: #4b5563;">
+    {% for highlight in highlights %}
+    <li style="margin-bottom: 8px;">{{ highlight }}</li>
+    {% endfor %}
+</ul>
+{% endif %}
+
+{% if upcoming_events %}
+<div class="info-box">
+    <p><strong>Événements à venir</strong></p>
+    {% for event in upcoming_events %}
+    <p>{{ event.date }} : {{ event.description }}</p>
+    {% endfor %}
+</div>
+{% endif %}
+
+{% if recommendations %}
+<p><strong>Recommandations</strong></p>
+<p>{{ recommendations }}</p>
+{% endif %}
+
+{% if cta_url %}
+<p style="text-align: center;">
+    <a href="{{ cta_url }}" class="button-cta">{{ cta_text | default('Voir le détail complet') }}</a>
+</p>
+{% endif %}
+
+<p>Nous restons à votre disposition pour toute question ou clarification.</p>
+
+<p>Cordialement,<br>
+<strong>{{ sender_name | default("L'équipe de " ~ company_name) }}</strong></p>
+{% endblock %}

@@ -1,0 +1,73 @@
+{#
+  Partial — bandeau d'alerte global « IA non configurée ».
+
+  Apparaît sur toutes les pages auth dès qu'aucun provider LLM (cloud ou
+  local) n'est enregistré dans le ``LLMManager``. Source de vérité :
+  ``handler._is_llm_configured()`` → injecté dans le namespace template
+  comme ``llm_configured`` (cf. ``app/handlers/base.py``).
+
+  Variables attendues dans le scope :
+  - ``llm_configured`` : booléen, fourni globalement.
+  - ``current_user`` : utilisateur courant (skip si anonyme — pas affiché sur
+    /login).
+
+  Message différencié :
+  - **admin** → lien cliquable vers ``/admin/ai-config`` + ton actionnable.
+  - **user** → message neutre, pas de lien (un user ne peut pas y aller).
+
+  Z-index 9600 : au-dessus du ``#komptia-offline-banner`` (9000) ET du
+  ``.komptia-privacy-badge`` (9500). Une indisponibilité IA est plus
+  actionnable qu'une déconnexion réseau (laquelle se résout typiquement
+  seule), et le badge privacy ne doit pas masquer le bouton dismiss du
+  banner. Reste sous les modals système (``z-[10010]``) — un confirm
+  doit bloquer ce banner, pas l'inverse (axe 17 LIFO).
+
+  Dismiss : bouton ``×`` géré par ``static/js/no-llm-banner.js`` qui
+  enregistre l'état dans ``sessionStorage`` (réapparait au prochain
+  refresh si toujours pas configuré).
+
+  Accessibilité : ``role="status"`` + ``aria-live="polite"`` — alerte de
+  configuration, pas une urgence. ``role="alert"`` impliquerait
+  implicitement ``aria-live="assertive"`` (spec ARIA 1.2), conflit avec
+  l'intent "non interruptif". ``status`` est la convention pour les
+  indicateurs persistants (ARIA Authoring Practices).
+#}
+{% if current_user and not llm_configured %}
+{# Contraste WCAG AA validé 2026-05-26 :
+   - light : amber-700 (#b45309) + text-white → ratio 4.96:1 ✅
+   - dark  : amber-800 (#92400e) + text-white → ratio 6.04:1 ✅
+   amber-600 + text-white échouait à 2.66:1 (en dessous du seuil 4.5:1
+   pour texte normal). #}
+<div id="komptia-no-llm-banner"
+     class="fixed top-0 left-0 right-0 z-[9600] bg-amber-700 dark:bg-amber-800 text-white text-sm py-2 px-4 shadow-md flex items-center justify-center gap-3"
+     role="status" aria-live="polite">
+    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+    </svg>
+    <div class="flex-1 text-center">
+        {# Test robuste : ``current_user.is_admin`` est une property du modèle
+           User qui retourne ``self.role == UserRole.ADMIN`` — pas de chaîne
+           d'attributs ``.role.value`` qui peut crasher si ``role`` est None
+           dans un état dégradé (session corrompue, mock anonyme, migration
+           BDD en cours). Fail-soft : ``getattr(..., False)`` retombe sur le
+           message user neutre plutôt que de crasher le template.
+        #}
+        {% if getattr(current_user, 'is_admin', False) %}
+            L'IA n'est pas configurée. <a href="/admin/ai-config" class="font-medium underline hover:no-underline">Configurez votre clé API</a> pour activer Iris et le copilot.
+        {% else %}
+            L'IA est temporairement indisponible — demandez à un administrateur de votre cabinet d'activer la configuration IA dans <em>Configuration IA</em>.
+        {% end %}
+    </div>
+    <button type="button"
+            id="komptia-no-llm-banner-close"
+            class="flex-shrink-0 ml-2 inline-flex items-center justify-center w-10 h-10 rounded hover:bg-amber-800/40 dark:hover:bg-amber-900/50 focus:outline-none focus:ring-2 focus:ring-white/60"
+            aria-label="Masquer cette alerte">
+        {# Touch target 40px (proche du minimum WCAG 2.5.5 = 44px tout en
+           restant compact). SVG 16px reste centré.
+        #}
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+        </svg>
+    </button>
+</div>
+{% end %}

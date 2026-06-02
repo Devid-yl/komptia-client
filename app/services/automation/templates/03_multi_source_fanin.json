@@ -1,0 +1,119 @@
+{
+  "komptia_export": {
+    "version": 2,
+    "type": "automation"
+  },
+  "template_meta": {
+    "id": "03_multi_source_fanin",
+    "label": "Multi-source (fan-in) → Format IA → Rapport → Email",
+    "description": "Deux requêtes SQL parallèles convergent sur une étape de format IA (qui peut fusionner, valider et nettoyer), puis un rapport agrégé. Démontre le fan-in — l'une des forces du DAG vs un workflow linéaire.",
+    "category": "advanced",
+    "icon": "diagram-3",
+    "difficulty": "avancé"
+  },
+  "automation": {
+    "name": "Modèle — Multi-source fan-in → Format IA → Email",
+    "description": "Deux extractions parallèles convergent sur une étape de format IA, puis un rapport unifié.",
+    "query_type": "sql",
+    "query_text": "-- Source A (votre première requête)\nSELECT TOP 100 * FROM table_a",
+    "schedule_type": "daily",
+    "schedule_config": {},
+    "output_format": "excel",
+    "recipients": [],
+    "notification_emails": [],
+    "notify_on_failure": true,
+    "notify_on_success": false,
+    "fail_policy": "abort"
+  },
+  "steps": [
+    {
+      "name": "Source A",
+      "step_type": "extract_sql",
+      "step_order": 0,
+      "config": {
+        "sql": "-- Source A : adaptez à votre besoin\nSELECT TOP 100 * FROM table_a"
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 80,
+      "layout_y": 80
+    },
+    {
+      "name": "Source B",
+      "step_type": "extract_sql",
+      "step_order": 1,
+      "config": {
+        "sql": "-- Source B : adaptez à votre besoin\nSELECT TOP 100 * FROM table_b"
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 380,
+      "layout_y": 80
+    },
+    {
+      "name": "Fusion et validation IA",
+      "step_type": "format_copilot",
+      "step_order": 2,
+      "config": {
+        "instruction": "Fusionne les deux jeux de données en alignant les colonnes communes. Vérifie qu'aucune ligne n'a un identifiant manquant et signale celles qui posent problème dans une feuille séparée."
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 220,
+      "layout_y": 240
+    },
+    {
+      "name": "Génération rapport",
+      "step_type": "report",
+      "step_order": 3,
+      "config": {
+        "title": "Rapport multi-source",
+        "prompt": "Synthétise les données consolidées : volumes par source, doublons éventuels, anomalies détectées."
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 220,
+      "layout_y": 400
+    },
+    {
+      "name": "Envoi par mail",
+      "step_type": "email",
+      "step_order": 4,
+      "config": {
+        "subject": "Rapport consolidé multi-sources",
+        "to": []
+      },
+      "is_enabled": true,
+      "max_retries": 1,
+      "retry_delay_seconds": 30,
+      "layout_x": 220,
+      "layout_y": 560
+    }
+  ],
+  "edges": [
+    {
+      "from_step_name": "Source A",
+      "to_step_name": "Fusion et validation IA",
+      "data_type": "workbook"
+    },
+    {
+      "from_step_name": "Source B",
+      "to_step_name": "Fusion et validation IA",
+      "data_type": "workbook"
+    },
+    {
+      "from_step_name": "Fusion et validation IA",
+      "to_step_name": "Génération rapport",
+      "data_type": "workbook"
+    },
+    {
+      "from_step_name": "Génération rapport",
+      "to_step_name": "Envoi par mail",
+      "data_type": "report_file"
+    }
+  ]
+}

@@ -1,0 +1,116 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Base de données
+*.db
+*.sqlite
+*.sqlite3
+# On ignore tout le contenu de ``data/`` (datastore user, DB files, snapshots
+# de classeurs, caches). Les seeds de config produit livrés-avec-le-code ont
+# été DÉPLACÉS sous ``app/`` (fix packaging 2026-06-01) car ``data/`` est exclu
+# de l'image Docker ET masqué au runtime par le volume ``komptia-data`` :
+#   - motifs analytiques → ``app/services/ai/data/analytical_patterns.yaml``
+#   - templates automation → ``app/services/automation/templates/*.json``
+# L'exception ``analytical_patterns.yaml`` ci-dessous reste tolérée : un dev peut
+# déposer une extension locale à l'ancien emplacement (fallback rétro-compatible).
+data/*
+!data/analytical_patterns.yaml
+tests/test_komptia.db
+
+# Logs
+*.log
+logs/
+
+# Configuration locale
+.env
+config.local.yaml
+
+# Rapports générés
+reports/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LibreOffice/OpenOffice lock files (créés quand un document est ouvert)
+.~lock.*#
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation temporaire
+*.tmp.md
+
+# Node.js / npm
+node_modules/
+package-lock.json
+
+# Backups & exports utilisateur (jamais commiter)
+*.bak
+komptia_iris_*.xlsx
+komptia_export_*.xlsx
+appfazia.db.old*
+
+# Graphify cache (regenerable, énorme)
+graphify-out/cache/
+
+# llm_log* — contient les prompts utilisateurs (PII), trop volumineux
+# pour git. Garde local uniquement. Couvre llm_log.md, llm_log_readable.md,
+# "llm_log copy.md", "llm_log copilot_agent_*.md", etc.
+llm_log*.md
+"llm_log *.md"
+
+# Backups produits par `make backup` — contiennent .env (clés !) et
+# toutes les données utilisateurs. JAMAIS dans git.
+backups/
+
+# Sauvegardes automatiques avant restore (`make restore`)
+.env.before-restore-*
+config.yaml.before-restore-*
+
+# Tous les snapshots .env (jamais committer, contiennent les vraies clés)
+.env.before-*
+.env.bak
+.env.local
+.env.*.local
+
+# Binaires .NET / Visual Studio (jamais dans git)
+**/bin/
+**/obj/
+*.dll
+*.exe
+*.pdb
+*.dylib
+*.nupkg
+
+# Archives legacy volumineuses (pipeline ancien, conservées localement seulement)
+_trash/outputs_legacy_pipeline_2026_05_05/
+
+# Tmpdirs des opérations make backup/restore (normalement nettoyés
+# automatiquement, mais protège en cas de crash en plein backup)
+.komptia-tmp.*
+
+# Outputs pipeline — artefacts régénérés à chaque run
+outputs/
+
+# Backups automatiques de logs (jamais committer)
+*.backup
+*.backup_*.md
+llm_log.md.backup

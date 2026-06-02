@@ -1,0 +1,33 @@
+{% extends "email/base.txt" %}
+
+{{ alert_title | default('⚠️ Alerte Importante') }}
+
+Bonjour {{ recipient_name | default('Cher client') }},
+
+{% if alert_level == 'error' %}
+ALERTE CRITIQUE
+{% elif alert_level == 'warning' %}
+⚠️ AVERTISSEMENT
+{% elif alert_level == 'success' %}
+INFORMATION POSITIVE
+{% else %}
+ℹ️ INFORMATION
+{% endif %}
+
+{{ alert_message }}
+
+{% if details %}
+DÉTAILS:
+{{ details }}
+{% endif %}
+
+{% if action_required %}
+ACTION REQUISE:
+{{ action_required }}
+{% endif %}
+
+Si vous avez des questions ou besoin d'assistance, notre équipe est à votre 
+disposition.
+
+Cordialement,
+{{ sender_name | default("L'équipe de " ~ company_name) }}

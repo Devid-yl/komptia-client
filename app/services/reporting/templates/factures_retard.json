@@ -1,0 +1,92 @@
+{
+  "id": "factures_retard",
+  "name": "Factures en Retard",
+  "description": "Liste des factures impayées avec ancienneté",
+  "category": "tresorerie",
+  "icon": "⚠️",
+  
+  "query": {
+    "type": "sql",
+    "sql": "SELECT f.numero as facture, c.nom as client, f.montant_ttc, f.date_echeance, CURRENT_DATE - f.date_echeance as jours_retard FROM factures f JOIN clients c ON f.client_id = c.id WHERE f.statut_paiement = 'impaye' AND f.date_echeance < CURRENT_DATE ORDER BY jours_retard DESC",
+    "parameters": []
+  },
+  
+  "chart": {
+    "enabled": true,
+    "type": "bar",
+    "x_column": "client",
+    "y_column": "montant_ttc",
+    "title": "Montants impayés par client",
+    "xlabel": "Client",
+    "ylabel": "Montant (€)"
+  },
+  
+  "columns": [
+    {
+      "name": "facture",
+      "label": "N° Facture",
+      "format": "text"
+    },
+    {
+      "name": "client",
+      "label": "Client",
+      "format": "text"
+    },
+    {
+      "name": "montant_ttc",
+      "label": "Montant TTC",
+      "format": "currency",
+      "suffix": " €"
+    },
+    {
+      "name": "date_echeance",
+      "label": "Échéance",
+      "format": "date",
+      "format_string": "%d/%m/%Y"
+    },
+    {
+      "name": "jours_retard",
+      "label": "Jours de retard",
+      "format": "integer",
+      "highlight_if": "> 30"
+    }
+  ],
+  
+  "aggregations": [
+    {
+      "column": "montant_ttc",
+      "operation": "sum",
+      "label": "Total impayés"
+    },
+    {
+      "column": "facture",
+      "operation": "count",
+      "label": "Nombre de factures"
+    },
+    {
+      "column": "jours_retard",
+      "operation": "avg",
+      "label": "Retard moyen"
+    }
+  ],
+  
+  "alerts": [
+    {
+      "condition": "jours_retard > 90",
+      "message": "⚠️ Factures en retard de plus de 90 jours - risque contentieux",
+      "level": "critical"
+    },
+    {
+      "condition": "jours_retard > 30",
+      "message": "⚠️ Factures en retard de plus de 30 jours - relance recommandée",
+      "level": "warning"
+    }
+  ],
+  
+  "metadata": {
+    "title": "Rapport Factures en Retard",
+    "description": "État des factures impayées avec délais de paiement dépassés",
+    "author": "Komptia",
+    "subject": "Gestion trésorerie"
+  }
+}

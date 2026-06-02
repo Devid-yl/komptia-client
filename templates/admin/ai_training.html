@@ -1,0 +1,1100 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+        <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Gérez les données d'entraînement du modèle IA</p>
+    </div>
+    <div class="flex items-center gap-2">
+        <button id="btn-add-data" class="btn btn-primary">
+            Ajouter des données
+        </button>
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+    <div class="card p-4">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">DDL (Tables)</p>
+        <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ stats.get('tables_count', 0) }}</p>
+    </div>
+    <div class="card p-4">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Vues SQL</p>
+        <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ stats.get('views_count', 0) }}</p>
+    </div>
+    <div class="card p-4">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Documentation</p>
+        <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ stats.get('documentation_count', 0) }}</p>
+    </div>
+    <div class="card p-4">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Question-SQL</p>
+        <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ stats.get('question_sql_count', 0) }}</p>
+    </div>
+    <div class="card p-4">
+        <p class="text-xs font-medium text-gray-500 uppercase tracking-wide dark:text-gray-400">Contexte métier</p>
+        <p class="text-2xl font-semibold text-gray-900 mt-1 dark:text-gray-100">{{ stats.get('business_context_count', 0) }}</p>
+    </div>
+</div>
+
+<!-- Sync History -->
+{% if sync_history %}
+<div class="card mb-6">
+    <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+        <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Historique des synchronisations</h2>
+    </div>
+    <div class="p-4 space-y-2">
+        {% for sync in sync_history %}
+        <div class="flex items-center justify-between py-2 border-b border-gray-100 last:border-0 dark:border-gray-800">
+            <div class="flex items-center gap-3">
+                {% if sync.success %}
+                <span class="badge badge-success">Succes</span>
+                <span class="text-sm text-gray-600 dark:text-gray-400">{{ sync.tables_added or 0 }} tables synchronisees</span>
+                {% else %}
+                <span class="badge badge-error">Echec</span>
+                <span class="text-sm text-gray-500 dark:text-gray-400">{{ (sync.get('error_message') or 'Erreur inconnue')[:80] }}</span>
+                {% end %}
+            </div>
+            <span class="text-xs text-gray-500 dark:text-gray-400">{{ sync.created_at_formatted if hasattr(sync, 'created_at_formatted') else '-' }}</span>
+        </div>
+        {% end %}
+    </div>
+</div>
+{% end %}
+
+<!-- Pending Reviews -->
+<div class="card mb-6" id="pending-section" style="display: none;">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+        <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">
+            En attente de validation
+            <span class="text-xs font-normal text-orange-500 ml-2" id="pending-count"></span>
+        </h2>
+    </div>
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="border-b border-gray-200 dark:border-gray-800">
+                    <th class="table-header text-left" style="width: 100px">Type</th>
+                    <th class="table-header text-left">Question</th>
+                    <th class="table-header text-left">SQL / Contenu</th>
+                    <th class="table-header text-left" style="width: 100px">Source</th>
+                    <th class="table-header text-left" style="width: 180px">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="pending-tbody" class="divide-y divide-gray-100 dark:divide-gray-800">
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Training Data -->
+<div class="card">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-800">
+        <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">
+            Données d'entraînement
+            <span class="text-xs font-normal text-gray-400 ml-2 dark:text-gray-500">{{ total_count }} éléments</span>
+        </h2>
+        <div class="flex items-center gap-2">
+            <select id="filter-type" class="input text-sm">
+                <option value="">Tous les types</option>
+                <option value="ddl" {% if current_type == 'ddl' %}selected{% end %}>DDL (Tables/Vues)</option>
+                <option value="documentation" {% if current_type == 'documentation' %}selected{% end %}>Documentation</option>
+                <option value="question_sql" {% if current_type == 'question_sql' %}selected{% end %}>Question-SQL</option>
+                <option value="business_context" {% if current_type == 'business_context' %}selected{% end %}>Contexte métier</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="space-y-2">
+        {% if training_data %}
+        {% for item in training_data %}
+        <div class="card hover:shadow-sm transition-shadow">
+            <div class="p-4">
+                <div class="flex items-start justify-between gap-3">
+                    {% set is_bc = item.data_type == 'documentation' and item.category == 'business_context' %}
+                    <div class="flex-1 min-w-0">
+                        <!-- Ligne 1 : type + identifiant principal -->
+                        <div class="flex items-center gap-2 mb-1 flex-wrap">
+                            {% if item.data_type == 'ddl' %}
+                            <span class="badge badge-neutral text-xs">DDL</span>
+                            {% if item.table_name %}
+                            <span class="font-semibold text-gray-900 dark:text-gray-100">{{ item.table_name }}</span>
+                            {% end %}
+                            {% elif is_bc %}
+                            <span class="badge badge-primary text-xs">Contexte métier</span>
+                            {% set bc_src = item.source or '' %}
+                            {% if bc_src.startswith('view_mining:') %}
+                            <span class="badge badge-warning text-xs" title="Généré automatiquement au sync">AUTO</span>
+                            {% elif bc_src.startswith('manual_override:') %}
+                            <span class="badge badge-neutral text-xs" title="Était auto, figé manuellement">OVERRIDE</span>
+                            {% else %}
+                            <span class="badge badge-success text-xs" title="Écrit manuellement">MANUEL</span>
+                            {% end %}
+                            {% set meta = item.get('metadata') or {} %}
+                            {% set tags_tables = meta.get('tags_tables') or [] if isinstance(meta, dict) else [] %}
+                            {% set bc_priority = meta.get('priority', 0) if isinstance(meta, dict) else 0 %}
+                            {% if tags_tables %}
+                            <div class="flex items-center gap-1 flex-wrap">
+                                {% for t in tags_tables[:8] %}
+                                <span class="inline-block bg-blue-50 text-blue-700 rounded px-1.5 py-0.5 text-xs font-mono dark:bg-blue-900/20 dark:text-blue-300">{{ t }}</span>
+                                {% end %}
+                                {% if len(tags_tables) > 8 %}
+                                <span class="text-xs text-gray-400 dark:text-gray-500">+{{ len(tags_tables) - 8 }}</span>
+                                {% end %}
+                            </div>
+                            {% end %}
+                            {% if bc_priority %}
+                            <span class="text-xs text-gray-500 dark:text-gray-400">prio {{ bc_priority }}</span>
+                            {% end %}
+                            {% elif item.data_type == 'documentation' %}
+                            <span class="badge badge-success text-xs">Doc</span>
+                            {% if item.category %}
+                            <span class="font-medium text-gray-700 dark:text-gray-300">{{ item.category }}</span>
+                            {% end %}
+                            {% elif item.data_type == 'question_sql' %}
+                            <span class="badge badge-warning text-xs">Q-SQL</span>
+                            {% end %}
+                        </div>
+
+                        <!-- Ligne 2 : contenu adapte au type -->
+                        {% if item.data_type == 'question_sql' %}
+                            {% if item.question %}
+                            <p class="text-sm text-gray-900 mb-1 dark:text-gray-100">{{ item.question }}</p>
+                            {% end %}
+                            {% set sql_val = item.sql or item.content or '' %}
+                            {% if sql_val %}
+                            <pre class="text-xs text-gray-500 bg-gray-50 rounded px-2 py-1 overflow-x-auto max-h-20 dark:bg-gray-900 dark:text-gray-400" style="white-space: pre-wrap; word-break: break-all;">{{ sql_val[:300] }}{% if len(sql_val) > 300 %}...{% end %}</pre>
+                            {% end %}
+                        {% elif item.data_type == 'ddl' %}
+                            {% set ddl_val = item.content or '' %}
+                            <pre class="text-xs text-gray-500 bg-gray-50 rounded px-2 py-1 overflow-x-auto max-h-20 dark:bg-gray-900 dark:text-gray-400" style="white-space: pre-wrap; word-break: break-all;">{{ ddl_val[:200] }}{% if len(ddl_val) > 200 %}...{% end %}</pre>
+                        {% elif is_bc %}
+                            {% set bc_val = item.content or '' %}
+                            <p class="text-sm text-gray-700 whitespace-pre-wrap dark:text-gray-300">{{ bc_val[:400] }}{% if len(bc_val) > 400 %}...{% end %}</p>
+                        {% elif item.data_type == 'documentation' %}
+                            {% set doc_val = item.content or '' %}
+                            {% if doc_val.startswith('{') or doc_val.startswith('[') %}
+                            <pre class="text-xs text-gray-500 bg-gray-50 rounded px-2 py-1 overflow-x-auto max-h-20 dark:bg-gray-900 dark:text-gray-400" style="white-space: pre-wrap;">{{ doc_val[:200] }}{% if len(doc_val) > 200 %}...{% end %}</pre>
+                            {% else %}
+                            <p class="text-sm text-gray-600 line-clamp-2 dark:text-gray-400">{{ doc_val[:200] }}{% if len(doc_val) > 200 %}...{% end %}</p>
+                            {% end %}
+                        {% else %}
+                            {% set content_val = item.content or '' %}
+                            <p class="text-sm text-gray-600 truncate dark:text-gray-400">{{ content_val[:150] }}</p>
+                        {% end %}
+
+                        <!-- Ligne 3 : metadata -->
+                        <div class="flex items-center gap-3 mt-2 text-xs text-gray-400 dark:text-gray-500">
+                            {% set src = item.source or 'manual' %}
+                            <span>{% if src == 'auto_sync' %}Sync auto{% elif src == 'auto_sync_view' %}Sync (vue){% elif src == 'schema_sync_inferred' %}Relation inferee{% elif src == 'schema_enricher' %}Enrichissement{% elif src == 'manual' %}Manuel{% elif src == 'feedback' %}Feedback{% elif src.startswith('view_mining:') %}View mining — {{ src[12:] }}{% elif src.startswith('manual_override:') %}Override — {{ src[16:] }}{% else %}{{ src }}{% end %}</span>
+                            <span>{{ item.formatted_date }}</span>
+                            {% if item.tags %}
+                            <span>{% for tag in item.tags[:3] %}<span class="inline-block bg-gray-100 rounded px-1.5 py-0.5 mr-1 dark:bg-gray-800">{{ tag }}</span>{% end %}</span>
+                            {% end %}
+                            {% if item.quality_score and item.quality_score != 1.0 %}
+                            <span>Score: {{ item.quality_score }}</span>
+                            {% end %}
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="flex items-center gap-1 flex-shrink-0">
+                        <button data-action="viewItem" data-item-id="{{ item.id }}" class="btn btn-secondary text-xs py-1 px-2">Voir</button>
+                        <button data-action="editItem" data-item-id="{{ item.id }}" class="btn btn-secondary text-xs py-1 px-2">Éditer</button>
+                        <button data-action="deleteItem" data-item-id="{{ item.id }}" class="btn btn-danger text-xs py-1 px-2">Supprimer</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% end %}
+        {% else %}
+        <div class="card p-8 text-center text-gray-500 dark:text-gray-400">
+            Aucune donnée d'entraînement
+        </div>
+        {% end %}
+    </div>
+
+    <!-- Pagination -->
+    {% if training_data %}
+    <div class="flex items-center justify-center gap-2 pt-4 mt-4 border-t border-gray-200 dark:border-gray-800">
+        {% if current_page > 1 %}
+        <a href="?type={{ current_type or '' }}&page={{ current_page - 1 }}" class="btn btn-secondary text-xs py-1 px-2">Prec.</a>
+        {% end %}
+        <span class="text-sm text-gray-600 dark:text-gray-400">
+            Page {{ current_page }}{% if total_pages %} / {{ total_pages }}{% end %}
+        </span>
+        {% if current_page < total_pages %}
+        <a href="?type={{ current_type or '' }}&page={{ current_page + 1 }}" class="btn btn-secondary text-xs py-1 px-2">Suiv.</a>
+        {% end %}
+    </div>
+    {% end %}
+</div>
+
+<!-- Datalist pour autocomplete des tables (alimentée au chargement) -->
+<datalist id="tables-datalist"></datalist>
+
+<!-- Add/Edit Modal (un seul modal sert pour les deux flows) -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="addModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-lg mx-4 dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="addModalTitle">Ajouter des données d'entraînement</h3>
+            <button class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeAddModal">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="addForm" class="p-4">
+            <div class="mb-4">
+                <label class="label" for="dataType">Type</label>
+                <select id="dataType" class="input w-full" required>
+                    <option value="documentation">Documentation</option>
+                    <option value="question_sql">Question-SQL</option>
+                    <option value="ddl">DDL (Table)</option>
+                    <option value="business_context">Contexte métier (règle par tables)</option>
+                </select>
+            </div>
+
+            <div class="mb-4" id="questionField" style="display: none;">
+                <label class="label" for="question">Question</label>
+                <input type="text" id="question" class="input w-full" placeholder="Comment lister les clients actifs ?">
+            </div>
+
+            <!-- Champs spécifiques DDL -->
+            <div class="mb-4" id="tableNameField" style="display: none;">
+                <label class="label" for="tableName">Nom de table</label>
+                <input type="text" id="tableName" class="input w-full" list="tables-datalist" placeholder="CLIENTS" autocomplete="off" maxlength="100">
+                <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Optionnel — utilisé pour indexer le DDL dans la recherche RAG. 100 caractères max.</p>
+            </div>
+
+            <!-- Champs spécifiques documentation -->
+            <div class="mb-4" id="docCategoryField" style="display: none;">
+                <label class="label" for="docCategory">Catégorie</label>
+                <input type="text" id="docCategory" class="input w-full" placeholder="ex : glossaire, règles_métier" maxlength="100">
+                <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Optionnel — regroupe les docs par thème. <code>business_context</code> est réservé (choisir le type dédié). 100 caractères max.</p>
+            </div>
+
+            <!-- Tags (documentation + question_sql + DDL) -->
+            <div class="mb-4" id="tagsField" style="display: none;">
+                <label class="label" for="itemTags">Tags</label>
+                <input type="text" id="itemTags" class="input w-full" placeholder="facturation, actif, clients" maxlength="500">
+                <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Tags séparés par des virgules — améliorent la pertinence du RAG. 500 caractères max (toutes virgules comprises).</p>
+            </div>
+
+            <!-- Quality score (question_sql uniquement) -->
+            <div class="mb-4" id="qualityScoreField" style="display: none;">
+                <label class="label" for="qualityScore">Score qualité</label>
+                <input type="number" id="qualityScore" class="input w-full" min="0" max="1" step="0.1" value="1.0">
+                <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Entre 0.0 et 1.0 — un score élevé privilégie cette paire en RAG.</p>
+            </div>
+
+            <!-- Champs spécifiques business_context -->
+            <div id="businessContextFields" style="display: none;">
+                <div class="mb-3 p-3 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800 dark:bg-blue-900/20 dark:border-blue-800/60 dark:text-blue-200">
+                    <strong>Contexte métier</strong> — une règle injectée automatiquement quand l'IA utilise une des tables listées. Ex : « Dossiers joue deux rôles selon le chemin de JOIN ». Aucun mot-clé n'est requis dans la question utilisateur.
+                </div>
+                <div class="mb-4">
+                    <label class="label" for="bcTablesInput">Tables concernées <span class="text-red-500">*</span></label>
+                    <div class="flex gap-2">
+                        <input type="text" id="bcTablesInput" class="input flex-1" list="tables-datalist" placeholder="Tape ou choisis une table…" autocomplete="off">
+                        <button type="button" id="bcAddTableBtn" class="btn btn-secondary text-sm">Ajouter</button>
+                    </div>
+                    <p id="bcTableWarning" class="text-xs text-orange-600 mt-1" style="display:none;">⚠ Cette table n'est pas dans la liste connue — vérifier l'orthographe.</p>
+                    <div id="bcTagsList" class="flex flex-wrap gap-1 mt-2"></div>
+                </div>
+                <div class="mb-4">
+                    <label class="label" for="bcPriority">Priorité</label>
+                    <input type="number" id="bcPriority" class="input w-full" value="2" min="0" max="10">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Plus grand = prioritaire en cas de dépassement du budget tokens. Auto-extrait = 1, manuel = 2+.</p>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label class="label" for="content">Contenu <span class="text-red-500" id="contentRequired">*</span></label>
+                <textarea id="content" class="input w-full font-mono text-sm" rows="8" required placeholder="SELECT * FROM clients WHERE actif = 1"></textarea>
+                <p id="contentHint" class="text-xs text-gray-500 mt-1 dark:text-gray-400" style="display:none;">Explique la règle métier en français (quel concept, quel chemin de JOIN, pourquoi c'est important).</p>
+            </div>
+
+            <div class="flex justify-end gap-2">
+                <button type="button" class="btn btn-secondary" data-action="closeAddModal">Annuler</button>
+                <button type="submit" class="btn btn-primary" id="addFormSubmit">Ajouter</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- View Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="viewModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Detail</h3>
+            <button class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeViewModal">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <div class="p-4" id="viewContent">
+        </div>
+    </div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+const addModal = document.getElementById('addModal');
+const viewModal = document.getElementById('viewModal');
+
+// escapeHtml() inherited from base.html
+
+const SOURCE_LABELS = {
+    'auto_sync': 'Sync auto',
+    'auto_sync_view': 'Sync auto (vue)',
+    'manual': 'Manuel',
+    'feedback': 'Feedback',
+};
+
+function formatSource(src) {
+    if (!src) return 'Manuel';
+    if (SOURCE_LABELS[src]) return SOURCE_LABELS[src];
+    if (src.startsWith('view_mining:')) return 'Auto — ' + src.substring(12);
+    if (src.startsWith('manual_override:')) return 'Override — ' + src.substring(16);
+    return src;
+}
+
+function formatDate(isoStr) {
+    if (!isoStr || isoStr.length < 10) return '-';
+    const parts = isoStr.substring(0, 10).split('-');
+    if (parts.length !== 3) return isoStr.substring(0, 10);
+    return parts[2] + '/' + parts[1] + '/' + parts[0];
+}
+
+// AT-M4 (2026-05-26) : helper partagé extrait dans
+// ``static/js/reload-scroll-preserve.js`` (chargé par base.html). On garde
+// un alias local ``reloadPreservingScroll`` pour ne pas casser les call-sites
+// existants. Cf. #66 polish — SSoT du pattern reload+scroll.
+//
+// ADV-11 (2026-05-26) : ajout du broadcast notify pour sync cross-tab. 2
+// admins sur /admin/ai-training simultanément → CRUD dans Tab 1 reload
+// Tab 2 automatiquement. Helper accepte un ``kind`` optionnel pour libeller
+// l'événement broadcast (training_pair_changed par défaut).
+function reloadPreservingScroll(kind) {
+    try {
+        if (window.komptiaAdminBroadcast) {
+            window.komptiaAdminBroadcast.notify(kind || 'training_pair_changed');
+        }
+    } catch (_e) { /* defensive */ }
+    if (window.komptiaReload && window.komptiaReload.preservingScroll) {
+        window.komptiaReload.preservingScroll();
+        return;
+    }
+    // Fallback si le module shared n'est pas chargé (defense-in-depth).
+    location.reload();
+}
+
+// ADV-11 (2026-05-26) : enregistre l'écouteur des changements remote AU LOAD.
+// Quand un autre admin modifie la training data, on reload pour afficher
+// les données fraîches.
+try {
+    if (window.komptiaAdminBroadcast && window.komptiaAdminBroadcast.reloadOnRemoteChange) {
+        window.komptiaAdminBroadcast.reloadOnRemoteChange();
+    }
+} catch (_e) { /* defensive */ }
+
+const trainingItems = new Map();
+{# Bug 2026-05-26 (AT-M8) : json_encode Tornado n'échappe pas ``</`` qui
+   peut casser un script-injection si un nom de table contient
+   ``</script>``. ``safe_json`` (= safe_json_for_script, passé par le
+   handler) échappe ``<``, ``>``, ``&``, U+2028, U+2029 en escapes JSON
+   légitimes — JSON.parse les décode correctement côté JS.
+
+   Sécurise principalement les champs texte saisis par l'admin :
+   ``content``, ``question``, ``sql``, ``table_name``, ``category``,
+   ``tags``, ``metadata``. Les autres (``data_type``, ``source``,
+   ``quality_score``, dates) sont des valeurs contrôlées côté serveur
+   donc moins risquées — on les sécurise quand même par cohérence. #}
+{% for item in training_data %}
+trainingItems.set({{ item.id }}, {
+    data_type: {% raw safe_json(item.data_type or '-') %},
+    content: {% raw safe_json(item.content or '') %},
+    source: {% raw safe_json(item.source or 'manual') %},
+    question: {% raw safe_json(item.get('question', '') or '') %},
+    sql: {% raw safe_json(item.get('sql', '') or '') %},
+    table_name: {% raw safe_json(item.get('table_name', '') or '') %},
+    category: {% raw safe_json(item.get('category', '') or '') %},
+    tags: {% raw safe_json(item.get('tags') or []) %},
+    quality_score: {% raw safe_json(item.get('quality_score') if item.get('quality_score') is not None else 1.0) %},
+    metadata: {% raw safe_json(item.get('metadata') or {}) %},
+    created_at: {% raw safe_json(item.created_at or '') %},
+    updated_at: {% raw safe_json(item.get('updated_at') or '') %}
+});
+{% end %}
+
+// ── Business context state (pour add + edit) ──
+let bcTagsTables = [];  // liste des tables sélectionnées pour le modal courant
+let bcKnownTables = new Set();  // tables valides (pour warning "table inconnue")
+let editingId = null;  // null = mode "add", sinon ID de l'item édité
+
+async function loadTablesDatalist() {
+    try {
+        const res = await fetch('/api/ai/schema/tables', {
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const tables = data.tables || [];
+        bcKnownTables = new Set(tables.map(t => t.toUpperCase()));
+        const dl = document.getElementById('tables-datalist');
+        if (dl) {
+            dl.innerHTML = tables.map(t => `<option value="${escapeHtml(t)}"></option>`).join('');
+        }
+    } catch (e) {
+        console.warn('loadTablesDatalist failed:', e);
+    }
+}
+
+function renderBcTags() {
+    const container = document.getElementById('bcTagsList');
+    if (!container) return;
+    container.innerHTML = bcTagsTables.map((t, idx) => `
+        <span class="inline-flex items-center gap-1 bg-blue-100 text-blue-800 rounded px-2 py-0.5 text-xs dark:bg-blue-900/30 dark:text-blue-200">
+            <span class="font-mono">${escapeHtml(t)}</span>
+            <button type="button" data-action="removeBcTag" data-tag-idx="${idx}" class="text-blue-600 hover:text-blue-900 dark:text-blue-400">&times;</button>
+        </span>
+    `).join('');
+}
+
+function addBcTag() {
+    const input = document.getElementById('bcTablesInput');
+    const warn = document.getElementById('bcTableWarning');
+    const raw = (input.value || '').trim();
+    if (!raw) return;
+    const normalized = raw.toUpperCase();
+    if (bcTagsTables.some(t => t.toUpperCase() === normalized)) {
+        input.value = '';
+        return;
+    }
+    bcTagsTables.push(raw);
+    input.value = '';
+    if (bcKnownTables.size > 0 && !bcKnownTables.has(normalized)) {
+        warn.style.display = 'block';
+    } else {
+        warn.style.display = 'none';
+    }
+    renderBcTags();
+}
+
+function removeBcTag(idx) {
+    bcTagsTables.splice(idx, 1);
+    renderBcTags();
+}
+
+function resetBcFields() {
+    bcTagsTables = [];
+    const warn = document.getElementById('bcTableWarning');
+    if (warn) warn.style.display = 'none';
+    const input = document.getElementById('bcTablesInput');
+    if (input) input.value = '';
+    const prio = document.getElementById('bcPriority');
+    if (prio) prio.value = '2';
+    renderBcTags();
+}
+
+function filterByType() {
+    const type = document.getElementById('filter-type').value;
+    window.location.href = '?type=' + type;
+}
+
+function setModalMode(type, opts = {}) {
+    // opts : { editing: bool, title: str }
+    const isBc = type === 'business_context';
+    const isQSQL = type === 'question_sql';
+    const isDDL = type === 'ddl';
+    const isDoc = type === 'documentation';
+
+    document.getElementById('questionField').style.display = isQSQL ? 'block' : 'none';
+    document.getElementById('businessContextFields').style.display = isBc ? 'block' : 'none';
+    document.getElementById('tableNameField').style.display = isDDL ? 'block' : 'none';
+    document.getElementById('docCategoryField').style.display = isDoc ? 'block' : 'none';
+    document.getElementById('qualityScoreField').style.display = isQSQL ? 'block' : 'none';
+    // Les tags sont partagés entre documentation / question_sql / DDL
+    // (business_context utilise tags_tables — différent, via son propre bloc).
+    document.getElementById('tagsField').style.display = (isDoc || isQSQL || isDDL) ? 'block' : 'none';
+
+    const contentHint = document.getElementById('contentHint');
+    if (contentHint) contentHint.style.display = isBc ? 'block' : 'none';
+    const contentArea = document.getElementById('content');
+    if (contentArea) {
+        if (isBc) {
+            contentArea.placeholder = "Ex : « La table Dossiers joue deux rôles selon le chemin de JOIN : client via Factures.facNoEnregDos, entité via Groupes.grpNoEnregDos. »";
+        } else if (isDDL) {
+            contentArea.placeholder = "CREATE TABLE clients (id INT PRIMARY KEY, nom VARCHAR(100), actif BIT);";
+        } else if (isQSQL) {
+            contentArea.placeholder = "SELECT * FROM clients WHERE actif = 1";
+        } else {
+            contentArea.placeholder = "Explication libre d'une règle métier ou d'un concept.";
+        }
+    }
+
+    // Titre + bouton
+    const defaultEditTitles = {
+        'business_context': 'Modifier le contexte métier',
+        'documentation': 'Modifier la documentation',
+        'ddl': 'Modifier le DDL',
+        'question_sql': 'Modifier la paire Question-SQL',
+    };
+    const title = opts.title
+        || (opts.editing ? (defaultEditTitles[type] || 'Modifier la donnée') : "Ajouter des données d'entraînement");
+    document.getElementById('addModalTitle').textContent = title;
+    document.getElementById('addFormSubmit').textContent = opts.editing ? 'Enregistrer' : 'Ajouter';
+}
+
+function openAddModal() {
+    editingId = null;
+    document.getElementById('addForm').reset();
+    resetBcFields();
+    // Dropdown reset, on force documentation par défaut
+    document.getElementById('dataType').disabled = false;
+    document.getElementById('dataType').value = 'documentation';
+    setModalMode('documentation', { editing: false });
+    addModal.classList.remove('hidden');
+    addModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(addModal, { layer: 'modal', lockScroll: true });
+}
+
+function openEditModal(id) {
+    const item = trainingItems.get(id);
+    if (!item) {
+        showToast('Donnee introuvable', 'error');
+        return;
+    }
+    editingId = id;
+    document.getElementById('addForm').reset();
+    resetBcFields();
+
+    // Déterminer le "type effectif" pour l'UI :
+    // un documentation avec category == business_context est édité comme BC.
+    const isBcRecord = item.category === 'business_context';
+    const effectiveType = isBcRecord ? 'business_context' : (item.data_type || 'documentation');
+
+    const dataTypeEl = document.getElementById('dataType');
+    dataTypeEl.value = effectiveType;
+    dataTypeEl.disabled = true;  // on ne change PAS le type en édition
+
+    setModalMode(effectiveType, { editing: true });
+
+    // Pré-remplissage selon le type
+    if (effectiveType === 'business_context') {
+        document.getElementById('content').value = item.content || '';
+        const meta = item.metadata || {};
+        bcTagsTables = Array.isArray(meta.tags_tables) ? [...meta.tags_tables] : [];
+        document.getElementById('bcPriority').value = (meta.priority != null) ? meta.priority : 2;
+        renderBcTags();
+    } else if (effectiveType === 'ddl') {
+        document.getElementById('content').value = item.content || '';
+        document.getElementById('tableName').value = item.table_name || '';
+        document.getElementById('itemTags').value = (Array.isArray(item.tags) ? item.tags.join(', ') : '');
+    } else if (effectiveType === 'question_sql') {
+        document.getElementById('question').value = item.question || '';
+        // Pour question_sql, le champ "content" du modal sert à éditer le SQL.
+        document.getElementById('content').value = item.sql || item.content || '';
+        document.getElementById('itemTags').value = (Array.isArray(item.tags) ? item.tags.join(', ') : '');
+        const qs = (item.quality_score != null) ? item.quality_score : 1.0;
+        document.getElementById('qualityScore').value = qs;
+    } else {
+        // documentation "classique"
+        document.getElementById('content').value = item.content || '';
+        document.getElementById('docCategory').value = item.category || '';
+        document.getElementById('itemTags').value = (Array.isArray(item.tags) ? item.tags.join(', ') : '');
+    }
+
+    addModal.classList.remove('hidden');
+    addModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(addModal, { layer: 'modal', lockScroll: true });
+}
+
+function closeAddModal() {
+    if (window.OverlayManager) window.OverlayManager.close(addModal);
+    addModal.classList.add('hidden');
+    addModal.classList.remove('flex');
+    editingId = null;
+    document.getElementById('dataType').disabled = false;
+}
+
+document.getElementById('dataType').addEventListener('change', function() {
+    setModalMode(this.value, { editing: editingId !== null });
+});
+
+document.getElementById('addForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const dataType = document.getElementById('dataType').value;
+    const content = (document.getElementById('content').value || '').trim();
+    const question = (document.getElementById('question').value || '').trim();
+    const tagsRaw = (document.getElementById('itemTags').value || '').trim();
+    const isEdit = editingId !== null;
+
+    // Contrat uniforme POST ↔ PUT : tags est TOUJOURS une liste de chaînes
+    // (le back gère le ",".join côté service). Une chaîne vide =
+    // demande explicite de vider les tags (la liste vide transmet la même
+    // intention côté backend).
+    const tagsList = tagsRaw
+        ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean)
+        : [];
+
+    const body = { type: dataType };
+
+    if (dataType === 'question_sql') {
+        if (!question) {
+            showToast('La question est requise', 'error');
+            return;
+        }
+        if (!content) {
+            showToast('Le SQL est requis', 'error');
+            return;
+        }
+        body.question = question;
+        body.sql = content;
+        body.tags = tagsList;
+        const qsRaw = document.getElementById('qualityScore').value;
+        if (qsRaw !== '' && qsRaw != null) {
+            const qs = parseFloat(qsRaw);
+            if (isNaN(qs) || qs < 0 || qs > 1) {
+                showToast('Le score qualité doit être entre 0.0 et 1.0', 'error');
+                return;
+            }
+            body.quality_score = qs;
+        }
+    } else if (dataType === 'business_context') {
+        if (!content) {
+            showToast('Le contenu est requis', 'error');
+            return;
+        }
+        if (bcTagsTables.length === 0) {
+            showToast('Au moins une table est requise', 'error');
+            return;
+        }
+        body.content = content;
+        body.tags_tables = bcTagsTables;
+        const prio = parseInt(document.getElementById('bcPriority').value, 10);
+        body.priority = isNaN(prio) ? 2 : prio;
+    } else if (dataType === 'ddl') {
+        if (!content) {
+            showToast('Le DDL est requis', 'error');
+            return;
+        }
+        body.content = content;
+        const tableName = (document.getElementById('tableName').value || '').trim();
+        if (isEdit || tableName) {
+            // À la création, table_name est optionnel (le back l'extrait parfois
+            // du CREATE TABLE). À l'édition, on envoie toujours la valeur saisie
+            // (vide = demande explicite de retrait).
+            body.table_name = tableName;
+        }
+        if (isEdit) body.tags = tagsList;  // tags non exposés à la création DDL
+    } else {
+        // documentation
+        if (!content) {
+            showToast('Le contenu est requis', 'error');
+            return;
+        }
+        body.content = content;
+        const cat = (document.getElementById('docCategory').value || '').trim();
+        if (cat.toLowerCase() === 'business_context') {
+            showToast("Catégorie réservée — choisir le type « Contexte métier »", 'error');
+            return;
+        }
+        if (isEdit || cat) body.category = cat;
+        if (isEdit || tagsRaw) body.tags = tagsList;
+    }
+
+    try {
+        const url = isEdit ? `/api/ai/training/${editingId}` : '/api/ai/training';
+        const method = isEdit ? 'PUT' : 'POST';
+        // Sur édition d'un business_context auto, on le promeut en manual_override
+        if (isEdit && dataType === 'business_context') {
+            const currentItem = trainingItems.get(editingId);
+            if (currentItem && (currentItem.source || '').startsWith('view_mining:')) {
+                body.promote_to_manual = true;
+            }
+        }
+        const res = await fetch(url, {
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-XSRFToken': getCookie('_xsrf')
+            },
+            body: JSON.stringify(body)
+        });
+
+        if (res.ok) {
+            showToast(isEdit ? 'Modifié' : 'Donnees ajoutees', 'success');
+            closeAddModal();
+            // AT-M4 + ADV-11 (2026-05-26) : préserve scroll + notify cross-tab.
+            reloadPreservingScroll(isEdit ? 'training_pair_updated' : 'training_pair_created');
+        } else {
+            // Bug 2026-05-26 (AT-M9 MOYEN) : avant ce fix, on affichait
+            // "Erreur" générique sur tout échec. Distinction par code HTTP
+            // pour que l'admin sache ce qui s'est passé :
+            //   - 404 : la donnée a été supprimée entre l'ouverture du
+            //     modal et le PUT (autre admin en parallèle).
+            //   - 409 : conflit d'optimistic-lock (AT-M1) ou unicité.
+            //   - 400/422 : validation côté serveur — afficher le détail.
+            //   - 5xx : erreur serveur, inviter à signaler.
+            let msg;
+            let serverMsg = '';
+            try {
+                const data = await res.json();
+                serverMsg = data.error || data.message || '';
+            } catch (_) { /* corps non JSON ou vide */ }
+
+            if (res.status === 404) {
+                msg = 'Donnée introuvable. Elle a peut-être été supprimée par un autre administrateur. Rafraîchissez la page.';
+            } else if (res.status === 409) {
+                msg = serverMsg || 'Conflit : la donnée a été modifiée entre temps. Rafraîchissez puis réessayez.';
+            } else if (res.status === 400 || res.status === 422) {
+                msg = serverMsg || 'Données invalides. Vérifiez le formulaire.';
+            } else if (res.status === 429) {
+                msg = serverMsg || 'Trop de requêtes. Attendez quelques secondes puis réessayez.';
+            } else if (res.status >= 500) {
+                msg = 'Une erreur est survenue côté serveur. Cliquez sur « Signaler » pour la transmettre.';
+            } else {
+                msg = serverMsg || 'Erreur (code ' + res.status + ').';
+            }
+            showToast(msg, 'error');
+        }
+    } catch (e) {
+        // Cas (d) réseau frontend — message pédagogique (cf. taxonomie 4-cas).
+        showToast('Erreur réseau. Vérifiez votre connexion puis réessayez.', 'error');
+    }
+});
+
+function viewItem(id) {
+    const item = trainingItems.get(id);
+    if (!item) {
+        showToast('Donnee introuvable', 'error');
+        return;
+    }
+
+    const dateStr = formatDate(item.updated_at || item.created_at);
+    const isBc = item.category === 'business_context';
+    const meta = item.metadata || {};
+    const tagsHtml = isBc && Array.isArray(meta.tags_tables) && meta.tags_tables.length
+        ? `<div>
+               <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Tables concernées</p>
+               <div class="flex flex-wrap gap-1">
+                   ${meta.tags_tables.map(t => `<span class="inline-block bg-blue-50 text-blue-700 rounded px-2 py-0.5 text-xs font-mono dark:bg-blue-900/20 dark:text-blue-300">${escapeHtml(t)}</span>`).join('')}
+               </div>
+           </div>`
+        : '';
+    const bcExtraHtml = isBc
+        ? `<div class="flex gap-8">
+               <div>
+                   <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Priorité</p>
+                   <p class="text-sm text-gray-600 dark:text-gray-400">${meta.priority != null ? meta.priority : 0}</p>
+               </div>
+               <div>
+                   <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Auto-généré</p>
+                   <p class="text-sm text-gray-600 dark:text-gray-400">${meta.auto_generated ? 'Oui' : 'Non'}</p>
+               </div>
+           </div>`
+        : '';
+
+    document.getElementById('viewContent').innerHTML = `
+        <div class="space-y-4">
+            <div>
+                <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Type</p>
+                <span class="badge">${escapeHtml(isBc ? 'Contexte métier' : item.data_type)}</span>
+            </div>
+            ${tagsHtml}
+            ${item.question ? `
+            <div>
+                <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Question</p>
+                <p class="text-sm text-gray-900 dark:text-gray-100">${escapeHtml(item.question)}</p>
+            </div>
+            ` : ''}
+            <div>
+                <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Contenu</p>
+                <pre class="bg-gray-50 border border-gray-200 rounded p-3 text-sm text-gray-800 overflow-x-auto whitespace-pre-wrap dark:bg-gray-900 dark:border-gray-800 dark:text-gray-200">${escapeHtml(item.content)}</pre>
+            </div>
+            ${bcExtraHtml}
+            <div class="flex gap-8">
+                <div>
+                    <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Source</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">${escapeHtml(formatSource(item.source))}</p>
+                </div>
+                <div>
+                    <p class="text-xs font-medium text-gray-500 uppercase mb-1 dark:text-gray-400">Date</p>
+                    <p class="text-sm text-gray-600 dark:text-gray-400">${dateStr}</p>
+                </div>
+            </div>
+        </div>
+    `;
+    viewModal.classList.remove('hidden');
+    viewModal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(viewModal, { layer: 'modal', lockScroll: true });
+}
+
+function closeViewModal() {
+    if (window.OverlayManager) window.OverlayManager.close(viewModal);
+    viewModal.classList.add('hidden');
+    viewModal.classList.remove('flex');
+}
+
+async function deleteItem(id) {
+    if (!(await appConfirm('Supprimer cette donnée ?'))) return;
+
+    try {
+        const res = await fetch(`/api/ai/training/${id}`, {
+            method: 'DELETE',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+
+        if (res.ok) {
+            showToast('Supprime', 'success');
+            // AT-M4 + ADV-11 (2026-05-26) : préserve scroll + notify cross-tab.
+            reloadPreservingScroll('training_pair_deleted');
+        } else {
+            // Bug 2026-05-26 (AT-M9 MOYEN) : messages d'erreur précis selon
+            // le code HTTP retourné par /api/ai/training/<id> (cf. taxonomie
+            // 4-cas Komptia).
+            let msg;
+            let serverMsg = '';
+            try {
+                const data = await res.json();
+                serverMsg = data.error || data.message || '';
+            } catch (_) { /* corps non JSON */ }
+
+            if (res.status === 404) {
+                msg = 'Donnée déjà supprimée ou introuvable. Rafraîchissez la page.';
+            } else if (res.status === 409) {
+                // Référence par data_access (AT-C2 fix).
+                msg = serverMsg || 'Impossible de supprimer : référencée par des règles de filtrage.';
+            } else if (res.status === 429) {
+                msg = serverMsg || 'Trop de requêtes. Attendez quelques secondes.';
+            } else if (res.status >= 500) {
+                msg = 'Erreur serveur. Cliquez sur « Signaler » pour transmettre.';
+            } else {
+                msg = serverMsg || 'Erreur (code ' + res.status + ').';
+            }
+            showToast(msg, 'error');
+        }
+    } catch (e) {
+        showToast('Erreur réseau. Vérifiez votre connexion puis réessayez.', 'error');
+    }
+}
+
+[addModal, viewModal].forEach(m => {
+    m.addEventListener('click', (e) => {
+        if (e.target === m) {
+            if (window.OverlayManager) window.OverlayManager.close(m);
+            m.classList.add('hidden');
+            m.classList.remove('flex');
+        }
+    });
+});
+
+// --- Pending Reviews ---
+async function loadPendingReviews() {
+    try {
+        const res = await fetch('/api/ai/training/pending', {
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.success || !data.data || data.data.length === 0) return;
+
+        const section = document.getElementById('pending-section');
+        const tbody = document.getElementById('pending-tbody');
+        const countEl = document.getElementById('pending-count');
+
+        section.style.display = 'block';
+        countEl.textContent = data.total + ' element(s)';
+
+        tbody.innerHTML = data.data.map(item => `
+            <tr class="hover:bg-orange-50" data-pending-id="${item.id}">
+                <td class="table-cell">
+                    <span class="badge badge-warning">${escapeHtml(item.data_type || '-')}</span>
+                </td>
+                <td class="table-cell max-w-xs">
+                    <p class="truncate text-gray-600 dark:text-gray-400" title="${escapeHtml((item.question || '').substring(0, 200))}">
+                        ${escapeHtml((item.question || '-').substring(0, 80))}
+                    </p>
+                </td>
+                <td class="table-cell max-w-sm">
+                    <p class="truncate text-gray-600 font-mono text-xs dark:text-gray-400" title="${escapeHtml((item.content || '').substring(0, 300))}">
+                        ${escapeHtml((item.content || '-').substring(0, 100))}
+                    </p>
+                </td>
+                <td class="table-cell text-gray-500 dark:text-gray-400">${formatSource(item.source)}</td>
+                <td class="table-cell">
+                    <div class="flex items-center gap-1">
+                        <button data-action="approvePending" data-item-id="${item.id}" class="btn btn-primary text-xs py-1 px-2">Approuver</button>
+                        <button data-action="rejectPending" data-item-id="${item.id}" class="btn btn-danger text-xs py-1 px-2">Rejeter</button>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+    } catch (e) {
+        console.error('loadPendingReviews failed:', e);
+    }
+}
+
+async function approvePending(id) {
+    try {
+        const res = await fetch(`/api/ai/training/${id}/approve`, {
+            method: 'POST',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        if (res.ok) {
+            showToast('Donnee approuvee', 'success');
+            const row = document.querySelector(`tr[data-pending-id="${id}"]`);
+            if (row) row.remove();
+            // Refresh count
+            const remaining = document.querySelectorAll('#pending-tbody tr').length;
+            if (remaining === 0) {
+                document.getElementById('pending-section').style.display = 'none';
+            } else {
+                document.getElementById('pending-count').textContent = remaining + ' element(s)';
+            }
+        } else {
+            // AT-M9 : message contextuel selon code HTTP.
+            let serverMsg = '';
+            try {
+                const data = await res.json();
+                serverMsg = data.error || data.message || '';
+            } catch (_) { /* corps non JSON */ }
+            let msg;
+            if (res.status === 404) msg = 'Donnée introuvable. Rafraîchissez la page.';
+            else if (res.status === 409) msg = serverMsg || 'Conflit : action déjà appliquée par un autre admin.';
+            else if (res.status >= 500) msg = 'Erreur serveur. Cliquez sur « Signaler » pour transmettre.';
+            else msg = serverMsg || 'Erreur (code ' + res.status + ').';
+            showToast(msg, 'error');
+        }
+    } catch (e) {
+        showToast('Erreur réseau. Vérifiez votre connexion puis réessayez.', 'error');
+    }
+}
+
+async function rejectPending(id) {
+    if (!(await appConfirm('Rejeter cette donnée ? Elle sera désactivée.'))) return;
+    try {
+        const res = await fetch(`/api/ai/training/${id}/reject`, {
+            method: 'POST',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        if (res.ok) {
+            showToast('Donnee rejetee', 'success');
+            const row = document.querySelector(`tr[data-pending-id="${id}"]`);
+            if (row) row.remove();
+            const remaining = document.querySelectorAll('#pending-tbody tr').length;
+            if (remaining === 0) {
+                document.getElementById('pending-section').style.display = 'none';
+            } else {
+                document.getElementById('pending-count').textContent = remaining + ' element(s)';
+            }
+        } else {
+            // AT-M9 : message contextuel selon code HTTP.
+            let serverMsg = '';
+            try {
+                const data = await res.json();
+                serverMsg = data.error || data.message || '';
+            } catch (_) { /* corps non JSON */ }
+            let msg;
+            if (res.status === 404) msg = 'Donnée introuvable (déjà traitée ?). Rafraîchissez.';
+            else if (res.status === 409) msg = serverMsg || 'Conflit : action déjà appliquée.';
+            else if (res.status >= 500) msg = 'Erreur serveur. Cliquez sur « Signaler » pour transmettre.';
+            else msg = serverMsg || 'Erreur (code ' + res.status + ').';
+            showToast(msg, 'error');
+        }
+    } catch (e) {
+        showToast('Erreur réseau. Vérifiez votre connexion puis réessayez.', 'error');
+    }
+}
+
+// Load pending + datalist on page load
+loadPendingReviews();
+loadTablesDatalist();
+
+// Event listeners
+document.getElementById('btn-add-data')?.addEventListener('click', openAddModal);
+document.getElementById('filter-type')?.addEventListener('change', filterByType);
+document.getElementById('bcAddTableBtn')?.addEventListener('click', addBcTag);
+document.getElementById('bcTablesInput')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ',') {
+        e.preventDefault();
+        addBcTag();
+    }
+});
+
+// Event delegation for data actions
+document.addEventListener('click', (e) => {
+    const target = e.target.closest('[data-action]');
+    if (!target) return;
+
+    const action = target.dataset.action;
+
+    if (action === 'closeAddModal') {
+        closeAddModal();
+    } else if (action === 'closeViewModal') {
+        closeViewModal();
+    } else if (action === 'viewItem') {
+        const id = parseInt(target.dataset.itemId);
+        viewItem(id);
+    } else if (action === 'editItem') {
+        const id = parseInt(target.dataset.itemId);
+        openEditModal(id);
+    } else if (action === 'deleteItem') {
+        const id = parseInt(target.dataset.itemId);
+        deleteItem(id);
+    } else if (action === 'removeBcTag') {
+        const idx = parseInt(target.dataset.tagIdx);
+        if (!Number.isNaN(idx)) removeBcTag(idx);
+    } else if (action === 'approvePending') {
+        const id = parseInt(target.dataset.itemId);
+        approvePending(id);
+    } else if (action === 'rejectPending') {
+        const id = parseInt(target.dataset.itemId);
+        rejectPending(id);
+    }
+});
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/ai-training. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_ai_training_v1',
+                title: 'Entraîner Iris sur votre base',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Pourquoi entraîner Iris',
+                        text: 'Iris répond mieux à mesure qu\'il connaît votre base de données : le nom des tables, leur rôle métier, vos formulations habituelles. Cette page rassemble tout ce qu\'il a appris et vous permet d\'ajouter, modifier ou retirer ces connaissances.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Synchronisation du schéma',
+                        text: 'Iris garde automatiquement à jour la structure de votre base (tables, colonnes, relations). La synchronisation s\'exécute selon la planification définie dans « Configuration IA » (/admin/ai-config), où vous pouvez aussi la déclencher manuellement. L\'historique en bas de cette page trace les synchronisations passées.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Ajouter de la documentation métier',
+                        text: 'Le bouton « Ajouter des données » permet d\'enrichir Iris avec trois types d\'éléments : documentation métier (« le compte 411 désigne les clients »), DDL personnalisé (vues, contraintes), et paires question/SQL d\'exemple (« Top 10 clients par CA » → le SQL correspondant). Plus vous en ajoutez, plus Iris est précis.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Modérer les apprentissages automatiques',
+                        text: 'Quand un utilisateur valide une réponse Iris (👍), elle arrive ici en « En attente d\'approbation ». Vous pouvez l\'approuver (Iris l\'utilisera comme référence) ou la rejeter (Iris l\'oubliera). Cela évite que des cas particuliers soient pris pour des règles générales.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+{% end %}

@@ -1,0 +1,54 @@
+{% extends "../base.html" %}
+
+{% block title %}Galerie de templates | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Galerie de templates</h1>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                Démarrez avec un mod&egrave;le pr&eacute;-fait. Chaque template cr&eacute;e une copie modifiable.
+            </p>
+        </div>
+        <div class="flex items-center gap-2">
+            <a href="/automations" class="btn btn-secondary text-sm">
+                <i class="bi bi-arrow-left"></i> Retour
+            </a>
+        </div>
+    </div>
+
+    <!-- Templates grid -->
+    <div id="komptia-templates-loading" class="text-center py-12 text-sm text-gray-500 dark:text-gray-400">
+        Chargement des templates...
+    </div>
+
+    <div id="komptia-templates-error"
+         class="hidden card border-red-200 bg-red-50 dark:bg-red-900/20 dark:border-red-800/60 px-4 py-3 mb-4">
+        <p class="text-sm text-red-700 dark:text-red-300" id="komptia-templates-error-msg">
+            Erreur de chargement.
+        </p>
+    </div>
+
+    <div id="komptia-templates-grid"
+         class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 hidden"
+         aria-live="polite">
+    </div>
+
+    <!-- Empty state -->
+    <div id="komptia-templates-empty"
+         class="hidden card px-4 py-8 text-center">
+        <p class="text-sm text-gray-500 dark:text-gray-400">
+            Aucun template disponible pour le moment.
+        </p>
+    </div>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script src="/static/js/automation-templates-gallery.js"
+        nonce="{{ handler.csp_nonce }}"></script>
+{% end %}

@@ -1,0 +1,21 @@
+/*
+ * Animation barre de progression indéterminée pour le modal
+ * « Améliorer l'anonymisation » (cf. ``static/js/privacy/improve-pseudos.js``).
+ *
+ * Externalisé en fichier CSS (au lieu d'un ``<style>`` inline injecté via
+ * JS) pour respecter une CSP stricte ``style-src 'self'`` sans
+ * ``unsafe-inline``. Le module JS charge ce fichier via ``<link>`` créé
+ * dynamiquement à la 1ʳᵉ ouverture du modal (lazy-load).
+ */
+@keyframes improveProgressSlide {
+    0% {
+        transform: translateX(-110%);
+    }
+    100% {
+        transform: translateX(370%);
+    }
+}
+
+.improve-progress-indeterminate {
+    animation: improveProgressSlide 1.2s ease-in-out infinite;
+}

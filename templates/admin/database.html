@@ -1,0 +1,531 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+        <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Gérez les connexions aux bases de données Sage</p>
+    </div>
+    <button id="btn-create-connection" class="btn btn-primary">
+        Nouvelle connexion
+    </button>
+</div>
+
+<!-- Source de données active -->
+{# Bascule SQL Server ↔ copie SQLite locale. Outil de dev/test offline
+   (BDD source injoignable, ou comparaison de deux jeux de données).
+   Réactivé 2026-05-27 (demande user).
+
+   AFFICHÉE UNIQUEMENT EN DEV via ``show_sage_mode_switch`` (handler :
+   ``config.is_development()`` — fail-closed : production client, staging ou
+   toute valeur ENVIRONMENT inattendue masque la carte). Raison : un
+   déploiement client tourne en production et n'a pas de copie SQLite locale
+   (``data/sage_copy.db``) — le bouton serait de toute façon ``disabled``
+   (cf. JS ``sageBtn.disabled = !data.sqlite_copy?.exists``). C'est un
+   masquage UI : le backend ``/api/sage-mode`` reste actif (le mode reste
+   pilotable via l'env ``USE_SQLITE_COPY``). Audit log à chaque bascule
+   (``AuditAction.SAGE_MODE_SWITCH``). #}
+{% if show_sage_mode_switch %}
+<div class="card mb-4" id="sage-mode-card">
+    <div class="flex items-center justify-between p-4">
+        <div class="flex items-center gap-3">
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">Source de données :</span>
+            <span id="sage-mode-badge" class="badge">Chargement...</span>
+            <span id="sage-mode-info" class="text-xs text-gray-400 dark:text-gray-500"></span>
+        </div>
+        <button id="btn-switch-mode" class="btn btn-secondary text-xs py-1 px-3" disabled>
+            Basculer...
+        </button>
+    </div>
+    <div id="sage-mode-message" class="hidden px-4 pb-3"></div>
+</div>
+{% end %}
+
+<!-- Connections List -->
+<div class="card">
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="border-b border-gray-200 dark:border-gray-800">
+                    <th class="table-header text-left">Nom</th>
+                    <th class="table-header text-left">Serveur</th>
+                    <th class="table-header text-left">Base</th>
+                    <th class="table-header text-left">Statut</th>
+                    <th class="table-header text-left">Dernier test</th>
+                    <th class="table-header text-left">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="connections-body" class="divide-y divide-gray-100 dark:divide-gray-800">
+                {% if connections %}
+                {% for conn in connections %}
+                <tr class="hover:bg-gray-50 dark:hover:bg-gray-800">
+                    <td class="table-cell font-medium text-gray-900 dark:text-gray-100">{{ conn.name }}</td>
+                    <td class="table-cell text-gray-600 dark:text-gray-400">{{ conn.host }}:{{ conn.port }}</td>
+                    <td class="table-cell text-gray-600 dark:text-gray-400">{{ conn.database }}</td>
+                    <td class="table-cell">
+                        {% if conn.is_active %}
+                        <span class="badge badge-success">Active</span>
+                        {% else %}
+                        <span class="badge">Inactive</span>
+                        {% end %}
+                    </td>
+                    <td class="table-cell">
+                        {% if conn.last_tested_at %}
+                            {% if conn.last_test_success %}
+                            <span class="badge badge-success">OK</span>
+                            {% else %}
+                            <span class="badge badge-danger">Echec</span>
+                            {% end %}
+                            <span class="text-xs text-gray-400 ml-1 dark:text-gray-500" title="{{ conn.last_test_message }}">{{ conn.last_tested_at[:16].replace('T', ' ') }}</span>
+                        {% else %}
+                            <span class="text-xs text-gray-400 dark:text-gray-500">Jamais testé</span>
+                        {% end %}
+                    </td>
+                    <td class="table-cell">
+                        <div class="flex items-center gap-2">
+                            <button data-action="testConnection" data-connection-id="{{ conn.id }}" class="btn btn-secondary text-xs py-1 px-2">
+                                Tester
+                            </button>
+                            <button data-action="openEditModal" data-connection-id="{{ conn.id }}" class="btn btn-secondary text-xs py-1 px-2">
+                                Modifier
+                            </button>
+                            {% if conn.is_active %}
+                            <button data-action="toggleConnection" data-connection-id="{{ conn.id }}" data-activate="false" class="btn btn-secondary text-xs py-1 px-2">
+                                Désactiver
+                            </button>
+                            {% else %}
+                            <button data-action="toggleConnection" data-connection-id="{{ conn.id }}" data-activate="true" class="btn btn-primary text-xs py-1 px-2">
+                                Activer
+                            </button>
+                            {% end %}
+                            <button data-action="deleteConnection" data-connection-id="{{ conn.id }}" data-connection-name="{{ conn.name }}" class="btn btn-danger text-xs py-1 px-2">
+                                Supprimer
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                {% end %}
+                {% else %}
+                <tr>
+                    <td colspan="6" class="table-cell text-center text-gray-500 py-8 dark:text-gray-400">
+                        Aucune connexion configurée
+                    </td>
+                </tr>
+                {% end %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Create/Edit Modal -->
+<div class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50" id="connectionModal">
+    <div class="bg-white rounded-lg shadow-lg w-full max-w-lg mx-4 dark:bg-gray-900">
+        <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="modalTitle">Nouvelle connexion</h3>
+            <button class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300" data-action="closeModal">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <form id="connectionForm" class="p-4">
+            <input type="hidden" id="connectionId" value="">
+            
+            <div class="grid grid-cols-2 gap-4">
+                <div class="col-span-2">
+                    <label class="label" for="connName">Nom de la connexion</label>
+                    <input type="text" id="connName" class="input w-full" required placeholder="Production Sage">
+                </div>
+                
+                <div>
+                    <label class="label" for="connHost">Serveur</label>
+                    <input type="text" id="connHost" class="input w-full" required placeholder="192.168.1.100">
+                </div>
+                
+                <div>
+                    <label class="label" for="connPort">Port</label>
+                    <input type="number" id="connPort" class="input w-full" value="1433" required>
+                </div>
+                
+                <div class="col-span-2">
+                    <label class="label" for="connDatabase">Base de données</label>
+                    <input type="text" id="connDatabase" class="input w-full" required placeholder="SAGE_COMPTA">
+                </div>
+                
+                <div>
+                    <label class="label" for="connUsername">Utilisateur</label>
+                    <input type="text" id="connUsername" class="input w-full" required placeholder="sa">
+                </div>
+                
+                <div>
+                    <label class="label" for="connPassword">Mot de passe</label>
+                    <input type="password" id="connPassword" class="input w-full" placeholder="Laisser vide pour ne pas changer">
+                </div>
+                
+                <div>
+                    <label class="label" for="connTimeout">Timeout (s)</label>
+                    <input type="number" id="connTimeout" class="input w-full" value="30" min="1" max="600">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">D&eacute;lai max d'attente pour une requ&ecirc;te. 30 s par d&eacute;faut, entre 1 et 600.</p>
+                </div>
+
+                <div>
+                    <label class="label" for="connMaxRows">Max lignes</label>
+                    <input type="number" id="connMaxRows" class="input w-full" value="1000" min="1" max="1000000000">
+                    <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">Plafond GLOBAL de lignes retourn&eacute;es par requ&ecirc;te &mdash; <strong>seule source de v&eacute;rit&eacute;</strong> pour toute l'application. Un appelant peut demander moins, jamais plus. 1000 par d&eacute;faut, entre 1 et 1&nbsp;000&nbsp;000&nbsp;000. Attention&nbsp;: une valeur tr&egrave;s &eacute;lev&eacute;e charge tout en RAM serveur ET dans le navigateur &mdash; choisir en connaissance de cause.</p>
+                </div>
+            </div>
+            
+            <div class="flex justify-end gap-2 mt-6">
+                <button type="button" class="btn btn-secondary" data-action="closeModal">Annuler</button>
+                <button type="submit" class="btn btn-primary">Enregistrer</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+// ── Switch Sage Mode (visible hors production uniquement) ──
+// Encapsulé dans une IIFE avec garde : en production la carte n'est pas
+// rendue (la condition show_sage_mode_switch est fausse), donc sageBtn est
+// null. Sans le garde ``if (!sageBtn) return;``, le addEventListener
+// ci-dessous lèverait une TypeError qui casserait TOUT le script — y compris
+// la gestion des connexions. L'IIFE évite aussi de polluer le scope global.
+(function initSageModeSwitch() {
+    const sageBadge = document.getElementById('sage-mode-badge');
+    const sageInfo = document.getElementById('sage-mode-info');
+    const sageBtn = document.getElementById('btn-switch-mode');
+    const sageMsg = document.getElementById('sage-mode-message');
+    if (!sageBtn) return;  // Carte masquée (production) → ne rien câbler.
+
+    let currentMode = null;
+
+    async function loadSageMode() {
+        try {
+            const res = await fetch('/api/sage-mode', {
+                headers: { 'X-XSRFToken': getCookie('_xsrf') }
+            });
+            const data = await res.json();
+            currentMode = data.mode;
+            updateSageModeUI(data);
+        } catch (e) {
+            sageBadge.textContent = 'Erreur';
+            sageBadge.className = 'badge badge-danger';
+        }
+    }
+
+    function updateSageModeUI(data) {
+        if (data.mode === 'sqlserver') {
+            sageBadge.textContent = 'SQL Server';
+            sageBadge.className = 'badge badge-success';
+            sageBtn.textContent = 'Basculer vers SQLite';
+            sageBtn.disabled = !data.sqlite_copy?.exists;
+            sageInfo.textContent = '';
+        } else {
+            sageBadge.textContent = 'SQLite (copie locale)';
+            sageBadge.className = 'badge bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300';
+            sageBtn.textContent = 'Basculer vers SQL Server';
+            sageBtn.disabled = false;
+            if (data.sqlite_copy?.last_modified) {
+                sageInfo.textContent = 'Copie du ' + data.sqlite_copy.last_modified + ' (' + data.sqlite_copy.size_mb + ' MB)';
+            }
+        }
+    }
+
+    sageBtn.addEventListener('click', async () => {
+        const targetMode = currentMode === 'sqlserver' ? 'sqlite' : 'sqlserver';
+        sageBtn.disabled = true;
+        sageBtn.textContent = 'Basculement...';
+        sageMsg.classList.add('hidden');
+
+        try {
+            const res = await fetch('/api/sage-mode', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-XSRFToken': getCookie('_xsrf')
+                },
+                body: JSON.stringify({ mode: targetMode })
+            });
+            const result = await res.json();
+
+            if (result.status === 'ok') {
+                showToast(result.message, 'success');
+                await loadSageMode();
+            } else {
+                showToast(result.message, 'error');
+                sageMsg.textContent = result.message;
+                sageMsg.className = 'px-4 pb-3 text-sm text-red-600 dark:text-red-400';
+                sageMsg.classList.remove('hidden');
+                sageBtn.disabled = false;
+                sageBtn.textContent = currentMode === 'sqlserver' ? 'Basculer vers SQLite' : 'Basculer vers SQL Server';
+            }
+        } catch (e) {
+            showToast('Erreur réseau', 'error');
+            sageBtn.disabled = false;
+            sageBtn.textContent = currentMode === 'sqlserver' ? 'Basculer vers SQLite' : 'Basculer vers SQL Server';
+        }
+    });
+
+    loadSageMode();
+})();
+
+// ── Connections ──
+const modal = document.getElementById('connectionModal');
+let editingId = null;
+
+function openCreateModal() {
+    editingId = null;
+    document.getElementById('modalTitle').textContent = 'Nouvelle connexion';
+    document.getElementById('connectionForm').reset();
+    document.getElementById('connPort').value = '1433';
+    document.getElementById('connTimeout').value = '30';
+    document.getElementById('connMaxRows').value = '1000';
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    if (window.OverlayManager) window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+}
+
+async function openEditModal(id) {
+    editingId = id;
+    document.getElementById('modalTitle').textContent = 'Modifier la connexion';
+    
+    try {
+        const res = await fetch(`/api/db-config/${id}`, {
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        const data = await res.json();
+        
+        if (data.success) {
+            const conn = data.connection;
+            document.getElementById('connName').value = conn.name;
+            document.getElementById('connHost').value = conn.host;
+            document.getElementById('connPort').value = conn.port;
+            document.getElementById('connDatabase').value = conn.database;
+            document.getElementById('connUsername').value = conn.username;
+            document.getElementById('connPassword').value = '';
+            document.getElementById('connTimeout').value = conn.timeout || 30;
+            document.getElementById('connMaxRows').value = conn.max_rows || 1000;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            if (window.OverlayManager) window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+        }
+    } catch (e) {
+        showToast('Erreur lors du chargement', 'error');
+    }
+}
+
+function closeModal() {
+    if (window.OverlayManager) window.OverlayManager.close(modal);
+    modal.classList.add('hidden');
+    modal.classList.remove('flex');
+}
+
+document.getElementById('connectionForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const data = {
+        name: document.getElementById('connName').value,
+        host: document.getElementById('connHost').value,
+        port: parseInt(document.getElementById('connPort').value),
+        database: document.getElementById('connDatabase').value,
+        username: document.getElementById('connUsername').value,
+        password: document.getElementById('connPassword').value,
+        timeout: parseInt(document.getElementById('connTimeout').value),
+        max_rows: parseInt(document.getElementById('connMaxRows').value),
+    };
+    
+    const url = editingId ? `/api/db-config/${editingId}` : '/api/db-config';
+    const method = editingId ? 'PUT' : 'POST';
+    
+    try {
+        const res = await fetch(url, {
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                'X-XSRFToken': getCookie('_xsrf')
+            },
+            body: JSON.stringify(data)
+        });
+        
+        const result = await res.json();
+        
+        if (res.ok) {
+            showToast(result.message || 'Enregistré', 'success');
+            closeModal();
+            location.reload();
+        } else {
+            // L'API renvoie le message actionnable sous "error" (les succès
+            // sous "message") — lire les deux pour ne pas tomber sur le
+            // générique 'Erreur' (rate-limit 429, conflit nom 409, etc.).
+            showToast(result.message || result.error || 'Erreur', 'error');
+        }
+    } catch (e) {
+        showToast('Erreur réseau', 'error');
+    }
+});
+
+async function testConnection(id) {
+    const btn = document.querySelector(`[data-action="testConnection"][data-connection-id="${id}"]`);
+    const originalText = btn?.textContent;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Test...';
+    }
+    try {
+        const res = await fetch(`/api/db-config/${id}/test`, {
+            method: 'POST',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            if (btn) {
+                btn.textContent = '✓ OK';
+                btn.classList.add('text-green-600', 'dark:text-green-400');
+            }
+            showToast(data.message || 'Connexion réussie', 'success');
+        } else {
+            if (btn) {
+                btn.textContent = '✗ Échec';
+                btn.classList.add('text-red-600', 'dark:text-red-400');
+            }
+            showToast(data.message || 'Échec de la connexion', 'error');
+        }
+        // Pas de reload : le test ne modifie pas l'état BDD, juste un
+        // round-trip ODBC vers Sage. Recharger forait l'admin  attendre
+        // 1.5s + re-render complet de la page  chaque test  ce qui
+        // l'incitait  re-cliquer dans l'attente, ouvrant une nouvelle
+        // connexion ODBC chaque fois (= rseau et CPU chauds inutilement).
+        // On rcupre le bouton aprs 3s pour viter le spam-click rapide.
+        if (btn) {
+            setTimeout(function() {
+                btn.disabled = false;
+                btn.textContent = originalText;
+                btn.classList.remove('text-green-600', 'dark:text-green-400', 'text-red-600', 'dark:text-red-400');
+            }, 3000);
+        }
+    } catch (e) {
+        showToast('Erreur réseau', 'error');
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = originalText;
+        }
+    }
+}
+
+async function toggleConnection(id, activate) {
+    try {
+        const res = await fetch(`/api/db-config/${id}/activate`, {
+            method: activate ? 'POST' : 'DELETE',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        
+        if (res.ok) {
+            location.reload();
+        } else {
+            const data = await res.json();
+            // Message actionnable sous "error" (cf. submitConnection).
+            showToast(data.message || data.error || 'Erreur', 'error');
+        }
+    } catch (e) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+async function deleteConnection(id, name) {
+    if (!(await appConfirm(`Supprimer la connexion "${name}" ?`))) return;
+
+    try {
+        const res = await fetch(`/api/db-config/${id}`, {
+            method: 'DELETE',
+            headers: { 'X-XSRFToken': getCookie('_xsrf') }
+        });
+        
+        if (res.ok) {
+            showToast('Connexion supprimée', 'success');
+            location.reload();
+        } else {
+            const data = await res.json();
+            // Message actionnable sous "error" (CANNOT_DELETE_ACTIVE 409, etc.).
+            showToast(data.message || data.error || 'Erreur', 'error');
+        }
+    } catch (e) {
+        showToast('Erreur réseau', 'error');
+    }
+}
+
+modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeModal();
+});
+
+// Event listeners
+document.getElementById('btn-create-connection')?.addEventListener('click', openCreateModal);
+
+// Event delegation for connection actions
+document.addEventListener('click', (e) => {
+    const target = e.target.closest('[data-action]');
+    if (!target) return;
+    
+    const action = target.dataset.action;
+    
+    if (action === 'closeModal') {
+        closeModal();
+    } else if (action === 'testConnection') {
+        const id = parseInt(target.dataset.connectionId);
+        testConnection(id);
+    } else if (action === 'openEditModal') {
+        const id = parseInt(target.dataset.connectionId);
+        openEditModal(id);
+    } else if (action === 'toggleConnection') {
+        const id = parseInt(target.dataset.connectionId);
+        const activate = target.dataset.activate === 'true';
+        toggleConnection(id, activate);
+    } else if (action === 'deleteConnection') {
+        const id = parseInt(target.dataset.connectionId);
+        const name = target.dataset.connectionName;
+        deleteConnection(id, name);
+    }
+});
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/database. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_database_v1',
+                title: 'Connecter Komptia à votre base de données',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Créer une connexion',
+                        text: 'Le bouton « Nouvelle connexion » en haut à droite ouvre un formulaire : nom, adresse du serveur SQL Server, port, base et identifiants. Vous pouvez enregistrer plusieurs connexions (production, test, archives...) et basculer entre elles à tout moment.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Tester avant d\'activer',
+                        text: 'Le bouton « Tester » sur chaque ligne valide que Komptia arrive bien à se connecter au serveur. La colonne « Dernier test » affiche le résultat (OK / Échec) et l\'heure. Testez avant d\'activer, surtout après un changement de mot de passe ou de réseau.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Une seule connexion active à la fois',
+                        text: 'Iris travaille toujours sur UNE base de données. Le bouton « Activer » bascule sur la connexion choisie ; l\'ancienne passe automatiquement en « Inactive ». Cela évite tout risque de mélange entre vos environnements.'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Surveiller l\'état',
+                        text: 'La colonne « Statut » de chaque ligne indique si la connexion est active et opérationnelle. Si elle tombe (réseau, serveur arrêté), Iris affiche un message clair à l\'utilisateur — sans planter ni renvoyer de résultats vides.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+</div>
+{% end %}

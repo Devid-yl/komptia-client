@@ -1,0 +1,2629 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block head %}
+<style>
+    .file-card { transition: all .15s; cursor: pointer; }
+    .file-card:hover { background: var(--bg-surface-2); }
+    .file-card.selected { background: var(--status-info-bg); border-color: var(--status-info, #3b82f6); }
+    .file-card.drag-over-folder { background: var(--status-info-bg); border-color: var(--status-info, #3b82f6) !important; }
+    .file-card.dragging { opacity: 0.4; }
+    .drop-zone { border: 2px dashed var(--border-strong, #d1d5db); border-radius: 8px; transition: all .2s; }
+    .drop-zone.drag-over { border-color: var(--status-info, #3b82f6); background: var(--status-info-bg); }
+    .breadcrumb-sep::before { content: '/'; color: var(--text-faint, #9ca3af); margin: 0 4px; }
+    .preview-panel-container { height: 500px; display: flex; flex-direction: column; }
+    .preview-panel { flex: 1; overflow: auto; }
+    .csv-table { font-size: 0.75rem; }
+    .csv-table th { position: sticky; top: 0; background: var(--bg-surface-2); }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes slideOut { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(100%); } }
+    .animate-in { animation: fadeIn .2s ease; }
+    .animate-spin { animation: spin .6s linear; }
+    .modal-backdrop { background: rgba(0,0,0,.3); }
+    .ctx-menu { box-shadow: 0 4px 12px rgba(0,0,0,.12); }
+    .toast { 
+        position: fixed; 
+        top: 20px; 
+        right: 20px; 
+        z-index: 9999; 
+        background: var(--bg-surface); 
+        border: 1px solid var(--border); 
+        border-radius: 8px; 
+        padding: 12px 16px; 
+        box-shadow: 0 4px 12px rgba(0,0,0,.12);
+        animation: slideIn .3s ease;
+    }
+    .toast.hide { animation: slideOut .3s ease; }
+
+    /* ── Workbook viewer modal (réutilise les styles d'Iris via iris-grid.css) ── */
+    #modal-workbook .modal-backdrop,
+    #modal-sql-result .modal-backdrop { background: rgba(0,0,0,0.45); }
+    #modal-workbook .wb-dialog,
+    #modal-sql-result .wb-dialog {
+        width: 95vw;
+        height: 90vh;
+        max-width: 1800px;
+    }
+    /* Aligne le bord droit des boutons du tab bar avec ceux du wb-header
+       (px-4 = 16px). Sans ça, les 4 boutons (recherche/save/export/fullscreen)
+       débordent de 13px à droite des boutons fermer/télécharger. */
+    #modal-workbook .grid-tab-bar,
+    #modal-sql-result .grid-tab-bar {
+        padding-right: 16px;
+    }
+
+    /* Fullscreen : neutraliser les translations Tailwind et les coins arrondis
+       pour que le dialog couvre 100% du viewport (pas de fond visible). */
+    #modal-workbook .wb-dialog.grid-fullscreen,
+    #modal-sql-result .wb-dialog.grid-fullscreen {
+        top: 0 !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        max-width: none !important;
+        transform: none !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+    }
+    #modal-workbook .wb-header,
+    #modal-sql-result .wb-header {
+        background: var(--bg-surface);
+        flex-shrink: 0;
+    }
+    .dark #modal-workbook .wb-header,
+    .dark #modal-sql-result .wb-header {
+        background: #0f172a;
+        border-bottom-color: rgba(255,255,255,0.06);
+    }
+    .dark #sql-result-container,
+    .dark #workbook-viewer-container { background: #0b1220; }
+    /* SQL result modal : la grille Iris prend toute la hauteur dispo */
+    #sql-result-container {
+        background: var(--bg-app);
+        min-height: 0;
+        padding: 0;
+    }
+    #sql-result-container > .iris-sql-card {
+        margin: 0;
+        border: none;
+        border-radius: 0;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    #sql-result-container > .iris-sql-card > .grid-tab-bar { flex-shrink: 0; }
+    #sql-result-container > .iris-sql-card > .grid-tab-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        min-height: 0;
+    }
+    #sql-result-container > .iris-sql-card > .grid-tab-content > .grid-tab-panel {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        min-height: 0;
+    }
+    #sql-result-container .iris-sql-table-wrap {
+        max-height: none;
+        overflow-y: auto;
+        flex: 1;
+    }
+    #workbook-viewer-container {
+        background: var(--bg-app);
+        overflow: auto;
+        min-height: 0;
+    }
+    /* La card Iris occupe tout l'espace disponible dans le modal */
+    #workbook-viewer-container > .iris-sql-card {
+        margin-top: 0;
+        border: none;
+        border-radius: 0;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+    }
+    /* Le tab bar reste en haut, tab-content prend le reste */
+    #workbook-viewer-container > .iris-sql-card > .grid-tab-bar {
+        flex-shrink: 0;
+    }
+    #workbook-viewer-container > .iris-sql-card > .grid-tab-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        min-height: 0;
+    }
+    #workbook-viewer-container > .iris-sql-card > .grid-tab-content > .grid-tab-panel {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        min-height: 0;
+    }
+    /* Quand la card est dans le modal, le wrap intérieur utilise la hauteur dispo */
+    #workbook-viewer-container .iris-sql-table-wrap {
+        max-height: none;
+        overflow-y: auto;
+        flex: 1;
+    }
+    /* Masque le bouton "Charger un classeur" du tab bar : redondant dans /datastore */
+    #workbook-viewer-container button[title="Charger un classeur"] {
+        display: none !important;
+    }
+    /* Icône "visualiser le classeur" sur les fichiers */
+    .ds-open-wb-btn {
+        background: none;
+        border: 1px solid transparent;
+        border-radius: 6px;
+        padding: 4px;
+        color: #6b7280;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: all .15s;
+    }
+    .ds-open-wb-btn:hover {
+        background: rgba(59, 130, 246, 0.08);
+        border-color: rgba(59, 130, 246, 0.3);
+        color: #1d4ed8;
+    }
+    /* Statuts dans le visualiseur de classeur (chargement / erreur / vide) */
+    .wb-status {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        height: 100%;
+        font-size: 0.9rem;
+        color: var(--text-muted);
+        text-align: center;
+        padding: 2rem;
+    }
+    .wb-status--error { color: #ef4444; }
+    .wb-status-detail {
+        color: var(--text-faint);
+        font-size: 0.8rem;
+    }
+
+    /* ── Dark mode overrides ─────────────────────────────────── */
+    .dark .file-card { color: #e2e8f0; }
+    .dark .file-card:hover { background: rgba(255,255,255,0.04); }
+    .dark .file-card.selected {
+        background: rgba(59,130,246,0.15);
+        border-color: #3b82f6;
+    }
+    .dark .file-card.drag-over-folder {
+        background: rgba(59,130,246,0.1);
+        border-color: #3b82f6;
+    }
+    .dark .drop-zone {
+        background: rgba(255,255,255,0.02);
+        border-color: rgba(255,255,255,0.08);
+    }
+    .dark .drop-zone.drag-over {
+        background: rgba(59,130,246,0.1);
+        border-color: #3b82f6;
+    }
+    .dark .csv-table th {
+        background: #111827;
+        color: var(--text-faint);
+        border-bottom-color: rgba(255,255,255,0.08);
+    }
+    .dark .csv-table td { color: #cbd5e1; border-bottom-color: rgba(255,255,255,0.04); }
+    .dark .toast {
+        background: #111827;
+        color: #f1f5f9;
+        border-color: var(--text-secondary);
+    }
+    .dark .ctx-menu {
+        background: #0f172a;
+        border-color: rgba(255,255,255,0.08);
+        box-shadow: 0 4px 12px rgba(0,0,0,.4);
+    }
+    .dark .ctx-menu button { color: #cbd5e1; }
+    .dark .ctx-menu button:hover { background: rgba(255,255,255,0.06); }
+    .dark .ctx-menu #ctx-delete:hover { background: rgba(239,68,68,0.15); color: #fca5a5; }
+    .dark .breadcrumb-sep::before { color: var(--text-muted); }
+    .dark .ds-open-wb-btn { color: var(--text-faint); }
+    .dark .ds-open-wb-btn:hover {
+        color: #60a5fa;
+        background: rgba(59,130,246,0.12);
+        border-color: rgba(59,130,246,0.3);
+    }
+    .dark .wb-status { color: var(--text-faint); }
+    .dark .wb-status-detail { color: var(--text-muted); }
+    .dark .wb-status--error { color: #fca5a5; }
+    .dark .toast { box-shadow: 0 4px 12px rgba(0,0,0,.4); }
+    .dark .file-card.selected {
+        background: rgba(59, 130, 246, 0.18);
+        border-color: #60a5fa;
+    }
+    .dark .file-card.drag-over-folder {
+        background: rgba(59, 130, 246, 0.22);
+        border-color: #60a5fa !important;
+    }
+    .dark .drop-zone {
+        border-color: rgba(255, 255, 255, 0.15);
+    }
+    .dark .drop-zone.drag-over {
+        border-color: #60a5fa;
+        background: rgba(59, 130, 246, 0.16);
+    }
+</style>
+<link rel="stylesheet" href="{{ static_url('css/iris-grid.css') }}">
+{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div id="datastore-app" class="max-w-7xl animate-in">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-5">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Gérez vos fichiers et données exportées</p>
+        </div>
+        <div class="flex items-center gap-2">
+            <button id="ds-btn-refresh" class="px-3 py-1.5 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300" title="Rafraîchir">
+                <svg id="ds-refresh-icon" class="w-3.5 h-3.5 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                Rafra&icirc;chir
+            </button>
+            <button id="ds-btn-upload" class="px-3 py-1.5 text-xs bg-gray-900 text-white rounded-md hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">
+                <svg class="w-3.5 h-3.5 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
+                Importer
+            </button>
+        </div>
+    </div>
+
+    <!-- Stats bar -->
+    <div class="flex items-center gap-6 mb-4 px-4 py-2.5 bg-white border border-gray-200 rounded-md text-xs text-gray-500 dark:bg-gray-900 dark:border-gray-800 dark:text-gray-400">
+        <span id="ds-stat-files">{{ stats["total_files"] }} fichier(s)</span>
+        <span id="ds-stat-size">{{ stats.get("file_bytes_human", stats["total_size_human"]) }} fichiers</span>
+        {% if stats.get("db_bytes", 0) > 0 %}
+        <span id="ds-stat-db" title="Données utilisateur stockées en base : anonymisation, conversations, dashboards, historique de recherche, etc.">
+            + {{ stats["db_bytes_human"] }} données
+        </span>
+        {% end %}
+        <span id="ds-stat-total" class="text-gray-700 dark:text-gray-300 font-medium">
+            {{ stats.get("total_used_human", stats["total_size_human"]) }} / {{ int(round(stats["quota_limit"] / (1024*1024))) }} Mo ({{ round(stats["quota_percent"], 1) }}%)
+        </span>
+        <span class="flex-1"></span>
+        <button id="ds-btn-selectall" class="hidden px-2 py-1 text-xs text-gray-700 border border-gray-200 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300">
+            <svg class="w-3 h-3 inline mr-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            <span id="ds-selectall-text">Tout sélectionner</span>
+        </button>
+        <span id="ds-selection-info" class="text-gray-900 font-medium hidden dark:text-gray-100">0 sélectionné(s)</span>
+        <button id="ds-btn-delete" class="hidden px-2 py-1 text-xs text-red-600 border border-red-200 rounded hover:bg-red-50 dark:border-red-800/60 dark:text-red-400 dark:hover:bg-red-900/20">Supprimer</button>
+        <button id="ds-btn-download" class="hidden px-2 py-1 text-xs text-gray-700 border border-gray-200 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300">Télécharger</button>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+        <!-- File browser -->
+        <div class="lg:col-span-2">
+
+            <!-- Breadcrumb -->
+            <div class="flex items-center gap-1 mb-3 text-sm">
+                <button id="ds-btn-home" class="text-gray-700 hover:text-gray-900 font-medium dark:text-gray-300 dark:hover:text-gray-100">
+                    <svg class="w-4 h-4 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h8.25"/></svg>
+                    Racine
+                </button>
+                <span id="ds-breadcrumb"></span>
+            </div>
+
+            <!-- Toolbar -->
+            <div class="flex items-center gap-2 mb-3">
+                <button id="ds-btn-back" class="hidden px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-600 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-400" title="Dossier parent">
+                    <svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18"/></svg>
+                    Retour
+                </button>
+                <button id="ds-btn-newfolder" class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-600 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-400">
+                    <svg class="w-3.5 h-3.5 inline mr-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 10.5v6m3-3H9m4.06-7.19l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z"/></svg>
+                    Nouveau dossier
+                </button>
+                <button id="ds-btn-newsql" class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-600 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-400" title="Créer un fichier .sql avec votre requête">
+                    <svg class="w-3.5 h-3.5 inline mr-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7c0-1.657 3.582-3 8-3s8 1.343 8 3-3.582 3-8 3-8-1.343-8-3z"/><path stroke-linecap="round" stroke-linejoin="round" d="M4 7v5c0 1.657 3.582 3 8 3 1.084 0 2.121-.082 3.072-.232M20 7v4"/><path stroke-linecap="round" stroke-linejoin="round" d="M18 14v6m3-3h-6"/></svg>
+                    Nouveau SQL
+                </button>
+                <input id="ds-search" type="text" placeholder="Filtrer..." class="ml-auto px-2.5 py-1 text-xs border border-gray-200 rounded-md w-40 focus:outline-none focus:ring-1 focus:ring-gray-300 dark:border-gray-800">
+            </div>
+
+            <!-- Drop zone / File list -->
+            <div id="ds-dropzone" class="drop-zone p-1 min-h-[300px]">
+                <div id="ds-file-list" class="space-y-0.5">
+                    <!-- populated by JS -->
+                </div>
+                <div id="ds-empty" class="hidden text-center py-16">
+                    <svg class="mx-auto w-16 h-16 text-gray-300 mb-4 dark:text-gray-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.25" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776"/></svg>
+                    <h3 class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200">Aucun fichier pour l'instant</h3>
+                    <p class="text-sm text-gray-500 mb-1 dark:text-gray-400 max-w-md mx-auto">Importez vos Excel ou CSV pour qu'Iris puisse les interroger en langage naturel.</p>
+                    <p class="text-xs text-gray-400 mb-4 dark:text-gray-500">Le Datastore est une zone de travail isolée ; vos fichiers restent locaux.</p>
+                    <div class="flex justify-center items-center gap-3 flex-wrap">
+                        <button type="button" id="ds-empty-btn-upload" class="btn btn-primary">
+                            <svg class="w-4 h-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
+                            Importer un fichier
+                        </button>
+                        <a href="/iris" class="text-sm text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Découvrir Iris →</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Preview panel -->
+        <div class="bg-white border border-gray-200 rounded-md preview-panel-container dark:bg-gray-900 dark:border-gray-800">
+            <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between flex-shrink-0 dark:border-gray-800">
+                <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Aper&ccedil;u</h2>
+                <span id="ds-preview-name" class="text-xs text-gray-400 truncate ml-2 dark:text-gray-500"></span>
+            </div>
+            <div id="ds-preview" class="preview-panel p-4 text-sm text-gray-500 flex items-center justify-center dark:text-gray-400">
+                <p class="text-xs text-gray-400 dark:text-gray-500">Sélectionnez un fichier</p>
+            </div>
+            <div id="ds-preview-actions" class="hidden border-t border-gray-100 p-3 flex gap-2 justify-center flex-shrink-0 dark:border-gray-800">
+                <button id="ds-btn-preview-download" class="px-4 py-1.5 text-xs border border-gray-200 rounded hover:bg-gray-50 w-28 dark:hover:bg-gray-800 dark:border-gray-800">Télécharger</button>
+                <button id="ds-btn-preview-edit-sql" class="hidden inline-flex items-center justify-center gap-1.5 px-4 py-1.5 text-xs border border-gray-200 rounded hover:bg-gray-50 w-28 dark:hover:bg-gray-800 dark:border-gray-800" title="Modifier la requête SQL puis la réexécuter" aria-label="Modifier la requête SQL">
+                    <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                    Modifier
+                </button>
+                <button id="ds-btn-preview-run-sql" class="hidden inline-flex items-center justify-center gap-1.5 px-4 py-1.5 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-700 w-28 dark:bg-emerald-700 dark:hover:bg-emerald-600" title="Exécuter la requête">
+                    <svg class="w-3 h-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                    Exécuter
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Upload Modal -->
+<div id="modal-upload" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0"></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg w-full max-w-md p-6 dark:bg-gray-900">
+        <h3 class="text-sm font-semibold text-gray-900 mb-4 dark:text-gray-100">Importer des fichiers</h3>
+        <div id="upload-dropzone" class="drop-zone p-8 text-center mb-4">
+            <svg class="mx-auto w-8 h-8 text-gray-300 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
+            <p class="text-sm text-gray-500 dark:text-gray-400">Glissez vos fichiers ici</p>
+            <p class="text-xs text-gray-400 mt-1 dark:text-gray-500">ou</p>
+            <label class="mt-2 inline-block px-3 py-1.5 text-xs bg-gray-900 text-white rounded cursor-pointer hover:bg-gray-800">
+                Parcourir
+                <input id="upload-input" type="file" multiple class="hidden">
+            </label>
+            <p class="text-[10px] text-gray-400 mt-3 dark:text-gray-500">CSV, Excel, JSON, XML, SQL, PDF, images — max 50 Mo</p>
+        </div>
+        <div id="upload-list" class="space-y-1 max-h-40 overflow-auto mb-4"></div>
+        <div class="flex justify-end gap-2">
+            <button id="btn-upload-cancel" class="px-3 py-1.5 text-xs border border-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800">Annuler</button>
+            <button id="btn-upload-confirm" disabled class="px-3 py-1.5 text-xs bg-gray-900 text-white rounded-md hover:bg-gray-800 disabled:opacity-40">Importer</button>
+        </div>
+    </div>
+</div>
+
+<!-- New Folder Modal -->
+<div id="modal-newfolder" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0"></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg w-full max-w-sm p-6 dark:bg-gray-900">
+        <h3 class="text-sm font-semibold text-gray-900 mb-4 dark:text-gray-100">Nouveau dossier</h3>
+        <input id="input-foldername" type="text" placeholder="Nom du dossier" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-gray-300 mb-4 dark:border-gray-800">
+        <div class="flex justify-end gap-2">
+            <button id="btn-newfolder-cancel" class="px-3 py-1.5 text-xs border border-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800">Annuler</button>
+            <button id="btn-newfolder-create" class="px-3 py-1.5 text-xs bg-gray-900 text-white rounded-md hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Créer</button>
+        </div>
+    </div>
+</div>
+
+<!-- New SQL File Modal -->
+<div id="modal-newsql" class="fixed inset-0 z-50 hidden" role="dialog" aria-modal="true" aria-labelledby="modal-newsql-title">
+    <div class="modal-backdrop absolute inset-0"></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg w-full max-w-2xl p-6 dark:bg-gray-900">
+        <h3 id="modal-newsql-title" class="text-sm font-semibold text-gray-900 mb-1 dark:text-gray-100">Nouveau fichier SQL</h3>
+        <p class="text-xs text-gray-500 mb-4 dark:text-gray-400">Saisissez votre requête. Elle sera enregistrée dans votre datastore et exécutable depuis l'aperçu.</p>
+        <label class="block text-[11px] font-medium text-gray-600 mb-1 dark:text-gray-400" for="input-sqlname">Nom du fichier</label>
+        <input id="input-sqlname" type="text" placeholder="query.sql" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-gray-300 mb-3 dark:border-gray-800 dark:bg-gray-800 dark:text-gray-100">
+        <label class="block text-[11px] font-medium text-gray-600 mb-1 dark:text-gray-400" for="input-sqlcontent">Requête SQL</label>
+        <textarea id="input-sqlcontent" rows="14" spellcheck="false" aria-describedby="sql-hint" placeholder="-- SELECT TOP 100 ... FROM ..." class="w-full px-3 py-2 text-xs border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-gray-300 font-mono leading-relaxed resize-y dark:border-gray-800 dark:bg-gray-800 dark:text-gray-100"></textarea>
+        <div class="flex justify-between items-center mt-2 mb-4">
+            <span id="sql-size-counter" class="text-[11px] text-gray-400 dark:text-gray-500">0 / 256 Ko</span>
+            <span id="sql-hint" class="text-[11px] text-gray-400 dark:text-gray-500">Astuce : Ctrl+Entrée pour créer · Tab pour indenter · Échap pour sortir du champ</span>
+        </div>
+        <div class="flex justify-end gap-2">
+            <button id="btn-newsql-cancel" class="px-3 py-1.5 text-xs border border-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800">Annuler</button>
+            <button id="btn-newsql-create" disabled class="px-3 py-1.5 text-xs bg-gray-900 text-white rounded-md hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Créer</button>
+        </div>
+    </div>
+</div>
+
+<!-- Rename Modal -->
+<div id="modal-rename" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0"></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg w-full max-w-sm p-6 dark:bg-gray-900">
+        <h3 class="text-sm font-semibold text-gray-900 mb-4 dark:text-gray-100">Renommer</h3>
+        <input id="input-rename" type="text" class="w-full px-3 py-2 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-gray-300 mb-4 dark:border-gray-800">
+        <div class="flex justify-end gap-2">
+            <button id="btn-rename-cancel" class="px-3 py-1.5 text-xs border border-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800">Annuler</button>
+            <button id="btn-rename-confirm" class="px-3 py-1.5 text-xs bg-gray-900 text-white rounded-md hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Renommer</button>
+        </div>
+    </div>
+</div>
+
+<!-- Workbook Viewer Modal -->
+<div id="modal-workbook" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0" data-wb-close></div>
+    <div class="wb-dialog absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg flex flex-col overflow-hidden dark:bg-gray-900">
+        <div class="wb-header px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <div class="flex items-center gap-2 min-w-0 flex-1">
+                <svg class="w-4 h-4 text-gray-500 flex-shrink-0 dark:text-gray-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                <h3 class="text-sm font-semibold text-gray-900 truncate dark:text-gray-100" id="workbook-viewer-name">Classeur</h3>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+                <button id="btn-workbook-download" class="hidden" title="Télécharger le fichier original" aria-hidden="true" tabindex="-1"></button>
+                <button id="btn-workbook-fullscreen" class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300" title="Plein écran" aria-label="Plein écran">
+                    <svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 8V4h4M16 4h4v4M4 16v4h4M16 20h4v-4"/></svg>
+                </button>
+                <button id="btn-workbook-close" class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300" title="Fermer (Echap)" aria-label="Fermer">
+                    <svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+        </div>
+        <div id="workbook-viewer-container" class="flex-1 flex flex-col"></div>
+    </div>
+</div>
+
+<!-- Modal: SQL result viewer (même pattern que modal-workbook) -->
+<div id="modal-sql-result" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0" data-sql-close></div>
+    <div class="wb-dialog absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg flex flex-col overflow-hidden dark:bg-gray-900">
+        <div class="wb-header px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <div class="flex items-center gap-2 min-w-0 flex-1">
+                <svg class="w-4 h-4 text-gray-500 flex-shrink-0 dark:text-gray-400" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                <h3 class="text-sm font-semibold text-gray-900 truncate dark:text-gray-100" id="sql-result-name">Résultat SQL</h3>
+                <span id="sql-result-stats" class="text-xs text-gray-500 truncate dark:text-gray-400"></span>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+                <button id="btn-sql-cancel" class="hidden px-2.5 py-1 text-xs border border-red-200 text-red-700 rounded-md hover:bg-red-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900/20" title="Annuler la requête en cours">
+                    Annuler
+                </button>
+                <button id="btn-sql-refresh" class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300" title="Ré-exécuter">
+                    <svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                </button>
+                <button id="btn-sql-save-as-workbook" class="hidden px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300" title="Enregistrer le résultat comme classeur dans le datastore" aria-label="Enregistrer comme classeur">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="inline mr-0.5 align-text-bottom" aria-hidden="true"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                    Enregistrer
+                </button>
+                <button id="btn-sql-result-close" class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-300" title="Fermer (Echap)" aria-label="Fermer" data-sql-close>
+                    <svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+        </div>
+        <div id="sql-result-container" class="flex-1 flex flex-col"></div>
+    </div>
+</div>
+
+<!-- Context menu -->
+<div id="ds-context-menu" role="menu" aria-label="Menu contextuel" class="ctx-menu fixed z-50 hidden bg-white border border-gray-200 rounded-md py-1 min-w-[140px] text-xs dark:bg-gray-900 dark:border-gray-800">
+    <button id="ctx-run-sql" role="menuitem" class="hidden w-full text-left px-3 py-1.5 hover:bg-emerald-50 text-emerald-700 dark:hover:bg-emerald-900/20 dark:text-emerald-300">Exécuter la requête</button>
+    <button id="ctx-download" role="menuitem" class="w-full text-left px-3 py-1.5 hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">Télécharger</button>
+    <button id="ctx-rename" role="menuitem" class="w-full text-left px-3 py-1.5 hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">Renommer</button>
+    <button id="ctx-move" role="menuitem" class="w-full text-left px-3 py-1.5 hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">Déplacer vers...</button>
+    <button id="ctx-copy" role="menuitem" class="w-full text-left px-3 py-1.5 hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">Copier le chemin</button>
+    <button id="ctx-analyze" role="menuitem" class="hidden w-full text-left px-3 py-1.5 hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">Analyser avec Iris</button>
+    <hr class="my-1 border-gray-100 dark:border-gray-800">
+    <button id="ctx-delete" role="menuitem" class="w-full text-left px-3 py-1.5 hover:bg-red-50 text-red-600 dark:text-red-400 dark:hover:bg-red-900/20">Supprimer</button>
+</div>
+
+<!-- Move Modal -->
+<div id="modal-move" class="fixed inset-0 z-50 hidden">
+    <div class="modal-backdrop absolute inset-0"></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-lg w-full max-w-md p-6 dark:bg-gray-900">
+        <h3 class="text-sm font-semibold text-gray-900 mb-4 dark:text-gray-100">Déplacer vers</h3>
+        <div class="mb-4">
+            <p class="text-xs text-gray-500 mb-2 dark:text-gray-400">Fichier: <span id="move-filename" class="font-medium text-gray-900 dark:text-gray-100"></span></p>
+            <label class="block text-xs text-gray-600 mb-1 dark:text-gray-400">Destination:</label>
+            <div id="move-folders" class="border border-gray-200 rounded-md p-2 max-h-60 overflow-auto text-sm dark:border-gray-800">
+                <!-- populated by JS -->
+            </div>
+        </div>
+        <div class="flex justify-end gap-2">
+            <button id="btn-move-cancel" class="px-3 py-1.5 text-xs border border-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-800">Annuler</button>
+            <button id="btn-move-confirm" class="px-3 py-1.5 text-xs bg-gray-900 text-white rounded-md hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200">Déplacer</button>
+        </div>
+    </div>
+</div>
+
+{% include "partials/external_sheets_modal.html" %}
+
+<script src="{{ static_url('js/components/external_sheets_picker.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# Tokenizer d'anonymisation — miroir Py↔JS partagé. Charger AVANT
+   iris-grid.js (qui y délègue tokenize/auto-pseudo via window.AnonTokenizer). #}
+<script src="{{ static_url('js/anonymization/tokenizer.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# Helpers de save anonymisation (validation client + format state_errors).
+   Source de vérité unique consommée par iris-grid.js ET privacy-page.js. #}
+<script src="{{ static_url('js/anonymization/save-helpers.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# Détail d'un terme anonymisé (coverage + audit). Chargé sur /datastore pour
+   que le modal "Confidentialité" d'iris-grid puisse ouvrir le panneau détail.
+   Le composant crée son DOM à la volée — pas de markup côté template. #}
+<script src="{{ static_url('js/privacy/term-detail-panel.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# Module "Améliorer l'anonymisation" (LLM local enrichit les pseudos via
+   POST /api/anonymization/improve-pseudo). Chargé AVANT iris-grid.js : son
+   bouton du modal Confidentialité y délègue. Modal HTML créé à la volée. #}
+<script src="{{ static_url('js/privacy/improve-pseudos.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script src="{{ static_url('js/iris-grid.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+const DS = {
+    currentPath: '',
+    items: [],
+    selected: new Set(),
+    pendingFiles: [],
+    previewPath: null,
+    ctxPath: null,
+
+    // ─── Workbook detection ─────────────────────────────
+    // Convention serveur (`_list_classeurs_sync`) : fichier .json dont le nom
+    // contient "classeur", ".afz" ou ".komptia". Couvre aussi les versions :
+    //   - classeur_2026-04-01.afz.json
+    //   - classeur_2026-04-02-14-07.afz_5_5_1_1.json  (versioned)
+    //   - foo.komptia.json
+    WORKBOOK_APP: 'komptia',
+
+    isWorkbookFile(item) {
+        if (!item || item.is_dir) return false;
+        const name = (item.name || '').toLowerCase();
+        if (!name.endsWith('.json')) return false;
+        return name.includes('classeur') || name.includes('.afz') || name.includes('.komptia');
+    },
+
+    isSqlFile(item) {
+        if (!item || item.is_dir) return false;
+        return (item.name || '').toLowerCase().endsWith('.sql');
+    },
+
+    _isWorkbookPayload(data) {
+        return !!(data && data.app === this.WORKBOOK_APP && Array.isArray(data.tabs));
+    },
+
+    _workbookDisplayName(path) {
+        const base = (path || '').split('/').pop();
+        return base
+            .replace(/\.json$/i, '')
+            .replace(/\.(afz|komptia)(?:_[\d_]+)?$/i, '');
+    },
+
+    // ─── Icons ──────────────────────────────────────────
+    icon(item) {
+        if (item.is_dir) return `<svg class="w-5 h-5 text-amber-400" fill="currentColor" viewBox="0 0 24 24"><path d="M2 6a2 2 0 012-2h5l2 2h9a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg>`;
+        const ext = item.extension;
+        const colors = {'.csv':'text-emerald-500','.xlsx':'text-emerald-600','.xls':'text-emerald-600','.json':'text-amber-500','.xml':'text-orange-500','.pdf':'text-red-500','.txt':'text-gray-400','.md':'text-gray-400','.png':'text-purple-500','.jpg':'text-purple-500','.jpeg':'text-purple-500','.svg':'text-purple-500'};
+        const c = colors[ext] || 'text-gray-400';
+        return `<svg class="w-5 h-5 ${c}" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>`;
+    },
+
+    // ─── Navigation ─────────────────────────────────────
+    async navigate(path) {
+        this.currentPath = path;
+        this.selected.clear();
+        this.updateSelectionUI();
+        await this.loadDir(path);
+        this.updateBackButton();
+    },
+
+    navigateUp() {
+        if (!this.currentPath) return;
+        const parts = this.currentPath.split('/').filter(Boolean);
+        parts.pop();
+        this.navigate(parts.join('/'));
+    },
+
+    updateBackButton() {
+        const btn = document.getElementById('ds-btn-back');
+        if (this.currentPath) {
+            btn.classList.remove('hidden');
+        } else {
+            btn.classList.add('hidden');
+        }
+    },
+
+    async loadDir(path) {
+        try {
+            const res = await fetch(`/api/datastore?path=${encodeURIComponent(path)}`);
+            const data = await res.json();
+            if (!data.success) return;
+            this.items = data.items || [];
+            this.renderList();
+            this.renderBreadcrumb(data.path || '');
+            if (data.stats) {
+                document.getElementById('ds-stat-files').textContent = data.stats.total_files + ' fichier(s)';
+                document.getElementById('ds-stat-size').textContent = data.stats.total_size_human;
+            }
+            // Si le fichier en preview n'existe plus dans la liste rechargée
+            // (ex : suppression / renommage / déplacement depuis un autre
+            // device), on nettoie le panneau preview pour eviter un faux
+            // signal "y a quelque chose à exécuter / télécharger". Sans
+            // cela, le bouton ▶ Exécuter pouvait rester visible apres la
+            // disparition du .sql sous-jacent et donner un 404 silencieux.
+            if (this.previewPath && !this.items.find(i => i.path === this.previewPath)) {
+                this._clearPreview();
+            }
+        } catch (e) { console.error('loadDir', e); }
+    },
+
+    _clearPreview() {
+        this.previewPath = null;
+        this._previewSqlContent = null;
+        const panel = document.getElementById('ds-preview');
+        const name = document.getElementById('ds-preview-name');
+        const actions = document.getElementById('ds-preview-actions');
+        const runSqlBtn = document.getElementById('ds-btn-preview-run-sql');
+        const editSqlBtn = document.getElementById('ds-btn-preview-edit-sql');
+        if (panel) panel.innerHTML = '<p class="text-xs text-gray-400 dark:text-gray-500">Sélectionnez un fichier</p>';
+        if (name) name.textContent = '';
+        if (actions) actions.classList.add('hidden');
+        if (runSqlBtn) runSqlBtn.classList.add('hidden');
+        if (editSqlBtn) editSqlBtn.classList.add('hidden');
+    },
+
+    renderBreadcrumb(path) {
+        const el = document.getElementById('ds-breadcrumb');
+        if (!path) { el.innerHTML = ''; return; }
+        const parts = path.split('/').filter(Boolean);
+        let html = '';
+        let acc = '';
+        parts.forEach((p, i) => {
+            acc += (i ? '/' : '') + p;
+            html += `<span class="breadcrumb-sep"></span><button class="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100" data-breadcrumb-path="${this.escAttr(acc)}">${this.esc(p)}</button>`;
+        });
+        el.innerHTML = html;
+        
+        // Add event listeners to breadcrumb buttons
+        el.querySelectorAll('[data-breadcrumb-path]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const path = btn.getAttribute('data-breadcrumb-path');
+                this.navigate(path);
+            });
+        });
+    },
+
+    renderList() {
+        const container = document.getElementById('ds-file-list');
+        const empty = document.getElementById('ds-empty');
+        const filter = (document.getElementById('ds-search')?.value || '').toLowerCase();
+        const filtered = filter ? this.items.filter(i => i.name.toLowerCase().includes(filter)) : this.items;
+
+        if (!filtered.length) {
+            container.innerHTML = '';
+            empty.classList.remove('hidden');
+            return;
+        }
+        empty.classList.add('hidden');
+
+        container.innerHTML = filtered.map(item => {
+            const sel = this.selected.has(item.path) ? 'selected' : '';
+            const isWb = !item.is_dir && this.isWorkbookFile(item);
+            const isSql = !item.is_dir && this.isSqlFile(item);
+            // Icône "œil" pour visualiser rapidement un classeur ou exécuter
+            // une requête SQL — même pattern UX pour les deux types visualisables.
+            let openBtn = '';
+            if (isWb) {
+                openBtn = `<button type="button" class="ds-open-wb-btn" data-open-workbook="${this.escAttr(item.path)}" title="Visualiser le classeur">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                   </button>`;
+            } else if (isSql) {
+                // Icône "play" (triangle plein) — distincte de l'œil (workbook)
+                // pour communiquer "exécuter" plutôt que "visualiser".
+                openBtn = `<button type="button" class="ds-open-wb-btn ds-run-sql-btn" data-run-sql="${this.escAttr(item.path)}" title="Exécuter la requête et voir le résultat" aria-label="Exécuter la requête">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                   </button>`;
+            }
+            return `
+            <div class="file-card flex items-center gap-3 px-3 py-2 rounded-md border border-transparent ${sel}"
+                 data-path="${this.escAttr(item.path)}"
+                 data-is-dir="${item.is_dir}"
+                 draggable="true">
+                <input type="checkbox" class="w-3.5 h-3.5 rounded border-gray-300 text-gray-900 focus:ring-gray-400 dark:border-gray-700 dark:text-gray-100"
+                       ${sel ? 'checked' : ''} data-checkbox-path="${this.escAttr(item.path)}">
+                ${this.icon(item)}
+                <div class="flex-1 min-w-0">
+                    <p class="text-sm text-gray-900 truncate dark:text-gray-100">${this.esc(item.name)}</p>
+                    ${!item.is_dir ? `<p class="text-[10px] text-gray-400 dark:text-gray-500">${this.esc(item.size_human)} &middot; ${this.esc(item.modified_human)}</p>` : ''}
+                </div>
+                ${openBtn}
+                ${item.extension ? `<span class="text-[10px] px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded dark:bg-gray-800 dark:text-gray-400">${this.esc(item.extension)}</span>` : ''}
+            </div>`;
+        }).join('');
+        
+        // Attach event listeners to each file card
+        container.querySelectorAll('.file-card').forEach(card => {
+            const path = card.getAttribute('data-path');
+            const isDir = card.getAttribute('data-is-dir') === 'true';
+            
+            // Checkbox
+            const checkbox = card.querySelector('[data-checkbox-path]');
+            if (checkbox) {
+                checkbox.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.toggleSelect(path);
+                });
+            }
+
+            // Open workbook button (eye icon)
+            const openBtn = card.querySelector('[data-open-workbook]');
+            if (openBtn) {
+                openBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    this.openWorkbook(path);
+                });
+            }
+
+            // Run SQL button (eye icon) — exécute la requête et affiche le
+            // résultat dans un modal dédié (même pattern UX que les classeurs).
+            // Le preview à droite reste inchangé (code SQL du fichier).
+            const runSqlBtn = card.querySelector('[data-run-sql]');
+            if (runSqlBtn) {
+                runSqlBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    this.executeSqlFile(path);
+                });
+            }
+
+            // Click
+            card.addEventListener('click', (e) => {
+                if (e.target.type === 'checkbox') return;
+                if (e.target.closest && e.target.closest('[data-open-workbook]')) return;
+                if (e.target.closest && e.target.closest('[data-run-sql]')) return;
+                this.clickItem(e, path);
+            });
+            
+            // Double click
+            card.addEventListener('dblclick', () => {
+                this.dblClickItem(path, isDir);
+            });
+            
+            // Context menu
+            card.addEventListener('contextmenu', (e) => {
+                this.contextMenu(e, path);
+            });
+            
+            // Drag and drop
+            card.addEventListener('dragstart', (e) => {
+                this.dragStart(e, path, isDir);
+            });
+            
+            card.addEventListener('dragend', (e) => {
+                this.dragEnd(e);
+            });
+            
+            card.addEventListener('dragover', (e) => {
+                this.dragOver(e, path, isDir);
+            });
+            
+            card.addEventListener('dragleave', (e) => {
+                this.dragLeave(e);
+            });
+            
+            card.addEventListener('drop', (e) => {
+                this.dropOnFolder(e, path, isDir);
+            });
+        });
+    },
+
+    filter(val) { this.renderList(); },
+
+    // ─── Selection ──────────────────────────────────────
+    clickItem(event, path) {
+        if (event.target.type === 'checkbox') return;
+        const item = this.items.find(i => i.path === path);
+        if (!item) return;
+        // Simple click: select only this, preview if file
+        if (!event.ctrlKey && !event.metaKey) {
+            this.selected.clear();
+            this.selected.add(path);
+        } else {
+            this.selected.has(path) ? this.selected.delete(path) : this.selected.add(path);
+        }
+        this.updateSelectionUI();
+        this.renderList();
+        if (item && !item.is_dir) this.loadPreview(path);
+    },
+
+    dblClickItem(path, isDir) {
+        if (isDir) { this.navigate(path); return; }
+        const item = this.items.find(i => i.path === path);
+        if (!item) return;
+        if (this.isSqlFile(item)) { this.executeSqlFile(path); return; }
+        if (this.isWorkbookFile(item)) { this.openWorkbook(path); }
+    },
+
+    toggleSelect(path) {
+        this.selected.has(path) ? this.selected.delete(path) : this.selected.add(path);
+        this.updateSelectionUI();
+        this.renderList();
+    },
+
+    updateSelectionUI() {
+        const n = this.selected.size;
+        const info = document.getElementById('ds-selection-info');
+        const del = document.getElementById('ds-btn-delete');
+        const dl = document.getElementById('ds-btn-download');
+        const selAll = document.getElementById('ds-btn-selectall');
+        const selAllText = document.getElementById('ds-selectall-text');
+        
+        // Afficher le bouton "Tout sélectionner" s'il y a des items
+        if (this.items.length > 0) {
+            selAll.classList.remove('hidden');
+            // Changer le texte selon l'état
+            if (n === this.items.length) {
+                selAllText.textContent = 'Tout désélectionner';
+            } else {
+                selAllText.textContent = 'Tout sélectionner';
+            }
+        } else {
+            selAll.classList.add('hidden');
+        }
+        
+        if (n) {
+            info.textContent = n + ' sélectionné(s)';
+            info.classList.remove('hidden');
+            del.classList.remove('hidden');
+            dl.classList.remove('hidden');
+        } else {
+            info.classList.add('hidden');
+            del.classList.add('hidden');
+            dl.classList.add('hidden');
+        }
+    },
+
+    toggleSelectAll() {
+        if (this.selected.size === this.items.length) {
+            // Tout désélectionner
+            this.selected.clear();
+        } else {
+            // Tout sélectionner
+            this.selected.clear();
+            this.items.forEach(item => this.selected.add(item.path));
+        }
+        this.renderList();
+        this.updateSelectionUI();
+    },
+
+    // ─── Preview ────────────────────────────────────────
+    async loadPreview(path) {
+        this.previewPath = path;
+        const panel = document.getElementById('ds-preview');
+        const name = document.getElementById('ds-preview-name');
+        const actions = document.getElementById('ds-preview-actions');
+        const runSqlBtn = document.getElementById('ds-btn-preview-run-sql');
+        const editSqlBtn = document.getElementById('ds-btn-preview-edit-sql');
+        panel.innerHTML = '<p class="text-xs text-gray-400 animate-pulse dark:text-gray-500">Chargement…</p>';
+        name.textContent = '';
+        actions.classList.add('hidden');
+        // Reset visibilité des boutons SQL — réactivés seulement si le preview
+        // répond avec ``type === 'sql'``. Évite un état persistant entre deux
+        // fichiers (sinon, sélectionner un .sql puis un .csv afficherait les
+        // boutons sur le .csv).
+        if (runSqlBtn) runSqlBtn.classList.add('hidden');
+        if (editSqlBtn) editSqlBtn.classList.add('hidden');
+
+        try {
+            const res = await fetch(`/api/datastore/preview?path=${encodeURIComponent(path)}`);
+            const data = await res.json();
+            if (!data.success) { panel.innerHTML = `<p class="text-xs text-red-400">${this.esc(data.error)}</p>`; return; }
+
+            name.textContent = data.file.name;
+            actions.classList.remove('hidden');
+            const p = data.preview;
+
+            if (p.type === 'csv') {
+                let html = '<div class="overflow-auto max-h-80"><table class="csv-table w-full text-left"><thead><tr>';
+                (p.headers || []).forEach(h => html += `<th class="px-2 py-1 border-b border-gray-200 text-gray-500 font-medium dark:border-gray-800 dark:text-gray-400">${this.esc(h)}</th>`);
+                html += '</tr></thead><tbody>';
+                (p.rows || []).forEach(row => {
+                    html += '<tr class="border-b border-gray-50">';
+                    row.forEach(c => html += `<td class="px-2 py-1 text-gray-700 dark:text-gray-300">${this.esc(c)}</td>`);
+                    html += '</tr>';
+                });
+                html += `</tbody></table></div><p class="text-[10px] text-gray-400 mt-2 dark:text-gray-500">${p.total_lines} lignes au total</p>`;
+                panel.innerHTML = html;
+            } else if (p.type === 'json' || p.type === 'text') {
+                panel.innerHTML = `<pre class="text-xs text-gray-700 whitespace-pre-wrap break-words max-h-80 overflow-auto font-mono dark:text-gray-300">${this.esc(p.content)}</pre>`;
+            } else if (p.type === 'sql') {
+                // Preview = contenu brut du fichier .sql uniquement. Le
+                // résultat d'exécution s'affiche dans un modal dédié
+                // (même pattern que les classeurs) déclenché par le
+                // bouton "Exécuter" du panneau d'actions, le bouton play
+                // sur la card, le double-clic ou le menu contextuel.
+                panel.innerHTML = `<pre class="text-xs text-gray-700 whitespace-pre-wrap break-words max-h-96 overflow-auto font-mono bg-gray-50 p-2 rounded border border-gray-200 dark:bg-gray-900 dark:border-gray-800 dark:text-gray-300">${this.esc(p.content)}</pre>`;
+                if (runSqlBtn) runSqlBtn.classList.remove('hidden');
+                if (editSqlBtn) editSqlBtn.classList.remove('hidden');
+                // Mémorise le contenu brut pour pouvoir le passer à l'éditeur
+                // sans le re-fetcher (le preview vient de le faire). ``p.content``
+                // est la SQL brute du fichier (utf-8-sig strip côté backend).
+                this._previewSqlContent = p.content || '';
+            } else if (p.type === 'image') {
+                panel.innerHTML = `<img src="${this.escAttr(p.content)}" class="max-w-full max-h-72 rounded">`;
+            } else if (p.type === 'info') {
+                panel.innerHTML = `<p class="text-xs text-gray-500 dark:text-gray-400">${this.esc(p.content)}</p>`;
+            } else if (p.type === 'error') {
+                panel.innerHTML = `<p class="text-xs text-red-500 dark:text-red-400">${this.esc(p.content)}</p>`;
+            } else {
+                panel.innerHTML = `<p class="text-xs text-gray-400 dark:text-gray-500">Aperçu non disponible pour ce type de fichier</p>`;
+            }
+        } catch (e) {
+            panel.innerHTML = `<p class="text-xs text-red-400">Erreur de chargement</p>`;
+        }
+    },
+
+    esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; },
+    escAttr(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); },
+
+    // ─── Exécution d'un fichier .sql stocké ────────────────────────
+    // Ouvre un modal dédié (#modal-sql-result) pour afficher le résultat —
+    // même pattern UX que le modal workbook. Le preview reste inchangé :
+    // il continue à afficher uniquement le code SQL du fichier.
+    _sqlResultOpenPath: null,
+    _sqlResultRequestToken: 0,
+    _sqlAbortController: null,
+    // Donnée prête à être sérialisée en .afz.json (alimentée par
+    // executeSqlFile() en cas de succès non-vide, remise à null sinon).
+    _currentSqlData: null,
+
+    _toggleSqlCancel(show) {
+        const btn = document.getElementById('btn-sql-cancel');
+        if (btn) btn.classList.toggle('hidden', !show);
+    },
+
+    _toggleSqlSaveAsWorkbook(show) {
+        const btn = document.getElementById('btn-sql-save-as-workbook');
+        if (btn) btn.classList.toggle('hidden', !show);
+    },
+
+    cancelSqlExec() {
+        if (this._sqlAbortController) {
+            try { this._sqlAbortController.abort(); } catch (e) {}
+        }
+        this._toggleSqlCancel(false);
+    },
+
+    async executeSqlFile(path) {
+        // Token pour ignorer les résultats de requêtes obsolètes quand
+        // l'utilisateur clique rapidement sur plusieurs .sql différents.
+        const token = ++this._sqlResultRequestToken;
+        this._sqlResultOpenPath = path;
+        // Reset du payload "save-as-workbook" dès le début pour éviter
+        // qu'un résultat précédent ne soit sauvé par erreur si le user
+        // clique Enregistrer avant le rendu du nouveau résultat.
+        this._currentSqlData = null;
+        this._toggleSqlSaveAsWorkbook(false);
+
+        // Abort éventuel d'une requête en vol (le user a cliqué sur un
+        // autre .sql avant que la précédente ne réponde).
+        if (this._sqlAbortController) {
+            try { this._sqlAbortController.abort(); } catch (e) {}
+        }
+        const controller = new AbortController();
+        this._sqlAbortController = controller;
+
+        const modal = document.getElementById('modal-sql-result');
+        const nameEl = document.getElementById('sql-result-name');
+        const statsEl = document.getElementById('sql-result-stats');
+        const containerEl = document.getElementById('sql-result-container');
+        if (!modal || !containerEl) return;
+
+        const displayName = (path || '').split('/').pop() || 'Résultat SQL';
+        nameEl.textContent = displayName;
+        statsEl.textContent = 'Exécution en cours…';
+        containerEl.innerHTML = '<p class="text-xs text-gray-400 animate-pulse p-4 dark:text-gray-500">Chargement du résultat…</p>';
+        modal.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+        this._toggleSqlCancel(true);
+
+        try {
+            const res = await fetch('/api/datastore/sql/execute', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-XSRFToken': getCookie('_xsrf'),
+                },
+                body: JSON.stringify({ path }),
+                signal: controller.signal,
+            });
+            if (token !== this._sqlResultRequestToken) return; // stale
+            const data = await res.json();
+            if (token !== this._sqlResultRequestToken) return;
+
+            if (!data.success) {
+                statsEl.textContent = '';
+                // Rendu sécurisé du bloc d'erreur + bouton "Modifier la requête" :
+                // - createElement + textContent (pas d'innerHTML risqué pour
+                //   ``data.error``/``data.sql`` qui peuvent contenir des chevrons).
+                // - addEventListener (CSP : pas d'onclick inline avec les nonces).
+                containerEl.innerHTML = '';
+                const wrap = document.createElement('div');
+                wrap.className = 'p-4 text-sm text-red-600 bg-red-50 border border-red-200 rounded dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-400 flex flex-col gap-3 items-start';
+
+                const msg = document.createElement('p');
+                msg.className = 'm-0';
+                msg.textContent = data.error || 'Erreur lors de l\'exécution.';
+                wrap.appendChild(msg);
+
+                const editBtn = document.createElement('button');
+                editBtn.type = 'button';
+                editBtn.className = 'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-red-300 bg-white text-red-700 rounded hover:bg-red-50 dark:bg-red-950 dark:text-red-200 dark:border-red-800 dark:hover:bg-red-900';
+                editBtn.setAttribute('aria-label', 'Modifier la requête SQL puis la réexécuter');
+                editBtn.innerHTML =
+                    '<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                    + 'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+                    + '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>'
+                    + '<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>'
+                    + '<span>Modifier la requête</span>';
+                // Pré-remplit l'éditeur avec le SQL qui vient d'échouer (data.sql)
+                // — le user n'a pas à recharger depuis disque.
+                const failingSql = typeof data.sql === 'string' ? data.sql : '';
+                editBtn.addEventListener('click', () => this.openSqlEditor(path, failingSql));
+                wrap.appendChild(editBtn);
+
+                containerEl.appendChild(wrap);
+                return;
+            }
+
+            // Délègue le rendu à ``_renderSqlResult`` — single source of truth
+            // pour : modal open, name/stats, grid construction, ``_currentSqlData``,
+            // save-as-workbook toggle, token bump. Évite la divergence avec le
+            // flux édition (``openSqlEditor``) qui passe par le même chemin.
+            // ⚠ ``_renderSqlResult`` bump le token : ce bump invalide notre propre
+            // ``token`` local, donc ne JAMAIS le relire après cet appel. Le check
+            // ``token !== this._sqlResultRequestToken`` plus haut a déjà filtré
+            // les réponses obsolètes — à ce point on est la dernière réponse en
+            // vie, OK pour publier le rendu.
+            this._renderSqlResult({
+                sql: data.sql || '',
+                columns: data.columns || [],
+                rows: data.rows || [],
+                row_count: data.row_count || 0,
+                execution_time_ms: data.execution_time_ms || 0,
+                truncated: !!data.truncated,
+                max_rows: data.max_rows || null,
+                savedFilename: path, // disque → comme une sauvegarde existante
+            }, path);
+        } catch (e) {
+            if (token !== this._sqlResultRequestToken) return;
+            statsEl.textContent = '';
+            // Distinguer annulation utilisateur de l'erreur réseau réelle.
+            if (e && e.name === 'AbortError') {
+                containerEl.innerHTML = '<div class="p-4 text-sm text-gray-500 dark:text-gray-400">Requête annulée.</div>';
+            } else {
+                containerEl.innerHTML = '<div class="p-4 text-sm text-red-600 dark:text-red-400">Erreur réseau.</div>';
+            }
+        } finally {
+            if (this._sqlAbortController === controller) {
+                this._sqlAbortController = null;
+            }
+            this._toggleSqlCancel(false);
+        }
+    },
+
+    closeSqlResultModal() {
+        const modal = document.getElementById('modal-sql-result');
+        if (modal && window.OverlayManager) window.OverlayManager.close(modal);
+        if (modal) modal.classList.add('hidden');
+        this._sqlResultOpenPath = null;
+        // Incrémenter le token pour invalider toute requête en vol
+        this._sqlResultRequestToken++;
+        const c = document.getElementById('sql-result-container');
+        if (c) c.innerHTML = '';
+        // Reset save-as-workbook state.
+        this._currentSqlData = null;
+        this._toggleSqlSaveAsWorkbook(false);
+    },
+
+    // ─── Ouverture de l'éditeur SQL (preview "Modifier" + bouton sur erreur)
+    //
+    // Trois cas d'usage :
+    //   1) Depuis la preview panel "Modifier" → ``path`` connu, sql=preview ou re-fetch.
+    //   2) Depuis l'alerte d'erreur d'exécution → ``path`` connu, sql = data.sql
+    //      retourné par l'API (la requête qui vient d'échouer).
+    //   3) Depuis le menu contextuel (futur) → ``path`` connu.
+    //
+    // Le modal `openSqlEditorModal` gère lui-même Exécuter (transient) et
+    // Enregistrer-et-exécuter (overwrite). En cas de succès, on rend le
+    // résultat dans le modal `#modal-sql-result` standard (même path que
+    // ``executeSqlFile``) pour rester cohérent avec le reste de l'UX.
+    async openSqlEditor(path, prefilledSql) {
+        if (typeof window.openSqlEditorModal !== 'function') {
+            if (typeof window.showToast === 'function') {
+                window.showToast('error', 'Éditeur SQL indisponible.');
+            }
+            return;
+        }
+        let sql = prefilledSql != null ? String(prefilledSql) : '';
+        // Si on n'a pas le SQL pré-rempli, on tente d'utiliser le contenu déjà
+        // chargé par le preview (cas habituel : user clique sur "Modifier"
+        // depuis le panneau preview). En dernier recours, fetch preview.
+        if (!sql && path && this.previewPath === path && this._previewSqlContent) {
+            sql = String(this._previewSqlContent);
+        }
+        if (!sql && path) {
+            try {
+                const res = await fetch(`/api/datastore/preview?path=${encodeURIComponent(path)}`);
+                const data = await res.json();
+                if (data && data.success && data.preview && data.preview.type === 'sql') {
+                    sql = String(data.preview.content || '');
+                }
+            } catch (e) { /* on tombera sur le garde-fou modal "SQL vide" */ }
+        }
+
+        window.openSqlEditorModal({
+            sql: sql,
+            filename: path || null,
+            allowSave: !!path,
+            onSuccess: (payload) => {
+                // Rend le résultat dans le modal-sql-result standard, comme
+                // ``executeSqlFile`` le ferait. On garde le path de référence
+                // pour autoriser "Save as workbook".
+                this._renderSqlResult(payload, path);
+                // Si on a save+run, le fichier a peut-être changé sur disque
+                // → on rafraîchit le preview pour refléter la nouvelle taille
+                // et mtime (sauf si l'user a navigué entre-temps).
+                if (payload.savedFilename && this.previewPath === path) {
+                    this.loadPreview(path).catch(() => { /* preview best-effort */ });
+                }
+            },
+        });
+    },
+
+    // Rend un résultat SQL (déjà exécuté) dans #modal-sql-result. Factorisé
+    // pour être appelé soit depuis executeSqlFile (flux normal), soit depuis
+    // openSqlEditor (édition inline). Évite la duplication du rendering.
+    _renderSqlResult(payload, sourcePath) {
+        const modal = document.getElementById('modal-sql-result');
+        const nameEl = document.getElementById('sql-result-name');
+        const statsEl = document.getElementById('sql-result-stats');
+        const containerEl = document.getElementById('sql-result-container');
+        if (!modal || !containerEl) return;
+
+        // Reset de l'état AVANT toute branche (rowCount===0, SqlResultGrid manquant,
+        // succès). Sinon : (1) sur branche dégradée, le payload .afz.json d'un run
+        // précédent reste actif → "Enregistrer comme classeur" exporterait des données
+        // stales. (2) Une fetch executeSqlFile en vol pourrait revenir et écraser le
+        // résultat fraîchement rendu — bump du token + abort de tout controller pendant
+        // pour invalider explicitement (cf. ``_sqlResultRequestToken`` guard).
+        this._currentSqlData = null;
+        this._toggleSqlSaveAsWorkbook(false);
+        this._sqlResultRequestToken++;
+        if (this._sqlAbortController) {
+            try { this._sqlAbortController.abort(); } catch (e) { /* idempotent */ }
+            this._sqlAbortController = null;
+        }
+
+        const displayName = (sourcePath || 'Résultat SQL').split('/').pop() || 'Résultat SQL';
+        nameEl.textContent = payload.savedFilename
+            ? displayName
+            : (sourcePath ? `${displayName} (modifiée)` : 'Requête modifiée');
+
+        const rowCount = payload.row_count || (payload.rows ? payload.rows.length : 0);
+        const timeMs = Math.round(payload.execution_time_ms || 0);
+        let info = `${rowCount} ligne${rowCount > 1 ? 's' : ''} · ${timeMs} ms`;
+        if (payload.truncated && payload.max_rows) info += ` (limité à ${payload.max_rows})`;
+        if (!payload.savedFilename && sourcePath) info += ' · modifiée non enregistrée';
+        statsEl.textContent = info;
+
+        if (modal.classList.contains('hidden')) {
+            modal.classList.remove('hidden');
+            if (window.OverlayManager) {
+                window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+            }
+        }
+
+        if (rowCount === 0) {
+            containerEl.innerHTML = '<p class="text-sm text-gray-500 italic p-4 dark:text-gray-400">Aucune ligne retournée.</p>';
+            return;
+        }
+        if (typeof SqlResultGrid !== 'function') {
+            containerEl.innerHTML = '<p class="text-sm text-red-500 p-4 dark:text-red-400">Grille indisponible (iris-grid.js non chargé).</p>';
+            return;
+        }
+
+        containerEl.innerHTML = '';
+        new SqlResultGrid(
+            containerEl,
+            payload.columns || [],
+            payload.rows || [],
+            payload.sql || '',
+            rowCount
+        );
+        // Active "Enregistrer comme classeur" (.afz.json) sur la version
+        // exécutée, qu'elle vienne du disque ou d'une édition transient.
+        this._currentSqlData = {
+            columns: payload.columns || [],
+            rows: payload.rows || [],
+            sql: payload.sql || '',
+            rowCount,
+            sourceFile: payload.savedFilename || sourcePath || null,
+            truncated: !!payload.truncated,
+            maxRows: payload.max_rows || null,
+            executionTimeMs: payload.execution_time_ms || 0,
+        };
+        this._sqlResultOpenPath = payload.savedFilename || sourcePath || null;
+        this._toggleSqlSaveAsWorkbook(true);
+    },
+
+    // ─── Enregistrer un résultat SQL comme classeur (.afz.json) ────
+    // Délègue à la feature SaveAs canonique de ``GridTabManager`` :
+    // - même modale (dark-mode-safe, focus, Enter/Escape, ARIA)
+    // - même sanitization de nom (anti path traversal, cap 200 chars)
+    // - même endpoint ``/api/datastore/upload`` (gzip transparent + atomic
+    //   write + auto-rename si conflit + register_upload + If-Match 412 +
+    //   quota 507 + reset autosave)
+    // Single source of truth = ``GridTabManager.saveWorkbookAs``. Avantage :
+    // toute évolution future du flow de sauvegarde (versioning,
+    // compression, signature) se propage automatiquement ici.
+    _compactDateStamp(d) {
+        const dd = d || new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${dd.getFullYear()}${pad(dd.getMonth() + 1)}${pad(dd.getDate())}_${pad(dd.getHours())}${pad(dd.getMinutes())}`;
+    },
+
+    _defaultWorkbookFilename(sourceFile) {
+        const baseRaw = (sourceFile || '').split('/').pop() || 'resultat_sql';
+        // Strip .sql et .afz.json puis nettoyer les points résiduels en fin
+        // pour éviter les noms du type "myquery._20260522_1430.afz.json".
+        const stripped = baseRaw.replace(/\.sql$/i, '').replace(/\.afz\.json$/i, '').replace(/\.+$/, '');
+        const base = stripped || 'resultat_sql';
+        return `${base}_${this._compactDateStamp()}.afz.json`;
+    },
+
+    // GridTabManager éphémère monté hors écran, réutilisé entre clics pour
+    // éviter de re-instancier (le GTM s'abonne à OverlayManager, listeners
+    // clavier globaux, etc. — création répétée = leak léger). On rappelle
+    // ``loadWorkbook`` à chaque clic pour rafraîchir les données.
+    _getSqlSaverTabMgr() {
+        if (this._sqlSaverTabMgr) return this._sqlSaverTabMgr;
+        if (!window.GridTabManager) return null;
+        const host = document.createElement('div');
+        // Hors-flow, invisible, mais le GTM a besoin d'un parent DOM réel
+        // (mount, mesures de layout pour la grille interne) — on ne peut
+        // pas le mettre en ``display:none`` (les mesures retournent 0).
+        host.style.cssText = 'position:absolute;left:-99999px;top:-99999px;width:1px;height:1px;overflow:hidden;pointer-events:none;';
+        host.setAttribute('aria-hidden', 'true');
+        host.setAttribute('data-purpose', 'sql-save-workbook-host');
+        document.body.appendChild(host);
+        this._sqlSaverHost = host;
+        const tabMgr = new window.GridTabManager(host);
+        // Toast canonique → toast applicatif (cohérence visuelle avec le
+        // reste de /datastore qui n'a pas la même barre de notification
+        // que la grille Iris standalone).
+        const self = this;
+        const origToast = (typeof tabMgr._showSaveToast === 'function')
+            ? tabMgr._showSaveToast.bind(tabMgr)
+            : null;
+        tabMgr._showSaveToast = function(msg, isError) {
+            try { if (origToast) origToast(msg, isError); } catch (e) { /* noop */ }
+            try { self.showToast(msg, isError ? 'error' : 'success'); } catch (e) { /* noop */ }
+        };
+        this._sqlSaverTabMgr = tabMgr;
+        return tabMgr;
+    },
+
+    saveSqlResultAsWorkbook() {
+        const data = this._currentSqlData;
+        if (!data || !Array.isArray(data.rows) || data.rows.length === 0) {
+            this.showToast('Aucun résultat à enregistrer.', 'error');
+            return;
+        }
+        // Garde-fou : si le résultat est tronqué mais le serveur n'a pas
+        // envoyé row_count, on refuse la sauvegarde (cf. fallback rows.length
+        // qui mentirait silencieusement sur la complétude des données).
+        if (data.truncated && typeof data.rowCount !== 'number') {
+            this.showToast('Métadonnées de résultat manquantes — impossible d\'enregistrer fidèlement.', 'error');
+            return;
+        }
+
+        const tabMgr = this._getSqlSaverTabMgr();
+        if (!tabMgr) {
+            this.showToast('Composant de sauvegarde indisponible (iris-grid.js non chargé).', 'error');
+            return;
+        }
+
+        // Snapshot du workbook au format attendu par ``loadWorkbook`` /
+        // ``GridTabManager.serialize`` (cf. ``classeur/reader.py`` v1).
+        // ``loadWorkbook`` valide ``app === 'komptia'`` et ``Array.isArray
+        // (tabs)`` — le reste est tolérant.
+        const tabLabel = (data.sourceFile || 'Résultat SQL').split('/').pop() || 'Résultat SQL';
+        const workbookData = {
+            version: 1,
+            app: 'komptia',
+            created_at: new Date().toISOString(),
+            active_tab: 0,
+            tabs: [
+                {
+                    label: tabLabel.replace(/\.sql$/i, '') || 'Résultat SQL',
+                    columns: data.columns || [],
+                    rows: data.rows || [],
+                    sql: data.sql || '',
+                    totalRowCount: typeof data.rowCount === 'number'
+                        ? data.rowCount
+                        : (data.rows ? data.rows.length : 0),
+                    truncated: !!data.truncated,
+                    cellDetails: {},
+                },
+            ],
+            generated_by: 'datastore_sql_save_as_workbook',
+            source_sql_file: data.sourceFile || null,
+        };
+
+        // Pré-remplit le default name (la modale canonique lit ``_currentFilePath``
+        // pour son default). On overwrite à CHAQUE clic — donc même si un save
+        // précédent a laissé l'instance partagée avec un path, le nouvel appel
+        // remet un nom dérivé du source SQL courant. Hash reset car nouveau fichier.
+        tabMgr._currentFilePath = this._defaultWorkbookFilename(data.sourceFile);
+        tabMgr._currentFileHash = null;
+        if (!tabMgr.loadWorkbook(workbookData)) {
+            this.showToast('Impossible d\'initialiser la sauvegarde (workbook invalide).', 'error');
+            return;
+        }
+        // ``loadWorkbook`` marque ``_dirty=true`` côté GTM (nouvelles données
+        // chargées). On reset pour éviter le prompt « modifications non
+        // sauvegardées » qui n'a aucun sens pour un export ponctuel.
+        tabMgr._dirty = false;
+
+        // Ouvre la modale canonique (cf. ``static/js/iris-grid.js::
+        // _openSaveAsModal`` — celle dont on a fixé le dark-mode plus tôt).
+        // L'appui sur Enregistrer y déclenche ``_saveToPath`` →
+        // ``_saveToPathAsync`` → POST ``/api/datastore/upload`` (single-flight
+        // garanti, 412/507 gérés, auto-rename serveur, toast via le hook).
+        tabMgr.saveWorkbookAs();
+    },
+
+    // ─── Upload ─────────────────────────────────────────
+    showUploadModal() {
+        this.pendingFiles = [];
+        document.getElementById('upload-list').innerHTML = '';
+        document.getElementById('btn-upload-confirm').disabled = true;
+        const m = document.getElementById('modal-upload');
+        m.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(m, { layer: 'modal', lockScroll: true });
+    },
+
+    handleFileSelect(fileList) {
+        this.pendingFiles = [...fileList];
+        this.renderUploadList();
+    },
+
+    handleUploadDrop(event) {
+        event.preventDefault();
+        event.currentTarget.classList.remove('drag-over');
+        this.pendingFiles = [...(event.dataTransfer.files || [])];
+        this.renderUploadList();
+    },
+
+    handleDrop(event) {
+        event.preventDefault();
+        event.currentTarget.classList.remove('drag-over');
+        this.pendingFiles = [...(event.dataTransfer.files || [])];
+        this.uploadFiles();
+    },
+
+    renderUploadList() {
+        const el = document.getElementById('upload-list');
+        el.innerHTML = this.pendingFiles.map(f =>
+            `<div class="flex items-center gap-2 text-xs text-gray-700 py-1 px-2 bg-gray-50 rounded dark:bg-gray-900 dark:text-gray-300">
+                <span class="truncate flex-1">${this.esc(f.name)}</span>
+                <span class="text-gray-400 dark:text-gray-500">${this.humanSize(f.size)}</span>
+            </div>`
+        ).join('');
+        document.getElementById('btn-upload-confirm').disabled = !this.pendingFiles.length;
+    },
+
+    async uploadFiles() {
+        if (!this.pendingFiles.length) return;
+        const form = new FormData();
+        this.pendingFiles.forEach(f => form.append('files', f));
+        form.append('path', this.currentPath);
+
+        try {
+            form.append('_xsrf', getCookie('_xsrf'));
+            const res = await fetch('/api/datastore/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (data.errors?.length) {
+                this.showToast('Erreurs : ' + data.errors.slice(0, 3).join(', '), 'error');
+            } else if (data.success) {
+                this.showToast('Fichier(s) importé(s)', 'success');
+            }
+        } catch (e) { this.showToast('Erreur lors de l\'import', 'error'); }
+
+        this.hideModals();
+        this.pendingFiles = [];
+        await this.refresh();
+    },
+
+    // ─── New folder ─────────────────────────────────────
+    showNewFolderModal() {
+        document.getElementById('input-foldername').value = '';
+        const m = document.getElementById('modal-newfolder');
+        m.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(m, { layer: 'modal', lockScroll: true });
+        setTimeout(() => document.getElementById('input-foldername').focus(), 100);
+    },
+
+    async createFolder() {
+        const name = document.getElementById('input-foldername').value.trim();
+        if (!name) return;
+        try {
+            const res = await fetch('/api/datastore/mkdir', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf')},
+                body: JSON.stringify({ name, path: this.currentPath }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                this.showToast(data.error || 'Erreur lors de la création', 'error');
+                return;
+            }
+            this.showToast('Dossier créé', 'success');
+        } catch (e) { this.showToast('Erreur lors de la création', 'error'); }
+        this.hideModals();
+        await this.refresh();
+    },
+
+    // ─── New SQL file ───────────────────────────────────
+    // Permet de créer un fichier .sql directement depuis le datastore
+    // sans repasser par l'upload. Branché sur l'endpoint existant
+    // POST /api/datastore/sql/save (handler: DatastoreSqlSaveAPIHandler).
+    //
+    // _MAX_SQL_BYTES DOIT refléter MAX_SQL_PAYLOAD_BYTES dans
+    // app/handlers/datastore.py:124 — si le backend change le cap,
+    // mettre à jour ici aussi pour éviter le décalage compteur/413.
+    _MAX_SQL_BYTES: 256 * 1024,
+    _creatingSql: false,
+
+    _defaultSqlFilename() {
+        return `query_${this._compactDateStamp()}.sql`;
+    },
+
+    _updateSqlCounter() {
+        const ta = document.getElementById('input-sqlcontent');
+        const counter = document.getElementById('sql-size-counter');
+        const btn = document.getElementById('btn-newsql-create');
+        if (!ta || !counter || !btn) return;
+        // TextEncoder donne la taille UTF-8 réelle (cohérente avec le backend).
+        const bytes = new TextEncoder().encode(ta.value).length;
+        const kb = (bytes / 1024).toFixed(1);
+        const maxKb = Math.round(this._MAX_SQL_BYTES / 1024);
+        counter.textContent = `${kb} / ${maxKb} Ko`;
+        const overLimit = bytes > this._MAX_SQL_BYTES;
+        counter.classList.toggle('text-red-500', overLimit);
+        counter.classList.toggle('dark:text-red-400', overLimit);
+        counter.classList.toggle('text-gray-400', !overLimit);
+        counter.classList.toggle('dark:text-gray-500', !overLimit);
+        const nameOk = !!(document.getElementById('input-sqlname')?.value.trim());
+        const sqlOk = !!ta.value.trim();
+        btn.disabled = this._creatingSql || overLimit || !nameOk || !sqlOk;
+    },
+
+    showNewSqlModal() {
+        const nameInput = document.getElementById('input-sqlname');
+        const contentInput = document.getElementById('input-sqlcontent');
+        if (nameInput) nameInput.value = this._defaultSqlFilename();
+        if (contentInput) contentInput.value = '';
+        this._creatingSql = false;
+        const btn = document.getElementById('btn-newsql-create');
+        if (btn) { btn.disabled = true; btn.textContent = 'Créer'; }
+        this._updateSqlCounter();
+        const m = document.getElementById('modal-newsql');
+        if (!m) return;
+        m.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(m, { layer: 'modal', lockScroll: true });
+        // Focus sur la textarea (l'objet de la modale est la requête, pas le nom).
+        setTimeout(() => contentInput?.focus(), 100);
+    },
+
+    async _postCreateSqlFile(filename, sql, overwrite) {
+        // Wrapper bas-niveau d'un POST /api/datastore/sql/save.
+        // Retourne {kind, ...} pour découpler la décision UI (overwrite, error)
+        // de la mécanique HTTP (single source pour la taxonomie d'erreurs).
+        try {
+            const res = await fetch('/api/datastore/sql/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+                body: JSON.stringify({ filename, sql, overwrite }),
+            });
+            let data = {};
+            try { data = await res.json(); } catch (e) { data = {}; }
+
+            if (res.ok && data.success) return { kind: 'ok', filename: data.filename || filename };
+            if (res.status === 409 && data.code === 'exists') {
+                return { kind: 'exists', filename: data.filename || filename };
+            }
+            const hasErr = data && typeof data.error === 'string' && data.error;
+            let msg;
+            if (hasErr) msg = data.error;
+            else if (res.status >= 500) msg = `Erreur serveur (${res.status}). Si le problème persiste, signalez-le.`;
+            else if (res.status >= 400) msg = `Erreur (${res.status}).`;
+            else msg = 'Réponse serveur invalide. Réessayez ou signalez le problème.';
+            return { kind: 'error', message: msg };
+        } catch (e) {
+            return { kind: 'network' };
+        }
+    },
+
+    async createSqlFile() {
+        // Garde-fou principal : si une création est déjà en vol, ne rien
+        // faire (protège des re-submits via Ctrl+Entrée pendant que la
+        // boîte de confirmation overwrite est ouverte).
+        if (this._creatingSql) return;
+
+        const nameInput = document.getElementById('input-sqlname');
+        const contentInput = document.getElementById('input-sqlcontent');
+        const btn = document.getElementById('btn-newsql-create');
+        if (!nameInput || !contentInput) return;
+
+        const filenameRaw = nameInput.value.trim();
+        const sql = contentInput.value;
+        if (!filenameRaw || !sql.trim()) return;
+
+        const bytes = new TextEncoder().encode(sql).length;
+        if (bytes > this._MAX_SQL_BYTES) {
+            this.showToast(`Requête trop volumineuse (max ${Math.round(this._MAX_SQL_BYTES / 1024)} Ko)`, 'error');
+            return;
+        }
+
+        // Auto-suffixe .sql côté client pour cohérence d'affichage — le
+        // backend le ferait de toute façon via _sanitize_user_filename.
+        const filename = /\.sql$/i.test(filenameRaw) ? filenameRaw : `${filenameRaw}.sql`;
+
+        this._creatingSql = true;
+        if (btn) { btn.disabled = true; btn.textContent = 'Création…'; }
+
+        try {
+            // Boucle : 1ère tentative sans overwrite. Si conflit, on demande
+            // confirmation à l'user puis on retente avec overwrite=true. Le
+            // flag _creatingSql reste à true sur toute la durée → pas de
+            // race avec une re-soumission via clavier/clic.
+            let overwrite = false;
+            // eslint-disable-next-line no-constant-condition
+            while (true) {
+                const result = await this._postCreateSqlFile(filename, sql, overwrite);
+                if (result.kind === 'ok') {
+                    this.showToast(`Fichier créé : ${result.filename}`, 'success');
+                    this.hideModals();
+                    await this.refresh();
+                    return;
+                }
+                if (result.kind === 'exists') {
+                    // Utilise le filename retourné par le backend (sanitized)
+                    // pour que le user voie le VRAI nom qui sera écrasé.
+                    const ok = window.confirm(`Un fichier "${result.filename}" existe déjà. L'écraser ?`);
+                    if (!ok) return;
+                    overwrite = true;
+                    continue;
+                }
+                if (result.kind === 'network') {
+                    this.showToast('Erreur réseau. Vérifiez votre connexion.', 'error');
+                    return;
+                }
+                // result.kind === 'error'
+                this.showToast(result.message || 'Erreur lors de la création.', 'error');
+                return;
+            }
+        } finally {
+            this._creatingSql = false;
+            if (btn) { btn.textContent = 'Créer'; }
+            this._updateSqlCounter();
+        }
+    },
+
+    // ─── Rename ─────────────────────────────────────────
+    renameCtx() {
+        this.hideContextMenu();
+        const item = this.items.find(i => i.path === this.ctxPath);
+        if (!item) return;
+        document.getElementById('input-rename').value = item.name;
+        const m = document.getElementById('modal-rename');
+        m.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(m, { layer: 'modal', lockScroll: true });
+        setTimeout(() => { const inp = document.getElementById('input-rename'); inp.focus(); inp.select(); }, 100);
+    },
+
+    async renameConfirm() {
+        const newName = document.getElementById('input-rename').value.trim();
+        if (!newName || !this.ctxPath) return;
+        // No-op : nouveau nom identique à l'actuel → on n'envoie pas la
+        // requête (le backend l'accepte aussi, mais autant éviter le RTT).
+        const currentItem = this.items.find(i => i.path === this.ctxPath);
+        if (currentItem && currentItem.name === newName) {
+            this.hideModals();
+            return;
+        }
+        try {
+            const res = await fetch('/api/datastore/rename', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf')},
+                body: JSON.stringify({ path: this.ctxPath, new_name: newName }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                this.showToast(data.error || 'Erreur lors du renommage', 'error');
+                return;
+            }
+            this.showToast('Renommé avec succès', 'success');
+        } catch (e) { this.showToast('Erreur réseau lors du renommage', 'error'); }
+        this.hideModals();
+        await this.refresh();
+    },
+
+    // ─── Delete ─────────────────────────────────────────
+    async deleteSelected() {
+        const paths = [...this.selected];
+        if (!paths.length) return;
+        if (!(await appConfirm(`Supprimer ${paths.length} élément(s) ?`))) return;
+        await this._delete(paths);
+    },
+
+    async deleteCtx() {
+        this.hideContextMenu();
+        if (!this.ctxPath) return;
+        if (!(await appConfirm(`Supprimer "${this.ctxPath.split('/').pop()}" ?`))) return;
+        this._delete([this.ctxPath]);
+    },
+
+    async _delete(paths) {
+        try {
+            const res = await fetch('/api/datastore/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf')},
+                body: JSON.stringify({ paths }),
+            });
+            const data = await res.json();
+            const deleted = typeof data.deleted === 'number' ? data.deleted : 0;
+            const errs = Array.isArray(data.errors) ? data.errors : [];
+            if (!data.success) {
+                // Aucune suppression (paths invalides, FS errors, etc.).
+                const detail = errs.length ? ` : ${errs.slice(0, 3).join('; ')}` : '';
+                this.showToast((data.error || 'Aucune suppression effectuée') + detail, 'error');
+            } else if (errs.length) {
+                // Succès partiel — informer du delta.
+                this.showToast(`${deleted}/${paths.length} supprimé(s). Échecs : ${errs.slice(0, 3).join('; ')}`, 'error');
+            } else {
+                this.showToast(`${deleted} élément(s) supprimé(s)`, 'success');
+            }
+        } catch (e) { this.showToast('Erreur réseau lors de la suppression', 'error'); }
+        this.selected.clear();
+        this.updateSelectionUI();
+        await this.refresh();
+    },
+
+    // ─── Download ───────────────────────────────────────
+    // Multi-select : Chrome/FF bloquent les clicks <a> programmatiques
+    // consécutifs après 2-3 (popup-blocker pour "multiple downloads") ;
+    // iOS Safari rejette silencieusement les clicks sans interaction
+    // directe. On espace les déclenchements de 300 ms et on prévient
+    // l'utilisateur s'il télécharge plus de 3 fichiers.
+    async downloadSelected() {
+        const paths = [...this.selected];
+        if (!paths.length) return;
+        if (paths.length > 3) {
+            this.showToast('Autorisez les téléchargements multiples si demandé', 'success');
+        }
+        for (const p of paths) {
+            this._triggerDownload(`/api/datastore/download?path=${encodeURIComponent(p)}`);
+            // Pause entre les déclenchements — sans cela, le navigateur
+            // peut filtrer tout ce qui suit le 2e click.
+            await new Promise(r => setTimeout(r, 300));
+        }
+    },
+
+    downloadCtx() {
+        this.hideContextMenu();
+        if (this.ctxPath) this._downloadFile(this.ctxPath);
+    },
+
+    downloadPreview() {
+        if (this.previewPath) this._downloadFile(this.previewPath);
+    },
+
+    _downloadFile(path) {
+        this._triggerDownload(`/api/datastore/download?path=${encodeURIComponent(path)}`);
+    },
+
+    // BOTH-1 — Single source of truth pour déclencher un download
+    // navigateur depuis une URL. Utilisé par _downloadFile (datastore)
+    // ET downloadCurrentWorkbook (visualiseur). Permet d'instrumenter
+    // (toast feedback, métrique, etc.) en un seul endroit.
+    _triggerDownload(url) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = '';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    },
+
+    // ─── Analyze / Report ───────────────────────────────
+    analyzeCtx() {
+        this.hideContextMenu();
+        if (!this.ctxPath) return;
+        // Le param ?prompt= est consommé par /iris pour pré-remplir la saisie.
+        // Guillemets typographiques pour éviter qu'un nom contenant `"` (légal
+        // sur macOS/Linux) casse la délimitation côté LLM.
+        const safePath = String(this.ctxPath).replace(/"/g, '”');
+        const prompt = `Analyse le fichier « ${safePath} »`;
+        window.location.href = `/iris?prompt=${encodeURIComponent(prompt)}`;
+    },
+
+    // ─── Context menu ───────────────────────────────────
+    // Pattern inspiré d'iris-grid.js::_openContextMenu, avec adaptations
+    // spécifiques à /datastore : menu statique dans le DOM (vs créé à la
+    // demande dans iris-grid), items conditionnels (Analyser/Exécuter selon
+    // le type d'élément cliqué), fermeture sur scroll/resize ajoutée (le
+    // menu se désynchronise sinon de la card d'origine). Les briques
+    // communes — OverlayManager dropdown, anti-overflow viewport,
+    // click-outside via mousedown stocké — sont alignées sur iris-grid.
+    contextMenu(event, path) {
+        event.preventDefault();
+        this.ctxPath = path;
+        const item = this.items.find(i => i.path === path);
+        const menu = document.getElementById('ds-context-menu');
+        if (!menu) return;
+
+        // Toggle fail-closed des items conditionnels — si on n'est pas SÛR
+        // que c'est un fichier (item undefined ou is_dir indéterminé), on
+        // cache : mieux vaut omettre une action que la déclencher sur un
+        // élément non supporté côté backend.
+        const isFile = !!(item && item.is_dir === false);
+        const analyzeBtn = document.getElementById('ctx-analyze');
+        if (analyzeBtn) {
+            analyzeBtn.classList.toggle('hidden', !isFile);
+        }
+        const runSqlBtn = document.getElementById('ctx-run-sql');
+        if (runSqlBtn) {
+            const showRun = isFile && this.isSqlFile(item);
+            runSqlBtn.classList.toggle('hidden', !showRun);
+        }
+
+        // Cleanup défensif des 3 handlers d'une éventuelle ouverture
+        // précédente non terminée (clics droits rapides successifs). Sans ça,
+        // les handlers scroll/resize fantômes restent attachés et ferment le
+        // menu suivant à la première détection.
+        this._removeCtxHandlers();
+
+        // Position initiale + affichage
+        const x = event.clientX;
+        const y = event.clientY;
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+        menu.classList.remove('hidden');
+
+        // Enregistrement OverlayManager (layer dropdown : Escape LIFO gratuit,
+        // dismiss-previous des autres dropdowns, pas de scroll-lock).
+        if (window.OverlayManager && typeof window.OverlayManager.open === 'function') {
+            try { window.OverlayManager.open(menu, { layer: 'dropdown' }); }
+            catch (e) { console.warn('[datastore] OverlayManager.open failed:', e); }
+        }
+
+        // Repositioning anti-overflow (après show, sinon getBoundingClientRect
+        // renvoie tout à zéro).
+        const rect = menu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) {
+            menu.style.left = Math.max(0, x - rect.width) + 'px';
+        }
+        if (rect.bottom > window.innerHeight) {
+            menu.style.top = Math.max(0, y - rect.height) + 'px';
+        }
+
+        // Click-outside : handler self-cleaning (s'auto-détache avant fermeture)
+        // — évite les leaks si une ouverture suivante écrase la référence
+        // avant que le setTimeout du run précédent n'ait fire.
+        const closeOnOutside = (e) => {
+            if (!menu.contains(e.target)) {
+                document.removeEventListener('mousedown', closeOnOutside);
+                this.hideContextMenu();
+            }
+        };
+        this.ctxOutsideHandler = closeOnOutside;
+        // setTimeout(0) pour que le mousedown qui a ouvert le menu (clic droit)
+        // ne soit pas immédiatement intercepté comme "outside".
+        setTimeout(() => document.addEventListener('mousedown', closeOnOutside), 0);
+
+        // Scroll/resize ferment le menu (sinon il reste à sa position absolue
+        // et flotte loin de la card d'origine). once: true → auto-retrait.
+        const closeOnViewportChange = () => this.hideContextMenu();
+        this.ctxScrollHandler = closeOnViewportChange;
+        this.ctxResizeHandler = closeOnViewportChange;
+        window.addEventListener('scroll', closeOnViewportChange, { once: true, capture: true, passive: true });
+        window.addEventListener('resize', closeOnViewportChange, { once: true, passive: true });
+    },
+
+    // Helper interne : retire les 3 handlers du menu contextuel s'ils
+    // existent encore. Appelé à la fois en ouverture (cleanup d'un run
+    // précédent non terminé) et en fermeture.
+    _removeCtxHandlers() {
+        if (this.ctxOutsideHandler) {
+            document.removeEventListener('mousedown', this.ctxOutsideHandler);
+            this.ctxOutsideHandler = null;
+        }
+        if (this.ctxScrollHandler) {
+            window.removeEventListener('scroll', this.ctxScrollHandler, { capture: true });
+            this.ctxScrollHandler = null;
+        }
+        if (this.ctxResizeHandler) {
+            window.removeEventListener('resize', this.ctxResizeHandler);
+            this.ctxResizeHandler = null;
+        }
+    },
+
+    // Handler du menu contextuel "Exécuter la requête" — ouvre le modal
+    // (même chemin que le bouton play sur la card et le double-clic).
+    runSqlCtx() {
+        this.hideContextMenu();
+        if (this.ctxPath) this.executeSqlFile(this.ctxPath);
+    },
+
+    hideContextMenu() {
+        const menu = document.getElementById('ds-context-menu');
+        if (!menu) return;
+        if (window.OverlayManager && typeof window.OverlayManager.close === 'function') {
+            try { window.OverlayManager.close(menu); }
+            catch (e) { console.warn('[datastore] OverlayManager.close failed:', e); }
+        }
+        menu.classList.add('hidden');
+        this._removeCtxHandlers();
+    },
+
+    // ─── Drag & Drop ────────────────────────────────────
+    draggedPath: null,
+    
+    dragStart(event, path, isDir) {
+        this.draggedPath = path;
+        event.currentTarget.classList.add('dragging');
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', path);
+    },
+    
+    dragEnd(event) {
+        event.currentTarget.classList.remove('dragging');
+        document.querySelectorAll('.drag-over-folder').forEach(el => el.classList.remove('drag-over-folder'));
+    },
+    
+    dragOver(event, targetPath, isDir) {
+        // Ne permettre le drop que sur les dossiers
+        if (!isDir || targetPath === this.draggedPath) {
+            event.dataTransfer.dropEffect = 'none';
+            return;
+        }
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+        event.currentTarget.classList.add('drag-over-folder');
+    },
+    
+    dragLeave(event) {
+        event.currentTarget.classList.remove('drag-over-folder');
+    },
+    
+    async dropOnFolder(event, targetPath, isDir) {
+        if (!isDir) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.currentTarget.classList.remove('drag-over-folder');
+        
+        if (!this.draggedPath || targetPath === this.draggedPath) return;
+        
+        const draggedItem = this.items.find(i => i.path === this.draggedPath);
+        if (!draggedItem) return;
+        
+        const targetFolder = targetPath;
+        const fileName = draggedItem.name;
+
+        if (!(await appConfirm(`Déplacer "${fileName}" vers "${targetPath.split('/').pop()}" ?`))) return;
+        
+        await this.moveItem(this.draggedPath, targetFolder);
+        this.draggedPath = null;
+    },
+
+    // ─── Move / Copy ────────────────────────────────────
+    // moveDestination = null : aucune sélection ; "" : racine explicite ;
+    // "<path>" : sous-dossier. Le bouton Déplacer reste désactivé tant
+    // que null (M-5 — défaut destructif corrigé : un clic sans sélection
+    // ne déplaçait plus silencieusement vers la racine).
+    moveDestination: null,
+
+    async showMoveModal() {
+        this.hideContextMenu();
+        const item = this.items.find(i => i.path === this.ctxPath);
+        if (!item) return;
+
+        document.getElementById('move-filename').textContent = item.name;
+        this.moveDestination = null;
+        this._refreshMoveConfirmState();
+
+        // Charger les dossiers ; exclude la source pour ne pas proposer
+        // une cible invalide (M-11).
+        await this.loadFoldersTree(this.ctxPath);
+
+        const m = document.getElementById('modal-move');
+        m.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(m, { layer: 'modal', lockScroll: true });
+    },
+
+    _refreshMoveConfirmState() {
+        const btn = document.getElementById('btn-move-confirm');
+        if (!btn) return;
+        const enabled = this.moveDestination !== null;
+        btn.disabled = !enabled;
+        btn.classList.toggle('opacity-50', !enabled);
+        btn.classList.toggle('cursor-not-allowed', !enabled);
+    },
+
+    async loadFoldersTree(excludeSource) {
+        try {
+            const qs = excludeSource ? `?exclude_source=${encodeURIComponent(excludeSource)}` : '';
+            const res = await fetch(`/api/datastore/folders${qs}`);
+            const data = await res.json();
+            if (!data.success) return;
+
+            const container = document.getElementById('move-folders');
+            const folders = data.folders || [];
+
+            // Construire les boutons. "Racine" est toujours présent et
+            // requiert une sélection explicite (M-5).
+            const html = [
+                `<button data-move-dest="" data-move-root="true" role="radio" aria-checked="false" tabindex="0"
+                        class="move-folder-btn w-full text-left px-2 py-1.5 text-xs rounded hover:bg-gray-50 mb-1 flex items-center gap-2 dark:hover:bg-gray-800">
+                    <svg class="w-4 h-4 text-gray-400 dark:text-gray-500" fill="currentColor" viewBox="0 0 24 24"><path d="M2 6a2 2 0 012-2h5l2 2h9a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg>
+                    <span class="text-gray-700 dark:text-gray-300">Racine (à la racine du datastore)</span>
+                </button>`,
+                ...folders.map(f => `
+                    <button data-move-dest="${this.escAttr(f.path)}" role="radio" aria-checked="false" tabindex="0"
+                            class="move-folder-btn w-full text-left px-2 py-1.5 text-xs rounded hover:bg-gray-50 mb-1 flex items-center gap-2 dark:hover:bg-gray-800"
+                            style="padding-left: ${(f.depth || 0) * 16 + 8}px">
+                        <svg class="w-4 h-4 text-amber-400" fill="currentColor" viewBox="0 0 24 24"><path d="M2 6a2 2 0 012-2h5l2 2h9a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg>
+                        <span class="text-gray-700 dark:text-gray-300">${this.esc(f.name)}</span>
+                    </button>
+                `),
+            ].join('');
+
+            container.innerHTML = html;
+            container.setAttribute('role', 'radiogroup');
+            container.setAttribute('aria-label', 'Choisir un dossier de destination');
+
+            const btns = Array.from(container.querySelectorAll('[data-move-dest]'));
+            btns.forEach((btn, idx) => {
+                btn.addEventListener('click', (e) => {
+                    this.selectMoveDestination(btn.getAttribute('data-move-dest'), e);
+                });
+                btn.addEventListener('keydown', (e) => {
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        const dir = e.key === 'ArrowDown' ? 1 : -1;
+                        const next = btns[(idx + dir + btns.length) % btns.length];
+                        if (next) next.focus();
+                    } else if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        this.selectMoveDestination(btn.getAttribute('data-move-dest'), { currentTarget: btn });
+                    }
+                });
+            });
+        } catch (e) {
+            console.error('loadFoldersTree', e);
+        }
+    },
+
+    selectMoveDestination(path, event) {
+        this.moveDestination = path;
+        // Highlight + ARIA aria-checked sync.
+        document.querySelectorAll('.move-folder-btn').forEach(btn => {
+            btn.classList.remove('bg-gray-100', 'font-medium', 'dark:bg-gray-800');
+            btn.setAttribute('aria-checked', 'false');
+        });
+        if (event && event.currentTarget) {
+            event.currentTarget.classList.add('bg-gray-100', 'font-medium', 'dark:bg-gray-800');
+            event.currentTarget.setAttribute('aria-checked', 'true');
+        }
+        this._refreshMoveConfirmState();
+    },
+
+    async moveConfirm() {
+        if (!this.ctxPath) return;
+        if (this.moveDestination === null) {
+            this.showToast('Sélectionnez un dossier de destination', 'error');
+            return;
+        }
+        await this.moveItem(this.ctxPath, this.moveDestination);
+        this.hideModals();
+    },
+
+    async moveItem(sourcePath, destFolder) {
+        try {
+            const body = { source: sourcePath, destination: destFolder };
+            // ``destFolder === ""`` signifie « Racine » explicitement choisie.
+            if (destFolder === '') body.move_to_root = true;
+            const res = await fetch('/api/datastore/move', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf')},
+                body: JSON.stringify(body),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                this.showToast(data.error || 'Erreur lors du déplacement', 'error');
+                return;
+            }
+            this.showToast('Déplacé avec succès', 'success');
+        } catch (e) {
+            this.showToast('Erreur lors du déplacement', 'error');
+        }
+        await this.refresh();
+    },
+    
+    copyPathCtx() {
+        // Note : on capture le path AVANT hideContextMenu pour éviter que
+        // la fermeture du menu détruise le geste utilisateur (Safari/FF
+        // exigent un gesture context pour clipboard.writeText).
+        const path = this.ctxPath;
+        this.hideContextMenu();
+        if (!path) return;
+        this._copyToClipboard(path).then(ok => {
+            if (ok) this.showToast('Chemin copié', 'success');
+        });
+    },
+
+    // Fallback clipboard cross-browser. `navigator.clipboard.writeText`
+    // n'est dispo qu'en contexte sécurisé (HTTPS ou localhost) ; en
+    // production cabinet sur HTTP LAN, il est `undefined`. Le fallback
+    // `document.execCommand('copy')` via textarea hidden est legacy
+    // mais marche en HTTP.
+    async _copyToClipboard(text) {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            try {
+                await navigator.clipboard.writeText(text);
+                return true;
+            } catch (err) {
+                if (err && err.name === 'NotAllowedError') {
+                    this.showToast('Autorisation clipboard refusée par le navigateur', 'error');
+                } else {
+                    // Tente le fallback legacy ; si lui aussi échoue, le toast
+                    // d'erreur sera affiché ci-dessous.
+                    if (this._legacyCopyToClipboard(text)) return true;
+                    this.showToast('Impossible de copier le chemin', 'error');
+                }
+                return false;
+            }
+        }
+        // Pas d'API moderne (HTTP non-localhost) → legacy.
+        if (this._legacyCopyToClipboard(text)) return true;
+        this.showToast('Copie indisponible dans ce navigateur', 'error');
+        return false;
+    },
+
+    _legacyCopyToClipboard(text) {
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.top = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            ta.setSelectionRange(0, ta.value.length);
+            const ok = document.execCommand('copy');
+            ta.remove();
+            return !!ok;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    // ─── Utils ──────────────────────────────────────────
+    hideModals() {
+        // Note: modal-sql-result a son propre handler de fermeture
+        // (closeSqlResultModal) — il NE fait PAS partie de hideModals()
+        // pour ne pas perdre le résultat affiché lors d'une autre action.
+        ['modal-upload', 'modal-newfolder', 'modal-newsql', 'modal-rename', 'modal-move'].forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (window.OverlayManager) window.OverlayManager.close(el);
+            el.classList.add('hidden');
+        });
+    },
+
+    humanSize(bytes) {
+        const units = ['o','Ko','Mo','Go'];
+        let i = 0;
+        let s = bytes;
+        while (s >= 1024 && i < units.length - 1) { s /= 1024; i++; }
+        return i === 0 ? s + ' o' : s.toFixed(1) + ' ' + units[i];
+    },
+
+    async refresh() { 
+        const icon = document.getElementById('ds-refresh-icon');
+        const btn = document.getElementById('ds-btn-refresh');
+        
+        // Animer l'icône
+        icon.classList.add('animate-spin');
+        btn.disabled = true;
+        
+        try {
+            await this.loadDir(this.currentPath);
+            
+            // Afficher notification de succès
+            this.showToast('Données actualisées', 'success');
+        } catch (e) {
+            this.showToast('Erreur lors de l\'actualisation', 'error');
+        } finally {
+            // Retirer l'animation après 600ms (durée de l'animation)
+            setTimeout(() => {
+                icon.classList.remove('animate-spin');
+                btn.disabled = false;
+            }, 600);
+        }
+    },
+
+    showToast(message, type = 'info') {
+        // Supprimer les anciens toasts
+        document.querySelectorAll('.toast').forEach(t => t.remove());
+        
+        // Créer le toast
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        toast.innerHTML = `
+            <div class="flex items-center gap-2 text-sm">
+                ${type === 'success' ? '<svg class="w-4 h-4 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>' : ''}
+                ${type === 'error' ? '<svg class="w-4 h-4 text-red-500 dark:text-red-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/></svg>' : ''}
+                <span class="text-gray-700 dark:text-gray-300">${this.esc(message)}</span>
+            </div>
+        `;
+        document.body.appendChild(toast);
+        
+        // Retirer après 2 secondes
+        setTimeout(() => {
+            toast.classList.add('hide');
+            setTimeout(() => toast.remove(), 300);
+        }, 2000);
+    },
+
+    // ─── Workbook viewer ────────────────────────────────
+    _workbookTabMgr: null,
+    _workbookOpen: false,
+    _workbookPath: null,
+    _workbookLoadToken: 0,
+
+    _setWorkbookStatus(container, message, { isError = false, detail = null } = {}) {
+        container.innerHTML = '';
+        const status = document.createElement('div');
+        status.className = isError ? 'wb-status wb-status--error' : 'wb-status';
+        const main = document.createElement('div');
+        main.textContent = message;
+        status.appendChild(main);
+        if (detail) {
+            const detailEl = document.createElement('div');
+            detailEl.className = 'wb-status-detail';
+            detailEl.textContent = detail;
+            status.appendChild(detailEl);
+        }
+        container.appendChild(status);
+    },
+
+    _mountWorkbook(container, data, path) {
+        const card = document.createElement('div');
+        card.className = 'iris-sql-card';
+        container.innerHTML = '';
+        container.appendChild(card);
+        const tabMgr = new window.GridTabManager(card);
+        tabMgr._currentFilePath = path;
+        // Fullscreen cible le dialog entier pour que rien de la modale ne reste visible.
+        const dialog = document.querySelector('#modal-workbook .wb-dialog');
+        if (dialog) tabMgr._fullscreenTarget = dialog;
+        // Le bouton plein écran a été déplacé dans le wb-header (à gauche du
+        // close), donc on masque celui de la barre d'actions de la grille.
+        tabMgr._hideFullscreenButton = true;
+        // Sync l'icône du bouton wb-header avec l'état fullscreen, peu importe
+        // la source du toggle (clic wb-header OU touche ESC qui appelle aussi
+        // _toggleTabFullscreen via le handler interne).
+        const enterFsIcon = '<svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 8V4h4M16 4h4v4M4 16v4h4M16 20h4v-4"/></svg>';
+        const exitFsIcon = '<svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 9V4M9 9H4M15 9V4M15 9h5M9 15v5M9 15H4M15 15v5M15 15h5"/></svg>';
+        const origToggleFs = tabMgr._toggleTabFullscreen.bind(tabMgr);
+        tabMgr._toggleTabFullscreen = function() {
+            origToggleFs();
+            const fsBtn = document.getElementById('btn-workbook-fullscreen');
+            if (fsBtn) {
+                const isFs = !!tabMgr._isFullscreen;
+                fsBtn.innerHTML = isFs ? exitFsIcon : enterFsIcon;
+                fsBtn.title = isFs ? 'Quitter le plein écran' : 'Plein écran';
+                fsBtn.setAttribute('aria-label', isFs ? 'Quitter le plein écran' : 'Plein écran');
+            }
+        };
+        // Hook : ajoute l'item « JSON original » dans le menu Exporter,
+        // qui délègue au handler existant downloadCurrentWorkbook().
+        tabMgr._renderExtraExportItems = function(menuEl, closeMenu) {
+            const item = document.createElement('button');
+            item.type = 'button';
+            item.className = 'grid-export-menu-item';
+            item.setAttribute('role', 'menuitem');
+            item.setAttribute('data-action', 'export-json');
+            item.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>'
+                + ' JSON original (.afz.json)<span class="grid-export-menu-item-sub">fichier complet</span>';
+            item.title = 'Télécharger le fichier classeur original';
+            item.addEventListener('click', function() {
+                closeMenu();
+                // Respecte le toggle « Valeurs : Clair · Anonymisé » du menu
+                // d'export (state ``_exportAnonymize`` sur le GridTabManager).
+                var anon = !!(tabMgr && tabMgr._exportAnonymize);
+                if (!anon) {
+                    var dl = document.getElementById('btn-workbook-download');
+                    if (dl) dl.click();
+                    return;
+                }
+                // Anonymisé : le serveur re-sérialise un .afz.json aux valeurs
+                // masquées (fail-closed). Le formatage reste un .afz.json.
+                var xsrf = (typeof getCookie === 'function') ? getCookie('_xsrf') : '';
+                var anonTermCount = null;
+                fetch('/api/datastore/download?path=' + encodeURIComponent(path) + '&anonymize=1', {
+                    headers: { 'X-Xsrftoken': xsrf }
+                }).then(function(r) {
+                    if (!r.ok) {
+                        return r.json().then(function(j) {
+                            throw new Error((j && j.error) || ('HTTP ' + r.status));
+                        });
+                    }
+                    anonTermCount = r.headers.get('X-Anon-Term-Count');
+                    return r.blob();
+                }).then(function(blob) {
+                    var url = URL.createObjectURL(blob);
+                    var a = document.createElement('a');
+                    a.href = url;
+                    var base = (path.split('/').pop() || 'classeur').replace(/\.afz\.json$/i, '');
+                    a.download = base + '_anonymise.afz.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    // F12 : 0 terme configuré → fichier identique au clair.
+                    if (anonTermCount === '0' && window.showToast) {
+                        window.showToast('Aucun terme configuré sur /data/privacy : le fichier est identique à un export en clair.', 'warning');
+                    }
+                }).catch(function(err) {
+                    if (window.showToast) {
+                        window.showToast('Échec export anonymisé : ' + (err.message || err), 'error');
+                    } else if (typeof console !== 'undefined') {
+                        console.error('[workbook-json-anon]', err);
+                    }
+                });
+            });
+            menuEl.appendChild(item);
+        };
+        if (!tabMgr.loadWorkbook(data)) throw new Error('loadWorkbook returned false');
+        return tabMgr;
+    },
+
+    openWorkbook(path) {
+        if (typeof window.GridTabManager !== 'function') {
+            this.showToast('Visualiseur indisponible (iris-grid.js non chargé)', 'error');
+            return;
+        }
+        const modal = document.getElementById('modal-workbook');
+        const container = document.getElementById('workbook-viewer-container');
+        const nameEl = document.getElementById('workbook-viewer-name');
+        if (!modal || !container) return;
+
+        this._disposeWorkbookTabMgr();
+        if (nameEl) nameEl.textContent = this._workbookDisplayName(path) || 'Classeur';
+        modal.classList.remove('hidden');
+        if (window.OverlayManager) window.OverlayManager.open(modal, { layer: 'modal', lockScroll: true });
+        this._workbookOpen = true;
+        this._workbookPath = null;
+        this._setWorkbookStatus(container, 'Chargement du classeur…');
+
+        const token = ++this._workbookLoadToken;
+        const xsrf = (typeof getCookie === 'function') ? getCookie('_xsrf') : '';
+
+        fetch('/api/datastore/download?path=' + encodeURIComponent(path), {
+            headers: { 'X-Xsrftoken': xsrf }
+        })
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(data => {
+            if (token !== this._workbookLoadToken || !this._workbookOpen) return;
+            if (!this._isWorkbookPayload(data)) {
+                this._setWorkbookStatus(container, 'Format de classeur invalide', {
+                    isError: true,
+                    detail: 'Ce fichier JSON n\'est pas un classeur Komptia.'
+                });
+                return;
+            }
+            if (data.tabs.length === 0) {
+                this._setWorkbookStatus(container, 'Classeur vide', {
+                    detail: 'Ce classeur ne contient aucun onglet.'
+                });
+                this._workbookPath = path;
+                return;
+            }
+            try {
+                this._workbookTabMgr = this._mountWorkbook(container, data, path);
+                this._workbookPath = path;
+            } catch (e) {
+                console.error('[Workbook] Render failed:', e);
+                this._setWorkbookStatus(container, 'Erreur lors de l\'affichage du classeur.', { isError: true });
+            }
+        })
+        .catch(err => {
+            if (token !== this._workbookLoadToken || !this._workbookOpen) return;
+            console.error('[Workbook] Load failed:', err);
+            this._setWorkbookStatus(container, 'Erreur de chargement du classeur.', { isError: true });
+        });
+    },
+
+    _disposeWorkbookTabMgr() {
+        const tabMgr = this._workbookTabMgr;
+        if (tabMgr && tabMgr._wbSnapshotTimer) clearTimeout(tabMgr._wbSnapshotTimer);
+        this._workbookTabMgr = null;
+    },
+
+    closeWorkbook() {
+        const modal = document.getElementById('modal-workbook');
+        const container = document.getElementById('workbook-viewer-container');
+        if (!modal) return;
+        if (window.OverlayManager) window.OverlayManager.close(modal);
+        modal.classList.add('hidden');
+        // Reset fullscreen state pour que la prochaine ouverture parte propre
+        const dialog = modal.querySelector('.wb-dialog');
+        if (dialog) dialog.classList.remove('grid-fullscreen');
+        // Reset l'icône du bouton plein écran à son état "entrer en plein écran"
+        const fsBtn = document.getElementById('btn-workbook-fullscreen');
+        if (fsBtn) {
+            fsBtn.innerHTML = '<svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 8V4h4M16 4h4v4M4 16v4h4M16 20h4v-4"/></svg>';
+            fsBtn.title = 'Plein écran';
+            fsBtn.setAttribute('aria-label', 'Plein écran');
+        }
+        this._disposeWorkbookTabMgr();
+        if (container) container.innerHTML = '';
+        this._workbookOpen = false;
+        this._workbookPath = null;
+        this._workbookLoadToken++;
+    },
+
+    downloadCurrentWorkbook() {
+        if (!this._workbookPath) {
+            this.showToast('Aucun classeur chargé', 'error');
+            return;
+        }
+        this._triggerDownload('/api/datastore/download?path=' + encodeURIComponent(this._workbookPath));
+    },
+
+    init() {
+        this.navigate(''); 
+        
+        // Event listeners for static buttons
+        document.getElementById('ds-btn-refresh')?.addEventListener('click', () => this.refresh());
+        document.getElementById('ds-btn-upload')?.addEventListener('click', () => this.showUploadModal());
+        // Bouton « Importer un fichier » de l'empty state — même handler.
+        document.getElementById('ds-empty-btn-upload')?.addEventListener('click', () => this.showUploadModal());
+        document.getElementById('ds-btn-selectall')?.addEventListener('click', () => this.toggleSelectAll());
+        document.getElementById('ds-btn-delete')?.addEventListener('click', () => this.deleteSelected());
+        document.getElementById('ds-btn-download')?.addEventListener('click', () => this.downloadSelected());
+        document.getElementById('ds-btn-home')?.addEventListener('click', () => this.navigate(''));
+        document.getElementById('ds-btn-back')?.addEventListener('click', () => this.navigateUp());
+        document.getElementById('ds-btn-newfolder')?.addEventListener('click', () => this.showNewFolderModal());
+        document.getElementById('ds-btn-newsql')?.addEventListener('click', () => this.showNewSqlModal());
+
+        // Preview actions
+        document.getElementById('ds-btn-preview-download')?.addEventListener('click', () => this.downloadPreview());
+        document.getElementById('ds-btn-preview-run-sql')?.addEventListener('click', () => {
+            // Garde-fou : ne déclenche que si on a un .sql actif dans le
+            // panneau preview. Le bouton est normalement masqué hors .sql,
+            // mais on revérifie pour blinder contre un état UI désynchronisé.
+            const path = this.previewPath;
+            if (!path) return;
+            const item = this.items.find(i => i.path === path);
+            if (item && this.isSqlFile(item)) this.executeSqlFile(path);
+        });
+        document.getElementById('ds-btn-preview-edit-sql')?.addEventListener('click', () => {
+            const path = this.previewPath;
+            if (!path) return;
+            const item = this.items.find(i => i.path === path);
+            if (!item || !this.isSqlFile(item)) return;
+            this.openSqlEditor(path);
+        });
+        
+        // Modal buttons (le backdrop du visualiseur de classeur est géré séparément via [data-wb-close])
+        document.querySelectorAll('.modal-backdrop:not([data-wb-close])').forEach(el => {
+            el.addEventListener('click', () => this.hideModals());
+        });
+        document.getElementById('btn-upload-cancel')?.addEventListener('click', () => this.hideModals());
+        document.getElementById('btn-upload-confirm')?.addEventListener('click', () => this.uploadFiles());
+        document.getElementById('btn-newfolder-cancel')?.addEventListener('click', () => this.hideModals());
+        document.getElementById('btn-newfolder-create')?.addEventListener('click', () => this.createFolder());
+        document.getElementById('btn-newsql-cancel')?.addEventListener('click', () => this.hideModals());
+        document.getElementById('btn-newsql-create')?.addEventListener('click', () => this.createSqlFile());
+        document.getElementById('btn-rename-cancel')?.addEventListener('click', () => this.hideModals());
+        document.getElementById('btn-rename-confirm')?.addEventListener('click', () => this.renameConfirm());
+        document.getElementById('btn-move-cancel')?.addEventListener('click', () => this.hideModals());
+        document.getElementById('btn-move-confirm')?.addEventListener('click', () => this.moveConfirm());
+        
+        // Input enter key handlers
+        document.getElementById('input-rename')?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') this.renameConfirm();
+        });
+        document.getElementById('input-foldername')?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') this.createFolder();
+        });
+
+        // New SQL modal — input/keyboard handlers
+        const sqlName = document.getElementById('input-sqlname');
+        const sqlContent = document.getElementById('input-sqlcontent');
+        sqlName?.addEventListener('input', () => this._updateSqlCounter());
+        sqlContent?.addEventListener('input', () => this._updateSqlCounter());
+        sqlName?.addEventListener('keydown', (e) => {
+            // Enter sur le nom passe le focus à la requête (pas de submit
+            // tant que l'utilisateur n'a pas rédigé sa SQL).
+            if (e.key === 'Enter') { e.preventDefault(); sqlContent?.focus(); }
+        });
+        sqlContent?.addEventListener('keydown', (e) => {
+            // Ctrl/Cmd+Entrée = submit (no-op si création en vol).
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                if (this._creatingSql) return;
+                this.createSqlFile();
+                return;
+            }
+            // Échap : sortir du textarea pour libérer le piège-clavier Tab.
+            // Le focus revient sur le bouton "Créer" (a11y WCAG 2.1.2).
+            if (e.key === 'Escape') {
+                const createBtn = document.getElementById('btn-newsql-create');
+                if (createBtn && !createBtn.disabled) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    createBtn.focus();
+                }
+                return;
+            }
+            // Tab = indenter (insertion 2 espaces). Shift+Tab : sortir du
+            // textarea pour ne PAS piéger les utilisateurs clavier-only
+            // qui veulent naviguer vers les boutons.
+            if (e.key === 'Tab' && !e.shiftKey) {
+                e.preventDefault();
+                const start = e.target.selectionStart;
+                const end = e.target.selectionEnd;
+                const value = e.target.value;
+                e.target.value = value.substring(0, start) + '  ' + value.substring(end);
+                e.target.selectionStart = e.target.selectionEnd = start + 2;
+                this._updateSqlCounter();
+            }
+            // Shift+Tab tombe dans le comportement natif (focus précédent).
+        });
+
+        // Search filter
+        document.getElementById('ds-search')?.addEventListener('input', (e) => {
+            this.filter(e.target.value);
+        });
+        
+        // Drag and drop - Main dropzone
+        const dsDropzone = document.getElementById('ds-dropzone');
+        if (dsDropzone) {
+            dsDropzone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.currentTarget.classList.add('drag-over');
+            });
+            dsDropzone.addEventListener('dragleave', (e) => {
+                e.currentTarget.classList.remove('drag-over');
+            });
+            dsDropzone.addEventListener('drop', (e) => {
+                this.handleDrop(e);
+            });
+        }
+        
+        // Drag and drop - Upload modal dropzone
+        const uploadDropzone = document.getElementById('upload-dropzone');
+        if (uploadDropzone) {
+            uploadDropzone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                e.currentTarget.classList.add('drag-over');
+            });
+            uploadDropzone.addEventListener('dragleave', (e) => {
+                e.currentTarget.classList.remove('drag-over');
+            });
+            uploadDropzone.addEventListener('drop', (e) => {
+                this.handleUploadDrop(e);
+            });
+        }
+        
+        // File input change
+        document.getElementById('upload-input')?.addEventListener('change', (e) => {
+            this.handleFileSelect(e.target.files);
+        });
+        
+        // Context menu buttons
+        document.getElementById('ctx-run-sql')?.addEventListener('click', () => this.runSqlCtx());
+        document.getElementById('ctx-download')?.addEventListener('click', () => this.downloadCtx());
+        document.getElementById('ctx-rename')?.addEventListener('click', () => this.renameCtx());
+        document.getElementById('ctx-move')?.addEventListener('click', () => this.showMoveModal());
+        document.getElementById('ctx-copy')?.addEventListener('click', () => this.copyPathCtx());
+        document.getElementById('ctx-analyze')?.addEventListener('click', () => this.analyzeCtx());
+        document.getElementById('ctx-delete')?.addEventListener('click', () => this.deleteCtx());
+        // Bloque le menu contextuel natif quand l'utilisateur fait clic droit
+        // DANS notre menu (le menu Komptia étant en position fixed hors card).
+        document.getElementById('ds-context-menu')?.addEventListener('contextmenu', (e) => e.preventDefault());
+        
+        // Workbook viewer modal wire-up
+        document.getElementById('btn-workbook-close')?.addEventListener('click', () => this.closeWorkbook());
+        document.getElementById('btn-workbook-download')?.addEventListener('click', () => this.downloadCurrentWorkbook());
+        document.getElementById('btn-workbook-fullscreen')?.addEventListener('click', () => {
+            const mgr = this._workbookTabMgr;
+            if (mgr && typeof mgr._toggleTabFullscreen === 'function') mgr._toggleTabFullscreen();
+        });
+        document.querySelectorAll('#modal-workbook [data-wb-close]').forEach(el => {
+            el.addEventListener('click', () => this.closeWorkbook());
+        });
+
+        // SQL result modal wire-up (même pattern que le workbook modal)
+        document.querySelectorAll('#modal-sql-result [data-sql-close]').forEach(el => {
+            el.addEventListener('click', () => this.closeSqlResultModal());
+        });
+        document.getElementById('btn-sql-refresh')?.addEventListener('click', () => {
+            if (this._sqlResultOpenPath) this.executeSqlFile(this._sqlResultOpenPath);
+        });
+        document.getElementById('btn-sql-cancel')?.addEventListener('click', () => this.cancelSqlExec());
+        document.getElementById('btn-sql-save-as-workbook')?.addEventListener('click', () => this.saveSqlResultAsWorkbook());
+
+        // Raccourci clavier global (Ctrl/Cmd+R = rafraîchir).
+        // Echap pour les modals est géré par OverlayManager (ferme le top-most).
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
+                e.preventDefault();
+                this.refresh();
+            }
+        });
+    }
+};
+
+document.addEventListener('DOMContentLoaded', () => DS.init());
+</script>
+
+{# Onboarding tour 1ère visite — composant chargé globalement via base.html.
+   Activation 1x par user grâce à la BDD (key 'datastore_v1'). Pattern
+   identique aux autres pages. 4 steps explicatifs, non-bloquants.
+   ATTENTION : ce template n'a pas de {% block scripts %}, donc le tour
+   est inline dans block content. On wrap dans DOMContentLoaded pour
+   que window.KomptiaOnboarding (chargé via base.html plus bas dans le
+   DOM) soit défini au moment où on l'appelle. Cf. mémoire
+   feedback_js_load_order_base_html.md. #}
+<script nonce="{{ handler.csp_nonce }}">
+    document.addEventListener('DOMContentLoaded', function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'datastore_v1',
+                title: 'Bienvenue dans votre Datastore',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Vos classeurs au même endroit',
+                        text: 'Le Datastore regroupe tous les fichiers Excel et CSV que vous voulez analyser. Ils restent stockés localement sur votre espace Komptia — pas de cloud externe, pas de partage involontaire.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Importer un fichier',
+                        text: 'Glissez-déposez vos fichiers sur la zone centrale, ou cliquez sur « Importer ». Vous pouvez organiser vos classeurs en dossiers et les renommer comme dans un explorateur classique.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Aperçu et actions',
+                        text: 'Cliquez sur un fichier pour le voir dans le panneau de droite. Vous pouvez ensuite le télécharger, l\'analyser avec l\'IA, ou — s\'il s\'agit d\'une requête SQL enregistrée — l\'exécuter directement contre la base de données.'
+                    },
+                    {
+                        icon: 'rocket',
+                        title: 'Iris interroge vos fichiers',
+                        text: 'Une fois vos fichiers importés, allez sur Iris et posez vos questions en français (« Top 10 lignes par montant dans clients.xlsx »). Iris travaille directement sur vos classeurs locaux, sans rien envoyer à l\'extérieur.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    });
+</script>
+</div>
+{% end %}

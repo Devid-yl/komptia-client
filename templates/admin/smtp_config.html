@@ -1,0 +1,376 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+<div class="mb-6">
+    <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+    <p class="mt-1 text-sm text-gray-600 dark:text-gray-400">Configuration unique pour tous les utilisateurs. Les emails sont personnalisés automatiquement.</p>
+</div>
+
+<!-- Config Source Status Banner -->
+<div id="config-source-banner" class="border rounded-lg p-3 mb-6 hidden">
+    <div class="flex items-center gap-2">
+        <span id="config-source-icon" class="text-lg"></span>
+        <div>
+            <p id="config-source-text" class="text-sm font-medium"></p>
+            <p id="config-source-detail" class="text-xs mt-0.5"></p>
+        </div>
+    </div>
+</div>
+
+<!-- Configuration Panel -->
+<div class="bg-white border border-gray-200 rounded-lg p-6 mb-6 dark:bg-gray-900 dark:border-gray-800">
+    <div class="flex items-center justify-between mb-4">
+        <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100">Paramètres SMTP</h2>
+        <span id="config-status" class="text-sm"></span>
+    </div>
+    
+    <form id="smtp-form" class="space-y-4">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Serveur SMTP *</label>
+                <input type="text" id="smtp-host" name="host" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" required placeholder="smtp.gmail.com">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Port *</label>
+                <input type="number" id="smtp-port" name="port" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" required placeholder="587">
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">587 pour TLS, 465 pour SSL</p>
+            </div>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Utilisateur SMTP *</label>
+                <input type="text" id="smtp-username" name="username" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" required placeholder="komptia@cabinet.local">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Mot de passe SMTP *</label>
+                <input type="password" id="smtp-password" name="password" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" placeholder="Laisser vide pour ne pas modifier">
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Pour Gmail/O365, utilisez un <strong>mot de passe d'application</strong> (pas votre mot de passe principal)</p>
+            </div>
+        </div>
+        
+        <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Email expéditeur *</label>
+            <input type="email" id="smtp-from-email" name="from_email" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" required placeholder="noreply@cabinet.local">
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Adresse technique qui apparaît dans le champ « De ». Combinée au « Nom expéditeur » ci-dessous pour donner « Nom &lt;email&gt; ».</p>
+        </div>
+
+        {# Display name SMTP (``From: <Nom> <email>``). Optionnel — si vide,
+           le fallback est le nom de l'application (config.app_name). Pas
+           un email, juste un libellé visible côté boîte de réception
+           du destinataire. #}
+        <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Nom expéditeur</label>
+            <input type="text" id="smtp-from-name" name="from_name" maxlength="255"
+                   class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100"
+                   placeholder="Service Comptabilité">
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                Libellé visible dans la boîte de réception du destinataire (par exemple « Service Comptabilité »).
+                Si vide, le nom de l'application est utilisé par défaut.
+            </p>
+        </div>
+
+        {# 2026-05-19 — Email destinataire des signalements (bouton "Signaler
+           un bug" + page d'erreur). SEULE source de vérité = ce champ —
+           aucun hardcode ailleurs (config.py est vide, l'admin doit saisir
+           une adresse ou les signalements ne partent pas par mail). #}
+        <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Email support (signalements)</label>
+            <input type="email" id="smtp-support-email" name="support_email" maxlength="254"
+                   class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100">
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                Destinataire des rapports d'erreur envoyés via le bouton « Signaler un bug »
+                (incluant stack traces, logs serveur et état du navigateur). Si vide,
+                les signalements sont enregistrés localement en audit-trail mais aucun mail
+                n'est envoyé — saisir une adresse pour activer l'envoi.
+            </p>
+            <p class="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                <span class="font-semibold">Important :</span> cette adresse reçoit aussi les
+                demandes d'approbation d'écriture SQL d'Iris (Iris-DBA-write). Ces mails
+                contiennent le SQL brut — donc potentiellement des données métier (valeurs des
+                clauses WHERE). Renseignez une adresse de confiance interne (p. ex. votre DBA),
+                pas une boîte externe ou prestataire.
+            </p>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+                <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" id="smtp-use-tls" name="use_tls" class="rounded border-gray-300 dark:border-gray-700" checked>
+                    <span class="text-sm text-gray-700 dark:text-gray-300">Utiliser TLS (recommandé)</span>
+                </label>
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Tentatives max</label>
+                <input type="number" id="smtp-max-retries" name="max_retries" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" value="3" min="1" max="10">
+            </div>
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Délai retry (s)</label>
+                <input type="number" id="smtp-retry-delay" name="retry_delay" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 placeholder-gray-400 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-100" value="5" min="0" max="60">
+            </div>
+        </div>
+        
+        <div class="flex items-center justify-between pt-4 border-t border-gray-200 dark:border-gray-800">
+            <label class="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" id="smtp-enabled" name="enabled" class="rounded border-gray-300 dark:border-gray-700" checked>
+                <span class="text-sm font-medium text-gray-900 dark:text-gray-100">Configuration active</span>
+            </label>
+            
+            <div class="flex items-center gap-3">
+                <button type="button" id="btn-test-smtp" class="btn btn-secondary">
+                    Tester la configuration
+                </button>
+                <button type="submit" class="btn btn-primary">
+                    Enregistrer
+                </button>
+            </div>
+        </div>
+    </form>
+</div>
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+function showStatus(message, type) {
+    const statusEl = document.getElementById('config-status');
+    statusEl.textContent = message;
+    statusEl.className = `text-sm ${type === 'success' ? 'text-green-600 dark:text-green-400' : type === 'error' ? 'text-red-600 dark:text-red-400' : 'text-gray-600 dark:text-gray-400'}`;
+    if (type !== 'loading') {
+        setTimeout(() => { statusEl.textContent = ''; }, 5000);
+    }
+}
+
+function updateConfigSourceBanner(source, envConfigured, updatedAt, updatedBy) {
+    const banner = document.getElementById('config-source-banner');
+    const icon = document.getElementById('config-source-icon');
+    const text = document.getElementById('config-source-text');
+    const detail = document.getElementById('config-source-detail');
+    banner.classList.remove('hidden');
+
+    if (source === 'db') {
+        banner.className = 'border rounded-lg p-3 mb-6 bg-green-50 border-green-200 dark:bg-green-900/20 dark:border-green-800/60';
+        icon.textContent = '\u2713';
+        icon.className = 'text-lg text-green-600 dark:text-green-400 font-bold';
+        text.textContent = 'Configuration BDD active';
+        text.className = 'text-sm font-medium text-green-800 dark:text-green-200';
+        let info = 'Les emails utilisent la configuration enregistrée ci-dessous';
+        if (updatedBy && updatedAt) {
+            const d = new Date(updatedAt);
+            info += ` \u2014 Mise \u00e0 jour le ${d.toLocaleDateString('fr-FR')} \u00e0 ${d.toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'})} par ${updatedBy}`;
+        }
+        detail.textContent = info;
+        detail.className = 'text-xs mt-0.5 text-green-700 dark:text-green-300';
+    } else if (source === 'env') {
+        banner.className = 'border rounded-lg p-3 mb-6 bg-yellow-50 border-yellow-200 dark:bg-yellow-900/20 dark:border-yellow-800/60';
+        icon.textContent = '\u26a0';
+        icon.className = 'text-lg';
+        text.textContent = 'Fallback .env actif';
+        text.className = 'text-sm font-medium text-yellow-800 dark:text-yellow-200';
+        detail.textContent = 'La config BDD n\u2019est pas active. Les emails utilisent les variables d\u2019environnement (.env)';
+        detail.className = 'text-xs mt-0.5 text-yellow-700 dark:text-yellow-300';
+    } else {
+        banner.className = 'border rounded-lg p-3 mb-6 bg-red-50 border-red-200 dark:bg-red-900/20 dark:border-red-800/60';
+        icon.textContent = '\u2717';
+        icon.className = 'text-lg text-red-600 dark:text-red-400 font-bold';
+        text.textContent = 'Aucune configuration SMTP';
+        text.className = 'text-sm font-medium text-red-800 dark:text-red-200';
+        detail.textContent = 'Aucune source SMTP configur\u00e9e. Remplissez le formulaire et activez la configuration.';
+        detail.className = 'text-xs mt-0.5 text-red-700 dark:text-red-300';
+    }
+}
+
+function clearFieldErrors() {
+    document.querySelectorAll('.field-error').forEach(el => el.remove());
+    document.querySelectorAll('.border-red-500').forEach(el => {
+        el.classList.remove('border-red-500', 'dark:border-red-500');
+        el.classList.add('border-gray-300', 'dark:border-gray-700');
+    });
+}
+
+function showFieldErrors(errors) {
+    clearFieldErrors();
+    const fieldMap = {
+        host: 'smtp-host', port: 'smtp-port',
+        from_email: 'smtp-from-email', username: 'smtp-username',
+        support_email: 'smtp-support-email',
+        from_name: 'smtp-from-name'
+    };
+    for (const [field, message] of Object.entries(errors)) {
+        const inputId = fieldMap[field];
+        if (!inputId) continue;
+        const input = document.getElementById(inputId);
+        if (!input) continue;
+        input.classList.remove('border-gray-300', 'dark:border-gray-700');
+        input.classList.add('border-red-500', 'dark:border-red-500');
+        const errEl = document.createElement('p');
+        errEl.className = 'field-error mt-1 text-xs text-red-600 dark:text-red-400';
+        errEl.textContent = message;
+        input.parentNode.appendChild(errEl);
+    }
+}
+
+async function loadConfig() {
+    try {
+        const res = await fetch('/api/admin/smtp-config', {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        if (!res.ok) { showStatus('Erreur de chargement', 'error'); return; }
+        const data = await res.json();
+
+        document.getElementById('smtp-host').value = data.host || '';
+        document.getElementById('smtp-port').value = data.port || 587;
+        document.getElementById('smtp-username').value = data.username || '';
+        document.getElementById('smtp-password').value = '';
+        document.getElementById('smtp-from-email').value = data.from_email || '';
+        // from_name peut être NULL → champ vide affiché (fallback côté
+        // serveur = config.app_name). On ne force PAS le placeholder dans
+        // ``value`` pour distinguer NULL (BDD) vs surcharge admin.
+        document.getElementById('smtp-from-name').value = data.from_name || '';
+        // 2026-05-19 — support_email peut être NULL → champ vide affiché
+        // (placeholder = default config.py). On ne force pas le placeholder
+        // dans le ``value`` pour distinguer NULL (BDD) vs surcharge user.
+        document.getElementById('smtp-support-email').value = data.support_email || '';
+        document.getElementById('smtp-use-tls').checked = data.use_tls !== false;
+        document.getElementById('smtp-max-retries').value = data.max_retries || 3;
+        document.getElementById('smtp-retry-delay').value = data.retry_delay || 5;
+        document.getElementById('smtp-enabled').checked = data.enabled === true;
+
+        updateConfigSourceBanner(data.config_source, data.env_configured, data.updated_at, data.updated_by);
+    } catch (e) {
+        showStatus('Erreur r\u00e9seau', 'error');
+    }
+}
+
+document.getElementById('smtp-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearFieldErrors();
+
+    const formData = {};
+    new FormData(e.target).forEach((value, key) => {
+        if (key === 'use_tls' || key === 'enabled') {
+            formData[key] = document.getElementById(`smtp-${key.replace('_', '-')}`).checked;
+        } else if (key === 'port' || key === 'max_retries' || key === 'retry_delay') {
+            formData[key] = parseInt(value);
+        } else if (key === 'password' && !value) {
+            return;
+        } else {
+            formData[key] = value;
+        }
+    });
+    // Checkboxes non cochées ne sont pas dans FormData
+    if (!('use_tls' in formData)) formData['use_tls'] = document.getElementById('smtp-use-tls').checked;
+    if (!('enabled' in formData)) formData['enabled'] = document.getElementById('smtp-enabled').checked;
+
+    showStatus('Enregistrement...', 'loading');
+
+    try {
+        const res = await fetch('/api/admin/smtp-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+            body: JSON.stringify(formData)
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+            showStatus('\u2713 Configuration enregistr\u00e9e avec succ\u00e8s', 'success');
+            document.getElementById('smtp-password').value = '';
+            loadConfig();
+        } else if (data.errors) {
+            showFieldErrors(data.errors);
+            showStatus('\u2717 Erreurs de validation', 'error');
+        } else {
+            showStatus(data.error || 'Erreur lors de l\u2019enregistrement', 'error');
+        }
+    } catch (e) {
+        showStatus('Erreur r\u00e9seau', 'error');
+    }
+});
+
+async function testSmtpConfig() {
+    clearFieldErrors();
+    showStatus('Test en cours...', 'loading');
+
+    const formData = {
+        host: document.getElementById('smtp-host').value,
+        port: parseInt(document.getElementById('smtp-port').value),
+        username: document.getElementById('smtp-username').value,
+        password: document.getElementById('smtp-password').value || null,
+        from_email: document.getElementById('smtp-from-email').value,
+        // from_name optionnel : si l'admin l'a modifié dans le form, on le
+        // teste tel quel (preview avant sauvegarde). Sinon le serveur tombe
+        // sur ``config.app_name``.
+        from_name: document.getElementById('smtp-from-name').value || '',
+        use_tls: document.getElementById('smtp-use-tls').checked,
+        max_retries: 1, retry_delay: 0
+    };
+
+    if (!formData.host || !formData.port || !formData.username || !formData.from_email) {
+        showStatus('\u2717 Veuillez remplir tous les champs obligatoires', 'error');
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/admin/smtp-config/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-XSRFToken': getCookie('_xsrf') },
+            body: JSON.stringify(formData)
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            showStatus('\u2713 Test r\u00e9ussi, email envoy\u00e9', 'success');
+        } else if (data.errors) {
+            showFieldErrors(data.errors);
+            showStatus('\u2717 Erreurs de validation', 'error');
+        } else {
+            showStatus('\u2717 Test \u00e9chou\u00e9 : ' + (data.error || 'Erreur inconnue'), 'error');
+        }
+    } catch (e) {
+        showStatus('\u2717 Erreur r\u00e9seau', 'error');
+    }
+}
+
+document.getElementById('btn-test-smtp')?.addEventListener('click', testSmtpConfig);
+loadConfig();
+</script>
+
+{# Onboarding tour 1ère visite admin sur /admin/smtp-config. 4 steps. #}
+<script nonce="{{ handler.csp_nonce }}">
+    (function() {
+        if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_smtp_config_v1',
+                title: 'Configurer l\'envoi d\'emails',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'À quoi sert le SMTP',
+                        text: 'Komptia envoie des emails dans plusieurs situations : rapports planifiés par automatisation, alertes système, signalements de bugs envoyés par vos utilisateurs. Sans serveur SMTP configuré, ces envois sont silencieusement abandonnés.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Saisir les paramètres',
+                        text: 'Remplissez les champs : serveur SMTP (par exemple smtp.gmail.com), port (587 pour TLS, 465 pour SSL), identifiant, mot de passe et adresse d\'expéditeur. Pour Gmail/Outlook, utilisez un mot de passe d\'application dédié plutôt que votre mot de passe principal.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Tester avant de sauvegarder',
+                        text: 'Le bouton « Tester » envoie un email de vérification à l\'adresse d\'expéditeur. Si vous le recevez, la configuration est bonne. Si vous obtenez une erreur, le message vous dit précisément ce qui cloche (port bloqué, mauvaise authentification, certificat...).'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Sécurité',
+                        text: 'Préférez toujours un mot de passe d\'application (Gmail, Outlook proposent cette option) plutôt que votre mot de passe principal. Activez TLS (port 587) ou SSL (port 465) : Komptia refuse les serveurs SMTP en clair pour ne pas exposer vos identifiants sur le réseau.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+{% end %}

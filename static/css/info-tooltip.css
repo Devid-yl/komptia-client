@@ -1,0 +1,131 @@
+/*
+ * Info Tooltip — composant réutilisable pour expliquer un KPI / label obscur.
+ *
+ * Usage HTML (CSP-safe, pas d'inline) :
+ *   <button class="info-icon" type="button" data-info="Sessions actuellement
+ *           connectées (token de session valide ET non expiré)."
+ *           aria-label="Info : sessions actives"></button>
+ *
+ * Le JS (info-tooltip.js) attache le comportement click → popover. Le tooltip
+ * s'ouvre au CLIC (et non au hover) — choix imposé par le brief : un user au
+ * trackpad ou tactile ne déclenche pas un hover, et un hover qui se met dans
+ * un menu obscur frustre l'utilisateur. Click = intention explicite.
+ *
+ * Conventions :
+ * - Icône 14×14, bg léger, hover/focus ring brand.
+ * - Popover max-width 280px, position auto (right par défaut, flip à gauche
+ *   si déborde via la classe .info-tooltip--left ajoutée par JS).
+ * - Animations courtes (160ms) pour ne pas masquer l'info derrière du
+ *   "fancy" qui ralentit l'usage.
+ */
+
+.info-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    margin-left: 4px;
+    border-radius: 50%;
+    background: rgba(148, 163, 184, 0.18);
+    color: #64748b;
+    cursor: pointer;
+    border: none;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    vertical-align: middle;
+    transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+}
+.info-icon:hover,
+.info-icon:focus-visible {
+    background: rgba(148, 163, 184, 0.32);
+    color: #1e293b;
+    outline: none;
+    box-shadow: 0 0 0 2px rgb(var(--brand-rgb) / 0.35);
+}
+.info-icon[aria-expanded="true"] {
+    background: rgb(var(--brand-rgb) / 0.18);
+    color: rgb(var(--brand-rgb));
+}
+.dark .info-icon {
+    background: rgba(255, 255, 255, 0.08);
+    color: #cbd5e1;
+}
+.dark .info-icon:hover,
+.dark .info-icon:focus-visible {
+    background: rgba(255, 255, 255, 0.16);
+    color: #f1f5f9;
+}
+.dark .info-icon[aria-expanded="true"] {
+    background: rgb(var(--brand-light-rgb) / 0.18);
+    color: rgb(var(--brand-light-rgb));
+}
+
+.info-tooltip {
+    position: absolute;
+    z-index: 9998; /* sous les modaux globaux (9999) — un info-tooltip ne
+                     doit JAMAIS bloquer un confirm/sync modal qui pop. */
+    max-width: 280px;
+    min-width: 160px;
+    padding: 8px 10px;
+    background: #1e293b;
+    color: #f1f5f9;
+    font-size: 12px;
+    line-height: 1.45;
+    /* Préserve les retours à la ligne ``&#10;`` posés par les auteurs (tooltips
+       à puces, ex. /admin/data-access) tout en gardant le wrap au max-width.
+       Sans ça (white-space: normal par défaut) les puces s'agglutinent sur une
+       seule ligne — dégradation UX silencieuse. */
+    white-space: pre-line;
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(-2px);
+    transition: opacity 0.16s, transform 0.16s;
+}
+.info-tooltip.info-tooltip--open {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+.dark .info-tooltip {
+    background: #0f172a;
+    color: #e2e8f0;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+/* Petit triangle pointant vers l'icône — placé au top-left par défaut
+ * (tooltip s'ouvre en bas à droite de l'icône). Quand la classe
+ * --left est ajoutée par JS (le tooltip flip à gauche du viewport), le
+ * triangle suit. */
+.info-tooltip::before {
+    content: "";
+    position: absolute;
+    top: -4px;
+    left: 12px;
+    width: 8px;
+    height: 8px;
+    background: inherit;
+    transform: rotate(45deg);
+    box-shadow: -1px -1px 0 0 rgba(0, 0, 0, 0.04);
+}
+.dark .info-tooltip::before {
+    box-shadow: -1px -1px 0 0 rgba(255, 255, 255, 0.04);
+}
+.info-tooltip.info-tooltip--left::before {
+    left: auto;
+    right: 12px;
+}
+/* Flip vertical : le tooltip est placé AU-DESSUS de l'icône (cas des i
+ * en bas du viewport, e.g. footer Iris). Le triangle pointe vers le bas. */
+.info-tooltip.info-tooltip--top::before {
+    top: auto;
+    bottom: -4px;
+    box-shadow: 1px 1px 0 0 rgba(0, 0, 0, 0.04);
+}
+.dark .info-tooltip.info-tooltip--top::before {
+    box-shadow: 1px 1px 0 0 rgba(255, 255, 255, 0.04);
+}

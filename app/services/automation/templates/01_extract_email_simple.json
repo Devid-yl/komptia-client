@@ -1,0 +1,83 @@
+{
+  "komptia_export": {
+    "version": 2,
+    "type": "automation"
+  },
+  "template_meta": {
+    "id": "01_extract_email_simple",
+    "label": "Extraction SQL → Rapport → Email",
+    "description": "Le pattern le plus courant : une requête SQL extrait les données, génère un rapport CSV/Excel, et l'envoie par mail. Idéal pour des rapports périodiques simples (factures du mois, relevé de comptes…).",
+    "category": "starter",
+    "icon": "envelope-paper",
+    "difficulty": "facile"
+  },
+  "automation": {
+    "name": "Modèle — Extraction SQL → Email",
+    "description": "Adaptez la requête SQL et les destinataires pour votre cas d'usage.",
+    "query_type": "sql",
+    "query_text": "-- Adaptez cette requête à votre besoin\nSELECT TOP 100 * FROM votre_table",
+    "schedule_type": "daily",
+    "schedule_config": {},
+    "output_format": "excel",
+    "recipients": [],
+    "notification_emails": [],
+    "notify_on_failure": true,
+    "notify_on_success": false,
+    "fail_policy": "abort"
+  },
+  "steps": [
+    {
+      "name": "Extraction des données",
+      "step_type": "extract_sql",
+      "step_order": 0,
+      "config": {
+        "sql": "-- Adaptez cette requête à votre besoin\nSELECT TOP 100 * FROM votre_table"
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 100,
+      "layout_y": 80
+    },
+    {
+      "name": "Génération rapport",
+      "step_type": "report",
+      "step_order": 1,
+      "config": {
+        "title": "Rapport quotidien",
+        "prompt": "Synthétise les données extraites en quelques sections (vue d'ensemble, points marquants, anomalies éventuelles)."
+      },
+      "is_enabled": true,
+      "max_retries": 0,
+      "retry_delay_seconds": 5,
+      "layout_x": 100,
+      "layout_y": 240
+    },
+    {
+      "name": "Envoi par mail",
+      "step_type": "email",
+      "step_order": 2,
+      "config": {
+        "subject": "Votre rapport quotidien Komptia",
+        "to": []
+      },
+      "is_enabled": true,
+      "max_retries": 1,
+      "retry_delay_seconds": 30,
+      "layout_x": 100,
+      "layout_y": 400
+    }
+  ],
+  "edges": [
+    {
+      "from_step_name": "Extraction des données",
+      "to_step_name": "Génération rapport",
+      "data_type": "workbook"
+    },
+    {
+      "from_step_name": "Génération rapport",
+      "to_step_name": "Envoi par mail",
+      "data_type": "report_file"
+    }
+  ]
+}

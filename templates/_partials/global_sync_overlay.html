@@ -1,0 +1,81 @@
+{# Partial — Overlay global "Synchronisation du schéma en cours".
+   Visible pour TOUS les utilisateurs authentifiés (admin + user) quand un
+   sync schéma est actif (manuel admin OU automatique scheduler). C'est
+   désormais le SEUL modal d'affichage du sync — le ``#syncModal`` legacy
+   a été supprimé (cf. base.html). Cohérent avec la doctrine "tous les
+   sync sont globaux" : un seul sync à la fois dans le système, donc une
+   seule UI partagée par tous.
+
+   Le bouton « Annuler » est rendu UNIQUEMENT pour l'admin
+   (``current_user.role.value == 'admin'``) car l'endpoint backend
+   ``DELETE /api/ai/schema/sync`` est ``@admin_required``. Defense-in-
+   depth : (1) garde Jinja côté SSR, (2) garde backend côté handler.
+
+   Lien SSE et logique d'apparition : ``static/js/global_sync_overlay.js``.
+   Stylé via Tailwind classes existantes (cohérent avec les autres modals
+   admin / dashboard). Z-index 10000 pour passer au-dessus des modals
+   classiques (9998-9999) — le sync est globalement bloquant. #}
+<div id="globalSyncOverlay"
+     class="hidden fixed inset-0 z-[10000] flex items-center justify-center bg-black/50"
+     role="dialog"
+     aria-modal="true"
+     aria-labelledby="globalSyncTitle">
+    <div class="bg-white rounded-lg shadow-xl max-w-md w-full mx-4 dark:bg-gray-900">
+        <div class="p-6">
+            <div class="flex items-center gap-3 mb-4">
+                <div class="w-10 h-10 bg-brand-100 dark:bg-brand-600/20 rounded-lg flex items-center justify-center">
+                    <svg class="w-5 h-5 text-brand-600 dark:text-brand-400 animate-spin"
+                         fill="none" viewBox="0 0 24 24" id="globalSyncSpinner">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    <svg class="w-5 h-5 text-green-600 dark:text-green-400 hidden"
+                         id="globalSyncDoneIcon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                    </svg>
+                </div>
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100" id="globalSyncTitle">Synchronisation du schéma</h3>
+                    {# ``aria-live="polite"`` posé UNIQUEMENT sur la zone qui change
+                       (FAIBLE-5 review : sinon NVDA/JAWS spammait l'announcement à
+                       chaque update DOM du wrapper, ~toutes les 500ms). #}
+                    <p class="text-sm text-gray-500 dark:text-gray-400" id="globalSyncMessage" aria-live="polite">Initialisation...</p>
+                </div>
+            </div>
+            <div class="mb-3">
+                <div class="flex justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+                    <span id="globalSyncStep">start</span>
+                    <span id="globalSyncPercent">0%</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-gray-800 rounded-full h-2 overflow-hidden">
+                    <div id="globalSyncBar" class="bg-brand-600 h-2 rounded-full transition-all duration-500 ease-out" style="width: 0%;"></div>
+                </div>
+            </div>
+            <p class="text-xs text-gray-400 dark:text-gray-500 mb-4" id="globalSyncEta"></p>
+            {# Bouton « Annuler » : admin uniquement. Le JS branche le click
+               sur ``DELETE /api/ai/schema/sync``. Pour un user non-admin,
+               le bouton n'est même pas rendu dans le DOM — la garde Jinja
+               élimine toute fuite UI. La garde backend ``@admin_required``
+               sur l'endpoint constitue le second rempart. #}
+            {# Zone de statut cancel, indépendante de ``#globalSyncMessage`` qui
+               est écrasée par chaque event ``schema_sync.progress``. Sans ce
+               container dédié, les messages d'erreur du cancel (5xx, network,
+               401, etc.) clignotaient < 1s avant d'être écrasés par le
+               prochain progress → erreur silencieuse côté UX (MOY-1 review).
+               Le JS écrit ici via ``cancelStatusEl.textContent`` et reset au
+               prochain ``started``. #}
+            <p id="globalSyncCancelStatus" class="text-xs text-gray-500 dark:text-gray-400 mb-3 hidden" role="status" aria-live="polite"></p>
+            <div class="flex justify-end gap-2">
+                {# Garde Jinja defensive : on protège contre ``role=None``
+                   (compte demi-créé, migration BDD pending, etc.). Sans ce
+                   ``getattr``, n'importe quelle page render-erait 500 — le
+                   partial est inclus sur TOUTES les pages, donc l'impact
+                   dépasse le scope sync (MOY-5 review). #}
+                {% if current_user and getattr(current_user, 'role', None) and getattr(current_user.role, 'value', None) == 'admin' %}
+                <button id="globalSyncCancelBtn" type="button" class="btn btn-secondary text-sm">Annuler</button>
+                {% end %}
+                <button id="globalSyncCloseBtn" type="button" class="btn btn-primary text-sm hidden">Fermer</button>
+            </div>
+        </div>
+    </div>
+</div>

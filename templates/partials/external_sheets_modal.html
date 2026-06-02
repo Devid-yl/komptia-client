@@ -1,0 +1,119 @@
+{# External Sheets Picker — modal partial réutilisable dans /iris, /datastore, /reports.
+   Structure pilotée par static/js/components/external_sheets_picker.js.
+   - 3 onglets : Autre classeur, Fichier Excel, Fichier CSV
+   - Source : datastore utilisateur OU upload depuis la machine
+   - Ajoute les feuilles sélectionnées au classeur actif (ou à la sélection rapport)
+#}
+{# A3-F10 : z-index aligné sur les tokens de layer OverlayManager. 100000 passait
+   AU-DESSUS de la pile toasts (10000) → un toast déclenché picker ouvert était
+   masqué. 9999 (layer system-modal) garde le picker au-dessus des modals normaux
+   (2000) dont il est issu, mais SOUS les toasts. #}
+<div id="ext-sheets-modal" class="fixed inset-0 hidden" style="z-index: 9999;">
+    <div class="absolute inset-0 bg-black/40" data-ext-sheets-close></div>
+    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-lg shadow-xl flex flex-col overflow-hidden dark:bg-gray-900"
+         style="width: min(720px, 95vw); max-height: 85vh;">
+        <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+            <h3 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Ajouter des feuilles externes</h3>
+            <button type="button" id="ext-sheets-close-btn" class="text-gray-500 hover:text-gray-700 px-2 py-1 dark:text-gray-400 dark:hover:text-gray-200" aria-label="Fermer" data-ext-sheets-close>
+                <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+
+        <div class="flex border-b border-gray-200 bg-gray-50 dark:bg-gray-900 dark:border-gray-800">
+            <button type="button" data-ext-tab="workbook"
+                    class="ext-tab-btn flex-1 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-white data-active:bg-white data-active:text-gray-900 data-active:border-b-2 data-active:border-blue-500 dark:text-gray-300 dark:hover:bg-gray-800"
+                    data-active>
+                Autre classeur
+            </button>
+            <button type="button" data-ext-tab="excel"
+                    class="ext-tab-btn flex-1 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-white dark:text-gray-300 dark:hover:bg-gray-800">
+                Fichier Excel
+            </button>
+            <button type="button" data-ext-tab="csv"
+                    class="ext-tab-btn flex-1 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-white dark:text-gray-300 dark:hover:bg-gray-800">
+                Fichier CSV
+            </button>
+        </div>
+
+        <div id="ext-sheets-status" class="hidden px-4 py-2 text-xs text-red-700 bg-red-50 border-b border-red-200 dark:bg-red-900/20 dark:border-red-800/60 dark:text-red-300"></div>
+
+        <div class="flex-1 overflow-auto p-4" style="min-height: 280px;">
+            {# ── Tab 1 : Autre classeur ── #}
+            <div data-ext-pane="workbook">
+                <p class="text-xs text-gray-600 mb-3 dark:text-gray-400">
+                    Choisissez une ou plusieurs feuilles depuis un autre classeur Komptia stocké dans votre datastore.
+                </p>
+                <div id="ext-wb-tree" class="space-y-1 text-sm"></div>
+                <div id="ext-wb-empty" class="hidden text-xs text-gray-500 italic mt-4 dark:text-gray-400">
+                    Aucun classeur trouvé dans votre datastore.
+                </div>
+            </div>
+
+            {# ── Tab 2 : Fichier Excel ── #}
+            <div data-ext-pane="excel" class="hidden">
+                <p class="text-xs text-gray-600 mb-3 dark:text-gray-400">
+                    Importez une ou plusieurs feuilles depuis un fichier Excel (.xlsx, .xls).
+                </p>
+                <div class="flex gap-2 mb-3">
+                    <button type="button" id="ext-excel-upload-btn"
+                            class="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300">
+                        Depuis mon ordinateur
+                    </button>
+                    <button type="button" id="ext-excel-browse-btn"
+                            class="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300">
+                        Depuis mon datastore
+                    </button>
+                    <input type="file" id="ext-excel-file-input" class="hidden" accept=".xlsx,.xls">
+                </div>
+                <div id="ext-excel-selected-file" class="hidden text-xs text-gray-600 mb-2 dark:text-gray-400"></div>
+
+                <div id="ext-excel-ds-list" class="hidden space-y-1 text-sm mb-3 max-h-48 overflow-auto border border-gray-200 rounded p-2 dark:border-gray-800"></div>
+
+                <div id="ext-excel-sheets" class="hidden">
+                    <label class="flex items-center gap-2 text-xs text-gray-700 mb-2 dark:text-gray-300">
+                        <input type="checkbox" id="ext-excel-first-row-header" class="rounded">
+                        Première ligne comme en-têtes (incompatible avec les fusions sur la ligne 1)
+                    </label>
+                    <div class="text-xs text-gray-500 mb-1 dark:text-gray-400">Feuilles trouvées :</div>
+                    <div id="ext-excel-sheet-list" class="space-y-1 text-sm"></div>
+                </div>
+            </div>
+
+            {# ── Tab 3 : Fichier CSV ── #}
+            <div data-ext-pane="csv" class="hidden">
+                <p class="text-xs text-gray-600 mb-3 dark:text-gray-400">
+                    Importez un ou plusieurs fichiers CSV. Encodage et séparateur détectés automatiquement.
+                </p>
+                <div class="flex gap-2 mb-3">
+                    <button type="button" id="ext-csv-upload-btn"
+                            class="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300">
+                        Depuis mon ordinateur
+                    </button>
+                    <button type="button" id="ext-csv-browse-btn"
+                            class="px-3 py-1.5 text-xs border border-gray-300 rounded-md hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:border-gray-700 dark:text-gray-300">
+                        Depuis mon datastore
+                    </button>
+                    <input type="file" id="ext-csv-file-input" class="hidden" accept=".csv" multiple>
+                </div>
+
+                <div id="ext-csv-ds-list" class="hidden space-y-1 text-sm mb-3 max-h-48 overflow-auto border border-gray-200 rounded p-2 dark:border-gray-800"></div>
+
+                <div id="ext-csv-files" class="space-y-2"></div>
+            </div>
+        </div>
+
+        <div class="px-4 py-3 border-t border-gray-200 flex items-center justify-between bg-gray-50 dark:bg-gray-900 dark:border-gray-800">
+            <span id="ext-sheets-count" class="text-xs text-gray-600 dark:text-gray-400">0 feuille(s) sélectionnée(s)</span>
+            <div class="flex gap-2">
+                <button type="button" id="ext-sheets-cancel" class="btn btn-secondary text-sm" data-ext-sheets-close>
+                    Annuler
+                </button>
+                <button type="button" id="ext-sheets-add" class="btn btn-primary text-sm" disabled>
+                    Ajouter
+                </button>
+            </div>
+        </div>
+    </div>
+</div>

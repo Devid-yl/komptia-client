@@ -1,0 +1,20 @@
+{# Badge rôle ADMIN / USER — partial partagé entre :
+   - templates/_partials/dashboard_users_table.html
+   - templates/admin/users.html
+
+   Variable attendue dans le scope du caller :
+   - ``role_is_admin`` : booléen ``True`` si le rôle est ADMIN.
+
+   SSoT palette (Bug 2026-05-26 F7 MOYEN) : avant ce partial, les 2 surfaces
+   utilisaient des couleurs différentes (amber/blue vs emerald/gray) — drift
+   visuel. Le partial fige la palette « sobre » historiquement intentionnelle :
+   - ADMIN = ring emerald (état "tout autorisé", subtil mais lisible)
+   - USER = ring gris neutre (pas de couleur de marque détournée pour un statut)
+
+   Contrastes WCAG AA validés en light + dark.
+#}
+{% if role_is_admin %}
+<span class="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-200/70 dark:bg-emerald-500/10 dark:text-emerald-300 dark:ring-emerald-500/25">admin</span>
+{% else %}
+<span class="text-[9px] font-medium uppercase px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 ring-1 ring-inset ring-gray-200/60 dark:bg-gray-800/70 dark:text-gray-300 dark:ring-gray-700/60">user</span>
+{% end %}

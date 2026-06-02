@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>{% block title %}{{ company_name }}{% endblock %}</title>
+    <style>
+        /* Reset */
+        body, p, h1, h2, h3, h4, h5, h6 { margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #111827;
+            background-color: #f9fafb;
+        }
+        
+        /* Container */
+        .email-container {
+            max-width: 600px;
+            margin: 20px auto;
+            background-color: #ffffff;
+            border: 1px solid #e5e7eb;
+        }
+        
+        /* Header */
+        .email-header {
+            background-color: #111827;
+            color: #ffffff;
+            padding: 24px 20px;
+            text-align: center;
+        }
+        .email-header h1 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .email-header .tagline {
+            font-size: 13px;
+            color: #9ca3af;
+        }
+        
+        /* Logo */
+        .logo {
+            max-width: 100px;
+            height: auto;
+            margin-bottom: 12px;
+        }
+        
+        /* Content */
+        .email-content {
+            padding: 32px 24px;
+        }
+        .email-content h2 {
+            color: #111827;
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+        .email-content p {
+            margin-bottom: 16px;
+            color: #4b5563;
+            font-size: 14px;
+        }
+        
+        /* Button CTA */
+        .button-cta {
+            display: inline-block;
+            padding: 10px 24px;
+            background-color: #111827;
+            color: #ffffff !important;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            margin: 16px 0;
+        }
+        
+        /* Info Box */
+        .info-box {
+            background-color: #f9fafb;
+            border-left: 3px solid #6b7280;
+            padding: 16px;
+            margin: 20px 0;
+        }
+        .info-box p {
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .info-box p:last-child {
+            margin-bottom: 0;
+        }
+        
+        /* Alert Box */
+        .alert-box {
+            background-color: #fef3c7;
+            border-left: 3px solid #d97706;
+            padding: 16px;
+            margin: 20px 0;
+        }
+        .alert-box.error {
+            background-color: #fef2f2;
+            border-color: #dc2626;
+        }
+        .alert-box.success {
+            background-color: #f0fdf4;
+            border-color: #16a34a;
+        }
+        
+        /* Footer */
+        .email-footer {
+            background-color: #f9fafb;
+            padding: 20px 24px;
+            text-align: center;
+            font-size: 12px;
+            color: #6b7280;
+            border-top: 1px solid #e5e7eb;
+        }
+        .email-footer p {
+            margin-bottom: 8px;
+        }
+        .email-footer a {
+            color: #4b5563;
+            text-decoration: underline;
+        }
+        
+        /* Responsive */
+        @media only screen and (max-width: 600px) {
+            .email-container {
+                margin: 0;
+                border: none;
+            }
+            .email-content {
+                padding: 24px 16px;
+            }
+            .email-header {
+                padding: 20px 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="email-container">
+        <!-- Header -->
+        <div class="email-header">
+            {% block header %}
+            {% if logo_url %}
+            <img src="{{ logo_url }}" alt="{{ company_name }}" class="logo">
+            {% endif %}
+            <h1>{{ company_name }}</h1>
+            {% if tagline %}<p class="tagline">{{ tagline }}</p>{% endif %}
+            {% endblock %}
+        </div>
+        
+        <!-- Content -->
+        <div class="email-content">
+            {% block content %}
+            <h2>{{ title | default('Information') }}</h2>
+            <p>{{ message | default('Contenu du message') }}</p>
+            {% endblock %}
+        </div>
+        
+        <!-- Footer -->
+        <div class="email-footer">
+            {% block footer %}
+            <p><strong>{{ company_name }}</strong></p>
+            {% if address %}<p>{{ address }}</p>{% endif %}
+            {% if phone or contact_email %}
+            <p>
+                {% if phone %}Tél: {{ phone }}{% endif %}
+                {% if phone and contact_email %} | {% endif %}
+                {% if contact_email %}Email: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>{% endif %}
+            </p>
+            {% endif %}
+            <p style="margin-top: 15px; font-size: 12px;">
+                Vous recevez cet email car vous êtes client de {{ company_name }}.<br>
+                <a href="{{ unsubscribe_url | default('#') }}">Se désabonner</a>
+            </p>
+            {% endblock %}
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,317 @@
+{% extends "../base.html" %}
+
+{% block title %}Historique des exécutions | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Historique des exécutions</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Toutes vos exécutions d'automations &middot; {{ total_count }} au total</p>
+        </div>
+        <a href="/dashboard" class="btn btn-secondary">Retour</a>
+    </div>
+
+    <!-- Filters -->
+    <div class="card mb-4">
+        <div class="flex flex-wrap items-center gap-4 px-4 py-3">
+            <div>
+                <select id="filter-status" class="input w-36">
+                    <option value="">Tous statuts</option>
+                    <option value="success" {% if status_filter == 'success' %}selected{% end %}>R&eacute;ussi</option>
+                    <option value="partial" {% if status_filter == 'partial' %}selected{% end %}>Partiel</option>
+                    <option value="failed" {% if status_filter == 'failed' %}selected{% end %}>Echec</option>
+                    <option value="pending" {% if status_filter == 'pending' %}selected{% end %}>En file</option>
+                    <option value="running" {% if status_filter == 'running' %}selected{% end %}>En cours</option>
+                    <option value="waiting" {% if status_filter == 'waiting' %}selected{% end %}>En attente</option>
+                    <option value="cancelled" {% if status_filter == 'cancelled' %}selected{% end %}>Annul&eacute;</option>
+                </select>
+            </div>
+            <div>
+                <select id="filter-days" class="input w-40">
+                    <option value="">Toute p&eacute;riode</option>
+                    <option value="1" {% if days_filter == '1' %}selected{% end %}>Derni&egrave;res 24h</option>
+                    <option value="7" {% if days_filter == '7' %}selected{% end %}>7 derniers jours</option>
+                    <option value="30" {% if days_filter == '30' %}selected{% end %}>30 derniers jours</option>
+                    <option value="90" {% if days_filter == '90' %}selected{% end %}>90 derniers jours</option>
+                </select>
+            </div>
+            {% if status_filter or days_filter %}
+            <a href="/executions" class="text-sm text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">R&eacute;initialiser</a>
+            {% end %}
+        </div>
+    </div>
+
+    {% if executions %}
+    <div class="card divide-y divide-gray-100 dark:divide-gray-800">
+        {% for execution in executions %}
+        <div class="px-5 py-3 hover:bg-gray-50 transition-colors dark:hover:bg-gray-800">
+            <div class="flex items-start gap-4">
+                <!-- Status Icon -->
+                <div class="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 {% if execution.status == 'success' %}bg-emerald-50 dark:bg-emerald-900/20{% elif execution.status == 'partial' %}bg-orange-50 dark:bg-orange-900/20{% elif execution.status == 'failed' %}bg-red-50 dark:bg-red-900/20{% elif execution.status == 'running' %}bg-blue-50 dark:bg-blue-900/20{% else %}bg-gray-50 dark:bg-gray-800{% end %}">
+                    {% if execution.status == 'success' %}
+                    <svg class="w-4 h-4 text-emerald-600 dark:text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5"/></svg>
+                    {% elif execution.status == 'partial' %}
+                    <svg class="w-4 h-4 text-orange-500 dark:text-orange-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"/></svg>
+                    {% elif execution.status == 'failed' %}
+                    <svg class="w-4 h-4 text-red-500 dark:text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                    {% elif execution.status == 'running' %}
+                    <svg class="w-4 h-4 text-blue-500 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M2.985 19.644l3.182-3.182"/></svg>
+                    {% else %}
+                    <svg class="w-4 h-4 text-gray-400 dark:text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                    {% end %}
+                </div>
+
+                <!-- Content -->
+                <div class="min-w-0 flex-1">
+                    <div class="flex items-center gap-2 mb-1">
+                        <h3 class="text-sm font-medium text-gray-900 truncate dark:text-gray-100">{{ execution._automation_name }}</h3>
+                        <span class="text-xs font-medium px-2 py-0.5 rounded-full flex-shrink-0 {% if execution.status == 'success' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 {% elif execution.status == 'partial' %}bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300 {% elif execution.status == 'failed' %}bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 {% elif execution.status == 'running' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 {% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300 {% end %}">
+                            {% if execution.status == 'success' %}R&eacute;ussi
+                            {% elif execution.status == 'partial' %}Partiel
+                            {% elif execution.status == 'failed' %}&Eacute;chec
+                            {% elif execution.status == 'running' %}En cours
+                            {% elif execution.status == 'waiting' %}En attente
+                            {% elif execution.status == 'pending' %}En file
+                            {% elif execution.status == 'cancelled' %}Annul&eacute;
+                            {% else %}{{ execution.status }}{% end %}
+                        </span>
+                    </div>
+
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
+                        {# UTC stocke en BDD ; converti en heure locale par
+                           static/js/local-datetime.js qui lit le `datetime` ISO. #}
+                        <time datetime="{{ execution.started_at.isoformat() }}+00:00"
+                              data-fmt-local="short"
+                              title="{{ execution.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC">
+                            {{ execution.started_at.strftime('%d/%m %H:%M') }} UTC
+                        </time>
+                        {% if execution.duration_seconds is not None %}
+                        <span>&middot; {{ "%.1f" % execution.duration_seconds }}s</span>
+                        {% end %}
+                        {% if execution.result_rows is not None %}
+                        <span>&middot; {{ execution.result_rows }} ligne(s)</span>
+                        {% end %}
+                        {% if execution.output_file_path %}
+                        <a href="/automations/download/{{ execution.id }}" target="_blank" class="text-brand-600 hover:text-brand-700 hover:underline dark:hover:text-brand-300">&middot; T&eacute;l&eacute;charger</a>
+                        {% end %}
+                        {% if execution.has_steps %}
+                        <button class="text-blue-600 hover:text-blue-800 hover:underline step-toggle dark:text-blue-400"
+                                data-execution-id="{{ execution.id }}">&middot; Voir les &eacute;tapes</button>
+                        {% end %}
+                        <a href="/executions/{{ execution.id }}" class="text-gray-500 hover:text-gray-700 hover:underline dark:text-gray-400 dark:hover:text-gray-200">&middot; D&eacute;tail</a>
+                    </div>
+
+                    {% if execution.error_message %}
+                    <div class="mt-2 p-2 bg-red-50 border border-red-100 rounded text-xs text-red-700 dark:bg-red-900/20 dark:text-red-300">
+                        <span class="font-medium">Erreur:</span> {{ execution.error_message }}
+                    </div>
+                    {% end %}
+
+                    <!-- Step details container (lazy-loaded) -->
+                    <div id="steps-{{ execution.id }}" class="hidden mt-3"></div>
+                </div>
+            </div>
+        </div>
+        {% end %}
+    </div>
+
+    <!-- Pagination -->
+    {% if total_pages > 1 %}
+    <div class="flex items-center justify-center gap-2 mt-6">
+        {% if page > 1 %}
+        <a href="/executions?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" 
+           class="px-3 py-2 text-sm border border-gray-300 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-700">&larr; Pr&eacute;c&eacute;dent</a>
+        {% end %}
+        
+        <div class="flex items-center gap-1">
+            {% for p in range(max(1, page - 2), min(total_pages + 1, page + 3)) %}
+            <a href="/executions?page={{ p }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}"
+               class="px-3 py-2 text-sm rounded {% if p == page %}bg-brand-600 text-white{% else %}border border-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800{% end %} dark:border-gray-700">{{ p }}</a>
+            {% end %}
+        </div>
+        
+        {% if page < total_pages %}
+        <a href="/executions?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" 
+           class="px-3 py-2 text-sm border border-gray-300 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-700">Suivant &rarr;</a>
+        {% end %}
+    </div>
+    
+    <p class="text-center text-xs text-gray-500 mt-3 dark:text-gray-400">Page {{ page }} sur {{ total_pages }}</p>
+    {% end %}
+
+    {% else %}
+    <div class="card px-4 py-12 text-center">
+        <svg class="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/>
+        </svg>
+        <p class="text-sm text-gray-500 mb-1 dark:text-gray-400">Aucune ex&eacute;cution</p>
+        <p class="text-xs text-gray-400 dark:text-gray-500">Cr&eacute;ez une automation pour commencer</p>
+        <a href="/automations" class="inline-block mt-3 text-sm text-brand-600 hover:text-brand-700 dark:hover:text-brand-300">Mes automations &rarr;</a>
+    </div>
+    {% end %}
+
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+function applyFilter(name, value) {
+    var params = new URLSearchParams(window.location.search);
+    if (value) params.set(name, value);
+    else params.delete(name);
+    params.delete('page');
+    window.location.search = params.toString();
+}
+
+// Event listeners
+document.getElementById('filter-status')?.addEventListener('change', function(e) {
+    applyFilter('status', e.target.value);
+});
+document.getElementById('filter-days')?.addEventListener('change', function(e) {
+    applyFilter('days', e.target.value);
+});
+
+// Step detail toggle (lazy-loaded)
+var stepCache = {};
+
+function statusBadge(status) {
+    var map = {
+        success: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">OK</span>',
+        failed: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">Echec</span>',
+        skipped: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400">Ignore</span>',
+        retried: '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">Retry</span>',
+    };
+    return map[status] || '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-yellow-100 text-yellow-700 dark:text-yellow-300">' + escapeHtml(status) + '</span>';
+}
+
+function stepTypeLabel(type) {
+    // ⚠️ Tenir aligné avec STEP_TYPE_META.label dans
+    // app/models/automation_step.py — 9 step types attendus :
+    // 4 Source + 1 Format + 2 Conversion + 2 Sortie. La fallback
+    // `|| type` retourne la valeur brute si un type est ajouté
+    // sans mise à jour ici (visible mais lisible).
+    var map = {
+        extract_sql: 'SQL',
+        load_workbook: 'Classeur',
+        load_saved_query: 'Requete sauvegardee',
+        format_copilot: 'Format IA',
+        report: 'Rapport',
+        export_workbook: 'Export',
+        email: 'Email',
+        save_to_datastore: 'Datastore',
+    };
+    return map[type] || type;
+}
+
+function formatDuration(ms) {
+    if (ms == null) return '-';
+    if (ms < 1000) return ms.toFixed(0) + 'ms';
+    return (ms / 1000).toFixed(2) + 's';
+}
+
+function renderSteps(steps) {
+    if (!steps.length) return '<p class="text-xs text-gray-400 dark:text-gray-500">Aucune donnee d\'etape</p>';
+    var html = '<div class="border border-gray-200 rounded-lg overflow-hidden dark:border-gray-800">';
+    html += '<table class="w-full text-xs">';
+    html += '<thead class="bg-gray-50 dark:bg-gray-900"><tr>';
+    html += '<th class="px-2 py-1.5 text-left text-gray-500 font-medium dark:text-gray-400">#</th>';
+    html += '<th class="px-2 py-1.5 text-left text-gray-500 font-medium dark:text-gray-400">Etape</th>';
+    html += '<th class="px-2 py-1.5 text-left text-gray-500 font-medium dark:text-gray-400">Type</th>';
+    html += '<th class="px-2 py-1.5 text-center text-gray-500 font-medium dark:text-gray-400">Statut</th>';
+    html += '<th class="px-2 py-1.5 text-center text-gray-500 font-medium dark:text-gray-400">Essai</th>';
+    html += '<th class="px-2 py-1.5 text-right text-gray-500 font-medium dark:text-gray-400">Lignes</th>';
+    html += '<th class="px-2 py-1.5 text-right text-gray-500 font-medium dark:text-gray-400">Duree</th>';
+    html += '</tr></thead><tbody class="divide-y divide-gray-100 dark:divide-gray-800">';
+    for (var i = 0; i < steps.length; i++) {
+        var s = steps[i];
+        var rowClass = s.status === 'failed' ? ' bg-red-50 dark:bg-red-900/20' : s.status === 'skipped' ? ' bg-gray-50 dark:bg-gray-800/50' : s.status === 'retried' ? ' bg-amber-50 dark:bg-amber-900/20' : '';
+        html += '<tr class="' + rowClass + '">';
+        html += '<td class="px-2 py-1.5 text-gray-400 dark:text-gray-500">' + s.step_order + '</td>';
+        html += '<td class="px-2 py-1.5 font-medium text-gray-700 dark:text-gray-300">' + escapeHtml(s.step_name) + '</td>';
+        html += '<td class="px-2 py-1.5"><span class="inline-block px-1.5 py-0.5 rounded bg-blue-50 text-blue-600 text-xs dark:bg-blue-900/20 dark:text-blue-400">' + stepTypeLabel(s.step_type) + '</span></td>';
+        html += '<td class="px-2 py-1.5 text-center">' + statusBadge(s.status) + '</td>';
+        html += '<td class="px-2 py-1.5 text-center text-gray-500 dark:text-gray-400">' + (s.attempt_number > 1 ? s.attempt_number : '-') + '</td>';
+        html += '<td class="px-2 py-1.5 text-right text-gray-600 dark:text-gray-400">';
+        if (s.rows_in != null && s.rows_out != null && s.status !== 'skipped') {
+            html += s.rows_in + ' &rarr; ' + s.rows_out;
+        } else {
+            html += '-';
+        }
+        html += '</td>';
+        html += '<td class="px-2 py-1.5 text-right text-gray-500 dark:text-gray-400">' + formatDuration(s.duration_ms) + '</td>';
+        html += '</tr>';
+        if (s.error_message) {
+            html += '<tr class="bg-red-50 dark:bg-red-900/20"><td colspan="7" class="px-3 py-1.5 text-red-600 dark:text-red-400">' + escapeHtml(s.error_message) + '</td></tr>';
+        }
+        if (s.warnings && s.warnings.length) {
+            html += '<tr class="bg-yellow-50 dark:bg-yellow-900/20"><td colspan="7" class="px-3 py-1.5 text-yellow-700 dark:text-yellow-300">';
+            for (var j = 0; j < s.warnings.length; j++) {
+                html += escapeHtml(s.warnings[j]) + '<br>';
+            }
+            html += '</td></tr>';
+        }
+    }
+    html += '</tbody></table></div>';
+    return html;
+}
+
+document.querySelectorAll('.step-toggle').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        var execId = this.getAttribute('data-execution-id');
+        var container = document.getElementById('steps-' + execId);
+        if (!container) return;
+
+        // Toggle visibility
+        if (!container.classList.contains('hidden') && container.innerHTML) {
+            container.classList.add('hidden');
+            this.textContent = '\u00b7 Voir les etapes';
+            return;
+        }
+
+        // Load if cached
+        if (stepCache[execId]) {
+            container.innerHTML = renderSteps(stepCache[execId]);
+            container.classList.remove('hidden');
+            this.textContent = '\u00b7 Masquer les etapes';
+            return;
+        }
+
+        // Fetch from API
+        var self = this;
+        self.textContent = 'Chargement...';
+        self.disabled = true;
+
+        fetch('/api/executions/' + execId + '/steps', {
+            headers: { 'X-Xsrftoken': getCookie('_xsrf') || '' }
+        })
+        .then(function(res) {
+            if (!res.ok) throw new Error('Erreur ' + res.status);
+            return res.json();
+        })
+        .then(function(data) {
+            if (data.success && data.steps) {
+                stepCache[execId] = data.steps;
+                container.innerHTML = renderSteps(data.steps);
+                container.classList.remove('hidden');
+                self.textContent = '\u00b7 Masquer les etapes';
+            } else {
+                container.innerHTML = '<p class="text-xs text-gray-400 dark:text-gray-500">Aucune donnee</p>';
+                container.classList.remove('hidden');
+                self.textContent = '\u00b7 Masquer les etapes';
+            }
+        })
+        .catch(function() {
+            container.innerHTML = '<p class="text-xs text-red-500 dark:text-red-400">Erreur de chargement</p>';
+            container.classList.remove('hidden');
+            self.textContent = '\u00b7 Masquer les etapes';
+        })
+        .finally(function() {
+            self.disabled = false;
+        });
+    });
+});
+</script>
+{% end %}

@@ -1,0 +1,107 @@
+{# Partial — Table monitoring utilisateurs (dashboard admin).
+
+   Variables attendues dans le scope du caller :
+   - ``users_overview`` : dict ``{users, total, truncated, limit}`` ou liste
+     plate (rétrocompat). Cf. ``AdminMonitoringService.get_users_overview``.
+
+   Sortie : section bordure + table dense (max-h: 360px scroll-y) avec une
+   ligne par user (username, rôle, sessions, recherches 7j, stockage,
+   quota %, dernière connexion). Si ``truncated``, footer "X/Y affichés".
+
+   Le partial gère son propre normalisation (dict vs liste) et empty state.
+#}
+{% set _users_list = users_overview.get("users", []) if isinstance(users_overview, dict) else (users_overview or []) %}
+{% set _users_total = users_overview.get("total", len(_users_list)) if isinstance(users_overview, dict) else len(_users_list) %}
+{% set _users_truncated = users_overview.get("truncated", False) if isinstance(users_overview, dict) else False %}
+<div class="bg-white border border-gray-200/80 rounded-xl shadow-sm mb-4 dark:bg-gray-900 dark:border-gray-800/80">
+    <div class="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
+        <div>
+            <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100 inline-flex items-center gap-2">
+                Monitoring utilisateurs
+                <span class="inline-flex items-center justify-center min-w-[1.5rem] h-5 px-1.5 text-[10px] font-medium tabular-nums rounded-md bg-gray-100 text-gray-600 ring-1 ring-inset ring-gray-200/60 dark:bg-white/[0.06] dark:text-gray-200 dark:ring-white/[0.06]" style="font-variant-numeric: tabular-nums;">{{ _users_total }}</span>
+            </h2>
+        </div>
+        <a href="/admin" class="text-xs text-gray-500 hover:text-gray-900 no-underline dark:text-gray-400 dark:hover:text-gray-100">G&eacute;rer les comptes &rarr;</a>
+    </div>
+    {% if _users_list %}
+    {# scroll-y wrapper en ``relative`` + table en ``relative`` pour garantir
+       que ``thead.sticky top-0`` accroche correctement sur Safari < 16 et
+       les contextes Chromium avec ``transform`` parent (review R2-A7). #}
+    <div class="scroll-y relative" style="max-height: 360px;">
+        <table class="w-full text-xs relative" aria-label="Monitoring utilisateurs">
+            <thead class="sticky top-0 bg-white dark:bg-gray-900 z-10">
+                <tr class="border-b border-gray-200 text-[10px] text-gray-500 uppercase dark:border-gray-800 dark:text-gray-400">
+                    <th class="px-4 py-1.5 text-left font-medium">Utilisateur</th>
+                    <th class="px-2 py-1.5 text-left font-medium">R&ocirc;le</th>
+                    <th class="px-2 py-1.5 text-right font-medium">Sessions</th>
+                    <th class="px-2 py-1.5 text-right font-medium">Rech. 7j</th>
+                    <th class="px-2 py-1.5 text-right font-medium">Stockage</th>
+                    <th class="px-2 py-1.5 text-right font-medium">Quota</th>
+                    <th class="px-4 py-1.5 text-right font-medium">Derni&egrave;re connexion</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in _users_list %}
+                {% set used_mb = u.get("storage_used_bytes", 0) / 1048576.0 %}
+                {% set quota_pct = u.get("quota_percent") %}
+                {# float() peut crasher si quota_pct est une string vide ou un dict
+                   (cas defensif : un futur backend buggy). On valide explicitement. #}
+                {% set quota_pct = quota_pct if isinstance(quota_pct, (int, float)) else None %}
+                {% set quota_pct_safe = (max(0.0, min(100.0, float(quota_pct))) if quota_pct is not None else 0.0) %}
+                {% set last = u.get("last_login") %}
+                <tr class="border-b border-gray-100 hover:bg-gray-50 dark:hover:bg-gray-800/60 dark:border-gray-800/60 {% if not u.get("is_active", True) %}opacity-60{% end %}">
+                    <td class="px-4 py-1.5">
+                        <span class="font-medium text-gray-900 dark:text-gray-100">{{ u.get("username") or "—" }}</span>
+                        {% if not u.get("is_active", True) %}<span class="ml-1 text-[9px] text-gray-400 uppercase dark:text-gray-500">d&eacute;sactiv&eacute;</span>{% end %}
+                    </td>
+                    <td class="px-2 py-1.5">
+                        {# F7 2026-05-26 : badge déplacé dans ``_partials/user_role_badge.html``
+                           (SSoT palette + dedup avec admin/users.html). #}
+                        {% set role_is_admin = bool(u.get("is_admin")) %}
+                        {% include "../_partials/user_role_badge.html" %}
+                    </td>
+                    <td class="px-2 py-1.5 text-right">
+                        {% if u.get("active_sessions", 0) > 0 %}
+                        <span class="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                            <span class="activity-dot bg-emerald-500"></span>{{ u.get("active_sessions", 0) }}
+                        </span>
+                        {% else %}<span class="text-gray-500 dark:text-gray-500">0</span>{% end %}
+                    </td>
+                    <td class="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">{{ u.get("searches_7d", 0) }}</td>
+                    <td class="px-2 py-1.5 text-right text-gray-600 dark:text-gray-400">{{ "%.1f" % used_mb }} Mo</td>
+                    <td class="px-2 py-1.5 text-right">
+                        {% if quota_pct is None %}
+                        <span class="text-gray-400 dark:text-gray-600">—</span>
+                        {% else %}
+                        <div class="flex items-center justify-end gap-1.5">
+                            <div class="w-12 bg-gray-100 rounded-full h-1 dark:bg-gray-700/60">
+                                <div class="rounded-full h-1 {% if quota_pct >= 100 %}bg-red-500{% elif quota_pct >= 80 %}bg-amber-500{% else %}bg-emerald-500{% end %}" style="width: {{ "%.1f" % quota_pct_safe }}%"></div>
+                            </div>
+                            <span class="w-9 text-right {% if quota_pct >= 100 %}text-red-600 font-semibold dark:text-red-400{% elif quota_pct >= 80 %}text-amber-600 dark:text-amber-400{% else %}text-gray-600 dark:text-gray-400{% end %}">{{ "%.0f" % quota_pct }}%</span>
+                        </div>
+                        {% end %}
+                    </td>
+                    <td class="px-4 py-1.5 text-right text-[10px] text-gray-500 dark:text-gray-400">
+                        {# ``last`` est un ISO 8601 produit par ``admin_monitoring`` — désormais avec
+                           suffixe ``+00:00`` (cf. ``ensure_utc``). Le ``<time>`` data-fmt-local est
+                           converti en heure locale par ``static/js/local-datetime.js``. Fallback SSR
+                           SUFFIXÉ ``UTC`` pour ne pas tromper le user si le JS ne tourne pas. #}
+                        {% if last %}<time datetime="{{ last }}" data-fmt-local="short">{{ last[:10] }} {{ last[11:16] }} UTC</time>{% else %}<span class="italic text-gray-400 dark:text-gray-600">jamais</span>{% end %}
+                    </td>
+                </tr>
+                {% end %}
+            </tbody>
+        </table>
+    </div>
+    {% if _users_truncated %}
+    <div class="px-4 py-1.5 border-t border-gray-100 text-center text-[10px] text-gray-500 dark:border-gray-800 dark:text-gray-400">
+        {{ len(_users_list) }} sur {{ _users_total }} affich&eacute;s &middot;
+        <a href="/admin" class="text-gray-700 underline hover:text-gray-900 dark:text-gray-300 dark:hover:text-gray-100">Voir tous les comptes &rarr;</a>
+    </div>
+    {% end %}
+    {% else %}
+    <div class="px-5 py-6 text-center">
+        <p class="text-xs text-gray-500 dark:text-gray-400">Aucun utilisateur &agrave; afficher</p>
+    </div>
+    {% end %}
+</div>
