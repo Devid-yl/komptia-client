@@ -40,12 +40,12 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.core.database import get_db_url
+from app.core.database import make_sync_engine
 
 logger = logging.getLogger(__name__)
 
@@ -62,17 +62,8 @@ def _create_sync_engine_with_wal():
     Pour PostgreSQL/MySQL ces PRAGMA SQLite sont ignorés silencieusement —
     l'event listener s'exécute mais la commande échoue côté driver.
     """
-    engine = create_engine(get_db_url())
-
-    @event.listens_for(engine, "connect")
-    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
-        try:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode = WAL")
-            cursor.execute("PRAGMA busy_timeout = 30000")
-            cursor.close()
-        except Exception:  # noqa: BLE001 — non-SQLite : silently ignore
-            pass
+    # make_sync_engine pose WAL + busy_timeout (via setup_pragmas) + PRAGMA key.
+    engine = make_sync_engine()
 
     return engine
 

@@ -79,8 +79,9 @@ RESPONSE_TIMEOUT_SECONDS: float = 5 * 60.0
 #:
 #: **Critère d'inclusion** : tout outil qui, en runtime, lit la BDD source
 #: (SQL Server / Sage) et fait remonter au LLM cloud des valeurs réelles
-#: — même obfusquées par ``anonymize_for_llm`` (Niveau 2 doctrine), car
-#: les chiffres et dates passent en clair.
+#: — même obfusquées par ``anonymize_for_llm`` (Niveau 2 doctrine), car des
+#: valeurs réelles (nombres notamment) transitent en clair. (#132 — les dates
+#: NE passent PAS en clair : tokenisées en ``[DATE_N]`` par la couche PII.)
 #:
 #: **Single source of truth** : le gate dans ``agent_service`` lit
 #: cette frozenset (via :func:`requires_consent`). Plus jamais de
@@ -179,6 +180,59 @@ def result_has_protected_rows(tool_result: Any) -> bool:
         if isinstance(payload, list) and len(payload) > 0:
             return True
     return False
+
+
+#: Outils pipeline NL→SQL. Hors :data:`CONSENT_REQUIRED_TOOLS` (frozenset
+#: statique) car un run COMPLET est gaté naturellement par l'``execute_sql``
+#: aval qui exécute le ``final_sql``. Mais un run ARRÊTÉ à une phase
+#: intermédiaire (feature « preview » — docs/design/iris_stop_at_phase.md)
+#: n'a PAS de ``final_sql`` ni d'``execute_sql`` aval, et renvoie ses
+#: factsheets (interpretation + entity names = VRAIES valeurs Sage) au LLM :
+#: c'est le seul chemin où la doctrine « le gate s'applique sur l'execute_sql
+#: aval » tombe. :func:`pipeline_result_needs_consent` ferme ce trou (CRIT-A).
+_PIPELINE_TOOLS: frozenset[str] = frozenset({"run_pipeline", "pipeline_resume"})
+
+
+def pipeline_result_needs_consent(tool_name: str, tool_result: Any) -> bool:
+    """Vrai si un ``tool_result`` de run pipeline doit déclencher le gate.
+
+    COMPLÉMENT de :func:`requires_consent` (statique) — répond à une question
+    *content-based* : « ce résultat pipeline transporte-t-il de vraies valeurs
+    Sage au LLM SANS qu'un ``execute_sql`` aval ne les gate ? ».
+
+    Déclenche ssi **toutes** ces conditions :
+
+    - ``tool_name`` est un outil pipeline (:data:`_PIPELINE_TOOLS`) ;
+    - le résultat n'est pas un échec (``success`` ≠ False) ;
+    - **aucun** ``final_sql`` n'a été produit (un SQL final → gate NATUREL sur
+      l'``execute_sql`` aval, on ne double-gate pas ici) ;
+    - des ``factsheets`` sont **effectivement présentes** dans
+      ``pipeline_artifacts`` (= vraies valeurs Sage réellement dans le payload
+      envoyé au LLM).
+
+    Piloté par la **présence des données** (factsheets dans le payload), PAS
+    par un numéro de phase hardcodé : si les factsheets ont été tronquées du
+    payload (cap taille) elles n'atteignent pas le LLM → pas de gate requis ;
+    inversement dès qu'elles y sont, on gate. Single source of truth du
+    périmètre consent pipeline.
+    """
+    if not isinstance(tool_name, str) or tool_name not in _PIPELINE_TOOLS:
+        return False
+    if not isinstance(tool_result, dict):
+        return False
+    if tool_result.get("success") is False:
+        return False
+    # Un final_sql présent → l'execute_sql aval gatera les rows réelles.
+    # (``final_sql`` falsy ici n'est PAS une inférence clean-vs-crash — on
+    # demande seulement « des vraies valeurs sont-elles dans CE payload ? » ;
+    # la distinction clean/crash reste portée par ``terminal_reason`` pour le
+    # rendu, cf. CRIT-B.)
+    if tool_result.get("final_sql"):
+        return False
+    artifacts = tool_result.get("pipeline_artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    return bool(artifacts.get("factsheets"))
 
 
 # ── Préférence persistée en BDD ─────────────────────────────────────────
@@ -291,6 +345,11 @@ class ConsentResponse:
     approved: bool
     abandoned: bool = False
     dont_ask_again: bool = False
+    #: ``True`` UNIQUEMENT quand l'abandon vient d'un TIMEOUT serveur (≠ refus
+    #: explicite ou Stop). Permet au caller de fermer le modal de consentement
+    #: PROACTIVEMENT côté client (#44) sans afficher « expiré » à tort sur un
+    #: refus utilisateur.
+    timed_out: bool = False
 
 
 #: Storage in-memory des Future en attente, keyed par ``conversation_id``.
@@ -449,14 +508,14 @@ async def request_consent(
             RESPONSE_TIMEOUT_SECONDS,
             conversation_id,
         )
-        return ConsentResponse(approved=False, abandoned=True)
+        return ConsentResponse(approved=False, abandoned=True, timed_out=True)
     except asyncio.TimeoutError:
         logger.info(
             "data_read_consent: timeout (%.0fs) sur conv=%s — traité comme abandon",
             RESPONSE_TIMEOUT_SECONDS,
             conversation_id,
         )
-        return ConsentResponse(approved=False, abandoned=True)
+        return ConsentResponse(approved=False, abandoned=True, timed_out=True)
     except asyncio.CancelledError:
         # Annulé par un autre request_consent ou par le caller — traité
         # comme abandon pour ne pas leak l'état au caller.

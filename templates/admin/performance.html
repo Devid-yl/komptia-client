@@ -970,4 +970,48 @@
     }
 })();
 </script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding admin_performance_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_performance_v1',
+                title: 'Surveiller la santé système',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'L\'état du système en un coup d\'œil',
+                        text: 'Le bandeau en haut résume la santé globale : process serveur, base source Sage, taux de hit du cache et latences. Choisissez la période (7, 30 ou 90 jours) avec les onglets en haut à droite, et activez « Auto 30s » pour un rafraîchissement automatique. Pour les métriques propres à l\'IA, le lien « Performance Iris » vous renvoie vers la page dédiée.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Tester les connexions externes',
+                        text: 'Les boutons « Tester maintenant » de la carte « Base source (Sage) » et de la carte « Providers LLM » lancent un ping immédiat et affichent la latence ou l\'erreur exacte. Pratique pour confirmer qu\'une panne vient bien de l\'extérieur avant d\'alerter. Ces tests sont limités en fréquence pour ne pas surcharger les services.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Régler les limites de stockage',
+                        text: 'Deux réglages globaux s\'appliquent à tous les utilisateurs : le « Quota stockage par utilisateur » (fichiers + données en base) et la « Taille maximale par fichier uploadé ». Saisissez la valeur en Mo et cliquez « Enregistrer » : le changement prend effet immédiatement, sans redémarrage.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Repérer ce qui ralentit',
+                        text: 'Les cartes de latence (génération SQL, exécution Sage) montrent les percentiles P50/P90/P99, la distribution des temps et l\'évolution quotidienne succès/échecs. Le bouton « Vider le cache » des requêtes SQL force une régénération, à utiliser après un changement de schéma.'
+                    },
+                    {
+                        icon: 'bell',
+                        title: 'Suivre les recommandations',
+                        text: 'Quand un indicateur dérape (cache trop bas, échecs d\'automations ou d\'emails, Sage indisponible), un compteur d\'alertes apparaît dans le bandeau et le lien « Voir détails » vous amène à la section « Recommandations » en bas de page, qui liste les actions concrètes à mener.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
 {% end %}

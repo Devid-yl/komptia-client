@@ -620,20 +620,14 @@ function reportListsError() {
 }
 
 function renderPagination(page, totalPages, total) {
-    var html = '';
-    if (totalPages > 1) {
-        html += '<button class="btn btn-secondary text-xs py-1 px-2" data-action="loadContacts" data-page="' + (page - 1) + '" ' + (page === 1 ? 'disabled' : '') + '>Préc.</button>';
-        for (var i = 1; i <= totalPages; i++) {
-            if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
-                html += '<button class="btn ' + (i === page ? 'btn-primary' : 'btn-secondary') + ' text-xs py-1 px-2" data-action="loadContacts" data-page="' + i + '">' + i + '</button>';
-            } else if (Math.abs(i - page) === 3) {
-                html += '<span class="text-gray-400 text-xs px-1 dark:text-gray-500">...</span>';
-            }
-        }
-        html += '<button class="btn btn-secondary text-xs py-1 px-2" data-action="loadContacts" data-page="' + (page + 1) + '" ' + (page === totalPages ? 'disabled' : '') + '>Suiv.</button>';
-        html += '<span class="text-xs text-gray-500 ml-2 dark:text-gray-400">' + total + ' contacts</span>';
-    }
-    document.getElementById('pagination').innerHTML = html;
+    // Pagination unifiée (static/js/pagination.js — même fenêtrage que l'UIModule serveur).
+    if (!window.KomptiaPagination) { return; }
+    window.KomptiaPagination.render(document.getElementById('pagination'), {
+        page: page,
+        totalPages: totalPages,
+        onNavigate: function (p) { loadContacts(p); },
+        countText: total + (total > 1 ? ' contacts' : ' contact'),
+    });
 }
 
 async function updateStats() {
@@ -867,6 +861,8 @@ document.getElementById('importForm').addEventListener('submit', async function 
 var listsData = [];
 var allListsData = [];
 var availableContactsCache = [];
+var memberPickerTotalMatches = 0;
+var memberPickerFetchedCount = 0;
 var currentMembersCache = [];
 
 // Tri client (les listes sont chargées entièrement, ~10-100 max).
@@ -1109,19 +1105,35 @@ var searchInitialContacts = debounce(async function () {
     });
     if (!resp.ok) return;
     var contacts = resp.data.contacts || [];
+    // #18f (verdict #67) — total AVANT filtrage local des déjà-sélectionnés
+    // (sinon on sous-annonce) : avec >50 matchs, le contact cherché peut
+    // être hors des 50 affichés — sans footer, l'user le croit inexistant
+    // et la liste de diffusion part incomplète.
+    var totalMatches = resp.data.total || contacts.length;
 
     var selectedIds = new Set(selectedInitialContacts.map(function (c) { return c.id; }));
     var available = contacts.filter(function (c) { return !selectedIds.has(c.id); });
 
-    renderInitialContactSuggestions(available);
+    renderInitialContactSuggestions(available, totalMatches, contacts.length);
     input.setAttribute('aria-expanded', 'true');
 }, 300);
 
-function renderInitialContactSuggestions(contacts) {
+function renderInitialContactSuggestions(contacts, totalMatches, fetchedCount) {
     var container = document.getElementById('initialContactSuggestions');
 
     if (contacts.length === 0) {
-        container.innerHTML = '<div class="p-3 text-sm text-gray-500 text-center dark:text-gray-400">Aucun contact trouvé</div>';
+        // Revue adv. lot 3 — si les 50 fetchés sont tous déjà sélectionnés
+        // mais qu'il EXISTE d'autres matchs (total > fetch), « Aucun contact
+        // trouvé » est un mensonge qui rouvre le trou #67.
+        if (typeof totalMatches === 'number' && typeof fetchedCount === 'number'
+            && totalMatches > fetchedCount) {
+            container.innerHTML = '<div class="p-3 text-sm text-amber-600 text-center '
+                + 'dark:text-amber-400">0 affich\u00e9 sur ' + totalMatches
+                + ' \u2014 les premiers r\u00e9sultats sont d\u00e9j\u00e0 '
+                + 's\u00e9lectionn\u00e9s, affinez la recherche</div>';
+        } else {
+            container.innerHTML = '<div class="p-3 text-sm text-gray-500 text-center dark:text-gray-400">Aucun contact trouvé</div>';
+        }
         container.classList.remove('hidden');
         return;
     }
@@ -1137,6 +1149,12 @@ function renderInitialContactSuggestions(contacts) {
 
     // Store contacts for lookup
     contacts.forEach(function (c) { contactsCache[c.id] = c; });
+    if (typeof totalMatches === 'number' && typeof fetchedCount === 'number'
+        && totalMatches > fetchedCount) {
+        container.innerHTML += '<div class="p-2 text-xs text-amber-600 text-center '
+            + 'dark:text-amber-400">' + fetchedCount + ' affich\u00e9s sur '
+            + totalMatches + ' \u2014 affinez la recherche</div>';
+    }
     container.classList.remove('hidden');
 }
 
@@ -1599,6 +1617,9 @@ var searchContactsToAdd = debounce(async function () {
     });
     if (!resp.ok) return;
     var contacts = resp.data.contacts || [];
+    // #18f (verdict #67) — même doctrine que le picker initial.
+    memberPickerTotalMatches = resp.data.total || contacts.length;
+    memberPickerFetchedCount = contacts.length;
 
     var memberIds = new Set(currentMembersCache.map(function (c) { return c.id; }));
     availableContactsCache = contacts.filter(function (c) { return !memberIds.has(c.id); });
@@ -1611,7 +1632,15 @@ function renderContactSuggestions() {
     var container = document.getElementById('contactSuggestions');
 
     if (availableContactsCache.length === 0) {
-        container.innerHTML = '<div class="p-3 text-sm text-gray-500 text-center dark:text-gray-400">Aucun contact trouvé</div>';
+        // Revue adv. lot 3 — même doctrine que le picker initial.
+        if (memberPickerTotalMatches > memberPickerFetchedCount) {
+            container.innerHTML = '<div class="p-3 text-sm text-amber-600 text-center '
+                + 'dark:text-amber-400">0 affich\u00e9 sur ' + memberPickerTotalMatches
+                + ' \u2014 les premiers r\u00e9sultats sont d\u00e9j\u00e0 '
+                + 'membres, affinez la recherche</div>';
+        } else {
+            container.innerHTML = '<div class="p-3 text-sm text-gray-500 text-center dark:text-gray-400">Aucun contact trouvé</div>';
+        }
         container.classList.remove('hidden');
         return;
     }
@@ -1625,6 +1654,11 @@ function renderContactSuggestions() {
             '</button>';
     }).join('');
 
+    if (memberPickerTotalMatches > memberPickerFetchedCount) {
+        container.innerHTML += '<div class="p-2 text-xs text-amber-600 text-center '
+            + 'dark:text-amber-400">' + memberPickerFetchedCount + ' affich\u00e9s sur '
+            + memberPickerTotalMatches + ' \u2014 affinez la recherche</div>';
+    }
     container.classList.remove('hidden');
 }
 
@@ -1791,7 +1825,6 @@ var actionMap = {
     editContact: function (t) { editContact(parseInt(t.dataset.contactId)); },
     toggleContact: function (t) { toggleContact(parseInt(t.dataset.contactId), t.dataset.activate === 'true'); },
     deleteContact: function (t) { deleteContact(parseInt(t.dataset.contactId), t.dataset.contactEmail); },
-    loadContacts: function (t) { loadContacts(parseInt(t.dataset.page)); },
     sortContacts: function (t) { sortContacts(t); },
     sortLists: function (t) { sortLists(t); },
     openMembersModal: function (t) { openMembersModal(parseInt(t.dataset.listId), t.dataset.listName); },

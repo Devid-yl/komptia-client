@@ -1,0 +1,19 @@
+{# ── Dépendances JS du grid SQL interactif (iris-grid.js) ──────────────────
+   Source de vérité UNIQUE de l'ordre de chargement des hard-deps du grid.
+   Inclure ce partial AVANT `<script .../iris-grid.js>` sur TOUTE page qui
+   charge le grid (iris, datastore, dashboard builder, automations edit).
+
+   Évite le bug récurrent « window.X absent » par oubli d'un <script> dans un
+   template (cf. dashboard qui chargeait iris-grid.js sans tokenizer.js →
+   `window.AnonTokenizer absent`). Cf. feedback_js_load_order_base_html.
+
+   Ordre requis :
+     1. tokenizer.js   → window.AnonTokenizer (miroir anonymisation Py↔JS)
+     2. save-helpers.js → validation save + format state_errors (SSoT)
+     3. grid-store.js   → window.GridStore (stockage à étages IndexedDB+localStorage,
+                          cf. docs/design/grid_storage_tiered_indexeddb.md)
+   Les modules privacy OPTIONNELS (term-detail-panel, improve-pseudos) restent
+   propres à chaque page (modal Confidentialité) et se chargent séparément. #}
+<script src="{{ static_url('js/anonymization/tokenizer.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script src="{{ static_url('js/anonymization/save-helpers.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script src="{{ static_url('js/grid-store.js') }}" nonce="{{ handler.csp_nonce }}"></script>

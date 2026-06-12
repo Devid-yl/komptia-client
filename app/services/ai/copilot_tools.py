@@ -16,9 +16,11 @@ pour garantir la cohérence avec l'ancien chemin one-shot.
 
 from __future__ import annotations
 
+import asyncio
 import copy as _copy
 import logging
 import time
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from app.services.ai.filter_extractor import extract_sql_scope
@@ -35,6 +37,7 @@ from app.services.result_assistant import (
     _expand_emit_tab,
     _recompute_emit_tab,
     _validate_emit_tab,
+    deanon_source_match,
 )
 
 logger = logging.getLogger(__name__)
@@ -878,6 +881,12 @@ class CopilotContext:
         # peut les enchaîner pour produire ou modifier plusieurs onglets dans
         # le même run, puis appeler ``done`` quand il a fini.
         self.terminal_kind: Optional[str] = None
+        # Relance de protocole (incident 2026-06-12) : True dès que la boucle
+        # a renvoyé UNE fois le rappel « appelle done/abandon » après un
+        # end_turn texte sans terminal. Borne anti-boucle : une seule relance
+        # par run — au 2e end_turn texte, la boucle rescue (travail accumulé)
+        # ou retourne l'erreur no_terminal (rien accompli).
+        self.end_turn_nudge_sent: bool = False
         # Liste des onglets émis par ``emit_tab`` / ``emit_via_code`` dans ce
         # run (FIFO). Chaque entrée garde le ``final_result`` complet (tab,
         # description, metrics, recompute_ms…). Packé dans ``terminal_result``
@@ -1011,12 +1020,37 @@ def _list_tabs_core(tabs_context: List[Dict[str, Any]]) -> Dict[str, Any]:
                     )
                 else:
                     vals = info.get("values", [])
-                    dist_summary[col] = vals[:20] + (
-                        [f"(+{info.get('distinct', 0) - len(vals)} autres)"]
-                        if info.get("truncated")
-                        else []
+                    # #18d (triage caps 2026-06-10) — consommer TOUTES les
+                    # valeurs fournies par le producteur (workbook_loader,
+                    # budget _COL_DISTINCT_MAX_VALUES=30 déjà calibré) : le
+                    # re-slice [:20] local créait une zone aveugle 21..30 où
+                    # le LLM voyait 20 valeurs SANS marqueur (le flag
+                    # ``truncated`` producteur ne s'allume qu'au-delà de 30,
+                    # et le « +N autres » était calculé sur len(vals), pas sur
+                    # ce qui était montré) → le LLM croyait la liste complète
+                    # et générait mappings/filtres incomplets en silence.
+                    # Marqueur dès que distinct > montré, calcul sur le montré.
+                    distinct_total = info.get("distinct", 0) or 0
+                    hidden = distinct_total - len(vals)
+                    dist_summary[col] = list(vals) + (
+                        [f"(+{hidden} autres)"] if hidden > 0 else []
                     )
             entry["col_distinct"] = dist_summary
+            # #18f — le front (iris-grid) scanne au plus MAX_SCAN_ROWS lignes
+            # pour bâtir col_distinct : au-delà, min/max/distinct sont des
+            # stats de PRÉFIXE. Le dire au LLM explicitement.
+            _scan = tab.get("col_distinct_scan")
+            if (
+                isinstance(_scan, dict)
+                and isinstance(_scan.get("total"), (int, float))
+                and isinstance(_scan.get("scanned"), (int, float))
+                and _scan["total"] > _scan["scanned"]
+            ):
+                entry["col_distinct_note"] = (
+                    f"⚠ stats calculées sur les {int(_scan['scanned'])} premières "
+                    f"lignes sur {int(_scan['total'])} — min/max/comptes distincts "
+                    "PARTIELS, ne pas les traiter comme exhaustifs"
+                )
         summary.append(entry)
     return {"tabs": summary}
 
@@ -1172,16 +1206,23 @@ def _aggregate_core(
 
     total = 0.0
     hit_count = 0
+    # #120 — même réconciliation que ``_recompute_emit_tab`` (SSoT
+    # ``deanon_source_match``) : le ``match`` LLM est cleartext (post-_full_restore)
+    # mais ``sheet_content`` est anonymisé → sans ça, ``aggregate`` (outil de pré-vol
+    # du LLM) renvoie 0 SILENCIEUX sur tout classeur anonymisé. Clés utiles seulement.
+    _needed_keys = set(match.keys()) | set(match_exclude.keys())
     for sc_cell in sheet_content:
         if not isinstance(sc_cell, dict):
             continue
         sc_match = sc_cell.get("match")
         if not isinstance(sc_match, dict):
             continue
+        # Vue cleartext pour les comparaisons UNIQUEMENT (jamais renvoyée au LLM).
+        sc_match_cmp = deanon_source_match(sc_match, pseudonymizer, _needed_keys)
         # match filter — scalaire (=) ou liste (IN)
         ok = True
         for mk, mv in match.items():
-            if not _emit_tab_match_value(sc_match.get(mk), mv):
+            if not _emit_tab_match_value(sc_match_cmp.get(mk), mv):
                 ok = False
                 break
         if not ok:
@@ -1192,7 +1233,7 @@ def _aggregate_core(
         for ek, evs in match_exclude.items():
             if not isinstance(evs, list):
                 continue
-            if _emit_tab_in_excluded(sc_match.get(ek), evs):
+            if _emit_tab_in_excluded(sc_match_cmp.get(ek), evs):
                 excluded = True
                 excluded_on_key = ek
                 break
@@ -1212,7 +1253,7 @@ def _aggregate_core(
                 if isinstance(row_idx, int):
                     excluded_rows_counted.add(row_idx)
                 if excluded_on_key is not None and excluded_on_key in exclude_hits:
-                    actual = sc_match.get(excluded_on_key)
+                    actual = sc_match_cmp.get(excluded_on_key)
                     for token in match_exclude.get(excluded_on_key, []):
                         if _emit_tab_scalar_eq(actual, token):
                             if token in exclude_hits[excluded_on_key]:
@@ -1435,6 +1476,7 @@ def _count_rows_core(
     sheet_content: List[Any],
     match: Dict[str, Any],
     match_exclude: Dict[str, Any],
+    pseudonymizer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Compte les lignes distinctes matchant filters. Pas de value_column.
 
@@ -1469,11 +1511,17 @@ def _count_rows_core(
         if isinstance(tokens, list):
             exclude_hits[col] = {t: 0 for t in tokens}
 
+    # #120 — réconciliation cleartext (SSoT ``deanon_source_match``) : sans ça,
+    # ``count_rows`` (outil de pré-vol du LLM) renvoie 0 SILENCIEUX sur tout classeur
+    # anonymisé (dims source tokenisés vs match LLM cleartext post-_full_restore).
+    _needed_keys = set(match.keys()) | set(match_exclude.keys())
     count = 0
     for dims in row_dims.values():
+        # Vue cleartext pour comparaison UNIQUEMENT (jamais renvoyée au LLM).
+        dims_cmp = deanon_source_match(dims, pseudonymizer, _needed_keys)
         ok = True
         for mk, mv in match.items():
-            if not _emit_tab_match_value(dims.get(mk), mv):
+            if not _emit_tab_match_value(dims_cmp.get(mk), mv):
                 ok = False
                 break
         if not ok:
@@ -1483,14 +1531,14 @@ def _count_rows_core(
         for ek, evs in match_exclude.items():
             if not isinstance(evs, list):
                 continue
-            if _emit_tab_in_excluded(dims.get(ek), evs):
+            if _emit_tab_in_excluded(dims_cmp.get(ek), evs):
                 excluded = True
                 excluded_on_key = ek
                 break
         if excluded:
             # Même logique qu'_aggregate_core (BLOCKER 1 review) : match tolérant.
             if excluded_on_key is not None and excluded_on_key in exclude_hits:
-                actual = dims.get(excluded_on_key)
+                actual = dims_cmp.get(excluded_on_key)
                 for token in match_exclude.get(excluded_on_key, []):
                     if _emit_tab_scalar_eq(actual, token):
                         if token in exclude_hits[excluded_on_key]:
@@ -1554,7 +1602,25 @@ def _iris_rows_to_sheet_content(
             # Symétrie avec ``_build_sheet_content_sql`` (workbook_loader)
             # qui coerce déjà.
             if not isinstance(val, (int, float)):
-                if isinstance(val, str):
+                if isinstance(val, Decimal):
+                    # CHEMIN LIVE (#149) : ask_iris / emit_tab_via_iris exécutent
+                    # un SQL frais sur Sage ; ``query_result.rows`` arrive NON
+                    # sérialisé (cf. copilot_iris_bridge : rows natives) → les
+                    # colonnes MONEY/NUMERIC/DECIMAL SQL Server sont des
+                    # ``decimal.Decimal`` natifs, PAS des strings. Le commentaire
+                    # ci-dessus (« sérialisé en string ») ne vaut QUE pour le
+                    # chemin .afz.json. Sans cette branche, la cellule MESURE
+                    # tombait dans le ``else: continue`` → droppée du
+                    # sheet_content → aggregate/count_rows copilot FAUX
+                    # silencieusement (même classe que #139/#147/#148).
+                    try:
+                        f = float(val)
+                    except (ValueError, OverflowError):
+                        continue
+                    if f != f or f in (float("inf"), float("-inf")):
+                        continue
+                    val = f
+                elif isinstance(val, str):
                     s = val.strip()
                     if not s:
                         continue
@@ -1749,6 +1815,32 @@ async def handle_ask_iris(
     # par colonne numérique de la row ; ``match`` = toutes les AUTRES colonnes.
     sheet_content = _iris_rows_to_sheet_content(rows, columns)
 
+    # **Cap d'accumulation par run (fix 2026-06-11, sweep Moyen confirmé)** :
+    # chaque ask_iris exécuté matérialise un onglet COMPLET (jusqu'à
+    # max_rows lignes) dans ctx.tabs_context + ctx.emits — sans borne, un
+    # run qui enchaîne les ask_iris accumule une mémoire non bornée, des
+    # list_tabs O(N) croissants et des tool_results toujours plus gros.
+    # Cap dérivé de MAX_TURNS (SSoT interne — chaque matérialisation
+    # consomme un tour ; en demander plus de la moitié n'a pas de sens).
+    # Import LOCAL : copilot_agent importe ce module au chargement (cycle).
+    from app.services.ai.copilot_agent import MAX_TURNS as _MAX_TURNS
+
+    _max_iris_tabs = max(1, _MAX_TURNS // 2)
+    if ctx._iris_tab_counter >= _max_iris_tabs:
+        logger.warning(
+            "ask_iris: cap d'onglets matérialisés atteint (%d) pour ce run — "
+            "résultat SQL non matérialisé.",
+            _max_iris_tabs,
+        )
+        return {
+            "status": "error",
+            "errors": [
+                f"Limite d'onglets ask_iris atteinte ({_max_iris_tabs} par run). "
+                "Réutilise les onglets déjà créés (list_tabs, read_tab_rows, "
+                "aggregate) ou termine avec `done`."
+            ],
+        }
+
     ctx._iris_tab_counter += 1
     label = f"iris_result_{ctx._iris_tab_counter}"
     tab_index = len(ctx.tabs_context)
@@ -1894,10 +1986,17 @@ async def handle_modify_tab_sql(
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("modify_tab_sql: bridge ask_iris a crashé")
+        # ``_safe_error_message`` (CWE-209, fix 2026-06-11) : l'exception
+        # vient du pipeline Iris (SQL Server pyodbc + provider LLM) — un
+        # timeout/refus de connexion embarque DSN, host, voire credentials.
+        # Ce message repart au LLM CLOUD en tool_result. Import LOCAL
+        # (cycle bridge→copilot_agent→ce module au chargement).
+        from app.services.ai.copilot_automation_bridge import _safe_error_message
+
         return {
             "status": "error",
             "target_tab_index": target_idx,
-            "errors": [f"Erreur interne lors de l'appel Iris : {exc}"],
+            "errors": [f"Erreur interne lors de l'appel Iris : {_safe_error_message(exc)}"],
         }
 
     errors = list(bridge_result.get("errors") or [])
@@ -1995,9 +2094,19 @@ async def handle_modify_tab_sql(
         "columns": columns,
         "row_count": row_count,
         "message": (
+            # Rappel de protocole OBLIGATOIRE (incident 2026-06-12) : sans la
+            # phrase « appelle done », ce message au passé accompli se lit
+            # comme une confirmation FINALE — Haiku le relayait en texte au
+            # lieu d'appeler l'outil terminal, et le run perdait tout. Les 5
+            # autres outils d'action (emit_tab, patch_tab, rename_tab,
+            # delete_tab, emit_via_code) portent déjà ce rappel —
+            # modify_tab_sql était le SEUL sans, et l'incident est tombé
+            # précisément dessus.
             f"SQL de l'onglet « {label_preserved} » mis à jour "
             f"({row_count} lignes). cellDetails éventuels ont été retirés "
-            "(incohérence valeur↔SQL après mutation)."
+            "(incohérence valeur↔SQL après mutation). Action accumulée — "
+            "rien n'est livré tant que tu n'as pas clôturé : continue avec "
+            "d'autres actions ou appelle `done` pour clôturer."
         ),
     }
     if errors:
@@ -2010,6 +2119,7 @@ def _count_rows_from_inputs(
     tabs_context: List[Dict[str, Any]],
     top_level_sheet_content: Optional[List[Dict[str, Any]]] = None,
     tabs_touched: Optional[set] = None,
+    pseudonymizer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Logique de ``handle_count_rows`` sans dépendance à ``CopilotContext``.
 
@@ -2048,7 +2158,7 @@ def _count_rows_from_inputs(
     if not sheet_content and tab.get("is_active"):
         sheet_content = top_level_sheet_content or []
 
-    result = _count_rows_core(sheet_content, match, match_exclude)
+    result = _count_rows_core(sheet_content, match, match_exclude, pseudonymizer=pseudonymizer)
     result["tab_idx"] = src_idx
     return result
 
@@ -2071,6 +2181,7 @@ async def handle_count_rows(
         tabs_context=ctx.tabs_context,
         top_level_sheet_content=ctx.sheet_content,
         tabs_touched=ctx.tabs_touched,
+        pseudonymizer=getattr(ctx, "_pseudonymizer", None),
     )
 
 
@@ -2180,6 +2291,138 @@ def _build_emit_parsed(args: Dict[str, Any]) -> Dict[str, Any]:
         "new_tab": bool(args.get("new_tab", True)),
         "tab": {k: v for k, v in args.items() if k != "new_tab"},
     }
+
+
+#: Cap d'octets par VALEUR de cellule (tâche #20, review) : le cap en
+#: nombre de cellules ne borne pas la mémoire — 1 cellule string de 50 Mo
+#: passait (deepcopy + JSON frontend non bornés). 100k chars par valeur =
+#: très au-delà de toute valeur métier légitime, et borne le payload total
+#: à MAX_EMIT_CELLS × _MAX_CELL_VALUE_LEN.
+_MAX_CELL_VALUE_LEN = 100_000
+
+
+def _oversized_str(val: Any) -> bool:
+    return isinstance(val, str) and len(val) > _MAX_CELL_VALUE_LEN
+
+
+def _validate_emit_payload_size(parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Caps de taille sur le payload d'un emit (tâche #20).
+
+    La génération par code (``add_cell``/``add_override``) est déjà capée
+    par le sandbox (``_MAX_CELLS``/``_MAX_OVERRIDES``) — mais les args
+    DIRECTS d'``emit_tab``/``preview_emit_tab`` (et le ``rows_overrides``
+    statique d'``emit_via_code``) ne l'étaient pas : un payload pathologique
+    (LLM bavard, prompt-injection via résultat SQL) partait en deepcopy +
+    expand + recompute + miroir tabs_context + JSON frontend sans borne.
+    Mêmes bornes que le sandbox (SSoT ``MAX_EMIT_CELLS``/``MAX_EMIT_OVERRIDES``).
+
+    Sémantique (alignée sur le sandbox) : caps PAR CATÉGORIE — cellules
+    (rows + sheet_content + cell_groups), cellDetails, rows_overrides ont
+    chacun leur borne, comme ``_MAX_CELLS``/``_MAX_OVERRIDES`` sont
+    distincts côté sandbox. Worst-case cumulé = somme des catégories.
+
+    Double appel OBLIGATOIRE (review #20) : AVANT expand (fail-fast, pas de
+    deepcopy d'un payload géant) **ET APRÈS expand** — ``cell_groups`` est
+    déroulé en ``cellDetails`` PAR expand : un check uniquement pré-expand
+    se faisait contourner (les cellules venaient du payload LLM, pas du
+    classeur). Le re-check post-expand couvre aussi tout futur champ
+    expandable. (``clone_structure_from``, lui, vient bien du classeur
+    existant, borné par construction.)
+
+    Hors périmètre documenté : la matérialisation ``ask_iris`` écrit dans
+    ``ctx.emits`` sans passer ici — elle est bornée par un AUTRE mécanisme
+    (cap d'onglets iris MAX_TURNS//2 + max_rows admin).
+
+    Retourne un dict d'erreur actionnable ou ``None`` si OK.
+    """
+    from app.services.ai.copilot_python_sandbox import (
+        MAX_EMIT_CELLS,
+        MAX_EMIT_OVERRIDES,
+    )
+
+    tab = parsed.get("tab") or {}
+    if not isinstance(tab, dict):
+        return None  # la validation de forme en aval gérera
+
+    rows = tab.get("rows")
+    dense_cells = 0
+    if isinstance(rows, list):
+        for r in rows:
+            if isinstance(r, list):
+                dense_cells += len(r)
+                if any(_oversized_str(v) for v in r):
+                    return {
+                        "error": (
+                            f"emit refusé : une valeur de cellule dépasse "
+                            f"{_MAX_CELL_VALUE_LEN} caractères. Tronque ou "
+                            "agrège la donnée avant émission."
+                        )
+                    }
+            elif _oversized_str(r):
+                # Row malformée (string géante) : la validation de forme la
+                # rejetterait en aval, mais APRÈS deepcopy — borne ici.
+                return {
+                    "error": (
+                        f"emit refusé : row string de plus de "
+                        f"{_MAX_CELL_VALUE_LEN} caractères (rows doit être "
+                        "une liste de listes)."
+                    )
+                }
+    sc = tab.get("sheet_content")
+    sparse_cells = 0
+    if isinstance(sc, list):
+        sparse_cells = len(sc)
+        for entry in sc:
+            if isinstance(entry, dict) and _oversized_str(entry.get("value")):
+                return {
+                    "error": (
+                        f"emit refusé : une valeur de sheet_content dépasse "
+                        f"{_MAX_CELL_VALUE_LEN} caractères."
+                    )
+                }
+    # cell_groups : déroulé en cellDetails par expand — compte les cellules
+    # DÈS le pré-expand pour fail-fast (le post-expand re-vérifie de toute
+    # façon via cellDetails).
+    group_cells = 0
+    cg = tab.get("cell_groups")
+    if isinstance(cg, list):
+        for g in cg:
+            if isinstance(g, dict) and isinstance(g.get("cells"), dict):
+                group_cells += len(g["cells"])
+    total_cells = dense_cells + sparse_cells + group_cells
+    if total_cells > MAX_EMIT_CELLS:
+        return {
+            "error": (
+                f"emit refusé : {total_cells} cellules (rows + sheet_content "
+                f"+ cell_groups), cap {MAX_EMIT_CELLS}. Découpe en plusieurs "
+                "onglets/emits, ou agrège les données avant émission."
+            )
+        }
+    cd = tab.get("cellDetails")
+    if isinstance(cd, dict) and len(cd) > MAX_EMIT_CELLS:
+        return {
+            "error": (
+                f"emit refusé : {len(cd)} cellDetails, cap {MAX_EMIT_CELLS}. "
+                "Ne détaille que les cellules qui en ont besoin."
+            )
+        }
+    ov = tab.get("rows_overrides")
+    if isinstance(ov, dict):
+        if len(ov) > MAX_EMIT_OVERRIDES:
+            return {
+                "error": (
+                    f"emit refusé : {len(ov)} rows_overrides, cap "
+                    f"{MAX_EMIT_OVERRIDES}. Découpe en plusieurs emits."
+                )
+            }
+        if any(_oversized_str(v) for v in ov.values()):
+            return {
+                "error": (
+                    f"emit refusé : une valeur de rows_overrides dépasse "
+                    f"{_MAX_CELL_VALUE_LEN} caractères."
+                )
+            }
+    return None
 
 
 #: Caps défensifs sur sort_by — empêche un payload pathologique (LLM
@@ -2774,11 +3017,20 @@ async def handle_preview_emit_tab(
 ) -> Dict[str, Any]:
     """Simule un emit_tab sans commit. Le LLM peut voir les warnings puis itérer."""
     parsed = _build_emit_parsed(args)
+    # Cap de taille AVANT la deepcopy (tâche #20) : pas de copie d'un
+    # payload pathologique. Preview = pas de terminal_kind.
+    size_err = _validate_emit_payload_size(parsed)
+    if size_err:
+        return {"ok": False, **size_err, "stage": "size"}
     # Travailler sur une COPY pour ne pas muter l'agent context pendant preview
     parsed_copy = _copy.deepcopy(parsed)
     expand_err = _expand_emit_tab(parsed_copy, ctx.tabs_context, ctx.sheet_content)
     if expand_err:
         return {"ok": False, **expand_err, "stage": "expand"}
+    # Re-check POST-expand (review #20) : cell_groups → cellDetails.
+    size_err = _validate_emit_payload_size(parsed_copy)
+    if size_err:
+        return {"ok": False, **size_err, "stage": "size"}
     val_err = _validate_emit_tab(parsed_copy, ctx.tabs_context)
     if val_err:
         return {"ok": False, **val_err, "stage": "validate"}
@@ -3150,8 +3402,13 @@ def _mirror_emit_to_tabs_context(
     except Exception as exc:
         # Ne jamais bloquer un emit valide à cause du mirroring : l'emit
         # reste dans ``ctx.emits``, le frontend appliquera au commit.
-        logger.debug(
-            "emit_tab tabs_context mirror skipped (non-bloquant): %s",
+        # WARNING et pas debug (fix 2026-06-11, tâche #14) : un mirror
+        # raté = l'agent voit un état PÉRIMÉ via list_tabs/read_tab_rows
+        # pour le reste du run (pathologie documentée run #60 : il croit
+        # l'emit échoué et bricole). Invisible en debug, ops doit le voir.
+        logger.warning(
+            "emit_tab tabs_context mirror skipped (non-bloquant — l'agent "
+            "verra un état périmé jusqu'à la fin du run): %s",
             exc,
             exc_info=True,
         )
@@ -3168,12 +3425,27 @@ async def handle_emit_tab(
     LLM voit l'erreur et peut retenter au turn suivant).
     """
     parsed = _build_emit_parsed(args)
+    # Cap de taille AVANT expand/recompute (tâche #20) : fail-fast sur un
+    # payload pathologique, même sémantique d'erreur qu'expand/validate
+    # (emit_tab_error → le LLM corrige au turn suivant).
+    size_err = _validate_emit_payload_size(parsed)
+    if size_err:
+        ctx.terminal_kind = "emit_tab_error"
+        ctx.terminal_result = size_err
+        return size_err
     # Expand forme compacte + recompute
     expand_err = _expand_emit_tab(parsed, ctx.tabs_context, ctx.sheet_content)
     if expand_err:
         ctx.terminal_kind = "emit_tab_error"
         ctx.terminal_result = expand_err
         return expand_err
+    # Re-check POST-expand (review #20) : cell_groups vient d'être déroulé
+    # en cellDetails — sans ce 2e check, il contournait le cap pré-expand.
+    size_err = _validate_emit_payload_size(parsed)
+    if size_err:
+        ctx.terminal_kind = "emit_tab_error"
+        ctx.terminal_result = size_err
+        return size_err
     val_err = _validate_emit_tab(parsed, ctx.tabs_context)
     if val_err:
         ctx.terminal_kind = "emit_tab_error"
@@ -3402,6 +3674,22 @@ async def handle_patch_tab(
         err = {"error": "patch_tab: patches requis (dict non-vide)."}
         ctx.terminal_result = err
         return err
+    # Cap de taille (tâche #20) : même SSoT que les emits (sandbox
+    # MAX_EMIT_OVERRIDES). Sans borne, un patches pathologique partait
+    # entier dans ctx.modifications → terminal_result → JSON frontend.
+    from app.services.ai.copilot_python_sandbox import MAX_EMIT_OVERRIDES
+
+    if len(patches) > MAX_EMIT_OVERRIDES:
+        ctx.terminal_kind = "emit_tab_error"
+        err = {
+            "error": (
+                f"patch_tab: {len(patches)} patches, cap {MAX_EMIT_OVERRIDES}. "
+                "Pour une réécriture aussi large, utilise emit_tab (rebuild "
+                "de l'onglet) ou découpe en plusieurs patch_tab."
+            )
+        }
+        ctx.terminal_result = err
+        return err
 
     _RC_RE = _re.compile(r"^\s*(\d+)\s*,\s*(\d+)\s*$")
     validated: Dict[str, Any] = {}
@@ -3460,14 +3748,29 @@ async def handle_patch_tab(
     }
 
 
+#: Cap sur la raison d'abandon affichée à l'utilisateur (fix 2026-06-10, bug
+#: vécu « message d'erreur illisible ») : la raison est du TEXTE LIBRE LLM,
+#: non borné avant le fix — des paragraphes entiers partaient dans la barre
+#: de statut. 200 chars suffisent pour une raison ; le LLM n'a pas vocation
+#: à « s'exprimer » vers l'UI (position produit David 2026-06-10).
+_ABANDON_REASON_MAX_CHARS = 200
+
+
 async def handle_abandon(
     args: Dict[str, Any],
     ctx: CopilotContext,
 ) -> Dict[str, Any]:
     """Terminal — l'agent renonce à la demande (faisabilité, ambiguïté, etc.)."""
     reason = args.get("reason", "Non spécifié")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "Non spécifié"
+    reason = reason.strip()
+    if len(reason) > _ABANDON_REASON_MAX_CHARS:
+        reason = reason[:_ABANDON_REASON_MAX_CHARS].rstrip() + "…"
     ctx.terminal_kind = "abandon"
-    ctx.terminal_result = {"error": f"Copilot a abandonné : {reason}"}
+    # ``error_kind`` machine-readable → 422 côté handler (classification
+    # sans matching de substring, fix 2026-06-11).
+    ctx.terminal_result = {"error": f"Copilot a abandonné : {reason}", "error_kind": "abandon"}
     return {"ok": True, "message": f"Abandon enregistré : {reason}"}
 
 
@@ -3700,22 +4003,75 @@ async def handle_run_python(
     from app.services.ai.copilot_python_sandbox import (
         SandboxError,
         run_exploration,
+        run_sandboxed,
+        wall_timeout_for,
     )
 
     code = args.get("code")
     if not isinstance(code, str) or not code.strip():
         return {"error": "run_python: `code` requis (string non-vide)."}
 
+    # Session contaminée par un timeout mur précédent (eXamine 2026-06-10
+    # CRITICAL) : le thread orphelin peut encore écrire dans ctx.session en
+    # arrière-plan — relancer un sandbox sur le même dict = race (dict
+    # changed size / agrégats corrompus silencieux). Fail-closed pour le
+    # reste du run.
+    if getattr(ctx, "sandbox_session_contaminated", False):
+        return {
+            "ok": False,
+            "error": (
+                "run_python: indisponible pour le reste de ce run — une "
+                "exécution précédente a dépassé le temps-mur et peut encore "
+                "écrire en arrière-plan. Termine avec les données déjà "
+                "disponibles ou abandonne."
+            ),
+        }
+
     # Snapshot isolé via deep-copy ; cf. `_build_sandbox_tabs` pour les
     # détails (symétrie run_python ↔ emit_via_code, skip dense pour SQL tabs).
     sandbox_tabs = _build_sandbox_tabs(ctx)
 
+    # **Hors event loop** (fix 2026-06-10) : le sandbox est synchrone
+    # (settrace + exec) — l'exécuter dans la coroutine gelait TOUT Tornado
+    # pour tous les users pendant jusqu'à 60s (et sans borne réelle sur les
+    # opérations C-pures, cf. wall_timeout_for). to_thread libère l'event
+    # loop ; wait_for pose une borne TEMPS-MUR dérivée du timeout coopératif
+    # (SSoT sandbox). Thread-safety : ``ctx.session``/``sandbox_tabs`` ne
+    # sont touchés par personne d'autre pendant l'await (les tools d'un run
+    # s'exécutent séquentiellement). Limitation : au timeout mur, le thread
+    # orphelin n'est pas tué (cf. docstring wall_timeout_for) — il peut
+    # encore muter ``ctx.session`` en arrière-plan ; accepté et documenté,
+    # l'upgrade subprocess reste la vraie isolation.
     try:
-        result = run_exploration(code, sandbox_tabs, ctx.session)
-    except SandboxError as exc:
+        result = await asyncio.wait_for(
+            run_sandboxed(run_exploration, code, sandbox_tabs, ctx.session),
+            timeout=wall_timeout_for(),
+        )
+    except asyncio.TimeoutError:
+        ctx.sandbox_session_contaminated = True
         return {
             "ok": False,
-            "error": f"run_python: {exc}",
+            "error": (
+                f"run_python: temps-mur dépassé ({wall_timeout_for():.0f}s). "
+                "Ton code fait probablement une opération massive (tri/produit "
+                "de grosses structures) — découpe le travail ou réduis les volumes."
+            ),
+        }
+    except SandboxError as exc:
+        # ``_safe_error_message`` (CWE-209, fix 2026-06-11) : la ligne 872 du
+        # sandbox réinjecte l'exception runtime BRUTE du code généré par le
+        # LLM (``{type}: {exc}``) — elle peut embarquer chemins serveur ou
+        # secrets d'env. Ce message part tel quel au LLM cloud en tool_result.
+        # Import LOCAL : le bridge importe copilot_agent qui importe ce module.
+        from app.services.ai.copilot_automation_bridge import _safe_error_message
+
+        # max_length=600 : le plus long message pédagogique du sandbox
+        # (interdiction `.format()`, ~450 chars interpolés) doit passer
+        # entier — le cap 300 par défaut amputerait la consigne de
+        # correction. Le but sécurité est le strip, pas la longueur.
+        return {
+            "ok": False,
+            "error": f"run_python: {_safe_error_message(exc, max_length=600)}",
         }
 
     # Retourne stdout + un aperçu du session (clés + taille estimée) pour
@@ -3739,7 +4095,10 @@ async def handle_run_python(
 
     return {
         "ok": True,
-        "stdout": stdout[:100],  # cap défensif si print() abondant
+        # #18f — cap défensif si print() abondant, mais ANNONCÉ : sans le
+        # marqueur, le LLM croit avoir vu tout le stdout de son script.
+        "stdout": stdout[:100]
+        + ([f"… (+{len(stdout) - 100} lignes tronquées)"] if len(stdout) > 100 else []),
         "session": session_preview,
         "note": (
             "`session` dict est PARTAGÉ entre tes appels run_python de ce turn. "
@@ -3770,6 +4129,8 @@ async def handle_emit_via_code(
     from app.services.ai.copilot_python_sandbox import (
         SandboxError,
         run_code_with_helpers,
+        run_sandboxed,
+        wall_timeout_for,
     )
 
     code = args.get("code")
@@ -3778,6 +4139,10 @@ async def handle_emit_via_code(
     label = args.get("label")
     if not isinstance(label, str) or not label.strip():
         return {"error": "emit_via_code: `label` requis (string non-vide)."}
+    # Calculé AVANT le sandbox (fix 2026-06-11, tâche #22) : les except
+    # Timeout/SandboxError ci-dessous doivent connaître le mode preview
+    # pour ne PAS poser de terminal_kind sur une simulation.
+    preview_mode = bool(args.get("preview", False))
 
     # Snapshot isolé via deep-copy (isolation sandbox ↔ ctx). Cf.
     # `_build_sandbox_tabs` pour les détails (symétrie run_python ↔
@@ -3786,15 +4151,67 @@ async def handle_emit_via_code(
 
     # Exécute le code dans le sandbox. On passe ctx.session : le LLM peut
     # utiliser les agrégats calculés dans les `run_python` précédents.
+    # **Hors event loop** + borne temps-mur : même protection que
+    # handle_run_python (cf. commentaire détaillé là-bas, fix 2026-06-10).
+    # Garde contamination — même raison que handle_run_python.
+    if getattr(ctx, "sandbox_session_contaminated", False):
+        return {
+            "ok": False,
+            "stage": "sandbox",
+            "error": (
+                "emit_via_code: indisponible pour le reste de ce run — une "
+                "exécution précédente a dépassé le temps-mur. Utilise emit_tab "
+                "(JSON direct) avec les données déjà disponibles, ou abandonne."
+            ),
+        }
+
     try:
-        result = run_code_with_helpers(code, sandbox_tabs, session=ctx.session)
+        result = await asyncio.wait_for(
+            run_sandboxed(run_code_with_helpers, code, sandbox_tabs, session=ctx.session),
+            timeout=wall_timeout_for(),
+        )
+    except asyncio.TimeoutError:
+        # Contamination posée MÊME en preview (tâche #22) : le thread
+        # orphelin peut encore muter ctx.session en arrière-plan — le
+        # danger est réel quelle que soit l'intention (simulation ou pas).
+        ctx.sandbox_session_contaminated = True
+        error_payload = {
+            "error": (
+                f"emit_via_code: temps-mur dépassé ({wall_timeout_for():.0f}s). "
+                "Découpe le travail ou réduis les volumes."
+            )
+        }
+        # terminal_kind UNIQUEMENT hors preview (fix 2026-06-11, tâche #22) :
+        # un preview est une SIMULATION — il ne doit pas muter l'état
+        # terminal du run. NB (review #22) : dans la boucle agent ACTUELLE,
+        # le dispatch break dès qu'un done/abandon est posé (copilot_agent
+        # ~1134), donc le clobber d'un done par un preview suivant n'est pas
+        # atteignable end-to-end aujourd'hui — cette garde est une défense
+        # en profondeur au niveau handler (appels hors-loop, réordonnance-
+        # ment futur de la boucle). Parité avec expand/validate/size,
+        # déjà preview-aware.
+        if not preview_mode:
+            ctx.terminal_kind = "emit_tab_error"
+            ctx.terminal_result = error_payload
+        return {
+            "ok": False,
+            "stage": "sandbox",
+            **error_payload,
+        }
     except SandboxError as exc:
         # Symétrie avec expand/validate : on marque terminal_kind=emit_tab_error
         # pour que la boucle de l'agent reset et passe au turn suivant avec
         # le message d'erreur en tool_result (le LLM peut corriger son code).
-        error_payload = {"error": f"emit_via_code: {exc}"}
-        ctx.terminal_kind = "emit_tab_error"
-        ctx.terminal_result = error_payload
+        # ``_safe_error_message`` (CWE-209) : même raison que run_python — les
+        # erreurs runtime du code LLM sont réinjectées brutes par le sandbox.
+        from app.services.ai.copilot_automation_bridge import _safe_error_message
+
+        # max_length=600 : cf. run_python (messages pédagogiques longs).
+        error_payload = {"error": f"emit_via_code: {_safe_error_message(exc, max_length=600)}"}
+        # Cf. commentaire du TimeoutError : pas de terminal_kind en preview.
+        if not preview_mode:
+            ctx.terminal_kind = "emit_tab_error"
+            ctx.terminal_result = error_payload
         return {
             "ok": False,
             "stage": "sandbox",
@@ -3836,7 +4253,18 @@ async def handle_emit_via_code(
         emit_args["cellDetails"] = cells
 
     parsed = _build_emit_parsed(emit_args)
-    preview_mode = bool(args.get("preview", False))
+    # ``preview_mode`` calculé en tête de fonction (tâche #22).
+
+    # Cap de taille (tâche #20) : la génération add_cell/add_override est
+    # déjà capée par le sandbox, mais le MERGE avec le rows_overrides
+    # STATIQUE des args peut dépasser — et les cellDetails générées passent
+    # ici aussi. Même sémantique qu'expand/validate.
+    size_err = _validate_emit_payload_size(parsed)
+    if size_err:
+        if not preview_mode:
+            ctx.terminal_kind = "emit_tab_error"
+            ctx.terminal_result = size_err
+        return {"ok": False, **size_err, "stage": "size", "logs": logs[:20]}
 
     # Travailler sur une copy en mode preview pour ne pas muter ctx
     parsed_work = _copy.deepcopy(parsed) if preview_mode else parsed
@@ -3847,6 +4275,13 @@ async def handle_emit_via_code(
             ctx.terminal_kind = "emit_tab_error"
             ctx.terminal_result = expand_err
         return {"ok": False, **expand_err, "stage": "expand", "logs": logs[:20]}
+    # Re-check POST-expand (review #20) : cell_groups → cellDetails.
+    size_err = _validate_emit_payload_size(parsed_work)
+    if size_err:
+        if not preview_mode:
+            ctx.terminal_kind = "emit_tab_error"
+            ctx.terminal_result = size_err
+        return {"ok": False, **size_err, "stage": "size", "logs": logs[:20]}
     val_err = _validate_emit_tab(parsed_work, ctx.tabs_context)
     if val_err:
         if not preview_mode:
@@ -4057,6 +4492,7 @@ COPILOT_TOOL_HANDLERS = {
     "plan_list": handle_plan_list,
 }
 
+
 async def dispatch_copilot_tool(
     tool_name: str,
     tool_input: Dict[str, Any],
@@ -4072,7 +4508,16 @@ async def dispatch_copilot_tool(
         result = await handler(tool_input or {}, ctx)
     except Exception as exc:
         logger.exception("Copilot tool %s a levé une exception", tool_name)
-        return {"error": f"Exception dans l'outil {tool_name} : {exc}"}
+        # ``_safe_error_message`` (CWE-209, fix 2026-06-11) : ce message part
+        # tel quel au LLM CLOUD dans le tool_result — un str(exc) brut peut
+        # contenir chemins serveur, credentials, IPs (la SSoT de sanitization
+        # existait déjà côté bridge automation mais ce boundary l'oubliait ;
+        # les données métier, elles, sont déjà anonymisées en amont).
+        # Import LOCAL : le bridge importe copilot_agent qui importe ce
+        # module (cycle au chargement).
+        from app.services.ai.copilot_automation_bridge import _safe_error_message
+
+        return {"error": f"Exception dans l'outil {tool_name} : {_safe_error_message(exc)}"}
 
     # Note importante (2026-04-22) : on NE fait PAS de miroir plan_status
     # injecté dans les tool_results. Le diagnostic du hang stress_noisy a

@@ -1,0 +1,624 @@
+{% extends "../base.html" %}
+
+{% block title %}{{ page_title }} | {{ app_name }}{% end %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+
+    <!-- Header -->
+    <div class="flex items-start justify-between mb-6 flex-wrap gap-3">
+        <div>
+            <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
+            <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400"
+               data-tooltip="Le registre des modèles est la source de vérité unique du runtime : fenêtres de contexte, plafonds de sortie, tarifs et capacités sont lus ici par tous les appels LLM. Les valeurs synchronisées depuis le fournisseur peuvent être incomplètes (les API n'exposent pas toujours fenêtres et tarifs) — vous pouvez les corriger : un override manuel est préservé par les synchronisations suivantes.">
+                Registre des modèles LLM — fenêtres, tarifs et capacités utilisés par tous les appels IA.
+            </p>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+            <button type="button" id="btn-sync-provider"
+                    class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:bg-gray-900 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+                    data-tooltip="Interroge l'API du fournisseur configuré dans Configuration IA et ajoute/actualise ses modèles dans le registre. Les overrides manuels sont préservés.">
+                ⟳ Sync fournisseur
+            </button>
+            <button type="button" id="btn-sync-litellm"
+                    class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:bg-gray-900 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
+                    data-tooltip="Complète fenêtres de contexte et tarifs depuis le registre public communautaire LiteLLM (les API des fournisseurs ne les exposent généralement pas). Les overrides manuels sont préservés.">
+                ⟳ Fenêtres &amp; tarifs (LiteLLM)
+            </button>
+        </div>
+    </div>
+
+    <!-- Barre filtres -->
+    <div class="flex items-center gap-3 mb-4 flex-wrap">
+        <input type="search" id="models-search" placeholder="Filtrer par nom…" autocomplete="off"
+               aria-label="Filtrer les modèles par nom"
+               class="px-3 py-1.5 text-sm border border-gray-300 rounded w-64 focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
+        <select id="provider-filter" aria-label="Filtrer par fournisseur"
+                class="px-3 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+            <option value="">Tous les fournisseurs</option>
+        </select>
+        <label class="inline-flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300 select-none">
+            <input type="checkbox" id="show-deprecated" class="rounded border-gray-300 dark:border-gray-700">
+            <span data-tooltip="Un modèle déprécié est refusé par le runtime avec un message explicite. Il est masqué par défaut ici comme dans les calculs — cochez pour le voir et, si besoin, le réactiver.">Afficher les dépréciés</span>
+        </label>
+        <span id="models-count" class="text-xs text-gray-500 dark:text-gray-400 ml-auto"></span>
+    </div>
+
+    <!-- États -->
+    <div id="models-loading" class="py-12 text-center text-sm text-gray-500 dark:text-gray-400">Chargement du registre…</div>
+
+    <div id="models-error" class="hidden py-10 text-center">
+        <p class="text-sm text-red-600 dark:text-red-400 mb-3" id="models-error-msg">Impossible de charger le registre.</p>
+        <button type="button" id="btn-retry-load"
+                class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:bg-gray-900 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800">Réessayer</button>
+    </div>
+
+    <div id="models-empty" class="hidden py-12 text-center">
+        <p class="text-sm text-gray-600 dark:text-gray-300 mb-1">Aucun modèle dans le registre.</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400">
+            Configurez une clé API dans <a href="/admin/ai-config" class="underline text-blue-600 dark:text-blue-400">Configuration IA</a>
+            (le test de connexion synchronise les modèles), ou utilisez « Sync fournisseur » ci-dessus.
+        </p>
+    </div>
+
+    <!-- Tableau -->
+    <div id="models-table-wrap" class="hidden overflow-x-auto bg-white border border-gray-200 rounded-lg dark:bg-gray-900 dark:border-gray-800">
+        <table class="min-w-full text-sm">
+            <thead>
+                <tr class="border-b border-gray-200 dark:border-gray-800 text-left text-xs text-gray-500 dark:text-gray-400">
+                    <th class="px-4 py-2.5 font-medium">Modèle</th>
+                    <th class="px-4 py-2.5 font-medium">Fournisseur</th>
+                    <th class="px-4 py-2.5 font-medium" data-tooltip="Taille maximale du contexte (entrée) en tokens. « ≈ à confirmer » signifie que la valeur n'a pas été confirmée par une source fiable (LiteLLM ou saisie admin) — les calculs restent valides mais prudents.">Fenêtre</th>
+                    <th class="px-4 py-2.5 font-medium" data-tooltip="Plafond de tokens en sortie par réponse. Tous les appels LLM sont automatiquement bornés à cette valeur.">Sortie max</th>
+                    <th class="px-4 py-2.5 font-medium" data-tooltip="Tarifs en dollars US par million de tokens (entrée / sortie). Un tarif à 0 sur un modèle payant fausse le suivi des coûts — corrigez-le ici.">Prix $/Mtok (in / out)</th>
+                    <th class="px-4 py-2.5 font-medium" data-tooltip="Capacités lues par le runtime pour activer les fonctions avancées : réflexion étendue, cache de prompt, outils.">Capacités</th>
+                    <th class="px-4 py-2.5 font-medium">Dernière sync</th>
+                    <th class="px-4 py-2.5 font-medium"></th>
+                </tr>
+            </thead>
+            <tbody id="models-tbody"></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Modal d'édition -->
+<div id="model-edit-modal" class="hidden fixed inset-0 z-50">
+    <div class="absolute inset-0 bg-black/40" id="model-edit-backdrop"></div>
+    <div class="relative max-w-lg mx-auto mt-16 bg-white rounded-lg shadow-xl border border-gray-200 dark:bg-gray-900 dark:border-gray-700 p-6"
+         role="dialog" aria-modal="true" aria-labelledby="model-edit-title">
+        <h2 id="model-edit-title" class="text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">Modifier le modèle</h2>
+        <p class="text-xs text-gray-500 dark:text-gray-400 mb-4" id="model-edit-name"></p>
+
+        <div class="grid grid-cols-2 gap-3 mb-3">
+            <label class="block">
+                <span class="text-xs text-gray-600 dark:text-gray-300">Fenêtre de contexte (tokens)</span>
+                <input type="number" id="edit-context-window" min="1" max="10000000" step="1"
+                       class="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+            </label>
+            <label class="block">
+                <span class="text-xs text-gray-600 dark:text-gray-300">Sortie max (tokens)</span>
+                <input type="number" id="edit-max-output" min="1" max="1000000" step="1"
+                       class="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+            </label>
+            <label class="block">
+                <span class="text-xs text-gray-600 dark:text-gray-300">Prix entrée ($/Mtok)</span>
+                <input type="number" id="edit-price-in" min="0" max="10000" step="0.01"
+                       class="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+            </label>
+            <label class="block">
+                <span class="text-xs text-gray-600 dark:text-gray-300">Prix sortie ($/Mtok)</span>
+                <input type="number" id="edit-price-out" min="0" max="10000" step="0.01"
+                       class="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 rounded bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100">
+            </label>
+        </div>
+
+        <div class="flex flex-col gap-2 mb-4 text-sm text-gray-700 dark:text-gray-200">
+            <label class="inline-flex items-center gap-2 select-none">
+                <input type="checkbox" id="edit-cap-thinking" class="rounded border-gray-300 dark:border-gray-700">
+                <span>Réflexion étendue (extended thinking)</span>
+            </label>
+            <label class="inline-flex items-center gap-2 select-none">
+                <input type="checkbox" id="edit-cap-caching" class="rounded border-gray-300 dark:border-gray-700">
+                <span>Cache de prompt</span>
+            </label>
+            <label class="inline-flex items-center gap-2 select-none">
+                <input type="checkbox" id="edit-cap-tools" class="rounded border-gray-300 dark:border-gray-700">
+                <span>Outils (tool use)</span>
+            </label>
+            <label class="inline-flex items-center gap-2 select-none pt-1 border-t border-gray-100 dark:border-gray-800">
+                <input type="checkbox" id="edit-deprecated" class="rounded border-gray-300 dark:border-gray-700">
+                <span data-tooltip="Un modèle déprécié est refusé par le runtime avec un message demandant d'en choisir un autre. Décochez pour réactiver un modèle déprécié par erreur.">Déprécié (refusé par le runtime)</span>
+            </label>
+        </div>
+
+        <p id="model-edit-error" class="hidden text-xs text-red-600 dark:text-red-400 mb-3"></p>
+
+        <div class="flex justify-end gap-2">
+            <button type="button" id="model-edit-cancel"
+                    class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:bg-gray-900 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800">Annuler</button>
+            <button type="button" id="model-edit-save"
+                    class="px-3 py-1.5 text-xs font-medium rounded bg-gray-900 text-white hover:bg-gray-700 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-300">Enregistrer</button>
+        </div>
+    </div>
+</div>
+{% end %}
+
+{% block scripts %}
+<script nonce="{{ handler.csp_nonce }}">
+(function () {
+    'use strict';
+
+    var state = { models: [], editing: null, saving: false };
+
+    var els = {
+        loading: document.getElementById('models-loading'),
+        error: document.getElementById('models-error'),
+        errorMsg: document.getElementById('models-error-msg'),
+        retry: document.getElementById('btn-retry-load'),
+        empty: document.getElementById('models-empty'),
+        wrap: document.getElementById('models-table-wrap'),
+        tbody: document.getElementById('models-tbody'),
+        search: document.getElementById('models-search'),
+        providerFilter: document.getElementById('provider-filter'),
+        showDeprecated: document.getElementById('show-deprecated'),
+        count: document.getElementById('models-count'),
+        syncProvider: document.getElementById('btn-sync-provider'),
+        syncLitellm: document.getElementById('btn-sync-litellm'),
+        modal: document.getElementById('model-edit-modal'),
+        backdrop: document.getElementById('model-edit-backdrop'),
+        editName: document.getElementById('model-edit-name'),
+        fCtx: document.getElementById('edit-context-window'),
+        fOut: document.getElementById('edit-max-output'),
+        fPin: document.getElementById('edit-price-in'),
+        fPout: document.getElementById('edit-price-out'),
+        fThinking: document.getElementById('edit-cap-thinking'),
+        fCaching: document.getElementById('edit-cap-caching'),
+        fTools: document.getElementById('edit-cap-tools'),
+        fDeprecated: document.getElementById('edit-deprecated'),
+        editError: document.getElementById('model-edit-error'),
+        editCancel: document.getElementById('model-edit-cancel'),
+        editSave: document.getElementById('model-edit-save'),
+    };
+
+    // SSoT : ``getCookie`` est fourni globalement par base.html (comme pour
+    // les autres pages admin) — ne PAS redéfinir une variante locale.
+
+    function toast(msg, type) {
+        if (window.showToast) { window.showToast(msg, type || 'info'); }
+    }
+
+    // Taxonomie d'erreurs (a) métier / (b) 4xx / (c) 5xx — le cas (d) offline
+    // est couvert par network-status.js global. Ne JAMAIS json() avant
+    // d'avoir vérifié le content-type (un 429/500 peut renvoyer du HTML).
+    async function readJsonSafe(res) {
+        try { return await res.json(); } catch (e) { return null; }
+    }
+    function httpErrorMessage(res, data) {
+        if (data && data.error) { return data.error; }
+        if (res.status === 403) { return 'Session expirée ou jeton de sécurité manquant — rechargez la page puis réessayez.'; }
+        if (res.status === 429) { return 'Trop de requêtes — patientez quelques secondes.'; }
+        if (res.status >= 500) { return 'Erreur serveur (' + res.status + ') — réessayez ou signalez le problème.'; }
+        return 'HTTP ' + res.status;
+    }
+
+    function fmtTokens(n) {
+        if (typeof n !== 'number') { return '—'; }
+        if (n >= 1000000) { return (n / 1000000).toLocaleString('fr-FR', { maximumFractionDigits: 1 }) + 'M'; }
+        if (n >= 1000) { return Math.round(n / 1000).toLocaleString('fr-FR') + 'K'; }
+        return String(n);
+    }
+    function fmtPrice(v) {
+        if (typeof v !== 'number') { return '—'; }
+        return v.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    // Doctrine date : page web → heure NAVIGATEUR (le backend émet de l'UTC).
+    function fmtDate(iso) {
+        if (!iso) { return '—'; }
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) { return '—'; }
+        return d.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+    }
+
+    function badge(text, cls, tooltip) {
+        var s = document.createElement('span');
+        s.className = 'inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ' + cls;
+        s.textContent = text;
+        if (tooltip) { s.setAttribute('data-tooltip', tooltip); }
+        return s;
+    }
+
+    function show(which) {
+        els.loading.classList.toggle('hidden', which !== 'loading');
+        els.error.classList.toggle('hidden', which !== 'error');
+        els.empty.classList.toggle('hidden', which !== 'empty');
+        els.wrap.classList.toggle('hidden', which !== 'table');
+    }
+
+    async function load() {
+        show('loading');
+        var url = '/api/admin/llm/models' + (els.showDeprecated.checked ? '?include_deprecated=1' : '');
+        var res;
+        try {
+            res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        } catch (e) {
+            els.errorMsg.textContent = 'Réseau indisponible — vérifiez la connexion puis réessayez.';
+            show('error');
+            return;
+        }
+        var data = await readJsonSafe(res);
+        if (!res.ok || !data || !data.success) {
+            els.errorMsg.textContent = 'Impossible de charger le registre : ' + httpErrorMessage(res, data);
+            show('error');
+            return;
+        }
+        state.models = data.models || [];
+        rebuildProviderFilter();
+        render();
+    }
+
+    function rebuildProviderFilter() {
+        var current = els.providerFilter.value;
+        var providers = {};
+        state.models.forEach(function (m) { if (m.provider) { providers[m.provider] = true; } });
+        while (els.providerFilter.options.length > 1) { els.providerFilter.remove(1); }
+        Object.keys(providers).sort().forEach(function (p) {
+            var o = document.createElement('option');
+            o.value = p; o.textContent = p;
+            els.providerFilter.appendChild(o);
+        });
+        els.providerFilter.value = current;
+        if (els.providerFilter.value !== current) { els.providerFilter.value = ''; }
+    }
+
+    function visibleModels() {
+        var q = (els.search.value || '').toLowerCase().trim();
+        var prov = els.providerFilter.value;
+        return state.models.filter(function (m) {
+            if (prov && m.provider !== prov) { return false; }
+            if (q && (m.name || '').toLowerCase().indexOf(q) === -1
+                  && (m.display_name || '').toLowerCase().indexOf(q) === -1) { return false; }
+            return true;
+        });
+    }
+
+    function render() {
+        if (!state.models.length) {
+            els.count.textContent = '';
+            show('empty');
+            return;
+        }
+        var list = visibleModels();
+        els.count.textContent = list.length + ' / ' + state.models.length + ' modèle(s)';
+        els.tbody.textContent = '';
+        if (!list.length) {
+            var tr0 = document.createElement('tr');
+            var td0 = document.createElement('td');
+            td0.colSpan = 8;
+            td0.className = 'px-4 py-6 text-center text-sm text-gray-500 dark:text-gray-400';
+            td0.textContent = 'Aucun modèle ne correspond au filtre.';
+            tr0.appendChild(td0);
+            els.tbody.appendChild(tr0);
+            show('table');
+            return;
+        }
+        list.forEach(function (m) {
+            var tr = document.createElement('tr');
+            tr.className = 'border-b border-gray-100 dark:border-gray-800'
+                + (m.deprecated_at ? ' opacity-60' : '');
+
+            // Modèle + badges
+            var tdName = document.createElement('td');
+            tdName.className = 'px-4 py-2.5';
+            var nameDiv = document.createElement('div');
+            nameDiv.className = 'font-medium text-gray-900 dark:text-gray-100';
+            nameDiv.textContent = m.display_name || m.name;
+            tdName.appendChild(nameDiv);
+            var sub = document.createElement('div');
+            sub.className = 'text-[11px] text-gray-500 dark:text-gray-400 flex items-center gap-1.5 flex-wrap';
+            if (m.display_name && m.display_name !== m.name) {
+                var idSpan = document.createElement('span');
+                idSpan.textContent = m.name;
+                sub.appendChild(idSpan);
+            }
+            if (m.manually_overridden) {
+                sub.appendChild(badge('override', 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+                    'Au moins une valeur a été corrigée manuellement — les synchronisations ne l\'écraseront pas.'));
+            }
+            if (m.deprecated_at) {
+                sub.appendChild(badge('déprécié', 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+                    'Refusé par le runtime depuis le ' + fmtDate(m.deprecated_at) + '. Modifier → décocher « Déprécié » pour réactiver.'));
+            }
+            if (m.is_utility) {
+                sub.appendChild(badge('utilitaire', 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300',
+                    'Petit modèle utilisé pour les tâches internes économiques.'));
+            }
+            tdName.appendChild(sub);
+            tr.appendChild(tdName);
+
+            // Fournisseur
+            var tdProv = document.createElement('td');
+            tdProv.className = 'px-4 py-2.5 text-gray-700 dark:text-gray-300';
+            tdProv.textContent = m.provider || '—';
+            tr.appendChild(tdProv);
+
+            // Fenêtre
+            var tdCtx = document.createElement('td');
+            tdCtx.className = 'px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap';
+            tdCtx.textContent = fmtTokens(m.context_window);
+            if (m.context_window_verified === false) {
+                tdCtx.appendChild(document.createTextNode(' '));
+                tdCtx.appendChild(badge('≈ à confirmer', 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300',
+                    'Valeur par défaut non confirmée par une source fiable. Lancez « Fenêtres & tarifs (LiteLLM) » ou saisissez la valeur exacte (Modifier).'));
+            }
+            tr.appendChild(tdCtx);
+
+            // Sortie max
+            var tdOut = document.createElement('td');
+            tdOut.className = 'px-4 py-2.5 text-gray-700 dark:text-gray-300';
+            tdOut.textContent = fmtTokens(m.max_output_tokens);
+            tr.appendChild(tdOut);
+
+            // Prix
+            var tdPrice = document.createElement('td');
+            tdPrice.className = 'px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap';
+            tdPrice.textContent = fmtPrice(m.input_price_per_mtok_usd) + ' / ' + fmtPrice(m.output_price_per_mtok_usd);
+            if ((m.input_price_per_mtok_usd === 0 || m.output_price_per_mtok_usd === 0) && !m.deprecated_at) {
+                tdPrice.appendChild(document.createTextNode(' '));
+                tdPrice.appendChild(badge('prix 0', 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+                    'Tarif à zéro : si ce modèle est payant, le suivi des coûts est sous-estimé. Corrigez via Modifier.'));
+            }
+            tr.appendChild(tdPrice);
+
+            // Capacités
+            var tdCaps = document.createElement('td');
+            tdCaps.className = 'px-4 py-2.5';
+            var caps = [];
+            if (m.supports_extended_thinking) { caps.push('réflexion'); }
+            if (m.supports_prompt_caching) { caps.push('cache'); }
+            if (m.supports_tool_use) { caps.push('outils'); }
+            if (m.supports_vision) { caps.push('vision'); }
+            tdCaps.className += ' text-[11px] text-gray-600 dark:text-gray-400';
+            tdCaps.textContent = caps.length ? caps.join(' · ') : '—';
+            tr.appendChild(tdCaps);
+
+            // Dernière sync
+            var tdSync = document.createElement('td');
+            tdSync.className = 'px-4 py-2.5 text-[11px] text-gray-500 dark:text-gray-400 whitespace-nowrap';
+            tdSync.textContent = fmtDate(m.last_synced_at);
+            tr.appendChild(tdSync);
+
+            // Actions
+            var tdAct = document.createElement('td');
+            tdAct.className = 'px-4 py-2.5 text-right';
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'px-2 py-1 text-xs font-medium rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 dark:bg-gray-900 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800';
+            btn.textContent = 'Modifier';
+            btn.addEventListener('click', function () { openEdit(m); });
+            tdAct.appendChild(btn);
+            tr.appendChild(tdAct);
+
+            els.tbody.appendChild(tr);
+        });
+        show('table');
+    }
+
+    // ── Modal d'édition ─────────────────────────────────────────────────
+    function openEdit(m) {
+        state.editing = m;
+        els.editName.textContent = m.name + ' (' + (m.provider || '?') + ')';
+        els.fCtx.value = m.context_window;
+        els.fOut.value = m.max_output_tokens;
+        els.fPin.value = m.input_price_per_mtok_usd;
+        els.fPout.value = m.output_price_per_mtok_usd;
+        els.fThinking.checked = !!m.supports_extended_thinking;
+        els.fCaching.checked = !!m.supports_prompt_caching;
+        els.fTools.checked = !!m.supports_tool_use;
+        els.fDeprecated.checked = !!m.deprecated_at;
+        els.editError.classList.add('hidden');
+        els.modal.classList.remove('hidden');
+    }
+    function closeEdit() {
+        state.editing = null;
+        els.modal.classList.add('hidden');
+    }
+
+    async function saveEdit() {
+        if (!state.editing || state.saving) { return; }
+        var payload = {};
+        var ctx = parseInt(els.fCtx.value, 10);
+        var out = parseInt(els.fOut.value, 10);
+        var pin = parseFloat(els.fPin.value);
+        var pout = parseFloat(els.fPout.value);
+        if (!Number.isInteger(ctx) || ctx <= 0) { return showEditError('Fenêtre de contexte invalide (entier > 0 attendu).'); }
+        if (!Number.isInteger(out) || out <= 0) { return showEditError('Sortie max invalide (entier > 0 attendu).'); }
+        if (isNaN(pin) || pin < 0) { return showEditError('Prix entrée invalide (nombre ≥ 0 attendu).'); }
+        if (isNaN(pout) || pout < 0) { return showEditError('Prix sortie invalide (nombre ≥ 0 attendu).'); }
+        if (ctx !== state.editing.context_window) { payload.context_window = ctx; }
+        if (out !== state.editing.max_output_tokens) { payload.max_output_tokens = out; }
+        if (pin !== state.editing.input_price_per_mtok_usd) { payload.input_price_per_mtok_usd = pin; }
+        if (pout !== state.editing.output_price_per_mtok_usd) { payload.output_price_per_mtok_usd = pout; }
+        if (els.fThinking.checked !== !!state.editing.supports_extended_thinking) { payload.supports_extended_thinking = els.fThinking.checked; }
+        if (els.fCaching.checked !== !!state.editing.supports_prompt_caching) { payload.supports_prompt_caching = els.fCaching.checked; }
+        if (els.fTools.checked !== !!state.editing.supports_tool_use) { payload.supports_tool_use = els.fTools.checked; }
+        if (els.fDeprecated.checked !== !!state.editing.deprecated_at) { payload.deprecated = els.fDeprecated.checked; }
+        if (!Object.keys(payload).length) { closeEdit(); return; }
+
+        state.saving = true;
+        els.editSave.disabled = true;
+        els.editSave.textContent = 'Enregistrement…';
+        var res, data;
+        try {
+            res = await fetch('/api/admin/llm/models/' + encodeURIComponent(state.editing.name), {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'X-Xsrftoken': getCookie('_xsrf')
+                },
+                body: JSON.stringify(payload)
+            });
+            data = await readJsonSafe(res);
+        } catch (e) {
+            resetSaveBtn();
+            return showEditError('Réseau indisponible — modification non enregistrée.');
+        }
+        resetSaveBtn();
+        if (!res.ok || !data || !data.success) {
+            return showEditError(httpErrorMessage(res, data));
+        }
+        // Remplacer la row locale par la version serveur (SSoT).
+        var updated = data.model;
+        var idx = state.models.findIndex(function (x) { return x.name === updated.name; });
+        if (idx !== -1) { state.models[idx] = updated; }
+        closeEdit();
+        var warm = data.cache_warmed === false
+            ? ' (cache runtime non rafraîchi — prendra effet au prochain rechargement interne)' : '';
+        toast('Modèle « ' + updated.name + ' » mis à jour' + warm, 'success');
+        // Un modèle nouvellement déprécié disparaît si le filtre est décoché.
+        render();
+    }
+    function resetSaveBtn() {
+        state.saving = false;
+        els.editSave.disabled = false;
+        els.editSave.textContent = 'Enregistrer';
+    }
+    function showEditError(msg) {
+        els.editError.textContent = msg;
+        els.editError.classList.remove('hidden');
+    }
+
+    // ── Syncs ───────────────────────────────────────────────────────────
+    async function runSync(btn, url, payload, label) {
+        if (btn.disabled) { return null; }
+        var original = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = label + '…';
+        var res, data;
+        try {
+            res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'X-Xsrftoken': getCookie('_xsrf')
+                },
+                body: JSON.stringify(payload || {})
+            });
+            data = await readJsonSafe(res);
+        } catch (e) {
+            toast('Réseau indisponible — synchronisation non lancée.', 'error');
+            btn.disabled = false; btn.textContent = original;
+            return null;
+        }
+        btn.disabled = false;
+        btn.textContent = original;
+        if (!res.ok || !data || !data.success) {
+            toast('Synchronisation échouée : ' + httpErrorMessage(res, data), 'error');
+            return null;
+        }
+        return data.stats || {};
+    }
+
+    async function syncProvider() {
+        // Le provider actif est celui de la config admin ; s'il y a plusieurs
+        // providers dans le registre on synchronise celui sélectionné dans le
+        // filtre, sinon chacun des providers connus.
+        var prov = els.providerFilter.value;
+        var providers = prov ? [prov] : Array.prototype.slice.call(els.providerFilter.options, 1).map(function (o) { return o.value; });
+        if (!providers.length) {
+            toast('Aucun fournisseur connu — configurez une clé API dans Configuration IA d\'abord.', 'info');
+            return;
+        }
+        var totals = { inserted: 0, updated: 0, skipped_overridden: 0 };
+        for (var i = 0; i < providers.length; i++) {
+            var stats = await runSync(els.syncProvider, '/api/admin/llm/models/sync', { provider: providers[i] }, 'Sync');
+            if (!stats) { return; }
+            if (stats.error) { toast('Sync ' + providers[i] + ' incomplète : ' + stats.error, 'warning'); continue; }
+            totals.inserted += stats.inserted || 0;
+            totals.updated += stats.updated || 0;
+            totals.skipped_overridden += stats.skipped_overridden || 0;
+        }
+        toast('Sync fournisseur : ' + totals.inserted + ' ajouté(s), ' + totals.updated + ' mis à jour, '
+            + totals.skipped_overridden + ' override(s) préservé(s).', 'success');
+        await load();
+    }
+
+    async function syncLitellm(allowRegression) {
+        // Jumelle du flux de /admin/ai-config (syncFromLitellm) — même API,
+        // même garde anti-régression amont.
+        var stats = await runSync(els.syncLitellm, '/api/admin/llm/models/sync-litellm',
+            { allow_regression: !!allowRegression }, 'LiteLLM');
+        if (!stats) { return; }
+        if (stats.error) { toast('Enrichissement incomplet : ' + stats.error, 'warning'); return; }
+        var skippedReg = stats.skipped_regression || 0;
+        toast((stats.updated || 0) + ' modèle(s) enrichi(s) — overrides préservés : '
+            + (stats.skipped_overridden || 0)
+            + (skippedReg ? ' — ' + skippedReg + ' régression(s) ignorée(s)' : ''),
+            (stats.updated || 0) > 0 ? 'success' : 'info');
+        if (skippedReg > 0 && !allowRegression) {
+            if (window.confirm(skippedReg + ' valeur(s) du registre LiteLLM sont PLUS PETITES que celles en BDD (régression amont possible). Appliquer quand même ?')) {
+                await syncLitellm(true);
+                return;
+            }
+        }
+        await load();
+    }
+
+    // ── Wiring ──────────────────────────────────────────────────────────
+    els.retry.addEventListener('click', load);
+    els.search.addEventListener('input', render);
+    els.providerFilter.addEventListener('change', render);
+    els.showDeprecated.addEventListener('change', load);
+    els.syncProvider.addEventListener('click', syncProvider);
+    els.syncLitellm.addEventListener('click', function () { syncLitellm(false); });
+    els.editCancel.addEventListener('click', closeEdit);
+    els.backdrop.addEventListener('click', closeEdit);
+    els.editSave.addEventListener('click', saveEdit);
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !els.modal.classList.contains('hidden')) { closeEdit(); }
+    });
+
+    load();
+})();
+</script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding admin_ai_models_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'admin_ai_models_v1',
+                title: 'Le registre des modèles IA',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'La source de vérité de vos modèles',
+                        text: 'Ce tableau liste tous les modèles IA connus de Komptia avec leur fenêtre de contexte, leur plafond de sortie, leurs tarifs et leurs capacités. C\'est ce registre que le runtime lit pour chaque appel IA : ce que vous voyez ici est ce que l\'application utilise réellement. Aucune donnée du cabinet n\'apparaît sur cette page — uniquement des caractéristiques techniques de modèles.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Remplir le registre',
+                        text: '« Sync fournisseur » interroge l\'API du fournisseur configuré dans Configuration IA et ajoute ou met à jour ses modèles. « Fenêtres & tarifs (LiteLLM) » complète ensuite les valeurs que les API n\'exposent pas toujours (taille de contexte, prix) depuis le registre public LiteLLM. Si le tableau est vide, commencez par configurer une clé API dans Configuration IA, ou lancez ces deux synchronisations.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Corriger ce qui cloche',
+                        text: 'Le bouton « Modifier » de chaque ligne ouvre la fiche du modèle : ajustez la fenêtre, la sortie max, les prix d\'entrée/sortie et les capacités (réflexion étendue, cache, outils). Les badges vous guident : « ≈ à confirmer » sur une fenêtre non vérifiée, « prix 0 » sur un tarif suspect qui fausserait le suivi des coûts. Une valeur que vous corrigez prend le badge « override » et n\'est plus écrasée par les synchronisations suivantes.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Déprécier ou réactiver',
+                        text: 'Dans la fiche d\'un modèle, la case « Déprécié » le retire des appels du runtime, qui le refusera avec un message demandant d\'en choisir un autre — utile quand un fournisseur retire un modèle. Les modèles dépréciés sont masqués par défaut : cochez « Afficher les dépréciés » en haut pour les revoir et, le cas échéant, en réactiver un décoché par erreur.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
+{% end %}

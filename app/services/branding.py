@@ -75,13 +75,13 @@ def _refresh_cache_from_db() -> None:
     company_name: Optional[str] = None
     smtp_from_name: Optional[str] = None
     try:
-        from sqlalchemy import create_engine, select
+        from sqlalchemy import select
         from sqlalchemy.orm import Session
 
-        from app.core.database import get_db_url
+        from app.core.database import make_sync_engine
         from app.models.smtp_global_config import SMTPGlobalConfig
 
-        engine = create_engine(get_db_url())
+        engine = make_sync_engine()
         try:
             with Session(engine) as session:
                 # ORDER BY id DESC LIMIT 1 — cohérent avec

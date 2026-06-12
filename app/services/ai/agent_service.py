@@ -194,11 +194,6 @@ def _replace_in_blocks_recursive(obj: Any, mapping: dict[str, str]) -> Any:
     return obj
 
 
-# Lock module-level pour le cold-start sync (evite les double-sync concurrents)
-_cold_start_lock = asyncio.Lock()
-# Cooldown : timestamp du dernier echec de cold-start (evite de retenter a chaque message)
-_cold_start_last_failure: float = 0.0
-_COLD_START_COOLDOWN = 300.0  # 5 minutes
 # Ensemble de tâches background actives (empêche le garbage collection prématuré)
 _background_tasks: set = set()
 # Compteur de conversations actives — l'enrichissement se met en pause quand > 0
@@ -402,7 +397,18 @@ def _get_tool_display(tool_name: str, tool_input: dict) -> dict[str, str]:
     return {"icon": icon, "label": label, "description": description}
 
 
-def _build_sql_restore_data(p: dict[str, Any]) -> dict[str, Any]:
+#: Cap des rows persistées pour le restore d'un ``execute_sql``. Borne la
+#: taille des ConversationMessage (croissance BDD, axe 21) — le résultat
+#: COMPLET reste récupérable en ré-exécutant le SQL (la grille le porte) ou
+#: via l'export serveur complet. Toute troncature par ce cap DOIT être
+#: signalée (``restore_truncated``) — jamais silencieuse (axe 5, finding
+#: critique #18a du triage caps 2026-06-10).
+_RESTORE_ROWS_CAP = 200
+
+
+def _build_sql_restore_data(
+    p: dict[str, Any], *, result_uid: str | None = None
+) -> dict[str, Any]:
     """Construit le ``_restore_data`` persisté d'un ``execute_sql`` (rejoué à la
     réhydratation conversation : page + widget).
 
@@ -411,16 +417,77 @@ def _build_sql_restore_data(p: dict[str, Any]) -> dict[str, Any]:
     replay). Sans le flag ``truncated``, le badge « ⚠ limité » s'affichait au
     replay live mais PAS au restore d'une conversation sauvegardée → l'user
     croyait voir un résultat complet alors qu'il était coupé au cap admin
-    (donnée fausse silencieuse, même classe que #53/#65). Le champ ``rows`` est
-    borné à 200 (parité avec le cap d'aperçu persisté côté serveur).
+    (donnée fausse silencieuse, même classe que #53/#65).
+
+    **#18a (triage caps 2026-06-10)** — le cap ``_RESTORE_ROWS_CAP`` est une
+    2ᵉ troncature, DISTINCTE du cap admin : une requête de 800 lignes sous le
+    cap admin (``truncated=False``) ne restaure que 200 lignes. Sans flag
+    dédié, la grille restaurée n'affichait NI badge NI toast d'export partiel
+    → export CSV de 200/800 lignes en silence. ``restore_truncated`` porte ce
+    signal ; le front l'OR avec ``truncated`` (et le dérive aussi de
+    ``row_count > rows.length`` pour les conversations persistées avant ce
+    fix).
     """
+    data = p.get("data", [])
     return {
         "columns": p.get("columns", []),
-        "rows": p.get("data", [])[:200],
+        "rows": data[:_RESTORE_ROWS_CAP],
         "sql": p.get("sql", ""),
         "row_count": p.get("row_count", 0),
         "truncated": bool(p.get("truncated", False)),
+        "restore_truncated": len(data) > _RESTORE_ROWS_CAP,
+        # Parité avec l'event live ``sql_results`` (#39 A5-F4) : sans ce champ,
+        # la bannière « non pré-validé par le SGBD » s'afficherait au live mais
+        # disparaîtrait au restore — contournement muet après refresh.
+        "oracle_prevalidated": bool(p.get("oracle_prevalidated", True)),
+        # C1 (L4O0) — clé stable d'appariement event↔grille au replay (None pour
+        # les conversations persistées avant ce fix → fallback FIFO côté front).
+        "result_uid": result_uid,
     }
+
+
+def _attach_sql_restore_data(
+    all_tool_calls: list[dict[str, Any]],
+    pending: list[dict[str, Any]],
+    run_token: str,
+) -> None:
+    """Attache le ``_restore_data`` (clé stable ``result_uid``) à CHAQUE
+    tool_result ``execute_sql`` réussi — C1 (L4O0).
+
+    **MUTATION IN-PLACE volontaire** : les dicts ``tool_result`` sont partagés
+    PAR RÉFÉRENCE avec ``ordered_segments`` (construit via ``{**tool_record}`` —
+    le spread copie le wrapper mais la valeur ``tool_result`` reste le même objet),
+    donc l'attache se propage à ce que ``_save_turn`` persiste.
+
+    **C1.4 — SSoT appelée AUX DEUX sites de persistance** (fin normale ET
+    cancel-save). Sans l'appel au cancel-save, un turn ANNULÉ persistait l'event
+    ``sql_results`` (avec son ``result_uid``) mais le ``tool_result`` SANS
+    ``_restore_data`` → au replay, ``byUid`` miss → grille VIDE (fail-safe, jamais
+    de données croisées, mais grille muette). Centraliser ici garantit la parité :
+    un futur changement de la logique d'attache reste à UN SEUL endroit (la dérive
+    cancel↔normal venait précisément de la duplication inline).
+
+    ``result_uid = f"{run_token}:{sid}"`` est IDENTIQUE à celui de l'event live
+    (boucle ``sql_results``) → appariement par clé garanti. No-op si aucun
+    ``execute_sql`` réussi / ``search_id`` hors borne (fail-safe)."""
+    for tc in all_tool_calls:
+        if tc["tool_name"] == "execute_sql" and tc["tool_result"].get("success"):
+            sid = tc["tool_result"].get("search_id")
+            if sid is not None and 0 <= sid < len(pending):
+                p = pending[sid]
+                # Invariant load-bearing (agent_tools : ``search_id == index`` dans
+                # ``pending_results``, append-only). Si un futur refactor réordonne
+                # ou filtre ``pending_results``, ``pending[sid]`` ne serait PLUS le
+                # résultat de CE tool_result → on apparierait des DONNÉES FAUSSES à
+                # un ``result_uid`` correct (la classe de corruption C1 elle-même,
+                # Q5). Garde fail-safe : n'attacher QUE si l'entrée pointée porte
+                # bien le même ``search_id`` ; sinon no-op (grille VIDE au replay =
+                # fail-safe, jamais de données croisées — cohérent avec C1.4). La
+                # clé absente (legacy) défaute à ``sid`` → comportement inchangé.
+                if p.get("search_id", sid) == sid:
+                    tc["tool_result"]["_restore_data"] = _build_sql_restore_data(
+                        p, result_uid=f"{run_token}:{sid}"
+                    )
 
 
 def _build_tool_summary(tool_name: str, result: Any) -> str:
@@ -1967,6 +2034,14 @@ def _enforce_pre_tool_rules(
                 ),
             }
 
+    # ── #15 anti-faux-silencieux (guard DUR execute_sql) : RETIRÉ 2026-06-11 sur
+    # demande utilisateur (David). Le blocage PHYSIQUE de ``execute_sql`` sur
+    # ambiguïté était jugé trop rigide (risque de coincer l'agent sur un faux
+    # positif). On GARDE le signal SOFT : ``align_request`` marque les concepts
+    # ambigus + bannière 🛑 + ``requires_user_clarification`` dans son résultat,
+    # et le prompt #12 (SQL_EXPERT) ordonne de DEMANDER plutôt que deviner — mais
+    # l'agent n'est plus FORCÉ. Détection (#11) + apprentissage (#13) conservés.
+
     # ── R24 schema_not_checked : RETIRÉ 2026-05-25 sur demande utilisateur ──
     # Voir git log. Remplacé par un nudge soft injecté en post-tool (cf.
     # `_enforce_post_tool_rules`) : si SQL_TOOLS appelé en nouvelle conv
@@ -2378,47 +2453,6 @@ class IrisAgent:
         if self._confidentiality is None:
             self._confidentiality = get_confidentiality_manager()
         return self._confidentiality
-
-    # ------------------------------------------------------------------
-    # Cold-start sync
-    # ------------------------------------------------------------------
-
-    async def _try_cold_start_sync(self, user: Any) -> bool:
-        """Tente un sync auto du schema depuis Sage + enrichissement. Retourne True si reussi."""
-        async with _cold_start_lock:
-            from app.services.ai.training_store import get_training_store
-
-            if await get_training_store().has_any_ddl():
-                return True
-
-            try:
-                from app.services.ai.schema_sync import get_sync_service
-
-                sync_service = get_sync_service()
-                # Timeout élevé : le sync inclut maintenant l'enrichissement
-                # programmatique (stats + valeurs pour ~388 tables).
-                result = await asyncio.wait_for(
-                    sync_service.sync_from_sage(user_id=getattr(user, "id", None)),
-                    timeout=600.0,
-                )
-                if not result.get("success"):
-                    logger.warning("Cold-start sync echouee: %s", result.get("error", "unknown"))
-                    return False
-                tables = result.get("tables_count", 0)
-                logger.info("Cold-start auto-sync: %d tables synchronisees", tables)
-
-                # L'enrichissement programmatique (stats, valeurs, FKs, cardinalité)
-                # doit être fait pendant le sync, pas dans un processus séparé.
-                # Les rôles sémantiques (LLM) ne sont générés que sur feedback ✅.
-                # Pas de background enrichment — pas de processus fantôme.
-                return tables > 0
-
-            except asyncio.TimeoutError:
-                logger.warning("Cold-start sync timeout (>60s)")
-                return False
-            except Exception as exc:
-                logger.warning("Cold-start sync echouee: %s", exc)
-                return False
 
     # ------------------------------------------------------------------
     # Cancellable LLM call
@@ -3287,6 +3321,25 @@ class IrisAgent:
         finally:
             lock.release()
 
+    def user_iris_memory_lock(self, user_id: int) -> asyncio.Lock:
+        """Lock par user sérialisant les écritures de ``User.iris_memory``.
+
+        SOURCE UNIQUE du lock (anti lost-update) : la fusion fin-de-run (``run()``)
+        ET l'endpoint ``PUT``/``DELETE`` ``/api/iris/user-memory`` (``iris.py``)
+        acquièrent CE MÊME lock via le singleton ``get_iris_agent()``. Sans ce
+        partage, une édition manuelle (PUT) pouvait être silencieusement écrasée
+        par une fusion de fin de run concourante (read-modify-write non atomique).
+
+        Lazy-create ATOMIQUE : aucun ``await`` entre le ``get`` et le ``set`` →
+        l'event loop ne réordonnance pas, donc jamais deux locks pour un même user.
+        Borné par le nombre d'utilisateurs (1 lock/user), comme les locks conv.
+        """
+        lock = self._user_iris_memory_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_iris_memory_locks[user_id] = lock
+        return lock
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -3317,7 +3370,12 @@ class IrisAgent:
         - {"type": "error", "message": "..."}
         - {"type": "done", "conversation_id": N, "tokens_used": N,
            "last_input_tokens": N, "context_window": N,
-           "model_name": "...", "model_display": "..."}
+           "model_name": "...", "model_display": "...",
+           "conversation_cost_usd": N, "conversation_cost_partial": bool}
+          ``conversation_cost_usd`` = cumul $ des appels LLM de la conversation
+          (puce discrète /iris). ``conversation_cost_partial`` = True si un modèle
+          hors registre pricing rend le total minorant (UI préfixe « ≥ »). Les deux
+          via le wrapper SSoT ``get_conversation_cost_usd_for_ui``.
           ``last_input_tokens`` reflète la TAILLE DE CONTEXTE envoyée au LLM
           au dernier turn (input_tokens + cache_creation + cache_read pour
           Anthropic ; prompt_tokens pour OpenAI-compat). C'est cette valeur
@@ -3329,6 +3387,19 @@ class IrisAgent:
           provider configuré (cold start).
         """
         start_time = time.monotonic()
+
+        # C1 (L4O0) — token unique pour CE run(). Sert à fabriquer
+        # ``result_uid = f"{token}:{search_id}"`` sur CHAQUE grille SQL : posé à
+        # l'identique sur l'event ``sql_results`` ET sur son ``_restore_data``
+        # (même token + même search_id → parité par construction, car
+        # ``search_id == index`` dans ``pending_results``). Le frontend apparie
+        # alors chaque grille à SES données par clé stable au lieu d'un FIFO
+        # global fragile qui mélangeait les turns (corruption silencieuse). Le
+        # token namespace par run → 0 collision cross-turn. Champ ADDITIF :
+        # les conversations legacy (sans uid) retombent sur le FIFO côté front.
+        import uuid as _uuid
+
+        sql_result_run_token = _uuid.uuid4().hex[:12]
 
         # Signaler qu'une conversation est active (pause l'enrichissement background)
         await increment_active_conversations()
@@ -3347,6 +3418,9 @@ class IrisAgent:
         active_model_name: Optional[str] = _snapshot.get("model_name")
         active_context_window: int = int(_snapshot.get("context_window") or 0)
         active_model_display: Optional[str] = _snapshot.get("model_display")
+        # Fenêtre confirmée par une source fiable (LiteLLM/override/seed) ? Sinon
+        # l'indicateur affichera « à confirmer » plutôt qu'un chiffre faux.
+        active_context_window_verified: bool = bool(_snapshot.get("context_window_verified"))
 
         if user is None:
             yield {"type": "error", "message": "Utilisateur non authentifié."}
@@ -3483,83 +3557,61 @@ class IrisAgent:
                 self._messages_cache[conversation_id] = list(history_messages)
                 logger.info("History loaded from DB: %d messages", len(history_messages))
 
-            # d. Cold-start check (1 seule query rapide, pas 4)
+            # d. Détection « base de connaissances vide » (1 query rapide).
+            #    PAS de synchronisation automatique ici : la sync du schéma est
+            #    gouvernée UNIQUEMENT par /admin/ai-config (section
+            #    « Synchronisation du schéma » → scheduler) ou par une action
+            #    manuelle (bouton « Synchroniser maintenant », outil
+            #    trigger_schema_sync). Quand la base est vide, on n'auto-sync
+            #    pas : on injecte une instruction de BLOCAGE SQL et on oriente
+            #    l'admin vers la config. Sans schéma, générer du SQL = requête
+            #    à l'aveugle (données fausses silencieuses) → INTERDIT.
             cold_start_instruction = ""
-            sync_done = False
             from app.services.ai.training_store import get_training_store
 
             has_ddl = await get_training_store().has_any_ddl()
             if not has_ddl:
-                logger.warning("Cold-start: 0 DDL dans le training store")
+                logger.warning(
+                    "Base de connaissances vide (0 DDL) — aucune sync auto "
+                    "déclenchée (sync gouvernée par /admin/ai-config). Injection "
+                    "d'une instruction de blocage SQL."
+                )
 
-                # Cooldown : ne pas retenter si echec recent
-                global _cold_start_last_failure
-                now = time.monotonic()
-                in_cooldown = (now - _cold_start_last_failure) < _COLD_START_COOLDOWN
-                sync_done = False
+                # Adapter le message selon le role.
+                # P2.3 SSoT : utiliser ``is_admin(user)`` (app/handlers/base.py)
+                # qui gere robustement UserRole enum + string + None (fail-closed).
+                # L'ancien check inline ``user_role == "admin" or getattr(.value)``
+                # comparait l'enum a une string : ``UserRole.ADMIN == "admin"``
+                # est False, et seul le fallback ``.value`` sauvait — fragile
+                # si un autre callsite oublie le fallback.
+                from app.handlers.base import is_admin as _is_admin
 
-                if not in_cooldown:
-                    # Todo #15 — Signal de progress UX. Le cold-start sync
-                    # peut prendre plusieurs secondes (charge initiale du
-                    # schéma BDD). Sans ce yield, l'user attend en silence
-                    # jusqu'au 1er token LLM (2-5s + sync_time). Le type
-                    # ``status`` est géré par le dispatcher iris.js ligne
-                    # 4547 et affiché dans le typing indicator (label).
-                    yield {
-                        "type": "status",
-                        "message": "Premier démarrage — synchronisation du schéma…",
-                    }
-                    sync_done = await self._try_cold_start_sync(user)
-                    if not sync_done:
-                        _cold_start_last_failure = now
-
-                if sync_done:
-                    from app.config import get_config
-
-                    db_label = get_config().sage.label
-                    yield {
-                        "type": "text_delta",
-                        "content": (
-                            "Ma base de connaissances était vide. "
-                            f"Le schéma a été synchronisé depuis {db_label}. "
-                            "Je traite votre demande.\n\n---\n\n"
-                        ),
-                    }
+                if _is_admin(user):
+                    cold_start_instruction = (
+                        "\n\n## IMPORTANT : Base de connaissances vide\n\n"
+                        "Tu n'as AUCUNE connaissance sur la base de donnees "
+                        "(0 schema de table, 0 documentation). Aucune "
+                        "synchronisation automatique n'est declenchee ici.\n\n"
+                        "**ACTION** : Informe l'administrateur qu'il doit lancer ou "
+                        "planifier la synchronisation du schema depuis Configuration IA, "
+                        "section « Synchronisation du schema » — bouton "
+                        "« Synchroniser maintenant » pour un sync immediat, ou activer "
+                        "la sync automatique pour une planification reguliere.\n\n"
+                        "**INTERDIT** : Ne genere JAMAIS de SQL sans schema. Tant que le "
+                        "schema n'est pas synchronise, tu REFUSES toute demande "
+                        "impliquant une requete SQL."
+                    )
                 else:
-                    # Sync impossible ou echouee — adapter le message selon le role.
-                    # P2.3 SSoT : utiliser ``is_admin(user)`` (app/handlers/base.py:901)
-                    # qui gere robustement UserRole enum + string + None (fail-closed).
-                    # L'ancien check inline ``user_role == "admin" or getattr(.value)``
-                    # comparait l'enum a une string : ``UserRole.ADMIN == "admin"``
-                    # est False, et seul le fallback ``.value`` sauvait — fragile
-                    # si un autre callsite oublie le fallback.
-                    from app.handlers.base import is_admin as _is_admin
-
-                    if _is_admin(user):
-                        cold_start_instruction = (
-                            "\n\n## IMPORTANT : Base de connaissances vide\n\n"
-                            "Tu n'as AUCUNE connaissance sur la base de donnees "
-                            "(0 schema de table, 0 documentation). "
-                            "La synchronisation automatique au demarrage a echoue.\n\n"
-                            "**ACTION IMMEDIATE** : Utilise ton outil `trigger_schema_sync` "
-                            "(source='sage') pour synchroniser le schema maintenant. "
-                            "Si cela echoue aussi, explique l'erreur a l'utilisateur "
-                            "et suggere de verifier la connexion BDD dans Configuration IA.\n\n"
-                            "**INTERDIT** : Ne genere JAMAIS de SQL sans schema. "
-                            "Synchronise d'abord, puis traite la demande."
-                        )
-                    else:
-                        cold_start_instruction = (
-                            "\n\n## BLOCAGE : Base de connaissances vide\n\n"
-                            "Tu n'as AUCUNE connaissance sur la base de donnees "
-                            "(0 schema de table, 0 documentation). "
-                            "La synchronisation automatique a echoue.\n\n"
-                            "Informe l'utilisateur qu'un administrateur doit "
-                            "synchroniser le schema depuis la page Configuration IA.\n\n"
-                            "Tu peux repondre aux questions generales qui ne necessitent "
-                            "pas de SQL, mais tu REFUSES toute demande impliquant une "
-                            "requete SQL."
-                        )
+                    cold_start_instruction = (
+                        "\n\n## BLOCAGE : Base de connaissances vide\n\n"
+                        "Tu n'as AUCUNE connaissance sur la base de donnees "
+                        "(0 schema de table, 0 documentation).\n\n"
+                        "Informe l'utilisateur qu'un administrateur doit "
+                        "synchroniser le schema depuis la page Configuration IA.\n\n"
+                        "Tu peux repondre aux questions generales qui ne necessitent "
+                        "pas de SQL, mais tu REFUSES toute demande impliquant une "
+                        "requete SQL."
+                    )
 
             # ── Chargement précoce du journal de découvertes ──────────
             # On charge le journal AVANT la décision RAG pour pouvoir
@@ -3596,7 +3648,15 @@ class IrisAgent:
             # ── Déjà-vu shortcut (Phase 0.5 standalone) ──
             # Même sans l'orchestrateur, on cherche des Q/SQL similaires validés
             # pour les injecter comme contexte dans le free loop.
-            if _deja_vu_pairs is None:
+            #
+            # Fail-closed « base vide » : si ``has_ddl`` est False, on NE
+            # constitue PAS de paires déjà-vu. Sinon le prefetch (plus bas)
+            # exécuterait le SQL validé sur Sage et injecterait ses résultats,
+            # alors que ``cold_start_instruction`` ordonne à Iris de REFUSER tout
+            # SQL sans schéma → incohérence + exécution SQL non maîtrisée. Tant
+            # que le schéma n'est pas synchronisé, pas de déjà-vu (ni recherche,
+            # ni prefetch, ni injection — tout dérive de ``_deja_vu_pairs``).
+            if _deja_vu_pairs is None and has_ddl:
                 try:
                     from app.services.ai.training_store import (
                         get_training_store,
@@ -3658,7 +3718,11 @@ class IrisAgent:
             # référence initiale mais son system prompt ne la contient
             # plus au tour N, et il va nier l'avoir vue.
             _restored_from_journal = False
-            if _deja_vu_pairs is None and _stored_initial_rag:
+            # Fail-closed « base vide » (cf. shortcut ci-dessus) : pas de
+            # restauration de paires déjà-vu depuis le journal tant que le
+            # schéma est absent — sinon le prefetch exécuterait du SQL alors
+            # qu'Iris doit refuser toute requête sans schéma.
+            if _deja_vu_pairs is None and _stored_initial_rag and has_ddl:
                 _stored_pairs_raw = _stored_initial_rag.get("pairs")
                 # Filtrage défensif : n'accepter que les entrées
                 # structurées correctement. Un journal corrompu
@@ -3995,6 +4059,47 @@ class IrisAgent:
                         len(_sql_literals),
                     )
 
+            # Connaissances ÉPINGLÉES (demande David 2026-06-10) — petit set curé
+            # de faits critiques sur la base (ex: comment accéder à une « entité »),
+            # injecté en TÊTE du prompt via le slot ``## Contexte base de données``
+            # (préfixe caché, haute saillance), indépendamment du RAG
+            # by-correspondence (qui a déjà laissé passer des faux silencieux).
+            # Curé par l'admin via /admin/ai-training (type "pinned") → zéro fait
+            # hardcodé ici (RÈGLE GÉNÉRICITÉ). N'est PAS le dump catalogue
+            # inconditionnel supprimé en task #93 : ici borné + curé.
+            #
+            # Revue adversariale 2026-06-10 :
+            # - Gardé sous ``not cold_start_instruction`` : en cold-start (aucune
+            #   table syncée) Iris DOIT refuser le SQL ; injecter une recette qui
+            #   référence des tables/vues au schéma non chargé = SQL à l'aveugle
+            #   (interdit par gladys.md). Une épingle n'a de sens que base connue.
+            # - Append-safe : on PRÉFIXE les épingles à ``knowledge_context`` au
+            #   lieu de l'écraser → un futur injecteur de contexte coexiste au lieu
+            #   d'être silencieusement perdu.
+            # - Fail-closed : toute erreur de lecture → pas d'injection (jamais de
+            #   crash du prompt) ; ``get_pinned_knowledge`` renvoie déjà "".
+            if not cold_start_instruction:
+                try:
+                    from app.services.ai.training_store import get_training_store
+
+                    _pinned_knowledge = await get_training_store().get_pinned_knowledge()
+                    if _pinned_knowledge:
+                        _pinned_block = (
+                            "**Connaissances de référence vérifiées (toujours valides "
+                            "pour cette base — applique-les en PRIORITÉ, ne les remets "
+                            "pas en question) :**\n\n" + _pinned_knowledge
+                        )
+                        knowledge_context = (
+                            _pinned_block + "\n\n" + knowledge_context
+                            if knowledge_context.strip()
+                            else _pinned_block
+                        )
+                except Exception as _pinned_exc:
+                    logger.warning(
+                        "Injection connaissances épinglées échouée (fail-closed): %s",
+                        _pinned_exc,
+                    )
+
             # g. Knowledge context = Niveau 1 (structure BDD, pas sensible).
             # NE PAS anonymiser — les DDL contiennent des alias SQL (Fac01, Grp01,
             # Cast, IsNull) que le sanitizer confond avec des noms propres.
@@ -4010,7 +4115,12 @@ class IrisAgent:
 
                     resolver = get_value_resolver()
                     resolved = await resolver.resolve_placeholders(pii_mapping)
-                    value_hints = resolver.build_column_hints(resolved)
+                    # Passer pii_mapping pour que les tokens ~xxx NON localisés
+                    # soient signalés LOUD dans le system prompt (sinon Iris
+                    # filtre sur une colonne devinée → données fausses silencieuses).
+                    value_hints = resolver.build_column_hints(
+                        resolved, all_placeholders=pii_mapping
+                    )
                 except Exception as vh_err:
                     logger.debug("Value resolution skipped: %s", vh_err)
 
@@ -4143,28 +4253,14 @@ class IrisAgent:
             from app.core import clock
 
             _now = clock.now_local()
-            _mois_fr = [
-                "janvier",
-                "février",
-                "mars",
-                "avril",
-                "mai",
-                "juin",
-                "juillet",
-                "août",
-                "septembre",
-                "octobre",
-                "novembre",
-                "décembre",
-            ]
-            _jours_fr = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
-            _date_str = (
-                f"{_jours_fr[_now.weekday()]} {_now.day} " f"{_mois_fr[_now.month - 1]} {_now.year}"
-            )
+            # SSoT noms FR : app.core.clock (plus de table mois/jours dupliquée
+            # ici — locale-indépendant, cf. clock.MONTHS_FR / format_date_fr).
+            _mois_courant = clock.MONTHS_FR[_now.month - 1]
+            _date_str = f"{clock.WEEKDAYS_FR[_now.weekday()]} {clock.format_date_fr(_now)}"
             system_prompt += (
                 f"\n\n## Date et heure actuelles\n"
                 f"Nous sommes le {_date_str}, il est {_now.strftime('%H:%M')}. "
-                f'"Ce mois-ci" = {_mois_fr[_now.month - 1]} {_now.year}. '
+                f'"Ce mois-ci" = {_mois_courant} {_now.year}. '
                 f'"Cette année" = {_now.year}. '
                 f"Résous les références temporelles avec ces informations."
             )
@@ -4433,11 +4529,6 @@ class IrisAgent:
                     if _prior_schema_check:
                         break
 
-            # Si un cold-start sync vient de réussir, le schéma est forcément frais
-            # → pas besoin de forcer check_schema_freshness (R24 bypass).
-            if sync_done:
-                _prior_schema_check = True
-
             # Charger le cahier de découvertes de la conversation
             from app.services.ai.discovery_journal import (
                 format_for_prompt,
@@ -4460,6 +4551,13 @@ class IrisAgent:
                 # pour peupler IrisAutomationResult. Si None : mode page/widget,
                 # _automation_mode reste False et les tools DAG-aware refusent.
                 "_automation_mode": automation_context is not None,
+                # S5 (L3O4) — contexte d'exécution ("page"/"widget"/"automation"),
+                # MÊME valeur que celle passée à ``filter_tools_for_context`` (SSoT).
+                # ``execute_tool`` la relit pour ré-appliquer la whitelist
+                # ``AUTOMATION_TOOL_CLASSIFICATION`` en défense-en-profondeur : le
+                # filtre d'exposition masque les tools blocked, mais un tool_use
+                # forgé/halluciné/rejoué pourrait quand même atteindre l'exécution.
+                "_exec_source": source,
                 # R8: flag export détecté dans le message utilisateur
                 "_export_requested": any(kw in msg_lower for kw in _EXPORT_KEYWORDS),
                 # R24: nouvelle conversation → schema check obligatoire
@@ -4535,6 +4633,12 @@ class IrisAgent:
                 # _automation_mode prend la VRAIE valeur (True) même si déjà
                 # initialisé à automation_context is not None ci-dessus.
                 context["_automation_mode"] = True
+                # S5 (review adversariale) — RE-stamp APRÈS le merge : la valeur
+                # de confiance ``source`` doit gagner même si un futur
+                # ``automation_context`` (ou un caller moins discipliné) contenait
+                # une clé ``_exec_source``. Rend l'invariant STRUCTUREL (le garde
+                # fail-closed de execute_tool ne peut pas être désarmé par le merge).
+                context["_exec_source"] = source
 
             _file_hint = ""
             if file_id:
@@ -5337,6 +5441,16 @@ class IrisAgent:
                     # relancer une question sur ce contexte préservé.
                     try:
                         if conversation_id is not None and ordered_segments:
+                            # C1.4 (L4O0) — attacher le _restore_data AVANT le
+                            # cancel-save, EN PARITÉ avec la fin normale (sinon la
+                            # grille rejouée est VIDE sur un turn annulé : event
+                            # sql_results persisté avec son uid mais tool_result
+                            # sans sql_data → byUid miss au replay). SSoT partagée.
+                            _attach_sql_restore_data(
+                                all_tool_calls,
+                                context.get("pending_results", []),
+                                sql_result_run_token,
+                            )
                             turn_visual_events.append(
                                 {
                                     "type": "cancelled",
@@ -5426,53 +5540,69 @@ class IrisAgent:
                 # flag serait False → blocage et retry en boucle).
                 context["_last_assistant_text"] = ""
 
-                # Compression mid-loop : si le contexte grossit trop pendant
-                # la chaîne d'outils, compresser les vieux tool results.
-                # Utilise le vrai input_tokens du turn précédent (pas une estimation).
-                if turn >= 3 and total_prompt_tokens > 0:
-                    compressed = self._compress_tool_loop_if_needed(
-                        messages, model, last_input_tokens=total_prompt_tokens
+                # Cap pré-envoi (anti 429 / rate-limit) : compresser les vieux
+                # tool results AVANT l'appel, à TOUS les turns, sur la base
+                # d'une ESTIMATION du contexte actuel. Le compte réel du turn
+                # précédent (total_prompt_tokens) rate les tool_result
+                # fraîchement appendés → le 1er appel surdimensionné partait
+                # quand même et se faisait throttler (Tier 1 = 50k tokens/min,
+                # contexte vu à 250-306k dans l'incident 2026-06-09). On prend
+                # max(estimation, vrai compte précédent) pour ne jamais
+                # sous-réagir. No-op sous le seuil → sûr dès turn 0.
+                est_input_tokens = self._estimate_messages_input_tokens(messages, request.system)
+                # last_input_tokens = vrai compte (cache-inclus) du turn
+                # PRÉCÉDENT = remplissage actuel de la context window. PAS
+                # total_prompt_tokens, qui est CUMULÉ sur tous les turns et
+                # déclencherait une sur-compression prématurée sur les longues
+                # conversations (revue CC-1). L'estimation couvre le tool_result
+                # fraîchement appendé que le compte précédent ne voit pas encore.
+                trigger_tokens = max(est_input_tokens, last_input_tokens)
+                compressed = self._compress_tool_loop_if_needed(
+                    messages,
+                    model,
+                    last_input_tokens=trigger_tokens,
+                    threshold_override=self._freeloop_pre_send_threshold(model),
+                )
+                if compressed:
+                    logger.info(
+                        "Mid-loop compression at turn %d: %d block(s) compressed "
+                        "(context ~%d tokens)",
+                        turn,
+                        compressed,
+                        trigger_tokens,
                     )
-                    if compressed:
-                        logger.info(
-                            "Mid-loop compression at turn %d: %d block(s) compressed "
-                            "(input_tokens was %d)",
-                            turn,
-                            compressed,
-                            total_prompt_tokens,
+                    # C22: Compression vient de raboter les tool_result
+                    # anciens. Le journal des découvertes (tables, SQL
+                    # validés, filtres) a accumulé plus d'infos que ce
+                    # que voit le LLM via les tool_result compressés.
+                    # On réinjecte le journal actuel dans la section
+                    # "Découvertes" du system_prompt — partie variable
+                    # (après CACHE_BREAKPOINT), donc n'invalide pas le
+                    # cache du préfixe stable.
+                    try:
+                        fresh = format_for_prompt(context.get("_discovery_journal", {}))
+                        new_system = _refresh_discoveries_section(
+                            request.system or "",
+                            fresh,
                         )
-                        # C22: Compression vient de raboter les tool_result
-                        # anciens. Le journal des découvertes (tables, SQL
-                        # validés, filtres) a accumulé plus d'infos que ce
-                        # que voit le LLM via les tool_result compressés.
-                        # On réinjecte le journal actuel dans la section
-                        # "Découvertes" du system_prompt — partie variable
-                        # (après CACHE_BREAKPOINT), donc n'invalide pas le
-                        # cache du préfixe stable.
-                        try:
-                            fresh = format_for_prompt(context.get("_discovery_journal", {}))
-                            new_system = _refresh_discoveries_section(
-                                request.system or "",
-                                fresh,
+                        if new_system != request.system:
+                            request = LLMRequest(
+                                prompt=request.prompt,
+                                system=new_system,
+                                model=request.model,
+                                temperature=request.temperature,
+                                max_tokens=request.max_tokens,
                             )
-                            if new_system != request.system:
-                                request = LLMRequest(
-                                    prompt=request.prompt,
-                                    system=new_system,
-                                    model=request.model,
-                                    temperature=request.temperature,
-                                    max_tokens=request.max_tokens,
-                                )
-                                logger.info(
-                                    "Discoveries section refreshed after "
-                                    "mid-loop compression (%d chars)",
-                                    len(fresh),
-                                )
-                        except Exception as _refresh_exc:
-                            logger.debug(
-                                "Discoveries refresh skipped: %s",
-                                _refresh_exc,
+                            logger.info(
+                                "Discoveries section refreshed after "
+                                "mid-loop compression (%d chars)",
+                                len(fresh),
                             )
+                    except Exception as _refresh_exc:
+                        logger.debug(
+                            "Discoveries refresh skipped: %s",
+                            _refresh_exc,
+                        )
 
                 # Rate limiting : protège contre le denial-of-wallet
                 rate_key = f"llm:user:{getattr(user, 'id', 'unknown')}"
@@ -5637,6 +5767,9 @@ class IrisAgent:
                         yield {
                             "type": "error",
                             "message": "Erreur de communication avec le modèle IA.",
+                            # IRIS-3 — erreur LLM inattendue (5xx-class, ≠ rate-limit
+                            # ou config connus) → reportable (bouton « Signaler »).
+                            "reportable": True,
                         }
                     return
 
@@ -5673,6 +5806,7 @@ class IrisAgent:
                     "last_input_tokens": last_input_tokens,
                     "total_tokens": total_tokens,
                     "context_window": active_context_window or None,
+                    "context_window_verified": active_context_window_verified,
                 }
 
                 stop_reason = response.get("stop_reason", "end_turn")
@@ -5938,6 +6072,23 @@ class IrisAgent:
                                         "content": json.dumps(res, default=str),
                                     }
                                 )
+                                # FIX (hunt it.49, bug HIGH data-loss) : persister AUSSI chaque
+                                # résultat parallèle dans ``ordered_segments`` (SSoT consommée par
+                                # ``_save_turn``) ET ``all_tool_calls`` — sinon le ``continue``
+                                # ci-dessous saute la boucle séquentielle (6775-6786) qui faisait
+                                # ces deux appends → le tool_result n'est JAMAIS écrit en BDD et
+                                # disparaît silencieusement au reload de la conversation. Parité
+                                # EXACTE avec le chemin séquentiel (même tool_record, même ordre =
+                                # ordre des tool_use blocks demandé par le LLM, déterministe).
+                                _para_tool_record = {
+                                    "tool_name": t_name,
+                                    "tool_input": t_input,
+                                    "tool_result": res,
+                                }
+                                all_tool_calls.append(_para_tool_record)
+                                ordered_segments.append(
+                                    {"type": "tool", **_para_tool_record}
+                                )
                             messages.append({"role": "user", "content": tool_results_for_messages})
                             continue  # Skip sequential loop, go to next LLM call
 
@@ -6059,6 +6210,25 @@ class IrisAgent:
                                     turn_visual_events.append(_evt)
                                     yield _evt
                                 if _final_synth is not None:
+                                    # #18f (revue adv. 2026-06-10) — le
+                                    # synthétique ÉCRASE le payload initial :
+                                    # les flags posés par _handle_run_pipeline
+                                    # (query_nl_truncated) doivent être
+                                    # repiqués ici, sinon le LLM ne voit
+                                    # jamais que la question a été amputée
+                                    # à 5000 chars (SQL répondant à une
+                                    # question partielle, sans signal).
+                                    if result.get("query_nl_truncated") and isinstance(
+                                        _final_synth, dict
+                                    ):
+                                        _final_synth["query_nl_truncated"] = True
+                                        _final_synth["warning"] = (
+                                            "La question a été tronquée à 5000 "
+                                            "caractères avant le pipeline — le SQL "
+                                            "peut ignorer la fin de la demande. "
+                                            "Signale-le à l'utilisateur et propose "
+                                            "de reformuler plus court."
+                                        )
                                     # Remplace le dict initial (avec run_id)
                                     # par le résumé synthétique destiné au LLM.
                                     result = _final_synth
@@ -6668,6 +6838,17 @@ class IrisAgent:
                                     "execution_time_ms": pending.get("execution_time_ms", 0),
                                     "search_id": pending.get("search_id"),
                                     "truncated": pending.get("truncated", False),
+                                    # Oracle fail-open : False = résultat NON pré-validé
+                                    # par le SGBD (bannière grille). Absent/True = normal.
+                                    "oracle_prevalidated": pending.get(
+                                        "oracle_prevalidated", True
+                                    ),
+                                    # C1 (L4O0) — clé stable event↔_restore_data.
+                                    "result_uid": (
+                                        f"{sql_result_run_token}:{pending.get('search_id')}"
+                                        if pending.get("search_id") is not None
+                                        else None
+                                    ),
                                 }
                             # Track how many we've sent without clearing the list
                             context["_sent_results_count"] = len(context["pending_results"])
@@ -6922,15 +7103,17 @@ class IrisAgent:
                         # étendre/restreindre : éditer la frozenset
                         # ``CONSENT_REQUIRED_TOOLS``, jamais cette condition.
                         #
-                        # ⚠️ ``run_pipeline`` EST VOLONTAIREMENT EXCLU du
-                        # gate. Le synthetic_result de pipeline (cf. bridge
-                        # ``_stream_pipeline_run_to_chat``) contient
-                        # ``final_sql`` + ``phases_summary`` + artifacts,
-                        # mais aucune row de résultat — gater dessus est
-                        # un théâtre de sécurité (rien à protéger). Le
-                        # gate naturel s'applique sur l'``execute_sql``
-                        # subséquent qui exécute ``final_sql`` (cf.
-                        # ``instructions_for_assistant`` du tool).
+                        # ⚠️ ``run_pipeline`` COMPLET reste hors du gate
+                        # statique : son synthetic_result contient
+                        # ``final_sql`` + ``phases_summary`` + artifacts mais
+                        # aucune row exécutée — le gate naturel s'applique sur
+                        # l'``execute_sql`` subséquent qui exécute ``final_sql``
+                        # (cf. ``instructions_for_assistant`` du tool).
+                        # EXCEPTION (2026-06-02, CRIT-A) : un run ARRÊTÉ à une
+                        # phase intermédiaire (feature preview) n'a PAS de
+                        # final_sql ni d'execute_sql aval, mais renvoie ses
+                        # factsheets (vraies valeurs Sage) au LLM → gaté par
+                        # ``pipeline_result_needs_consent`` (content-based).
                         # Garde + check rows à protéger délégués au module
                         # ``data_read_consent`` (single source of truth + tests
                         # dédiés). ``execute_sql`` et ``peek_table_data`` ont
@@ -6939,11 +7122,22 @@ class IrisAgent:
                         # gère les deux via ``row_count`` comme métrique
                         # uniforme + fallback défensif.
                         from app.services.ai.data_read_consent import (
+                            pipeline_result_needs_consent as _pipeline_needs_consent,
                             requires_consent as _requires_consent,
                             result_has_protected_rows as _result_has_rows,
                         )
 
-                        if _requires_consent(tool_name) and _result_has_rows(result):
+                        # Gate si : (a) outil du périmètre statique
+                        # (execute_sql/peek_table_data) avec rows à protéger,
+                        # OU (b) run pipeline arrêté à une phase intermédiaire
+                        # qui renvoie ses factsheets (vraies valeurs Sage) SANS
+                        # execute_sql aval pour les gater (CRIT-A — voir
+                        # docs/design/iris_stop_at_phase.md + le commentaire
+                        # « run_pipeline exclu » ci-dessus qui ne vaut QUE pour
+                        # les runs complets avec final_sql).
+                        if (_requires_consent(tool_name) and _result_has_rows(result)) or (
+                            _pipeline_needs_consent(tool_name, result)
+                        ):
                             _user_id_consent = (
                                 getattr(user, "id", None) if user is not None else None
                             )
@@ -7093,6 +7287,21 @@ class IrisAgent:
                                         cancel_event=cancel_event,
                                     )
                                     if _consent_resp.abandoned:
+                                        # PIPE consent-modal-proactive (#44) — si
+                                        # l'abandon vient d'un TIMEOUT serveur (≠
+                                        # refus/Stop explicite), pousser
+                                        # ``data_read_consent_expired`` pour fermer
+                                        # le modal PROACTIVEMENT côté client (sinon
+                                        # il traîne jusqu'au clic tardif). Le flag
+                                        # ``timed_out`` distingue le timeout d'un
+                                        # refus (sur lequel afficher « expiré »
+                                        # serait trompeur — le modal est déjà fermé
+                                        # par le handler de réponse).
+                                        if getattr(_consent_resp, "timed_out", False):
+                                            yield {
+                                                "type": "data_read_consent_expired",
+                                                "conversation_id": _conv_id_int,
+                                            }
                                         # User a fermé totalement : Iris
                                         # ne reçoit PAS les résultats.
                                         result = {
@@ -7289,14 +7498,16 @@ class IrisAgent:
                 turn_visual_events.append(sugg_evt)
                 yield sugg_evt
 
-            # Enrich execute_sql tool_results with actual SQL data for restoration
-            pending = context.get("pending_results", [])
-            for tc in all_tool_calls:
-                if tc["tool_name"] == "execute_sql" and tc["tool_result"].get("success"):
-                    sid = tc["tool_result"].get("search_id")
-                    if sid is not None and 0 <= sid < len(pending):
-                        p = pending[sid]
-                        tc["tool_result"]["_restore_data"] = _build_sql_restore_data(p)
+            # Enrich execute_sql tool_results with actual SQL data for restoration.
+            # C1 (L4O0) — MÊME result_uid que l'event sql_results (token de run +
+            # search_id==sid). SSoT `_attach_sql_restore_data` (appelée aussi au
+            # cancel-save → parité, cf. C1.4). Mutation in-place propagée à
+            # ordered_segments (tool_result partagé par référence).
+            _attach_sql_restore_data(
+                all_tool_calls,
+                context.get("pending_results", []),
+                sql_result_run_token,
+            )
 
             # Save to DB (ordered_segments preserves streaming order)
             await self._save_turn(
@@ -7390,10 +7601,10 @@ class IrisAgent:
                                 fuse_user_memory,
                             )
 
-                            _user_mem_lock = self._user_iris_memory_locks.get(_u_id)
-                            if _user_mem_lock is None:
-                                _user_mem_lock = asyncio.Lock()
-                                self._user_iris_memory_locks[_u_id] = _user_mem_lock
+                            # SSoT : MÊME lock que l'endpoint PUT/DELETE user-memory
+                            # (cf. ``user_iris_memory_lock`` + iris.py) → la fusion ne
+                            # peut plus écraser une édition manuelle concourante.
+                            _user_mem_lock = self.user_iris_memory_lock(_u_id)
 
                             async with _user_mem_lock:
                                 _existing_mem = await self._load_fresh_user_iris_memory(_u_id)
@@ -7650,6 +7861,7 @@ class IrisAgent:
             for report_info in context.get("report_saves", []):
                 try:
                     saved_report = await self._persist_report(report_info)
+
                     rpt_evt = {
                         "type": "report_ready",
                         "report_id": saved_report.id,
@@ -7658,6 +7870,9 @@ class IrisAgent:
                         "format": report_info["format"],
                         "row_count": report_info["row_count"],
                         "download_url": f"/api/reports/{saved_report.id}/download",
+                        # Oracle fail-open (FAILLE 1) : rapport généré sans
+                        # pré-validation SGBD → avertissement sur la carte.
+                        "oracle_prevalidated": report_info.get("oracle_prevalidated", True),
                     }
                     turn_visual_events.append(rpt_evt)
                     yield rpt_evt
@@ -7736,14 +7951,44 @@ class IrisAgent:
                         _persist_err,
                         exc_info=True,
                     )
+            # Coût LLM cumulé de la conversation pour la puce discrète /iris
+            # (event ``done`` → ``updateIrisCost`` côté client). MÊME SSoT que la
+            # réhydratation de page (IrisPageHandler) : un seul wrapper partagé.
+            # Fail-soft — un échec de lecture du coût ne doit jamais casser la fin
+            # du turn ; on émet ``done`` avec 0.0/False et le client conserve sa
+            # dernière valeur (le champ reste présent pour la compat client).
+            conversation_cost_usd = 0.0
+            conversation_cost_partial = False
+            try:
+                from app.services.ai.llm_call_tracker import (
+                    get_conversation_cost_usd_for_ui,
+                )
+
+                conversation_cost_usd, conversation_cost_partial = (
+                    await get_conversation_cost_usd_for_ui(
+                        conversation_id,
+                        user_id=getattr(user, "id", None),
+                    )
+                )
+            except Exception as _cost_err:  # noqa: BLE001 — observabilité non-bloquante
+                logger.warning(
+                    "Lecture coût conversation pour la puce /iris échouée "
+                    "(conversation_id=%s): %s",
+                    conversation_id,
+                    _cost_err,
+                )
             yield {
                 "type": "done",
                 "conversation_id": conversation_id,
                 "tokens_used": total_tokens,
                 "last_input_tokens": last_input_tokens,
                 "context_window": active_context_window or None,
+                "context_window_verified": active_context_window_verified,
                 "model_name": active_model_name,
                 "model_display": active_model_display,
+                # Puce coût /iris — cumul $ de la conversation (resette à l'effacement).
+                "conversation_cost_usd": conversation_cost_usd,
+                "conversation_cost_partial": conversation_cost_partial,
             }
 
         except Exception as exc:
@@ -7763,7 +8008,11 @@ class IrisAgent:
                 user_message = await _classify_agent_error_for_user(exc, user)
             except Exception:  # pragma: no cover — défense si import impossible
                 user_message = "Une erreur interne est survenue. Réessayez."
-            yield {"type": "error", "message": user_message}
+            # IRIS-3 — catch-all d'exception agent inattendue (5xx-class) →
+            # reportable (bouton « Signaler »). Le message classifié peut être
+            # métier dans de rares cas, mais rater un Signaler sur une vraie
+            # erreur interne est pire qu'un Signaler en trop.
+            yield {"type": "error", "message": user_message, "reportable": True}
         finally:
             # C2 — Release le lock conversation EN PREMIER (avant les
             # autres cleanup). Garantit qu'un autre WS en attente peut
@@ -8681,7 +8930,12 @@ class IrisAgent:
     # ------------------------------------------------------------------
 
     def _compress_tool_loop_if_needed(
-        self, messages: list[dict], model: str, *, last_input_tokens: int = 0
+        self,
+        messages: list[dict],
+        model: str,
+        *,
+        last_input_tokens: int = 0,
+        threshold_override: "int | None" = None,
     ) -> int:
         """
         Compresse les vieux tool results pendant la boucle outil.
@@ -8701,7 +8955,15 @@ class IrisAgent:
         )
 
         budget_input = get_context_window_for_model(model) - get_max_tokens_for_model(model)
-        threshold = int(budget_input * _TOOL_LOOP_COMPRESS_PCT)
+        default_threshold = int(budget_input * _TOOL_LOOP_COMPRESS_PCT)
+        if threshold_override is not None and threshold_override > 0:
+            # Cap pré-envoi abaissé (ex: comptes à faible rate-limit Anthropic
+            # Tier 1 = 50k tokens/min). ``min`` : un override ne peut que
+            # DESCENDRE le seuil (compresser plus tôt), jamais le monter
+            # (compresser moins serait une régression silencieuse).
+            threshold = min(int(threshold_override), default_threshold)
+        else:
+            threshold = default_threshold
 
         # Utiliser le vrai token count si disponible (plus précis)
         estimated_tokens = last_input_tokens
@@ -8752,6 +9014,71 @@ class IrisAgent:
             )
 
         return compressed
+
+    def _estimate_messages_input_tokens(
+        self, messages: list[dict], system: "str | None"
+    ) -> int:
+        """Estime (sans appel LLM) les tokens d'input du PROCHAIN appel :
+        ``system`` + tous les ``messages``.
+
+        Pourquoi une estimation et pas le vrai compte : le vrai ``input_tokens``
+        n'arrive qu'APRÈS l'appel (réponse API). Le compte du turn précédent
+        RATE les ``tool_result`` fraîchement appendés → un ballon (ex: 250k)
+        partait quand même et se faisait throttler. On mesure donc le contexte
+        ACTUEL avant d'envoyer.
+
+        Conservateur (marge 1.6× via la SSoT ``estimate_token_count_conservative``,
+        sommée par message → borne supérieure) pour ne JAMAIS sous-estimer un
+        ballon. ``len(str)`` est O(1) → pas d'allocation lourde. L'autorité
+        finale reste le compte API.
+        """
+        from app.constants_ai import estimate_token_count_conservative
+
+        total = estimate_token_count_conservative(system or "")
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total += estimate_token_count_conservative(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, str):
+                        total += estimate_token_count_conservative(block)
+                    elif isinstance(block, dict):
+                        for v in block.values():
+                            if isinstance(v, str):
+                                total += estimate_token_count_conservative(v)
+                            elif v is not None:
+                                total += estimate_token_count_conservative(str(v))
+        return total
+
+    @staticmethod
+    def _freeloop_pre_send_threshold(model: str) -> "int | None":
+        """Seuil (tokens) du cap pré-envoi free-loop.
+
+        ``None`` → garde le seuil interne ``0.75 × budget`` du modèle (défaut :
+        on ne fait que déplacer la compression AVANT l'appel, sans changer le
+        seuil). Override par l'env ``KOMPTIA_FREELOOP_MAX_INPUT_TOKENS`` pour
+        les comptes à faible rate-limit (Tier 1 Anthropic 50k tokens/min →
+        poser ~40000). Clampé au budget du modèle (anti-valeur absurde) ;
+        une valeur invalide/≤0 est ignorée (retombe sur le défaut). Dynamique :
+        aucun magic number hardcodé dans le call-site.
+        """
+        raw = os.environ.get("KOMPTIA_FREELOOP_MAX_INPUT_TOKENS", "").strip()
+        if not raw:
+            return None
+        try:
+            val = int(raw)
+        except ValueError:
+            return None
+        if val <= 0:
+            return None
+        from app.constants_ai import (
+            get_context_window_for_model,
+            get_max_tokens_for_model,
+        )
+
+        budget = get_context_window_for_model(model) - get_max_tokens_for_model(model)
+        return min(val, max(1, budget))
 
     @staticmethod
     def _compress_tool_content(raw_json: str) -> str:
@@ -9235,6 +9562,7 @@ def build_pipeline_recap_payload(
     pipeline_artifacts: Optional[dict],
     pipeline_auto_assumptions: Optional[list],
     pipeline_user_answers: Optional[list],
+    stopped_after_phase: Optional[str] = None,
 ) -> dict:
     """Construit le payload structuré du récap final (todo #16).
 
@@ -9268,6 +9596,11 @@ def build_pipeline_recap_payload(
         "aggregations": [],
         "auto_assumptions": [],
         "user_answers": [],
+        # T18 — run « preview » arrêté à une phase intermédiaire : l'UI rend
+        # le récap comme une HYPOTHÈSE à valider (pas une réponse finale) +
+        # un bouton « continuer vers le SQL ». None/absent = run complet.
+        "stopped_after_phase": stopped_after_phase,
+        "is_hypothesis": bool(stopped_after_phase),
     }
 
     # ─── Interpretations (depuis concept_resolution compact) ───────────
@@ -9825,6 +10158,59 @@ async def _load_pipeline_artifacts_for_agent(run_id: int, user_id: int) -> Optio
     return _compact_run_artifacts(run_id, run_status, data)
 
 
+async def _build_llm_facing_artifacts(user_id: Optional[int], pipeline_artifacts: Any) -> Any:
+    """Copie des artefacts pipeline SÛRE pour envoi au LLM cloud (T10, CRIT-A).
+
+    Les ``factsheets`` contiennent de VRAIES valeurs Sage (``interpretation``
+    construite à partir d'échantillons réels + ``top_entity_names``, cf.
+    ``_compact_factsheets``). On les anonymise (Niveau 2 : tokens §…§ des
+    termes /data-privacy du propriétaire + PII regex EMAIL/SIRET/IBAN/…),
+    forward-only comme ``execute_sql`` — les tokens §…§ sont STABLES, donc
+    dé-anonymisés dans la réponse d'Iris par le Pseudonymizer (pas besoin du
+    ``restore_fn``).
+
+    Travail sur une **copie profonde** : l'original ``pipeline_artifacts``
+    (vraies valeurs) reste intact pour le récap UI montré à l'utilisatrice
+    (Niveau 5 — l'user voit le réel, le LLM voit le token). Couche cumulative
+    au gate de consentement (T9, ``pipeline_result_needs_consent``).
+
+    Fail-CLOSED (PII) : si l'anonymisation lève (BDD down, bug pseudonymizer),
+    on RETIRE les factsheets du payload LLM plutôt que d'envoyer les vraies
+    valeurs en clair — cohérent avec la doctrine ``execute_sql`` « REFUS de
+    retour brut ». Pas de factsheets / artefacts non-dict → retourné tel quel.
+
+    INVARIANT (review adversariale finale, Faible) : ``factsheets`` est le SEUL
+    porteur de VRAIES valeurs Sage dans ``pipeline_artifacts`` — les sections
+    ``concept_resolution`` / ``resolution_signals`` sont schéma-only (Niveau 1 :
+    noms table/col, scores, labels — vérifié dans ``_compact_concept_resolution``
+    / ``_compact_resolution_signals``). Si un futur dev y ajoute une valeur
+    réelle échantillonnée, ÉTENDRE l'anonymisation ici (anonymiser ces sections
+    aussi, ou tout ``pipeline_artifacts``) — sinon fuite hors du gate T9.
+
+    Voir docs/design/iris_stop_at_phase.md (D9/T10).
+    """
+    if not isinstance(pipeline_artifacts, dict) or not pipeline_artifacts.get("factsheets"):
+        return pipeline_artifacts
+    try:
+        import copy as _copy
+
+        from app.services.anonymization import anonymize_for_llm
+
+        llm_copy = _copy.deepcopy(pipeline_artifacts)
+        anon_fs, _restore = await anonymize_for_llm(user_id, llm_copy["factsheets"], "IRIS_CHAT")
+        llm_copy["factsheets"] = anon_fs
+        return llm_copy
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "_build_llm_facing_artifacts: anonymisation factsheets échouée — "
+            "factsheets RETIRÉES du payload LLM (fail-closed PII)"
+        )
+        llm_copy = dict(pipeline_artifacts)
+        llm_copy.pop("factsheets", None)
+        llm_copy["factsheets_omitted_anon_error"] = True
+        return llm_copy
+
+
 _PIPELINE_PHASE_ICONS = {
     "1.1-1.2": "🔍",
     "1.2.5": "🗂",
@@ -9835,6 +10221,94 @@ _PIPELINE_PHASE_ICONS = {
     "3": "📊",
     "4": "⚙️",
 }
+
+
+# PIPE terminal-event — types d'events TERMINAUX d'un run pipeline (fin / échec /
+# annulation). SSoT : sert au bridge chat à (a) ne JAMAIS dropper ces events sous
+# backpressure (sinon le tour de chat se fige jusqu'au timeout agent ~5min) et
+# (b) détecter la fin du run.
+_PIPELINE_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "pipeline_complete",
+        "pipeline_failed",
+        "pipeline_cancelled",
+        "pipeline_cancelled_grace_timeout",
+        "pipeline_cancelled_no_subscriber",
+    }
+)
+
+# PIPE terminal-backstop (#45) — nombre de cycles d'attente (5s chacun) sans
+# AUCUN event avant de sonder la BDD. 3 → ~15s de silence avant le 1er poll.
+_BACKSTOP_TIMEOUT_CYCLES: int = 3
+
+
+async def _check_pipeline_run_terminal_in_db(run_id: int) -> Optional[Any]:
+    """Retourne le ``PipelineRunStatus`` si le run ``run_id`` est terminal en BDD,
+    sinon ``None`` (run encore actif, introuvable, ou erreur de lecture).
+
+    Lecture courte, dédiée, best-effort : ne JAMAIS propager — le backstop ne
+    doit pas casser le bridge ; en cas d'échec on retombe sur l'attente normale.
+    """
+    try:
+        from app.models.pipeline_run import PipelineRun
+
+        async with get_session() as _sess:
+            run = await _sess.get(PipelineRun, run_id)
+            if run is not None and run.is_terminal():
+                return run.status
+    except Exception:  # noqa: BLE001 — best-effort, ne jamais casser le bridge
+        logger.exception(
+            "_check_pipeline_run_terminal_in_db: lecture statut run %s échouée", run_id
+        )
+    return None
+
+
+def _synthesize_backstop_terminal_event(status: Any) -> dict:
+    """Construit l'event terminal MANQUANT à partir du statut BDD terminal.
+
+    On ne peut PAS reconstruire un résultat (SQL final) jamais reçu : on finalise
+    honnêtement. ``CANCELLED`` → annulation ; tout le reste (``FAILED``, et même
+    ``SUCCESS`` dont le résultat n'a jamais transité) → échec « résultat non
+    transmis » plutôt qu'un faux succès vide (pas de donnée fausse silencieuse).
+    """
+    from app.models.pipeline_run import PipelineRunStatus
+
+    if status == PipelineRunStatus.CANCELLED:
+        return {"type": "pipeline_cancelled", "message": "Le pipeline a été annulé."}
+    return {
+        "type": "pipeline_failed",
+        "message": (
+            "Le pipeline s'est terminé côté serveur mais son résultat n'a pas "
+            "été transmis (connexion interrompue). Relancez votre requête si besoin."
+        ),
+    }
+
+
+async def _finalize_orphaned_bridge(
+    run_id: int, subscriber_id: str, user_id: int, *, immediate: bool
+) -> None:
+    """Cleanup DÉTACHÉ quand ``_stream_pipeline_run_to_chat`` se ferme AVANT la
+    fin du run (Stop explicite, fermeture/refresh d'onglet, coupure WS).
+
+    Désabonne du bus PUIS stoppe le ``PipelineRunner`` — sinon il continue à
+    tourner orphelin et brûle des crédits Anthropic + requête Sage dans le vide
+    (audit PIPE-1). Lancé via ``create_task`` pour SURVIVRE à l'annulation du
+    turn agent (un ``await`` dans le ``finally`` d'un générateur annulé ne
+    s'exécuterait pas jusqu'au bout). L'ordre unsubscribe→stop garantit que la
+    grace-cancel voit bien 0 subscriber au moment de décider.
+    """
+    try:
+        from app.services.ai.pipeline_event_bus import get_event_bus
+
+        await get_event_bus().unsubscribe(run_id, subscriber_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("_finalize_orphaned_bridge: unsubscribe failed run_id=%s", run_id)
+    try:
+        from app.services.ai.pipeline_runner import stop_run_from_chat
+
+        await stop_run_from_chat(run_id, user_id, immediate=immediate)
+    except Exception:  # noqa: BLE001
+        logger.exception("_finalize_orphaned_bridge: stop run failed run_id=%s", run_id)
 
 
 async def _stream_pipeline_run_to_chat(
@@ -9894,8 +10368,28 @@ async def _stream_pipeline_run_to_chat(
     # pipeline_complete uniquement ; sinon listes vides.
     pipeline_auto_assumptions: list[dict] = []
     pipeline_user_answers: list[dict] = []
+    # T18 — run « preview » arrêté tôt : marqueurs pour le récap UI (carte
+    # « hypothèse à valider »). Posés par l'event pipeline_complete ; None =
+    # run complet.
+    pipeline_stopped_after_phase: str | None = None
+    pipeline_terminal_reason: str | None = None
 
     async def _enqueue(event: dict) -> None:
+        # PIPE terminal-event — les events TERMINAUX (fin/échec/annulation) sont
+        # critiques et rares : droppés sous backpressure, le bridge boucle
+        # jusqu'au timeout agent (~5min) puis erreur au lieu de finir. On les met
+        # SANS timeout (block-put) : le consommateur draine toutes les ~5s → ils
+        # passent forcément. Les events non terminaux (progress) restent
+        # droppables après 2s (perdre un progress est sans conséquence).
+        if event.get("type") in _PIPELINE_TERMINAL_EVENT_TYPES:
+            try:
+                await queue.put(event)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "_stream_pipeline_run_to_chat: put event terminal échoué (type=%s)",
+                    event.get("type"),
+                )
+            return
         try:
             await asyncio.wait_for(queue.put(event), timeout=2.0)
         except asyncio.TimeoutError:
@@ -9906,6 +10400,9 @@ async def _stream_pipeline_run_to_chat(
 
     await bus.subscribe(run_id, subscriber_id, _enqueue)
 
+    # PIPE terminal-backstop (#45) — cycles d'attente consécutifs SANS event ;
+    # remis à 0 dès qu'un event arrive.
+    _consecutive_timeouts = 0
     try:
         while not completed:
             if cancel_event is not None and cancel_event.is_set():
@@ -9916,10 +10413,29 @@ async def _stream_pipeline_run_to_chat(
                 break
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=5.0)
+                _consecutive_timeouts = 0
             except asyncio.TimeoutError:
                 # Pas d'event reçu : continuer à attendre, mais permettre
                 # le check cancel_event régulier.
-                continue
+                _consecutive_timeouts += 1
+                # PIPE terminal-backstop (#45) — après quelques cycles de silence,
+                # vérifier si le run est DÉJÀ terminal en BDD (process mort sans
+                # avoir émis son event terminal). Si oui, synthétiser l'event
+                # manquant et le LAISSER TOMBER dans le traitement terminal normal
+                # ci-dessous ; sinon, ré-attendre (le run est encore actif).
+                if _consecutive_timeouts < _BACKSTOP_TIMEOUT_CYCLES:
+                    continue
+                _consecutive_timeouts = 0
+                _term_status = await _check_pipeline_run_terminal_in_db(run_id)
+                if _term_status is None:
+                    continue
+                logger.warning(
+                    "_stream_pipeline_run_to_chat: run %s terminal en BDD (%s) sans "
+                    "event terminal reçu — backstop finalise le bridge",
+                    run_id,
+                    _term_status,
+                )
+                event = _synthesize_backstop_terminal_event(_term_status)
 
             etype = event.get("type", "")
 
@@ -10001,13 +10517,7 @@ async def _stream_pipeline_run_to_chat(
                         "phase": event.get("phase_id"),
                         "message": msg,
                     }
-            elif etype in (
-                "pipeline_complete",
-                "pipeline_failed",
-                "pipeline_cancelled",
-                "pipeline_cancelled_grace_timeout",
-                "pipeline_cancelled_no_subscriber",
-            ):
+            elif etype in _PIPELINE_TERMINAL_EVENT_TYPES:
                 final_status = etype.replace("pipeline_", "")
                 final_sql = event.get("final_sql")
                 error_message = event.get("message")
@@ -10031,6 +10541,9 @@ async def _stream_pipeline_run_to_chat(
                 # transparence + permettre la correction ciblée.
                 pipeline_auto_assumptions = event.get("auto_assumptions") or []
                 pipeline_user_answers = event.get("user_answers") or []
+                # T18 — marqueurs run preview (arrêt intermédiaire) pour le récap.
+                pipeline_stopped_after_phase = event.get("stopped_after_phase")
+                pipeline_terminal_reason = event.get("terminal_reason")
                 completed = True
                 break
             elif etype == "pipeline_started":
@@ -10064,11 +10577,33 @@ async def _stream_pipeline_run_to_chat(
                 }
 
     finally:
-        # Cleanup : désabonner pour éviter les fuites
-        try:
-            await bus.unsubscribe(run_id, subscriber_id)
-        except Exception:  # noqa: BLE001
-            logger.exception("_stream_pipeline_run_to_chat: unsubscribe failed")
+        if completed:
+            # Happy path inchangé : run terminé normalement → désabonner inline.
+            try:
+                await bus.unsubscribe(run_id, subscriber_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("_stream_pipeline_run_to_chat: unsubscribe failed")
+        else:
+            # PIPE-1 — le bridge se ferme AVANT la fin du run (Stop explicite via
+            # cancel_event, fermeture/refresh d'onglet → CancelledError/
+            # GeneratorExit, coupure WS). On détache un cleanup (unsubscribe +
+            # arrêt du runner) dans une task qui SURVIT à l'annulation du turn :
+            # sinon le PipelineRunner reste orphelin et brûle des crédits
+            # Anthropic + requête Sage dans le vide. Cancel immédiat si Stop
+            # explicite, sinon grace-cancel (fenêtre de reconnexion).
+            _immediate = cancel_event is not None and cancel_event.is_set()
+            try:
+                asyncio.get_running_loop().create_task(
+                    _finalize_orphaned_bridge(
+                        run_id, subscriber_id, user_id, immediate=_immediate
+                    ),
+                    name=f"chat-bridge-stop-{run_id}",
+                )
+            except RuntimeError:
+                logger.warning(
+                    "_stream_pipeline_run_to_chat: no running loop to stop orphaned run_id=%s",
+                    run_id,
+                )
 
     # Synthèse finale pour le LLM Iris (compact)
     total_in = sum(p.get("tokens_input", 0) for p in phase_summaries)
@@ -10089,6 +10624,11 @@ async def _stream_pipeline_run_to_chat(
             run_id,
         )
         pipeline_artifacts = None
+
+    # T10 (CRIT-A) — copie LLM-facing avec factsheets anonymisées (vraies
+    # valeurs Sage → tokens §…§). L'original ``pipeline_artifacts`` (réel)
+    # reste la source du récap UI (Niveau 5). Cf. ``_build_llm_facing_artifacts``.
+    llm_pipeline_artifacts = await _build_llm_facing_artifacts(user_id, pipeline_artifacts)
 
     # T29★ — Détection de concepts low-confidence/disambiguation dans les
     # artefacts compactés. Permet d'enrichir les instructions à l'agent
@@ -10129,7 +10669,29 @@ async def _stream_pipeline_run_to_chat(
     # L'agent doit pouvoir exploiter les artefacts (proposer SQL candidats,
     # poser question métier, etc.) au lieu de fermer en 1-2 phrases.
     # T29★ : injection des hints disambiguation (concaténés en fin).
-    if final_status == "complete":
+    if final_status == "complete" and pipeline_terminal_reason == "stopped_clean":
+        # B1 — Arrêt VOLONTAIRE en mode aperçu (stopped_clean) : le run a été
+        # arrêté à une phase intermédiaire SANS produire de SQL (voulu). Il ne
+        # faut SURTOUT PAS prendre la branche « complete » ci-dessous (« SQL
+        # prêt / execute_sql ») — ce serait faux et contredirait la carte UI
+        # « hypothèse ». Le signal vient de terminal_reason (contrôle de flux,
+        # CRIT-B), pas de final_sql=None. Cf. docs/design/iris_stop_at_phase.md §8.
+        _stop_ph = pipeline_stopped_after_phase or "intermédiaire"
+        instructions_for_assistant = (
+            f"Arrêt VOLONTAIRE en mode aperçu à la phase {_stop_ph} — AUCUN SQL "
+            "final n'a été produit (c'est ATTENDU, pas une erreur). Les artefacts "
+            "dans `pipeline_artifacts` sont une HYPOTHÈSE de mapping à faire valider : "
+            "blueprint (tables candidates + graphe de JOINs) pour un arrêt en 1.5, "
+            "fact sheets (tables/colonnes résolues + valeurs échantillonnées) pour un "
+            "arrêt en 3. Présente-les en TERMES MÉTIER (« voici les tables que "
+            "j'utiliserais — ça correspond à ce que tu veux ? »), JAMAIS comme une "
+            "réponse finale. N'appelle PAS `execute_sql` (il n'y a pas de SQL). Quand "
+            "l'utilisateur valide OU corrige le mapping, appelle "
+            "`pipeline_resume(run_id, from_phase=<phase juste après l'arrêt>)` pour "
+            "reprendre jusqu'au SQL (passe sa correction via `state_overrides` si "
+            "pertinent). NE prétends PAS que le SQL est prêt."
+        )
+    elif final_status == "complete":
         instructions_for_assistant = (
             "Pipeline terminée avec succès — SQL final disponible. "
             "Présente brièvement le résultat. Tu peux exécuter le SQL avec "
@@ -10367,9 +10929,17 @@ async def _stream_pipeline_run_to_chat(
         "total_cost_usd": round(total_cost, 4),
         "total_duration_seconds": round(total_duration, 1),
         "error_message": error_message,
-        "pipeline_artifacts": pipeline_artifacts,
+        # T10 — copie anonymisée (factsheets tokenisées). Le récap UI plus bas
+        # utilise ``pipeline_artifacts`` (vraies valeurs) — Niveau 5.
+        "pipeline_artifacts": llm_pipeline_artifacts,
         "instructions_for_assistant": instructions_for_assistant,
     }
+    # B1 — signal STRUCTURÉ (pas seulement textuel) du run preview arrêté tôt,
+    # pour que le LLM ne confonde pas avec un run complet. final_sql reste None.
+    if pipeline_terminal_reason == "stopped_clean":
+        synthetic_result["is_hypothesis"] = True
+        synthetic_result["stopped_after_phase"] = pipeline_stopped_after_phase
+
     # Fix L8++ #63 (2026-05-20) : propagation structurée des indices
     # de recovery au LLM. Champs non posés (None) si la pipeline n'a pas
     # crashé sur un ConceptUnresolvedError — silencieux dans le cas normal.
@@ -10406,6 +10976,7 @@ async def _stream_pipeline_run_to_chat(
                 pipeline_artifacts,
                 pipeline_auto_assumptions,
                 pipeline_user_answers,
+                stopped_after_phase=pipeline_stopped_after_phase,
             )
             yield {
                 "type": "pipeline_recap",

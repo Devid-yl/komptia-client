@@ -167,6 +167,17 @@ class ConsoleFormatter(logging.Formatter):
         return message
 
 
+# ── Noms de fichiers de log — SOURCE DE VÉRITÉ UNIQUE ─────────────────────
+# Ce module est le PRODUCTEUR des fichiers de log (AppLogger.setup les crée).
+# Tout consommateur qui doit relire ces fichiers (ex:
+# ``app/services/feedback/feedback_service.py`` qui en joint la queue au mail
+# support) DOIT importer ces constantes plutôt que recopier les littéraux —
+# sinon un rename ici casserait silencieusement la lecture là-bas (fichier
+# introuvable → retour vide, aucune erreur visible).
+PRIMARY_LOG_FILENAME = "komptia.log"  # TimedRotatingFileHandler → komptia.log.YYYY-MM-DD
+ERROR_LOG_FILENAME = "errors.log"  # RotatingFileHandler (ERROR+ uniquement)
+
+
 class AppLogger:
     """
     Logger centralisé pour Komptia
@@ -207,7 +218,7 @@ class AppLogger:
 
         # Handler fichier (rotation quotidienne)
         file_handler = logging.handlers.TimedRotatingFileHandler(
-            config.logs_dir / "komptia.log",
+            config.logs_dir / PRIMARY_LOG_FILENAME,
             when="midnight",
             interval=1,
             backupCount=30,  # Garde 30 jours
@@ -219,7 +230,7 @@ class AppLogger:
 
         # Handler erreurs séparé
         error_handler = logging.handlers.RotatingFileHandler(
-            config.logs_dir / "errors.log",
+            config.logs_dir / ERROR_LOG_FILENAME,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",

@@ -170,30 +170,18 @@ async def delete_term_for_user(
     category_before = row.category
     risk_level_before = row.risk_level
 
-    audit_id = await anon_audit.log_audit_action(
-        session,
-        user_id=user_id,
-        term=term_value,
-        anonymization_term_id=term_id,
-        action="delete",
-        triggered_by="user_panel",
-        triggered_by_user_id=triggered_by_user_id,
-        category=category_before,
-        risk_level=risk_level_before,
-        enabled=enabled_before,
-        confirmed=confirmed_before,
-        changed_fields={
-            "enabled": [enabled_before, None],
-            "confirmed": [confirmed_before, None],
-        },
-        reason=reason or "user-driven delete via /api/anonymization/terms/:id",
-    )
-
     # Critical #37 review : DELETE conditionnel + check rowcount.
     # SQLite ne supporte pas SELECT FOR UPDATE, mais on peut détecter une
     # race (un autre DELETE concurrent a déjà fait le travail) via le
     # rowcount du DELETE. Si rowcount=0, le terme a déjà été supprimé →
     # on retourne ``already_deleted=True`` au lieu d'un faux ``success``.
+    #
+    # DELETE AVANT audit (fix 2026-06-11, tâche #23) : l'ancien ordre
+    # audit→delete écrivait une entrée d'audit « delete » MÊME quand le
+    # rowcount révélait que la suppression avait déjà eu lieu (double-clic,
+    # 2 onglets) → l'historique comptait 2 suppressions pour 1 terme.
+    # L'audit doit tracer ce qui s'est PASSÉ : il n'est écrit que si CE
+    # DELETE a effectivement supprimé la row (même transaction → atomique).
     result = await session.execute(
         delete(AnonymizationTerm).where(
             AnonymizationTerm.id == term_id,
@@ -201,6 +189,32 @@ async def delete_term_for_user(
         )
     )
     rowcount = getattr(result, "rowcount", -1)
+
+    audit_id = None
+    if rowcount != 0:
+        audit_id = await anon_audit.log_audit_action(
+            session,
+            user_id=user_id,
+            term=term_value,
+            # None par doctrine du modèle (« peut être null si l'audit
+            # concerne une suppression — la row n'existe plus ») : la row
+            # vient d'être supprimée, référencer son id violerait la FK.
+            # État final identique à l'ancien ordre audit→delete (le
+            # ondelete=SET NULL aurait NULLifié la référence au delete).
+            anonymization_term_id=None,
+            action="delete",
+            triggered_by="user_panel",
+            triggered_by_user_id=triggered_by_user_id,
+            category=category_before,
+            risk_level=risk_level_before,
+            enabled=enabled_before,
+            confirmed=confirmed_before,
+            changed_fields={
+                "enabled": [enabled_before, None],
+                "confirmed": [confirmed_before, None],
+            },
+            reason=reason or "user-driven delete via /api/anonymization/terms/:id",
+        )
 
     return {
         "id": term_id,
@@ -394,9 +408,15 @@ async def list_audit(
     if triggered_by_filter and triggered_by_filter in anon_audit.TRIGGERED_BY_VALUES:
         base_where.append(AnonymizationAudit.triggered_by == triggered_by_filter)
     if term_contains and isinstance(term_contains, str) and term_contains.strip():
-        # ILIKE bindé via SQLAlchemy — pas d'injection.
-        like_pattern = f"%{term_contains.strip()}%"
-        base_where.append(AnonymizationAudit.term.ilike(like_pattern))
+        # ILIKE bindé via SQLAlchemy — pas d'injection. MAIS les wildcards
+        # LIKE (%, _) de l'input restaient interprétés (fix 2026-06-11,
+        # tâche #23) : chercher « 50% » matchait tout ce qui commence par
+        # « 50 », chercher « a_c » matchait « abc » — résultats FAUX
+        # silencieusement. Échappement explicite + clause ESCAPE.
+        needle = term_contains.strip()
+        needle = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_pattern = f"%{needle}%"
+        base_where.append(AnonymizationAudit.term.ilike(like_pattern, escape="\\"))
 
     # FIX review H1 : clamp range since/until à AUDIT_RANGE_MAX_DAYS pour
     # éviter un FULL SCAN sur l'index created_at (un user qui pose
@@ -999,14 +1019,24 @@ async def scan_datastore_tokens(
     # + source_ref="iris:<conv_id>".
     iris_messages_processed = 0
     iris_messages_added = 0
+    iris_truncated = False  # #40 — cap atteint sur les messages Iris ?
+    iris_scan_failed = False  # #40 review — phase Iris plantée AVANT de scanner ?
     try:
         async for iris_event in _scan_user_iris_messages_streaming(user_id):
-            if iris_event.get("step") == "iris_message":
+            if iris_event.get("step") == "iris_messages_start":
+                iris_truncated = bool(iris_event.get("truncated"))
+            elif iris_event.get("step") == "iris_message":
                 iris_messages_processed += 1
                 iris_messages_added += int(iris_event.get("added_in_message", 0) or 0)
                 total_added += int(iris_event.get("added_in_message", 0) or 0)
             yield iris_event
     except Exception:  # noqa: BLE001
+        # #40 review (Moyen) — si la phase Iris plante AVANT le 1er event, on
+        # n'a rien scanné : signaler l'ÉCHEC (et pas seulement « tronqué »).
+        # Sinon le scan « terminé » paraît exhaustif alors qu'AUCUN message
+        # Iris n'a été couvert → leur PII reste en clair (même symptôme que
+        # le cap, autre cause/remédiation).
+        iris_scan_failed = True
         logger.warning(
             "scan_datastore: phase iris_messages échouée (skip, scan global continue)",
             exc_info=True,
@@ -1023,10 +1053,13 @@ async def scan_datastore_tokens(
             "tokens_unique": len(all_tokens),
             "terms_added_to_bdd": total_added,
         },
-        # ``truncated`` reflète uniquement le cap fichiers (``SCAN_MAX_FILES``).
-        # Le cap tokens (``SCAN_MAX_TOKENS``) a été retiré le 2026-05-19 : seul
-        # le quota disque user borne légitimement le nombre de tokens.
-        "truncated": files_truncated,
+        # ``truncated`` = cap fichiers (``SCAN_MAX_FILES``) OU cap messages Iris
+        # (#40) OU échec de la phase Iris. Sans ces signaux, les PII des messages
+        # Iris non couverts partent en clair au LLM alors que l'user croit son
+        # inventaire complet. Clés dédiées pour que l'UI différencie le libellé.
+        "truncated": files_truncated or iris_truncated or iris_scan_failed,
+        "iris_truncated": iris_truncated,
+        "iris_scan_error": iris_scan_failed,
     }
 
 
@@ -1193,7 +1226,6 @@ async def _scan_user_dashboards_streaming(
             # reflète aussi les dashboards (sans ça, sous-comptage).
             "tokens_in_dashboard": list(tokens_in_dashboard),
         }
-
 
 
 def _extract_tabs_from_file_sync(path: Path) -> Optional[List[Dict[str, Any]]]:
@@ -1366,7 +1398,11 @@ async def scan_workbook_terms(
         or 0
     )
 
-    return {"scanned": len(origins_by_token), "added": count_after - count_before}
+    # max(0, …) (fix 2026-06-11, tâche #23) : un cleanup/delete concurrent
+    # entre les deux COUNT pouvait rendre le delta NÉGATIF — « added: -400 »
+    # affiché à l'utilisateur. Le delta reste une approximation (non
+    # transactionnel) ; on le borne au sens métier (« combien d'ajouts »).
+    return {"scanned": len(origins_by_token), "added": max(0, count_after - count_before)}
 
 
 async def scan_automation_terms(
@@ -1454,7 +1490,8 @@ async def scan_automation_terms(
 
     return {
         "scanned": len(origins_by_token),
-        "added": count_after - count_before,
+        # max(0, …) : cf. scan_workbook_terms (delta non transactionnel, #23).
+        "added": max(0, count_after - count_before),
         "tokens": list(origins_by_token.keys()),
     }
 
@@ -1575,20 +1612,33 @@ async def _scan_user_iris_messages_streaming(
     async with _get_iris_session() as session:
         # user_id vit sur Conversation, pas ConversationMessage — JOIN
         # nécessaire pour scoper aux conversations du user.
+        # #40 — on SELECT max_messages+1 (sentinelle) pour DÉTECTER si le cap a
+        # été atteint : sans ce signal, l'utilisateur croit son inventaire
+        # /data-privacy complet alors que les messages Iris les plus ANCIENS
+        # n'ont pas été scannés → leurs PII partent EN CLAIR au LLM (faille
+        # confidentialité niveau 2, doctrine CLAUDE.md).
         result = await session.execute(
             select(ConversationMessage)
             .join(Conversation, ConversationMessage.conversation_id == Conversation.id)
             .where(Conversation.user_id == user_id)
             .where(ConversationMessage.tool_result.isnot(None))
             .order_by(ConversationMessage.created_at.desc())
-            .limit(max_messages)
+            .limit(max_messages + 1)
         )
         messages = list(result.scalars().all())
+
+    iris_truncated = len(messages) > max_messages
+    if iris_truncated:
+        messages = messages[:max_messages]  # ne scanner que le cap
 
     if not messages:
         return
 
-    yield {"step": "iris_messages_start", "total": len(messages)}
+    yield {
+        "step": "iris_messages_start",
+        "total": len(messages),
+        "truncated": iris_truncated,
+    }
 
     for msg in messages:
         rows: Optional[List[Dict[str, Any]]] = None
@@ -1756,7 +1806,8 @@ async def scan_dashboard_terms(
     # (review interne 2026-05-20 #9).
     return {
         "scanned": len(origins_by_token),
-        "added": count_after - count_before,
+        # max(0, …) : cf. scan_workbook_terms (delta non transactionnel, #23).
+        "added": max(0, count_after - count_before),
         "tokens": list(origins_by_token.keys()),
     }
 

@@ -27,12 +27,15 @@ import shutil
 from datetime import timedelta
 from pathlib import Path
 
-from sqlalchemy import and_, create_engine, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.core.database import get_db_url
+
+# get_db_url ré-exposé (et passé explicitement à make_sync_engine) pour rester
+# monkeypatchable par les tests (patch de ``pipeline_cleanup.get_db_url``).
+from app.core.database import get_db_url, make_sync_engine
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +103,7 @@ def cleanup_pipeline_runs_job() -> None:
     paused_abandon_days = _paused_abandon_days()
     paused_cutoff_naive = (clock.now() - timedelta(days=paused_abandon_days)).replace(tzinfo=None)
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     deleted_count = 0
     try:
         with Session(engine) as session:

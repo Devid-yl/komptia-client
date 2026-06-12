@@ -37,9 +37,12 @@
     var DEBOUNCE_MS = 300;
     var ROW_HEIGHT = 36;
     var BUFFER_ROWS = 10;
-    var ONBOARDING_KEY = 'privacy_v1';
+    var ONBOARDING_KEY = 'privacy_v2';
 
     // ── État ──────────────────────────────────────────────────────────
+    // Nombre de groupes de provenance affichés par page (pagination client).
+    var GROUPS_PER_PAGE = 12;
+
     var state = {
         terms: [],            // Liste complète (référence)
         filteredTerms: [],    // Liste après filtre + recherche
@@ -52,6 +55,11 @@
         // ``AnonTokenizer.isPureNumeric`` (single source of truth Py↔JS).
         termsTypeFilter: 'all',
         termsSearch: '',
+        // Pagination CLIENT par GROUPE de provenance (pas par terme) : la liste
+        // est un accordéon groupé/collapsable, paginer les groupes garde chaque
+        // groupe intact (compteurs + select-all corrects) et borne le DOM.
+        // Reset à 1 quand un filtre/recherche change (applyFilters).
+        termsPage: 1,
         statsLoaded: false,
         loadStatsReqId: 0,
         loadTermsReqId: 0,
@@ -293,7 +301,7 @@
         return true;
     }
 
-    function applyFilters() {
+    function applyFilters(keepPage) {
         var arr = [];
         for (var i = 0; i < state.terms.length; i++) {
             if (termMatchesFilter(
@@ -307,6 +315,13 @@
             }
         }
         state.filteredTerms = arr;
+        // Nouveau filtre/recherche → page 1. Sur une simple MUTATION de la
+        // liste (ex: suppression d'un terme), keepPage=true conserve la page
+        // courante — le clamp de renderGroupedTerms corrige si elle déborde
+        // (évite de ré-éjecter l'admin en page 1 au milieu de son tri).
+        if (!keepPage) {
+            state.termsPage = 1;
+        }
         if (typeof renderGroupedTerms === 'function') {
             renderGroupedTerms();
         }
@@ -364,10 +379,20 @@
     }
 
     function _escapeHTML(s) {
+        // #101 (XSS, CWE-79) — échappe AUSSI les guillemets `"` / `'` : ce helper
+        // est utilisé DANS des attributs HTML (`value=`, `aria-label=`,
+        // `data-group-key=`…) avec des valeurs contrôlées (termes /data-privacy,
+        // tapés OU issus d'un scan de classeur / noms de colonnes de la source).
+        // Le motif `textContent → innerHTML` n'échappait que `& < >` → un terme
+        // contenant `"` cassait l'attribut (breakout → injection d'event handler).
+        // Échapper les guillemets rend la sortie sûre en contexte texte ET attribut.
         if (s == null) return '';
-        var d = document.createElement('div');
-        d.textContent = String(s);
-        return d.innerHTML;
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;');
     }
 
     //: Récupère la valeur "courante" d'un terme : si l'utilisateur a fait des
@@ -639,9 +664,19 @@
                 state.seenCategories.add(seenKey);
             }
         }
+        // ── Pagination par groupe : borne le DOM + nav Première/Dernière ──
+        // (le DOM ne contient au plus que GROUPS_PER_PAGE groupes à la fois).
+        var allKeys = grouped.orderedKeys;
+        var totalGroups = allKeys.length;
+        var totalPages = Math.max(1, Math.ceil(totalGroups / GROUPS_PER_PAGE));
+        if (state.termsPage > totalPages) { state.termsPage = totalPages; }
+        if (state.termsPage < 1) { state.termsPage = 1; }
+        var startIdx = (state.termsPage - 1) * GROUPS_PER_PAGE;
+        var pageKeys = allKeys.slice(startIdx, startIdx + GROUPS_PER_PAGE);
+
         var html = '';
-        for (var i = 0; i < grouped.orderedKeys.length; i++) {
-            var key = grouped.orderedKeys[i];
+        for (var i = 0; i < pageKeys.length; i++) {
+            var key = pageKeys[i];
             var label = grouped.labels[key];
             var rows = grouped.groups[key];
             var keyParts = _splitGroupKey(key);
@@ -714,6 +749,27 @@
         // Compteur dans footer.
         var cnt = $('terms-count-visible');
         if (cnt) cnt.textContent = String(state.filteredTerms.length);
+        // Pagination des groupes de provenance (Première ⏮ ‹ … › Dernière ⏭).
+        _renderTermsPager(totalPages, totalGroups);
+    }
+
+    function _renderTermsPager(totalPages, totalGroups) {
+        var el = $('terms-pagination');
+        if (!el || !window.KomptiaPagination) { return; }
+        window.KomptiaPagination.render(el, {
+            page: state.termsPage,
+            totalPages: totalPages,
+            onNavigate: function (p) {
+                state.termsPage = p;
+                renderGroupedTerms();
+                // Remonte en haut de la liste scrollable pour voir la page.
+                var box = $('terms-groups');
+                if (box && typeof box.scrollTo === 'function') {
+                    box.scrollTo({ top: 0 });
+                }
+            },
+            countText: totalGroups + ' groupe' + (totalGroups > 1 ? 's' : ''),
+        });
     }
 
     function _populateCategoryFilter(termsArr) {
@@ -758,6 +814,10 @@
         try {
             var data = await fetchJson('/api/anonymization/terms?detailed=1');
             if (reqId !== state.loadTermsReqId) return;
+            // Jeton de révision pour le verrou optimiste du PUT (fix lost
+            // update 2026-06-10) — renvoyé en expected_revision aux saves.
+            state.revision = (data && typeof data.revision === 'string')
+                ? data.revision : null;
             var st = (data && data.anonymization_state) || {};
             var termsArr = Array.isArray(st.terms) ? st.terms : [];
             state.terms = termsArr;
@@ -1084,8 +1144,9 @@
             }
             // applyFilters() chaîne renderGroupedTerms en interne — un
             // seul appel suffit (fix #4 — supprime le double-render
-            // qui éjectait le focus sur le body).
-            applyFilters();
+            // qui éjectait le focus sur le body). keepPage=true : une
+            // suppression ne doit pas renvoyer l'admin en page 1.
+            applyFilters(true);
             // Restauration focus sur la ligne adjacente après re-render
             // (fix #11 — WCAG 2.4.3). On cherche un bouton delete
             // adjacent dans le DOM mis à jour. Préfère la ligne SUIVANTE
@@ -1218,7 +1279,18 @@
         try {
             await fetchJson('/api/anonymization/terms', {
                 method: 'PUT',
-                body: JSON.stringify({ anonymization_state: built.state }),
+                // state_scope "full" : /data-privacy charge l'état DÉTAILLÉ
+                // complet (?detailed=1) — le replace backend peut donc
+                // supprimer y compris les termes désactivés absents du body.
+                // Sans cette déclaration, le backend est fail-closed
+                // (scope actif) et préserverait les désactivés (fix 2026-06-10).
+                // expected_revision : verrou optimiste (409 si un autre
+                // onglet/scan a écrit depuis le chargement — rien d'écrasé).
+                body: JSON.stringify({
+                    anonymization_state: built.state,
+                    state_scope: 'full',
+                    expected_revision: state.revision || undefined,
+                }),
             });
             toast(action === 'delete' ? 'Termes supprimés.'
                 : action === 'enable' ? 'Termes activés.'
@@ -1255,25 +1327,18 @@
                 {
                     icon: 'sparkle',
                     title: 'Les termes que vous protégez',
-                    text: 'Vous décidez quels mots (noms de clients, références, montants sensibles...) '
-                        + 'doivent être masqués avant tout échange avec l\'intelligence artificielle. '
-                        + 'Vous gardez la main : ajout, désactivation, suppression à tout moment.',
+                    text: 'Vous décidez quels mots (noms de clients, références, montants sensibles...) doivent être masqués avant tout échange avec l\'intelligence artificielle. Vous gardez la main : « Ajouter un terme », activer/désactiver via la case, ou supprimer à tout moment.'
                 },
                 {
                     icon: 'chart',
                     title: 'Komptia repère pour vous',
-                    text: 'Cliquez sur « Scanner » pour que Komptia parcoure vos données et vous '
-                        + 'propose automatiquement la liste des termes à protéger. Vous validez ce '
-                        + 'qui vous convient, vous écartez le reste.',
+                    text: 'Cliquez sur « Scanner mes données » pour que Komptia parcoure votre datastore et vous propose une liste de termes à protéger. Les nouveaux termes arrivent « en attente » : vous activez ceux qui vous conviennent, vous écartez le reste.'
                 },
                 {
-                    icon: 'bell',
+                    icon: 'shield',
                     title: 'Une protection invisible pour vous',
-                    text: 'Avant chaque envoi à l\'IA, vos termes sont remplacés par un nom neutre '
-                        + '(par exemple « Client_A12 »). À réception de la réponse, Komptia rétablit '
-                        + 'automatiquement les vraies valeurs : vous voyez vos données, l\'IA ne les '
-                        + 'voit jamais.',
-                },
+                    text: 'Avant chaque envoi à l\'IA, vos termes sont remplacés par un pseudonyme neutre. À réception de la réponse, Komptia rétablit automatiquement les vraies valeurs : vous voyez vos données, l\'IA ne les voit jamais.'
+                }
             ],
         });
     }
@@ -1439,8 +1504,9 @@
                     'info'
                 );
                 actImprove.disabled = true;
+                var _persisted = false;
                 try {
-                    await _persistDirtyTerms();
+                    _persisted = await _persistDirtyTerms();
                 } catch (err) {
                     toast(
                         "Échec enregistrement (" + ((err && err.message) || 'inconnue')
@@ -1451,6 +1517,15 @@
                     return;
                 } finally {
                     actImprove.disabled = false;
+                }
+                // Échec SOFT (fix 2026-06-11, finding review #13) :
+                // _persistDirtyTerms ne throw pas sur validation KO / save
+                // déjà en vol / 409 révision / PUT KO — elle retourne false
+                // (et a déjà affiché son toast). Sans ce check, l'amélioration
+                // démarrait sur des termes NON persistés — exactement le
+                // « state incohérent » que ce flow doit empêcher.
+                if (_persisted === false) {
+                    return;
                 }
             }
             window.PrivacyImprovePseudos.openAndStartImprove(_improveDeps());
@@ -1659,14 +1734,26 @@
         }
     }
 
+    // Contrat de retour (fix 2026-06-11, tâche #13) : ``true`` si l'état
+    // local est COHÉRENT avec le serveur à la sortie (PUT confirmé, ou rien
+    // à persister) ; ``false`` sur tout échec soft (validation, save déjà
+    // en vol, 409 révision, PUT KO) — la fonction a alors déjà affiché son
+    // toast. Elle ne THROW jamais pour ces échecs : les callers qui ont
+    // besoin de l'invariant « ne pas continuer sur state incohérent »
+    // (ex: flow Améliorer) doivent tester le retour, pas le catch.
     async function _persistDirtyTerms() {
-        if (state.dirtyTerms.size === 0) return;
+        if (state.dirtyTerms.size === 0) return true;
         // Idempotence guard : si un save est déjà en vol (PUT + reload),
         // refuser un 2e appel. Sans ça, un clic rapide / spam keyboard
         // peut lancer 2 PUTs en parallèle et créer une race sur le clear
         // de ``state.dirtyTerms``. Adversarial HIGH 2026-05-20.
         if (state.saveInFlight) {
-            return;
+            // Feedback explicite au lieu d'un drop SILENCIEUX (fix
+            // 2026-06-11, tâche #13) : sur 3000+ termes le PUT+reload dure
+            // plusieurs secondes — l'user qui re-clique croyait le bouton
+            // cassé (« ça chargeait trop longtemps », bug vécu).
+            toast('Enregistrement déjà en cours — patiente quelques secondes…', 'info');
+            return false;
         }
         // Construit le payload PUT : copy de l'état complet avec les patches
         // appliqués. Le backend remplace l'état via replace_state (upsert+
@@ -1703,7 +1790,7 @@
                     + 'save-helpers.js chargé avant privacy-page.js ?'
                 );
             }
-            return;
+            return false;
         }
         var validation = window.AnonymizationSaveHelpers.validatePseudoMap(payloadTerms);
         if (validation.errors.length) {
@@ -1712,7 +1799,7 @@
                     ? ' (+' + (validation.errors.length - 1) + ' autre(s))'
                     : '');
             toast(msg, 'error');
-            return;
+            return false;
         }
 
         var btnSave = $('btn-save');
@@ -1762,12 +1849,38 @@
                 method: 'PUT',
                 body: JSON.stringify({
                     anonymization_state: { version: 1, terms: payloadTerms },
+                    // /data-privacy charge l'état détaillé complet → replace
+                    // full légitime (cf. commentaire du PUT bulk ci-dessus).
+                    state_scope: 'full',
+                    // Verrou optimiste (cf. PUT bulk).
+                    expected_revision: state.revision || undefined,
                 }),
             });
+            // Adopter la révision post-write (filet si le reload phase 2
+            // échoue en soft — sinon le prochain save 409-erait à tort).
+            if (resp && typeof resp.revision === 'string') {
+                state.revision = resp.revision;
+            }
         } catch (err) {
             // Le PUT lui-même a échoué : pas de clear, l'user peut retenter.
             // Parse ``err.data.state_errors`` via helper pour message lisible.
             var errData = (err && err.data) || {};
+            // Révision périmée (un autre onglet/scan a écrit) : rien n'a été
+            // écrasé — recharger la liste (reset dirty + nouvelle révision),
+            // l'user réapplique ses modifs sur du frais.
+            if (errData.error_code === 'STATE_REVISION_MISMATCH') {
+                state.saveInFlight = false;
+                if (btnSave) { btnSave.disabled = false; btnSave.textContent = _btnSaveOriginalText; }
+                if (btnDiscard) btnDiscard.disabled = false;
+                toast(
+                    'Tes termes ont été modifiés entre-temps (autre onglet ou '
+                    + 'scan). Rien n\'a été écrasé — liste rechargée, '
+                    + 'réapplique tes modifications.',
+                    'error'
+                );
+                await Promise.all([loadStats(), loadTerms()]);
+                return false;
+            }
             var stErrs = Array.isArray(errData.state_errors) ? errData.state_errors : [];
             var detailMsg = window.AnonymizationSaveHelpers.formatStateErrors(
                 stErrs,
@@ -1792,7 +1905,7 @@
                 btnSave.textContent = _btnSaveOriginalText;
             }
             if (btnDiscard) btnDiscard.disabled = false;
-            return;
+            return false;
         }
         // ── Phase 2 : clear + toast (PUT confirmé OK) ──────────────────
         // PUT a réussi. Clear immédiat des dirty (avant reload) — fix UX
@@ -1863,6 +1976,8 @@
             }
             if (btnDiscard) btnDiscard.disabled = false;
         }
+        // PUT confirmé (le reload phase 3 est cosmétique) → état cohérent.
+        return true;
     }
 
     function _classifyDeps() {

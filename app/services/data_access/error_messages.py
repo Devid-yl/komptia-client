@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import enum
 import re
-from typing import Any, Literal, Optional, TypedDict
+from typing import Any, Final, Literal, Optional, TypedDict
 
 
 class GenericMessageKind(enum.Enum):
@@ -1258,11 +1258,15 @@ def _categorize_sql_error(sqlstate: Optional[str], raw_message: str) -> str:
     # à détecter AVANT tout le reste car le message contient « réseau » (dans
     # « ce n'est PAS un problème réseau ») qui pourrait sinon induire en erreur.
     # Couvre le chemin string-sérialisé (le chemin exception est court-circuité
-    # par isinstance(SageDriverMissingError) dans sanitize_sql_for_client). Les
-    # marqueurs proviennent des messages SSoT de discover_sage_odbc_driver().
+    # par isinstance(SageDriverMissingError) dans sanitize_sql_for_client). Le
+    # marqueur est la SSoT ``exceptions.DRIVER_MISSING_MARKER`` (pas une copie
+    # littérale) → une reformulation du message côté sage_connector casse le
+    # test de garde au lieu de dégrader silencieusement la catégorisation.
+    from app.core.exceptions import DRIVER_MISSING_MARKER
+
     if (
-        "aucun driver odbc" in lower
-        or "le module python pyodbc n'est pas disponible" in lower
+        DRIVER_MISSING_MARKER in lower
+        or "module python pyodbc n'est pas disponible" in lower
     ):
         return "deployment"
     if "timeout" in lower or "delai" in lower or "expired" in lower:
@@ -1473,3 +1477,76 @@ async def sanitize_sql_for_client(
         category=category,
         detail_for_admin=None,
     )
+
+
+#: Message client GÉNÉRIQUE par CATÉGORIE pour les erreurs PIPELINE (L6O2).
+#: La catégorisation reste SSoT (:func:`sanitize_sql_for_client`) ; on NE renvoie
+#: JAMAIS son ``["message"]`` car, pour les catégories actionnables
+#: (referential/type/syntax), il echoe un ``Détail : {raw}`` — et un ``str(exc)``
+#: NON-SQL routé par substring (ex. ``ValueError("cannot convert … /srv/…/run.json")``
+#: → catégorie ``type``) ferait fuiter un path/fragment serveur. On dérive donc
+#: un message 100 % générique de la SEULE catégorie. Aucun nom de table/colonne
+#: hardcodé (générique). Partagé par le chemin REST (status/history) ET le forward
+#: WS de l'event ``pipeline_failed``.
+_PIPELINE_ERROR_BY_CATEGORY: dict[str, str] = {
+    "referential": "Le pipeline a échoué : une table ou colonne référencée est introuvable.",
+    "type": "Le pipeline a échoué : incompatibilité de type de données.",
+    "syntax": "Le pipeline a échoué : erreur de syntaxe dans le SQL généré.",
+    "permission": "Le pipeline a échoué : accès aux données refusé.",
+    "connection": "Le pipeline a échoué : la base de données source est injoignable.",
+    "timeout": "Le pipeline a échoué : délai dépassé.",
+    "deployment": "Le pipeline a échoué : problème de configuration côté serveur.",
+}
+_PIPELINE_ERROR_GENERIC = "Le pipeline a échoué (détails techniques côté serveur)."
+
+
+async def sanitize_pipeline_error_for_client(raw_or_exc: Any, user: Any) -> str:
+    """Message client GÉNÉRIQUE pour une erreur pipeline (``str(exc)`` brut).
+
+    SSoT unique pour présenter un échec de pipeline au client SANS jamais
+    exposer le raw : catégorise via :func:`sanitize_sql_for_client` puis dérive
+    un message de la SEULE ``category`` (cf. :data:`_PIPELINE_ERROR_BY_CATEGORY`)
+    — jamais le détail (qui peut echoer un path/fragment, cf. L6O2). Le raw +
+    traceback restent en BDD/logs pour le diagnostic admin/Iris.
+    """
+    payload = await sanitize_sql_for_client(raw_or_exc, user, audience="user")
+    return _PIPELINE_ERROR_BY_CATEGORY.get(payload["category"], _PIPELINE_ERROR_GENERIC)
+
+
+#: Chemin filesystem ABSOLU (Unix ≥2 segments, ou Windows ``C:\\...``). Le
+#: look-behind ``(?<![\w./])`` ancre le ``/`` initial sur un NON-mot/non-point/
+#: non-slash → évite les faux positifs sur les dates (``06/11/2026``), fractions
+#: (``1/2``), chemins relatifs (``a/b``) et doubles-slash d'URL (``http://``).
+_ABS_PATH_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![\w./])/[\w.\-]+(?:/[\w.\-]+)+|[A-Za-z]:\\[\w.\-\\]+"
+)
+
+#: Pre-cap défensif AVANT le regex (parité avec ``redaction.py``). Le pattern
+#: est prouvé linéaire (le séparateur ``/`` est disjoint de ``[\w.\-]`` → pas de
+#: backtracking ambigu), donc ce cap est de l'hygiène/borne-CPU, pas une garde
+#: anti-ReDoS — sur un ``metadata_summary`` (colonne ``Text`` non bornée) lu à
+#: chaque status/history + event WS, on borne le coût linéaire.
+_PATH_REDACT_INPUT_MAX_CHARS: Final[int] = 50_000
+
+
+def redact_filesystem_paths(text: Optional[str]) -> Optional[str]:
+    """Remplace les chemins filesystem ABSOLUS par ``[chemin]`` (défense en
+    profondeur, L6O1/S8).
+
+    Pour les champs texte libres forwardés au client (ex. ``metadata_summary``
+    d'une phase pipeline) dont l'innocuité repose sur une convention, pas sur une
+    barrière : si un futur code y pousse un path serveur, on évite la fuite du
+    layout filesystem. Conservateur : ne touche QUE les chemins absolus (cf.
+    :data:`_ABS_PATH_RE`), jamais les dates/fractions/chemins relatifs/URLs.
+    ``None``/non-str pass-through.
+
+    Limite connue : un path contenant une ESPACE (``/a/David Yala/x``) n'est
+    redigé que jusqu'à l'espace (``[chemin] Yala/x``) — le tail fuit partiellement.
+    Sur la box de déploiement les paths n'ont pas d'espace ; acceptable comme
+    défense conservatrice (mieux vaut sous-rediger qu'over-rediger un résumé).
+    """
+    if not text or not isinstance(text, str):
+        return text
+    if len(text) > _PATH_REDACT_INPUT_MAX_CHARS:
+        text = text[:_PATH_REDACT_INPUT_MAX_CHARS]
+    return _ABS_PATH_RE.sub("[chemin]", text)

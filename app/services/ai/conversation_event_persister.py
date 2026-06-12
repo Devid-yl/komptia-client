@@ -375,6 +375,8 @@ class SequentialEventPersister:
 async def get_events_for_conversation(
     conversation_id: int,
     after_seq: int = 0,
+    before_seq: "int | None" = None,
+    limit: "int | None" = None,
 ) -> list[dict]:
     """Retourne les events d'une conversation triés par ``seq`` ASC.
 
@@ -383,6 +385,16 @@ async def get_events_for_conversation(
         after_seq : retourne uniquement les events avec ``seq > after_seq``.
                     Permet la pagination / fetch incrémental côté admin UI.
                     Default 0 = tous.
+        before_seq : IRIS-events-loadmore (#54) — pagination ARRIÈRE : si fourni
+                    (>0), ne retourne que les events ANTÉRIEURS (``seq <
+                    before_seq``). Combiné à ``limit``, donne le BLOC des N events
+                    juste avant ``before_seq`` (tail du passé), trié ASC. Sert au
+                    bouton « Charger l'historique plus ancien ». Default None.
+        limit : si fourni (>0), ne retourne que les ``limit`` events les PLUS
+                RÉCENTS (tail), toujours triés ``seq`` ASC pour un affichage
+                chronologique. Borne le coût de rendu /iris sur une conversation
+                très utilisée (audit IRIS-events). Default ``None`` = tous
+                (rétro-compat — l'admin UI continue de tout charger).
 
     Format : list de dicts ``{seq, turn_index, event_type, payload (str JSON),
     created_at}``. Le frontend fait ``JSON.parse(payload)`` pour reconstruire
@@ -393,10 +405,24 @@ async def get_events_for_conversation(
             select(ConversationEvent)
             .where(ConversationEvent.conversation_id == conversation_id)
             .where(ConversationEvent.seq > after_seq)
-            .order_by(ConversationEvent.seq.asc())
         )
-        result = await session.execute(stmt)
-        rows = list(result.scalars().all())
+        # IRIS-events-loadmore (#54) — pagination ARRIÈRE : filtrer AVANT la
+        # logique tail (limit), pour que le tail s'applique au sous-ensemble
+        # « plus ancien que before_seq » (les N events juste avant lui).
+        if before_seq is not None and before_seq > 0:
+            stmt = stmt.where(ConversationEvent.seq < before_seq)
+        if limit is not None and limit > 0:
+            # Tail des N plus récents : ORDER BY seq DESC LIMIT N (la BDD ne
+            # matérialise que N lignes), puis on réinverse en ASC pour un
+            # affichage chronologique. Le frontend gère un baseline ``_seq`` > 1
+            # (cf. iris.js ws.onmessage : « baseline _seq=X »).
+            stmt = stmt.order_by(ConversationEvent.seq.desc()).limit(limit)
+            result = await session.execute(stmt)
+            rows = list(reversed(result.scalars().all()))
+        else:
+            stmt = stmt.order_by(ConversationEvent.seq.asc())
+            result = await session.execute(stmt)
+            rows = list(result.scalars().all())
     return [
         {
             "seq": r.seq,
@@ -426,6 +452,25 @@ async def get_max_seq_for_conversation(conversation_id: int) -> int:
         result = await session.execute(stmt)
         max_seq = result.scalar()
     return int(max_seq or 0)
+
+
+async def get_min_seq_for_conversation(conversation_id: int) -> int:
+    """Retourne le ``seq`` minimum stocké pour la conversation, ou 0 si vide.
+
+    IRIS-events-loadmore (#54) — sert à calculer ``has_more_older`` : il reste de
+    l'historique plus ancien à charger SSI le plus ancien event rendu côté client
+    a un ``seq`` strictement supérieur à ce minimum global (les seq peuvent avoir
+    des trous → on compare au min réel, PAS à 1).
+    """
+    from sqlalchemy import func as sql_func
+
+    async with get_session() as session:
+        stmt = select(sql_func.min(ConversationEvent.seq)).where(
+            ConversationEvent.conversation_id == conversation_id
+        )
+        result = await session.execute(stmt)
+        min_seq = result.scalar()
+    return int(min_seq or 0)
 
 
 async def get_max_turn_index_for_conversation(conversation_id: int) -> int:

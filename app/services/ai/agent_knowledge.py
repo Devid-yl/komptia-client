@@ -22,6 +22,66 @@ from app.services.ai.training_store import TrainingStore, get_training_store
 
 logger = logging.getLogger(__name__)
 
+
+async def get_concept_glossary_mappings(concepts: list[str]) -> dict[str, list[dict]]:
+    """Lecteur runtime du ``ConceptGlossary`` (glossaire appris par feedback ✅).
+
+    Tâche #13 (2026-06-10) : la table était ÉCRITE
+    (``_persist_concept_resolutions_on_validate``) mais jamais RELUE — la boucle
+    « demander une fois → apprendre → rejouer » restait ouverte. Ce lecteur la
+    referme : pour chaque concept (normalisé ``lower()``), renvoie les mappings
+    (table, colonne) déjà validés, triés par ``(usage_count, confidence)`` desc,
+    pour qu'``align_request`` applique une désambiguïsation passée sans redemander.
+
+    GLOBAL (mono-déploiement, pas d'isolation cross-user — cf. modèle).
+    Fail-closed : toute erreur → ``{}`` (ne casse jamais le flow d'alignement).
+
+    Returns:
+        ``{concept_lower: [{"table","column","value_type","confidence",
+        "usage_count"}, ...]}`` — vide si aucun concept appris.
+    """
+    if not concepts:
+        return {}
+    normed = {(c or "").strip().lower() for c in concepts if c and c.strip()}
+    if not normed:
+        return {}
+    try:
+        from sqlalchemy import select as _select
+
+        from app.core.database import get_session
+        from app.models.concept_glossary import ConceptGlossary
+
+        out: dict[str, list[dict]] = {}
+        async with get_session() as session:
+            rows = (
+                (
+                    await session.execute(
+                        _select(ConceptGlossary).where(
+                            ConceptGlossary.concept.in_(list(normed))
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        for r in rows:
+            out.setdefault(r.concept, []).append(
+                {
+                    "table": r.table_name,
+                    "column": r.column_name,
+                    "value_type": r.value_type,
+                    "confidence": r.confidence,
+                    "usage_count": r.usage_count,
+                }
+            )
+        for key in out:
+            out[key].sort(key=lambda m: (m["usage_count"], m["confidence"]), reverse=True)
+        return out
+    except Exception as exc:  # fail-closed
+        logger.warning("get_concept_glossary_mappings a échoué (fail-closed): %s", exc)
+        return {}
+
+
 # Cache TTL pour le catalogue de tables (en secondes)
 _TABLE_CATALOGUE_TTL = 300  # 5 minutes
 
@@ -1287,6 +1347,7 @@ class AgentKnowledge:
         conversation_id: int,
         feedback: str,
         is_admin: bool = False,
+        message_id: Optional[int] = None,
     ) -> None:
         """
         Apprend depuis le feedback d'une conversation.
@@ -1312,6 +1373,12 @@ class AgentKnowledge:
                 "negative" — cf. ``_POSITIVE_KEYWORDS`` / ``_ADJUST_KEYWORDS``).
             is_admin: True si le feedback émane d'un admin → paires Q/SQL
                 auto-approuvées ; sinon en attente d'approbation (fail-closed).
+            message_id: D4 (L1O2) — id du message assistant ciblé par le feedback.
+                Si fourni, la résolution question/tool est BORNÉE à ``created_at <=``
+                celui du message ciblé → on apprend la paire Q/SQL du BON tour
+                (cas d'un vote sur un tour ANCIEN au replay). ``None`` (live /
+                auto-feedback / legacy) → dernier tour de la conv (comportement
+                historique, correct car le dernier message EST le bon).
         """
         from sqlalchemy import select, desc
         from app.core.database import get_session
@@ -1340,16 +1407,35 @@ class AgentKnowledge:
                 # indépendant du timing JS (POST vs ws.send).
                 from app.constants import AUTO_FEEDBACK_OPTIONS
 
+                # D4 — borne du tour ciblé par l'``id`` du message (PAS ``created_at``).
+                # Les messages d'un même tour PARTAGENT le ``created_at`` (func.now()
+                # au flush, résolution seconde — cf. conversation.py:173-181 / base.py) ;
+                # seul l'``id`` auto-incrémenté est strictement monotone = ordre
+                # d'insertion réel. Borner par ``id <= target_id`` isole donc le tour
+                # de façon tie-free (le message assistant FINAL du tour a le plus grand
+                # ``id`` du tour ; le tour suivant a des ``id`` strictement plus grands),
+                # là où ``created_at <=`` laisserait passer le user du tour suivant en
+                # cas d'égalité de seconde → mauvaise paire Q/SQL apprise (Q5). Le tri
+                # ajoute ``desc(id)`` en tiebreaker déterministe. ``id`` absent /
+                # introuvable / hors-conv → borne None = comportement historique.
+                target_id = None
+                if message_id is not None:
+                    target = await session.get(ConversationMessage, message_id)
+                    if target is not None and target.conversation_id == conversation_id:
+                        target_id = target.id  # == message_id (lookup par PK)
+
                 _auto_fb_triggers = [opt["value"] for opt in AUTO_FEEDBACK_OPTIONS]
+                _user_stmt = select(ConversationMessage).where(
+                    ConversationMessage.conversation_id == conversation_id,
+                    ConversationMessage.role == MessageRole.USER,
+                    ConversationMessage.content.notin_(_auto_fb_triggers),
+                )
+                if target_id is not None:
+                    _user_stmt = _user_stmt.where(ConversationMessage.id <= target_id)
                 user_msg = await session.execute(
-                    select(ConversationMessage)
-                    .where(
-                        ConversationMessage.conversation_id == conversation_id,
-                        ConversationMessage.role == MessageRole.USER,
-                        ConversationMessage.content.notin_(_auto_fb_triggers),
-                    )
-                    .order_by(desc(ConversationMessage.created_at))
-                    .limit(1)
+                    _user_stmt.order_by(
+                        desc(ConversationMessage.created_at), desc(ConversationMessage.id)
+                    ).limit(1)
                 )
                 user_msg = user_msg.scalar_one_or_none()
 
@@ -1358,36 +1444,41 @@ class AgentKnowledge:
 
                 # Chercher le dernier tool « informatif » pour le feedback.
                 # Priorité : run_pipeline (contexte le plus riche) > execute_sql.
+                _pipeline_stmt = select(ConversationMessage).where(
+                    ConversationMessage.conversation_id == conversation_id,
+                    ConversationMessage.role == MessageRole.TOOL,
+                    ConversationMessage.tool_name == "run_pipeline",
+                )
+                if target_id is not None:
+                    _pipeline_stmt = _pipeline_stmt.where(ConversationMessage.id <= target_id)
                 pipeline_msg = await session.execute(
-                    select(ConversationMessage)
-                    .where(
-                        ConversationMessage.conversation_id == conversation_id,
-                        ConversationMessage.role == MessageRole.TOOL,
-                        ConversationMessage.tool_name == "run_pipeline",
-                    )
-                    .order_by(desc(ConversationMessage.created_at))
-                    .limit(1)
+                    _pipeline_stmt.order_by(
+                        desc(ConversationMessage.created_at), desc(ConversationMessage.id)
+                    ).limit(1)
                 )
                 pipeline_msg = pipeline_msg.scalar_one_or_none()
 
+                _exec_stmt = select(ConversationMessage).where(
+                    ConversationMessage.conversation_id == conversation_id,
+                    ConversationMessage.role == MessageRole.TOOL,
+                    ConversationMessage.tool_name == "execute_sql",
+                )
+                if target_id is not None:
+                    _exec_stmt = _exec_stmt.where(ConversationMessage.id <= target_id)
                 exec_sql_msg = await session.execute(
-                    select(ConversationMessage)
-                    .where(
-                        ConversationMessage.conversation_id == conversation_id,
-                        ConversationMessage.role == MessageRole.TOOL,
-                        ConversationMessage.tool_name == "execute_sql",
-                    )
-                    .order_by(desc(ConversationMessage.created_at))
-                    .limit(1)
+                    _exec_stmt.order_by(
+                        desc(ConversationMessage.created_at), desc(ConversationMessage.id)
+                    ).limit(1)
                 )
                 exec_sql_msg = exec_sql_msg.scalar_one_or_none()
 
             # Décider lequel des deux est le plus récent (donc le plus
-            # probablement lié au feedback). Si les deux existent, on prend
-            # le plus récent par ``created_at``.
+            # probablement lié au feedback). On compare par ``id`` (monotone,
+            # tie-free) et non ``created_at`` (égal au sein d'un tour → départage
+            # non déterministe).
             chosen_msg = None
             if pipeline_msg and exec_sql_msg:
-                if (pipeline_msg.created_at or 0) >= (exec_sql_msg.created_at or 0):
+                if pipeline_msg.id >= exec_sql_msg.id:
                     chosen_msg = pipeline_msg
                 else:
                     chosen_msg = exec_sql_msg
@@ -1967,7 +2058,13 @@ class AgentKnowledge:
         parts = ["### Règles de correction apprises (situations similaires passées)\n"]
         for rule in rules:
             category = rule.get("category", "")
-            content = rule.get("content", "")[:300]
+            # #18f (triage caps 2026-06-10) — le content des règles est
+            # structuré : une coupe muette à 300 chars laissait le LLM
+            # lire une règle amputée comme si elle était complète.
+            _raw_content = rule.get("content", "")
+            content = _raw_content[:300]
+            if len(_raw_content) > 300:
+                content += " […règle tronquée]"
             # Extraire le type d'erreur depuis la catégorie (format: "correction:type")
             error_type = category.split(":", 1)[1] if ":" in category else category
             parts.append(f"- **Type** : {error_type}")

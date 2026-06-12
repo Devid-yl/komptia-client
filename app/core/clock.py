@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import time as _time
 from datetime import date, datetime, timezone, tzinfo
-from typing import Optional
+from typing import Final, Optional, Union
 
 __all__ = [
     "now",
@@ -64,7 +64,21 @@ __all__ = [
     "naive_utc",
     "ensure_utc",
     "resolve_machine_tz_name",
+    # Formatage FR locale-indépendant (SSoT — cf. plus bas)
+    "MONTHS_FR",
+    "MONTHS_FR_ABBR",
+    "WEEKDAYS_FR",
+    "WEEKDAYS_FR_ABBR",
+    "strftime_fr",
+    "format_date_fr",
+    "format_local_fr",
+    "to_local",
+    "iso_utc",
 ]
+
+#: Garde-fou one-shot : True une fois que :func:`machine_tz` a dû retomber sur
+#: UTC faute de fuseau résoluble (évite de spammer le chemin chaud du warning).
+_machine_tz_fallback_warned = False
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +110,226 @@ def today() -> date:
     différer derrière un conteneur ``TZ=UTC``).
     """
     return now_local().date()
+
+
+# ---------------------------------------------------------------------------
+# Formatage FR locale-indépendant — SOURCE DE VÉRITÉ UNIQUE des noms FR
+# ---------------------------------------------------------------------------
+# Pourquoi ici : l'image de prod (python:slim) n'embarque AUCUNE locale système
+# (`fr_FR.UTF-8`), donc ``strftime("%B")`` rend « June » au lieu de « juin »
+# (rapports, contexte date envoyé au LLM). Plutôt que d'ajouter le paquet
+# ``locales`` + hardcoder ``fr_FR`` dans l'image (anti-générique, casserait un
+# futur client non-FR), on substitue les noms FR EN CODE, indépendamment de l'OS.
+# Komptia est une app francophone (UI FR, front ``toLocaleDateString('fr-FR')``).
+# Ces tables remplacent les listes dupliquées (``iris_oneshot._MONTHS_FR``).
+
+#: Mois en français — index = ``datetime.month - 1`` (0 = janvier).
+MONTHS_FR: Final[tuple[str, ...]] = (
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+)
+
+#: Mois abrégés (pour ``%b``). « mars / mai / juin » n'ont pas d'abréviation.
+MONTHS_FR_ABBR: Final[tuple[str, ...]] = (
+    "janv.",
+    "févr.",
+    "mars",
+    "avr.",
+    "mai",
+    "juin",
+    "juil.",
+    "août",
+    "sept.",
+    "oct.",
+    "nov.",
+    "déc.",
+)
+
+#: Jours de la semaine — index = ``datetime.weekday()`` (0 = lundi).
+WEEKDAYS_FR: Final[tuple[str, ...]] = (
+    "lundi",
+    "mardi",
+    "mercredi",
+    "jeudi",
+    "vendredi",
+    "samedi",
+    "dimanche",
+)
+
+#: Jours abrégés (pour ``%a``).
+WEEKDAYS_FR_ABBR: Final[tuple[str, ...]] = (
+    "lun.",
+    "mar.",
+    "mer.",
+    "jeu.",
+    "ven.",
+    "sam.",
+    "dim.",
+)
+
+
+def strftime_fr(dt: Union[datetime, date], fmt: str) -> str:
+    """``strftime`` localisé FR, **INDÉPENDANT de la locale système**.
+
+    Substitue les codes locale-dépendants (``%A`` jour, ``%a`` jour abrégé,
+    ``%B`` mois, ``%b`` mois abrégé) par leurs valeurs françaises AVANT de
+    déléguer le reste (``%Y``, ``%d``, ``%H``…) à :meth:`datetime.strftime`.
+    Garantit un rendu FR identique sur tout OS sans dépendre d'un paquet
+    ``locales`` dans l'image (python:slim n'en livre aucune).
+
+    Les ``%%`` littéraux sont préservés. Les noms FR injectés ne contiennent
+    aucun ``%`` → ils traversent ``strftime`` inchangés.
+
+    PORTÉE : seuls ``%A``/``%a``/``%B``/``%b`` sont garantis FR. Les codes
+    COMPOSITES locale-dépendants ``%c`` (date+heure), ``%x`` (date), ``%X``
+    (heure), ``%p`` (AM/PM) NE sont PAS neutralisés → ils restent rendus par la
+    locale système (anglais sur python:slim). Ne pas les utiliser dans les
+    ``format_string`` de templates si un rendu FR est attendu (préférer
+    ``%d/%m/%Y %H:%M``). Aucun call-site Komptia ne les emploie aujourd'hui.
+
+    ``fmt=None`` lève ``TypeError`` (comme :meth:`datetime.strftime`) plutôt
+    qu'un ``AttributeError`` opaque — les appelants qui catchent déjà
+    ``TypeError`` (ex. template_manager) gardent leur fallback. ``fmt=""``
+    retourne ``""``. Un ``\\x00`` dans ``fmt`` (config/template corrompu) lève
+    ``ValueError`` (le sentinel interne est un NUL → on refuse toute collision).
+    """
+    if fmt is None:
+        raise TypeError("strftime_fr: le format strftime ne peut pas être None")
+    sentinel = "\x00"  # protège les '%%' littéraux d'une ré-interprétation
+    if sentinel in fmt:
+        raise ValueError("strftime_fr: caractère NUL interdit dans le format strftime")
+    out = (
+        fmt.replace("%%", sentinel)
+        .replace("%A", WEEKDAYS_FR[dt.weekday()])
+        .replace("%a", WEEKDAYS_FR_ABBR[dt.weekday()])
+        .replace("%B", MONTHS_FR[dt.month - 1])
+        .replace("%b", MONTHS_FR_ABBR[dt.month - 1])
+        .replace(sentinel, "%%")
+    )
+    return dt.strftime(out)
+
+
+def format_date_fr(dt: Union[datetime, date], *, with_time: bool = False) -> str:
+    """Date française lisible : « 2 juin 2026 » (ou « …, 14:30 » si ``with_time``).
+
+    Helper de confort au-dessus de :data:`MONTHS_FR` pour le cas le plus courant
+    (jour mois année). ``with_time`` n'ajoute l'heure que pour un ``datetime``.
+    """
+    base = f"{dt.day} {MONTHS_FR[dt.month - 1]} {dt.year}"
+    if with_time and isinstance(dt, datetime):
+        base += f", {dt.strftime('%H:%M')}"
+    return base
+
+
+def to_local(value: Union[datetime, str, None]) -> Optional[datetime]:
+    """Convertit un **instant** UTC (``datetime`` ou ISO 8601) en ``datetime``
+    **aware dans la TZ serveur** (``config.server.timezone`` via :func:`machine_tz`).
+
+    Brique bas-niveau partagée par les formateurs serveur (``format_local_fr`` +
+    les call-sites à format custom). Un ``datetime`` naïf est interprété UTC
+    (convention de stockage Komptia, cf. :func:`ensure_utc`) ; le suffixe ``Z``
+    des chaînes est toléré. Retourne ``None`` si la valeur est absente/illisible.
+
+    ⚠️ Pour un **instant** uniquement : une chaîne date-nue (``"2026-04-19"``)
+    serait lue à minuit UTC et basculerait d'un jour vers un fuseau en retard sur
+    UTC. Les call-sites qui affichent une date nue doivent la détecter en amont
+    (cf. :func:`format_local_fr`).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt: Optional[datetime] = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        # ``fromisoformat`` (py3.10) ne parse pas le suffixe « Z » → on le mappe
+        # (ancré en FIN uniquement : un « Z » au milieu = corruption → le parse
+        # échoue → None, fail-safe).
+        iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            dt = datetime.fromisoformat(iso)
+        except ValueError:
+            return None
+    else:
+        return None
+    aware_utc = ensure_utc(dt)  # naïf → aware UTC ; aware → inchangé
+    if aware_utc is None:
+        return None
+    return aware_utc.astimezone(machine_tz())
+
+
+def iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """ISO 8601 **horodaté** (offset explicite) d'un instant stocké, pour ÉMISSION
+    au FRONTEND (JS).
+
+    Pourquoi : un ISO **naïf** (``"2026-06-08T17:40:00"``) est mal-parsé par
+    ``new Date()`` côté navigateur — interprété comme heure LOCALE du visiteur, pas
+    UTC → décalage silencieux (ex. +4h pour ``America/Guadeloupe``). On garantit
+    donc l'offset (``+00:00`` pour un naïf, convention de stockage Komptia = UTC)
+    pour que le JS reconvertisse correctement vers le fuseau du navigateur.
+
+    ``None`` → ``None``. Un ``datetime`` aware conserve son offset (déjà parsable).
+    """
+    aware = ensure_utc(dt)  # naïf → aware UTC ; aware → inchangé
+    return aware.isoformat() if aware is not None else None
+
+
+def format_local_fr(value: Union[datetime, date, str, None], *, with_time: bool = False) -> str:
+    """Formate un instant UTC stocké en date FR dans la **TZ serveur configurée**.
+
+    SOURCE DE VÉRITÉ UNIQUE de l'affichage daté **côté serveur** (SSR). Accepte :
+
+    * un ``datetime`` (naïf ⇒ interprété UTC par convention Komptia, ou aware),
+    * une chaîne ISO 8601 (``"2026-06-08T17:40:00"``, avec/sans fuseau, ``Z`` ok),
+    * une **date nue** (``date`` ou ``"2026-06-08"``) ⇒ reformatée SANS conversion
+      de fuseau (une date n'a pas d'heure à convertir).
+
+    Convertit l'instant vers :func:`machine_tz` (``config.server.timezone``) puis
+    rend en français **locale-indépendant** (``JJ/MM/AAAA`` ± ``HH:MM``).
+
+    Pourquoi : les colonnes ORM ``DateTime`` (sans ``timezone=True``) stockent
+    l'UTC en naïf ; un rendu par découpage de la chaîne ISO afficherait l'heure
+    UTC brute (ex. +4h pour ``America/Guadeloupe`` = UTC−4). Ce helper centralise
+    la conversion pour que TOUT rendu serveur partage le même fuseau (cf.
+    :func:`now_local`).
+
+    Fail-safe : ``None`` / vide / illisible / type non géré ⇒ ``"-"`` (un
+    timestamp corrompu ne doit jamais casser un template admin). :func:`machine_tz`
+    retombe elle-même sur UTC si ``config.server.timezone`` est invalide.
+    """
+    if value is None:
+        return "-"
+    # Date nue (objet ``date`` non-datetime, ou ``"YYYY-MM-DD"``) : pas de
+    # conversion TZ. NB : ``datetime`` est sous-classe de ``date`` → on teste
+    # ``datetime`` AVANT (plus bas) ; ici on n'attrape que les vraies ``date``.
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return f"{value.day:02d}/{value.month:02d}/{value.year}"
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return "-"
+        if "T" not in raw and ":" not in raw:  # chaîne date-nue
+            try:
+                d = datetime.fromisoformat(raw)
+            except ValueError:
+                return "-"
+            return f"{d.day:02d}/{d.month:02d}/{d.year}"
+
+    local = to_local(value)
+    if local is None:
+        return "-"
+    return strftime_fr(local, "%d/%m/%Y %H:%M" if with_time else "%d/%m/%Y")
 
 
 def timestamp() -> float:
@@ -251,4 +485,19 @@ def machine_tz() -> tzinfo:
 
             return pytz.timezone(name)
         except Exception:
+            # Fuseau non résoluble (nom invalide / alias non IANA). On retombe sur
+            # UTC pour ne pas crasher, MAIS on l'annonce une seule fois (chemin
+            # chaud) : sinon l'affichage des dates repasse en UTC EN SILENCE — le
+            # bug « +4h » revient sans le moindre signal (donnée fausse masquée).
+            global _machine_tz_fallback_warned
+            if not _machine_tz_fallback_warned:
+                _machine_tz_fallback_warned = True
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Fuseau horaire %r non résoluble → dates affichées EN UTC. "
+                    "Corrigez `config.server.timezone` / la variable d'env TZ "
+                    "(nom IANA, ex. America/Guadeloupe) puis redémarrez.",
+                    name,
+                )
             return timezone.utc

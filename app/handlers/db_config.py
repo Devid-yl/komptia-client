@@ -95,7 +95,9 @@ _NAME_MAX_LEN: Final[int] = 100
 _HOST_MAX_LEN: Final[int] = 255
 _DATABASE_MAX_LEN: Final[int] = 255
 _USERNAME_MAX_LEN: Final[int] = 255
-_PASSWORD_MAX_LEN: Final[int] = 1024  # bcrypt rejects > 72 mais passwords stockés Fernet : large
+# Cap défensif anti-body géant. Le mdp de connexion est chiffré Fernet (pas
+# bcrypt) → aucune limite d'algorithme ; sans rapport avec la borne bcrypt 72o.
+_PASSWORD_MAX_LEN: Final[int] = 1024
 
 # Rate-limits — protections contre l'abus du formulaire admin.
 # Test = (5 par 60s) : un admin légitime n'enchaîne pas 5 tests/sec ;

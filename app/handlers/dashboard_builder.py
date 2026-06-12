@@ -69,10 +69,6 @@ from app.services.dashboard.dashboard_builder_service import (
     AVAILABLE_METRICS,
     DashboardBuilderService,
 )
-from app.services.dashboard.delivery_service import (
-    send_dashboard_delivery_job,
-    send_dashboard_email,
-)
 from app.services.dashboard.filter_service import DashboardFilterService
 from app.services.dashboard.template_service import DashboardTemplateService
 from app.services.dashboard.widget_planner import (
@@ -212,6 +208,11 @@ class _Msg:
     RATE_LIMIT_DASHBOARD_EXPORT: Final[str] = (
         "Trop d'exports rapprochés. Patientez un instant avant de réessayer."
     )
+    RATE_LIMIT_WORKBOOK_SAVE: Final[str] = "Trop de sauvegardes rapprochées. Patientez un instant."
+    WORKBOOK_TOO_LARGE: Final[str] = (
+        "Classeur trop volumineux pour être sauvegardé. "
+        "Réduisez le nombre de lignes ou contactez votre administrateur."
+    )
     TOO_MANY_RECIPIENTS: Final[str] = (
         f"Trop de destinataires (max {DashboardSchedule.MAX_RECIPIENTS})."
     )
@@ -310,6 +311,12 @@ _send_now_limiter = RateLimiter()
 #: réserves process-local que ``_send_now_limiter`` (cf. ci-dessus).
 _data_refresh_limiter = RateLimiter()
 _export_limiter = RateLimiter()
+
+#: Sauvegarde du classeur d'un widget grille (bouton « Enregistrer ») —
+#: aligné sur le quota d'upload datastore (20/min) : même nature d'opération
+#: (écriture fichier + quota), même protection anti-emballement.
+_workbook_save_limiter = RateLimiter()
+RATE_LIMIT_WORKBOOK_SAVE: Final[tuple[int, int]] = (20, 60)
 
 
 # ── Helpers de réponse ────────────────────────────────────────────────────
@@ -696,9 +703,81 @@ async def _load_owned_dashboard_or_response(
 # ─────────────────────────────────────────────────────────────────────────
 
 
+#: Préférence (``UserPreference.key``) mémorisant le dernier dashboard
+#: CONSULTÉ — l'entrée ``GET /dashboards`` y retourne en priorité au
+#: rechargement de la page. L'ancien comportement (« le plus récemment
+#: modifié ») reste le fallback si la préférence est absente, corrompue ou
+#: pointe un dashboard supprimé.
+_LAST_DASHBOARD_PREF_KEY: Final[str] = "last_dashboard_id"
+
+
+def _pick_landing_dashboard(pref_value: Any, dashboards: list) -> int | None:
+    """Choisit le dashboard d'atterrissage depuis la préférence utilisateur.
+
+    Retourne l'id si la préférence est un entier valide ET présent dans
+    ``dashboards`` (liste owner-only — la vérification d'appartenance est
+    fail-closed contre une valeur périmée/forgée). Sinon ``None`` → le
+    caller retombe sur le comportement historique (plus récemment modifié).
+    """
+    try:
+        wanted = int(str(pref_value))
+    except (TypeError, ValueError):
+        return None
+    for d in dashboards or []:
+        if isinstance(d, dict) and d.get("id") == wanted:
+            return wanted
+    return None
+
+
+async def _get_last_dashboard_pref(session: Any, user_id: int) -> str | None:
+    """Lit la valeur brute de la préférence (``None`` si absente)."""
+    from app.models.user_preference import UserPreference
+
+    result = await session.execute(
+        sa_select(UserPreference).where(
+            UserPreference.user_id == user_id,
+            UserPreference.key == _LAST_DASHBOARD_PREF_KEY,
+        )
+    )
+    pref = result.scalar_one_or_none()
+    return pref.value if pref is not None else None
+
+
+async def _remember_last_dashboard(session: Any, user_id: int, dashboard_id: int) -> None:
+    """Upsert de la préférence (même pattern que ``data_read_consent``).
+
+    Commit laissé au caller (``db_session`` committe à la sortie). No-op si
+    la valeur est déjà à jour — pas d'UPDATE parasite à chaque F5 sur le
+    même dashboard.
+    """
+    from app.models.user_preference import UserPreference
+
+    value = str(int(dashboard_id))
+    result = await session.execute(
+        sa_select(UserPreference).where(
+            UserPreference.user_id == user_id,
+            UserPreference.key == _LAST_DASHBOARD_PREF_KEY,
+        )
+    )
+    pref = result.scalar_one_or_none()
+    if pref is None:
+        session.add(
+            UserPreference(
+                user_id=user_id,
+                key=_LAST_DASHBOARD_PREF_KEY,
+                value=value,
+                category="preference",
+            )
+        )
+    elif pref.value != value:
+        pref.value = value
+
+
 class DashboardBuilderPageHandler(AuthenticatedHandler):
-    """Entrée ``GET /dashboards`` : redirige vers le dashboard le plus récent
-    possédé par l'utilisateur. Si aucun n'existe, en crée un vide pour
+    """Entrée ``GET /dashboards`` : redirige vers le dernier dashboard
+    CONSULTÉ par l'utilisateur (préférence persistée serveur — survit au
+    rechargement, au changement de navigateur et de poste). Fallback : le
+    plus récemment modifié. Si aucun n'existe, en crée un vide pour
     atterrir directement sur ses widgets (plutôt qu'une liste intermédiaire).
     """
 
@@ -714,7 +793,11 @@ class DashboardBuilderPageHandler(AuthenticatedHandler):
             )
 
             if dashboards:
-                target_id = dashboards[0]["id"]
+                pref_value = await _get_last_dashboard_pref(session, self.current_user.id)
+                picked = _pick_landing_dashboard(pref_value, dashboards)
+                # ``is not None`` (pas ``or``) : ne jamais confondre un id
+                # falsy avec « préférence absente ».
+                target_id = picked if picked is not None else dashboards[0]["id"]
             else:
                 created = await service.create_dashboard(
                     session,
@@ -747,6 +830,19 @@ class DashboardBuilderViewHandler(AuthenticatedHandler):
 
         if not dashboard:
             raise tornado.web.HTTPError(404, _Msg.DASHBOARD_NOT_FOUND)
+
+        # Mémorise le dernier dashboard CONSULTÉ (≠ modifié) — l'entrée
+        # /dashboards y retournera au prochain chargement. Session séparée
+        # et best-effort : un échec d'écriture (BDD locked → 504 du context
+        # manager) ne doit JAMAIS empêcher l'affichage de la page. Posé
+        # APRÈS le check 404 : une URL invalide ne doit pas être mémorisée.
+        try:
+            async with self.db_session() as pref_session:
+                await _remember_last_dashboard(pref_session, self.current_user.id, did)
+        except Exception:  # noqa: BLE001 — préférence non critique
+            logger.warning(
+                "Mémorisation du dernier dashboard échouée (non bloquant)", exc_info=True
+            )
 
         self.render(
             "dashboard/builder_view.html",
@@ -1129,6 +1225,147 @@ class DashboardWidgetDetailAPIHandler(AuthenticatedHandler):
             )
 
 
+class DashboardWidgetExtraTabsAPIHandler(AuthenticatedHandler):
+    """PUT — remplace les feuilles SQL d'un widget grille.
+
+    Deux contrats (read-modify-write côté serveur dans les deux cas — jamais la
+    config complète depuis le client → pas de clobber par une copie périmée) :
+
+    - **``{"sheets": [{"query"}, {"label","query"}, ...]}``** (« piloté par les
+      feuilles ») : liste ORDONNÉE unique. Feuille 0 = principale → ``query`` ;
+      reste → ``extra_tabs``. → ``set_widget_sheets``.
+    - **``{"extra_tabs": [{"label","query"}, ...]}``** (legacy) : uniquement les
+      onglets additionnels (la requête principale reste inchangée). →
+      ``set_widget_extra_tabs``.
+
+    Owner-only (enforcé dans le service via join Dashboard).
+    """
+
+    @require_role("admin", "user")
+    async def put(self, dashboard_id: str, widget_id: str) -> None:
+        did = self._parse_int_or_400(dashboard_id, "dashboard_id")
+        wid = self._parse_int_or_400(widget_id, "widget_id")
+        body = _require_body(self)
+        if body is None:
+            return
+
+        service = get_dashboard_builder_service()
+        try:
+            async with self.db_session() as session:
+                if "sheets" in body:
+                    # Contrat « piloté par les feuilles » : feuille 0 = principale
+                    # (→ query), feuilles 1..n → extra_tabs.
+                    widget = await service.set_widget_sheets(
+                        session, wid, did, self.current_user.id, body.get("sheets")
+                    )
+                else:
+                    # Legacy : uniquement les onglets additionnels.
+                    widget = await service.set_widget_extra_tabs(
+                        session, wid, did, self.current_user.id, body.get("extra_tabs")
+                    )
+            if not widget:
+                _json_error(self, _Msg.WIDGET_NOT_FOUND, 404)
+                return
+            _json_success(self, {"widget": widget})
+        except ValueError as exc:
+            _json_error(self, str(exc), 400)
+        except SQLAlchemyError:
+            _log_and_error_500(
+                self,
+                f"set widget extra_tabs {wid}",
+                _Msg.ERROR_UPDATE,
+                context={"widget_id": wid, "dashboard_id": did},
+            )
+
+
+class DashboardWidgetWorkbookAPIHandler(AuthenticatedHandler):
+    """PUT ``/api/dashboards/:id/widgets/:wid/workbook`` — sauvegarde MANUELLE
+    du classeur d'un widget grille (bouton « Enregistrer » du widget).
+
+    Body : classeur Komptia complet (``GridTabManager.serialize()``), JSON
+    brut ou gzippé (magic bytes ``0x1f 0x8b`` — même contrat que l'upload
+    datastore). Header ``If-Match`` optionnel (hash du fichier connu côté
+    client) → 412 si le classeur a été modifié dans un autre onglet.
+
+    Réponses : 200 ``{success, widget, workbook_hash}`` ; 400 validation ;
+    404 widget introuvable/non-propriétaire ; 412 conflit ; 413 quota ou
+    payload trop gros ; 429 rate-limit.
+    """
+
+    @require_role("admin", "user")
+    async def put(self, dashboard_id: str, widget_id: str) -> None:
+        did = self._parse_int_or_400(dashboard_id, "dashboard_id")
+        wid = self._parse_int_or_400(widget_id, "widget_id")
+
+        save_max, save_window = RATE_LIMIT_WORKBOOK_SAVE
+        if not _workbook_save_limiter.check(
+            f"user:{self.current_user.id}",
+            max_requests=save_max,
+            window_seconds=save_window,
+        ):
+            self.set_header("Retry-After", str(save_window))
+            _json_error(self, _Msg.RATE_LIMIT_WORKBOOK_SAVE, 429)
+            return
+
+        raw = self.request.body or b""
+        if not raw:
+            _json_error(self, _Msg.BODY_EMPTY, 400)
+            return
+        # Cap de taille (octets COMPRESSÉS reçus) = cap admin d'upload
+        # datastore — même source de vérité, même nature d'opération. Le cap
+        # de DÉCOMPRESSION (anti zip-bomb) est appliqué plus bas par
+        # ``decode_afz_bytes`` (quota stockage admin).
+        from app.services.ai.config_service import get_max_upload_size_bytes
+
+        max_bytes = await get_max_upload_size_bytes()
+        if isinstance(max_bytes, int) and max_bytes > 0 and len(raw) > max_bytes:
+            _json_error(self, _Msg.WORKBOOK_TOO_LARGE, 413)
+            return
+
+        expected_hash = self.request.headers.get("If-Match", "").strip().strip('"') or None
+
+        from app.services.dashboard.widget_workbook_store import (
+            WorkbookConflictError,
+            WorkbookQuotaError,
+        )
+
+        service = get_dashboard_builder_service()
+        try:
+            async with self.db_session() as session:
+                result = await service.save_widget_workbook(
+                    session,
+                    wid,
+                    did,
+                    self.current_user.id,
+                    raw,
+                    expected_hash=expected_hash,
+                )
+            if not result:
+                _json_error(self, _Msg.WIDGET_NOT_FOUND, 404)
+                return
+            _json_success(
+                self,
+                {"widget": result["widget"], "workbook_hash": result["workbook_hash"]},
+            )
+        except WorkbookConflictError as exc:
+            self.write_json(
+                {"success": False, "error": str(exc), "error_code": "ETAG_MISMATCH"}, 412
+            )
+        except WorkbookQuotaError as exc:
+            self.write_json(
+                {"success": False, "error": str(exc), "error_code": "QUOTA_EXCEEDED"}, 413
+            )
+        except ValueError as exc:
+            _json_error(self, str(exc), 400)
+        except SQLAlchemyError:
+            _log_and_error_500(
+                self,
+                f"save widget workbook {wid}",
+                _Msg.ERROR_SAVE,
+                context={"widget_id": wid, "dashboard_id": did},
+            )
+
+
 class DashboardWidgetReorderAPIHandler(AuthenticatedHandler):
     """POST ``/api/dashboards/:id/widgets/reorder`` — réordonner les widgets."""
 
@@ -1213,6 +1450,11 @@ class DashboardDataAPIHandler(AuthenticatedHandler):
         if not ok:
             return
 
+        # ``?refresh=1`` → bypass du cache de résultats (bouton « rafraîchir »).
+        # Toute autre valeur / absence → cache normal. Lecture tolérante.
+        refresh_arg = (self.get_argument("refresh", "") or "").strip().lower()
+        force_refresh = refresh_arg in ("1", "true", "yes")
+
         service = get_dashboard_builder_service()
         try:
             async with self.db_session() as session:
@@ -1224,6 +1466,7 @@ class DashboardDataAPIHandler(AuthenticatedHandler):
                     filter_state=filter_state,
                     drill_filters=drill_filters,
                     user=self.current_user,
+                    force_refresh=force_refresh,
                 )
             # JSON ne supporte pas les clés int : on cast en str côté handler.
             # Le client JS reconvertit en number pour lookup via widget.id.
@@ -1462,293 +1705,6 @@ class DashboardFilterReorderAPIHandler(AuthenticatedHandler):
 # ─────────────────────────────────────────────────────────────────────────
 
 
-class DashboardScheduleAPIHandler(AuthenticatedHandler):
-    """GET / PUT / DELETE de la ``DashboardSchedule`` d'un dashboard.
-
-    À la différence des autres handlers, celui-ci écrit directement dans
-    l'ORM (pas de service dédié). La vérification ownership est donc
-    faite localement via ``_load_owned_dashboard_or_response``.
-    """
-
-    @require_role("admin", "user")
-    async def get(self, dashboard_id: str) -> None:
-        did = self._parse_int_or_400(dashboard_id, "dashboard_id")
-
-        try:
-            async with self.db_session() as session:
-                dashboard = await _load_owned_dashboard_or_response(self, session, did)
-                if dashboard is None:
-                    return
-
-                result = await session.execute(
-                    sa_select(DashboardSchedule).where(
-                        DashboardSchedule.dashboard_id == did,
-                        DashboardSchedule.user_id == self.current_user.id,
-                    )
-                )
-                schedule = result.scalar_one_or_none()
-
-            _json_success(
-                self,
-                {"schedule": schedule.to_dict() if schedule else None},
-            )
-        except SQLAlchemyError:
-            _log_and_error_500(
-                self,
-                f"get schedule {did}",
-                _Msg.ERROR_FETCH,
-                context={"dashboard_id": did},
-            )
-
-    @require_role("admin", "user")
-    async def put(self, dashboard_id: str) -> None:
-        did = self._parse_int_or_400(dashboard_id, "dashboard_id")
-        body = _require_body(self)
-        if body is None:
-            return
-
-        # Validation stricte avant ORM : évite un round-trip BDD pour un
-        # message trop long (ancien code : silent truncate `raw_msg[:1000]`
-        # — user n'est pas informé de la coupure, contraire à la règle
-        # anti-silent-failure).
-        raw_msg = body.get("message")
-        if raw_msg is not None and isinstance(raw_msg, str):
-            if len(raw_msg) > _MAX_SCHEDULE_MESSAGE_LEN:
-                _json_error(self, _Msg.MESSAGE_TOO_LONG, 400)
-                return
-
-        try:
-            async with self.db_session() as session:
-                dashboard = await _load_owned_dashboard_or_response(self, session, did)
-                if dashboard is None:
-                    return
-
-                result = await session.execute(
-                    sa_select(DashboardSchedule).where(
-                        DashboardSchedule.dashboard_id == did,
-                        DashboardSchedule.user_id == self.current_user.id,
-                    )
-                )
-                schedule = result.scalar_one_or_none()
-                is_new = schedule is None
-                if is_new:
-                    schedule = DashboardSchedule(
-                        dashboard_id=did,
-                        user_id=self.current_user.id,
-                        schedule_type="daily",
-                    )
-
-                schedule_type = body.get("schedule_type", schedule.schedule_type)
-                if schedule_type not in DashboardSchedule.VALID_SCHEDULE_TYPES:
-                    _json_error(
-                        self,
-                        (
-                            f"Type invalide: '{schedule_type}'. "
-                            f"Valeurs: {', '.join(DashboardSchedule.VALID_SCHEDULE_TYPES)}"
-                        ),
-                        400,
-                    )
-                    return
-
-                export_format = body.get("export_format", schedule.export_format or "excel")
-                if export_format not in DashboardSchedule.VALID_EXPORT_FORMATS:
-                    _json_error(
-                        self,
-                        (
-                            f"Format invalide: '{export_format}'. "
-                            f"Valeurs: {', '.join(DashboardSchedule.VALID_EXPORT_FORMATS)}"
-                        ),
-                        400,
-                    )
-                    return
-
-                schedule.schedule_type = schedule_type
-                schedule.schedule_config = body.get(
-                    "schedule_config", schedule.schedule_config or {}
-                )
-                schedule.export_format = export_format
-                schedule.recipients = body.get("recipients", schedule.recipients)
-                schedule.subject = body.get("subject", schedule.subject)
-                schedule.message = raw_msg if raw_msg is not None else schedule.message
-                schedule.is_active = bool(body.get("is_active", schedule.is_active))
-
-                errors = schedule.validate()
-                if errors:
-                    _json_error(self, "; ".join(errors), 400)
-                    return
-
-                if is_new:
-                    session.add(schedule)
-                await session.flush()
-
-                # Capturer les valeurs AVANT commit : expire_on_commit=True
-                # (défaut SQLAlchemy 2.0) expire les attributs lazy-loaded
-                # après commit → ``MissingGreenlet`` si on lit après.
-                sched_dict = schedule.to_dict()
-                sched_id = schedule.id
-                await session.commit()
-
-            # APScheduler sync HORS de la session DB (évite de tenir la
-            # connexion pendant le dialogue avec APScheduler).
-            try:
-                _sync_dashboard_schedule_job(sched_id, sched_dict)
-            except Exception:  # noqa: BLE001 — scheduler ne doit pas casser la réponse
-                logger.warning("Erreur sync APScheduler pour schedule %s", sched_id, exc_info=True)
-
-            _json_success(self, {"schedule": sched_dict})
-        except SQLAlchemyError:
-            _log_and_error_500(
-                self,
-                f"update schedule {did}",
-                _Msg.ERROR_UPDATE,
-                context={"dashboard_id": did},
-            )
-
-    @require_role("admin", "user")
-    async def delete(self, dashboard_id: str) -> None:
-        did = self._parse_int_or_400(dashboard_id, "dashboard_id")
-
-        try:
-            async with self.db_session() as session:
-                dashboard = await _load_owned_dashboard_or_response(self, session, did)
-                if dashboard is None:
-                    return
-
-                result = await session.execute(
-                    sa_select(DashboardSchedule).where(
-                        DashboardSchedule.dashboard_id == did,
-                        DashboardSchedule.user_id == self.current_user.id,
-                    )
-                )
-                schedule = result.scalar_one_or_none()
-                if not schedule:
-                    _json_error(self, _Msg.SCHEDULE_NOT_FOUND, 404)
-                    return
-
-                sched_id = schedule.id
-                await session.delete(schedule)
-                await session.commit()
-
-            try:
-                get_scheduler().remove_job(f"dashboard_schedule_{sched_id}")
-            except Exception:  # noqa: BLE001 — scheduler ne doit pas casser la réponse
-                logger.warning("Erreur retrait job APScheduler %s", sched_id, exc_info=True)
-
-            _json_success(self)
-        except SQLAlchemyError:
-            _log_and_error_500(
-                self,
-                f"delete schedule {did}",
-                _Msg.ERROR_DELETE,
-                context={"dashboard_id": did},
-            )
-
-
-class DashboardSendNowAPIHandler(AuthenticatedHandler):
-    """POST ``/api/dashboards/:id/send-now`` — envoi immédiat par email."""
-
-    @require_role("admin", "user")
-    async def post(self, dashboard_id: str) -> None:
-        did = self._parse_int_or_400(dashboard_id, "dashboard_id")
-        body = _optional_body(self)
-
-        # ── Validation d'input (400) AVANT le rate-limit ────────────────
-        # Principe : un body invalide ne doit PAS consommer le quota d'un
-        # user légitime (sinon un attaquant pourrait épuiser le quota
-        # d'un user en envoyant des bodies mal formés). Le rate-limit
-        # est consommé uniquement pour les requêtes structurellement
-        # valides. Cap recipients + type-strict en premier, puis quota.
-        recipients_raw = body.get("recipients")
-        # Type-strict : seul ``None`` (absent) ou ``list`` sont acceptés.
-        # Tout autre type (str, dict, int) = 400 explicite — sinon le
-        # cap suivant est silencieusement contourné et le service
-        # downstream fallback sur ``user.email`` (silent data corruption :
-        # le user croit avoir envoyé à sa liste, en réalité envoyé à lui).
-        if recipients_raw is not None and not isinstance(recipients_raw, list):
-            _json_error(self, _Msg.INVALID_RECIPIENTS_TYPE, 400)
-            return
-        # Cap recipients (task #104) — aligné single-source-of-truth avec
-        # ``DashboardSchedule.MAX_RECIPIENTS`` (50). Combo mail-bombing
-        # sinon : un POST = 1000 destinataires via un seul body, le
-        # service downstream parcourrait la liste sans buffer côté
-        # handler. 50 = même borne que la validation côté modèle.
-        if (
-            isinstance(recipients_raw, list)
-            and len(recipients_raw) > DashboardSchedule.MAX_RECIPIENTS
-        ):
-            _json_error(self, _Msg.TOO_MANY_RECIPIENTS, 400)
-            return
-        recipients = recipients_raw if isinstance(recipients_raw, list) and recipients_raw else None
-
-        # ── Rate-limit AVANT load BDD / SMTP / rendu (task #104) ────────
-        # Le SMTP de l'organisation est un relais autorisé pour les emails signés
-        # ``[Komptia]`` ; un user authentifié qui boucle cet endpoint avec
-        # ``recipients=[victim@external.com]`` transformerait l'app en
-        # spam vector. Quota aligné ``contacts.py::RATE_LIMIT_SEND_EMAIL``
-        # (20/h/user) — anti-drift inter-endpoints.
-        send_max, send_window = RATE_LIMIT_DASHBOARD_SEND
-        if not _send_now_limiter.check(
-            f"user:{self.current_user.id}",
-            max_requests=send_max,
-            window_seconds=send_window,
-        ):
-            # ``Retry-After`` = taille de la fenêtre = borne sup
-            # conservative (sliding window : le slot peut redevenir libre
-            # dès la seconde suivante). C'est une promesse "au plus dans
-            # N secondes", pas le minimum exact — RFC 7231 §7.1.3 conforme.
-            self.set_header("Retry-After", str(send_window))
-            _json_error(self, _Msg.RATE_LIMIT_DASHBOARD_SEND, 429)
-            return
-
-        export_format = body.get("export_format")
-        if export_format not in (None, "csv", "excel"):
-            export_format = None
-
-        period_days = _parse_bounded_int(
-            body.get("period_days"),
-            _PERIOD_DAYS_MIN,
-            _PERIOD_DAYS_MAX,
-            default=_PERIOD_DAYS_DEFAULT,
-        )
-
-        try:
-            async with self.db_session() as session:
-                # Anti-IDOR (tâche #102) : 404 anti-énumération AVANT toute
-                # opération qui exposerait le dashboard d'un autre user
-                # (leak widgets + spam vector signé [Komptia] sinon).
-                # Logue un warning IDOR côté serveur si mismatch d'owner
-                # (task #104) — toujours 404 côté client.
-                dashboard = await _load_owned_dashboard_or_response(self, session, did)
-                if dashboard is None:
-                    return
-
-                result = await send_dashboard_email(
-                    session,
-                    did,
-                    self.current_user.id,
-                    recipients=recipients,
-                    period_days=period_days,
-                    export_format=export_format,
-                )
-            # ``send_dashboard_email`` retourne déjà
-            # ``{"success": bool, "error": str | None}`` — on propage tel quel
-            # en préservant le code HTTP (200 par défaut, le service gère
-            # ses propres erreurs d'envoi côté SMTP).
-            self.write_json(result)
-        except SQLAlchemyError:
-            _log_and_error_500(
-                self,
-                f"send-now dashboard {did}",
-                _Msg.ERROR_SEND,
-                context={"dashboard_id": did},
-            )
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# API REST — Templates (built-in + user-saved)
-# ─────────────────────────────────────────────────────────────────────────
-
-
 class DashboardTemplatesAPIHandler(AuthenticatedHandler):
     """GET ``/api/dashboards/templates`` — liste des templates."""
 
@@ -1893,43 +1849,3 @@ class DashboardUserTemplateDeleteAPIHandler(AuthenticatedHandler):
                 context={"template_id": tid},
             )
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Helpers APScheduler
-# ─────────────────────────────────────────────────────────────────────────
-
-
-def _sync_dashboard_schedule_job(schedule_id: int, schedule: dict[str, Any]) -> None:
-    """Aligne le job APScheduler sur l'état courant d'un ``DashboardSchedule``.
-
-    Appelé après un PUT qui a modifié un schedule. Si ``is_active=False`` ou
-    si ``schedule_type`` est absent, on retire le job ; sinon on le remplace
-    (``add_job`` upsert-like).
-
-    Cette fonction vit au module-level (pas dans la classe handler) pour :
-    * être testable sans instancier un handler ;
-    * être appelable depuis d'autres services si besoin (ex. batch re-sync).
-    """
-    scheduler = get_scheduler()
-    job_id = f"dashboard_schedule_{schedule_id}"
-
-    if not schedule.get("is_active"):
-        scheduler.remove_job(job_id)
-        return
-
-    stype = schedule.get("schedule_type")
-    sconfig = schedule.get("schedule_config") or {}
-    if not stype:
-        return
-
-    try:
-        scheduler.add_job(
-            job_id=job_id,
-            func=send_dashboard_delivery_job,
-            trigger_type=stype,
-            trigger_config=sconfig,
-            args=[schedule_id],
-            name=f"Dashboard delivery schedule #{schedule_id}",
-        )
-    except ValueError:
-        logger.warning("Config schedule invalide pour schedule %d", schedule_id, exc_info=True)

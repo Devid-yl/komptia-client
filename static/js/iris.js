@@ -39,11 +39,29 @@ let currentConversationId = null;
  * la continuité du seq (sinon faux warnings sur les premiers events). */
 let lastEventSeq = 0;
 
+/** @type {number} IRIS-events-loadmore (#54) — ``seq`` du PLUS ANCIEN event rendu
+ * côté client. Curseur ``before_seq`` pour « charger l'historique plus ancien ».
+ * ``Infinity`` = rien rendu. Mis à jour au replay initial + à chaque prepend. */
+let minRenderedSeq = Infinity;
+
 /** @type {string} */
 // Rôle auto-détecté par le backend (plus de sélection manuelle)
 
 /** @type {boolean} */
 let isStreaming = false;
+// WS-1 — quand l'user clique « Nouvelle conversation » pendant un run, on
+// annule le run ET on cesse de rendre ses events EN VOL (sinon le contenu de
+// l'ancien run réapparaît dans la conv vidée). Ce flag drop les events
+// jusqu'au terminal du run annulé (puis se relâche). Filet : ``sendMessage``
+// le relâche aussi (cas où le terminal n'arriverait jamais).
+let _irisDiscardInflight = false;
+
+// WS-1 — types d'events TERMINAUX d'un run (relâchent le drop des events en
+// vol). SSoT du critère « le run est fini » côté drop.
+function _irisIsTerminalEvent(t) {
+    return t === 'text_complete' || t === 'error'
+        || t === 'cancelled' || t === 'pipeline_cancelled';
+}
 // Mirroir global de ``isStreaming`` — lu par ``iris-grid.js`` dans le
 // guard ``beforeunload`` pour ne déclencher l'avertissement
 // "modifications non enregistrées" que si Iris streame réellement
@@ -163,8 +181,18 @@ const typingIndicator = document.getElementById('typingIndicator');
  * Tous les rendus dans messagesArea DOIVENT passer par ce helper (sauf
  * le typingIndicator lui-même).
  */
+// IRIS-events-loadmore (#54) — cible de redirection du rendu pour le PREPEND
+// (« charger l'historique plus ancien »). Quand non-null, appendToMessages
+// écrit dans ce DocumentFragment au lieu de #messagesArea → on rend les events
+// anciens hors-flux, puis on insère le fragment EN TÊTE + ajuste le scroll.
+let _prependTarget = null;
 function appendToMessages(el) {
-    if (!messagesArea || !el) return;
+    if (!el) return;
+    if (_prependTarget) {
+        _prependTarget.appendChild(el);
+        return;
+    }
+    if (!messagesArea) return;
     messagesArea.appendChild(el);
     _ensureTypingIndicatorLast();
 }
@@ -561,6 +589,17 @@ var _cwMissingWarned = false; // ne logger qu'une fois
 var _cwEstimatedDelta = 0;
 var _cwTotal = null;
 var _cwModelDisplay = null;
+// Fenêtre confirmée par une source fiable ? false → l'indicateur préfixe le
+// total par « ≈ » et signale « à confirmer » (anti donnée-fausse : un modèle
+// choisi mais jamais enrichi a une fenêtre provisoire 200K qu'on ne présente
+// pas comme une vérité).
+// Fail-safe : tous les chemins serveur-autoritatifs (done, context_progress,
+// snapshot, config) résolvent ``verified`` via ``=== true`` — l'ABSENCE du
+// flag (event futur qui l'oublierait) compte donc comme NON vérifié, jamais
+// l'inverse. Ce défaut initial est sans impact visuel : l'indicateur reste
+// ``hidden`` jusqu'au 1er ``updateContextWindow``, qui fournit toujours
+// ``verified``.
+var _cwVerified = true;
 var _cwRecomputeRaf = null;
 var _CW_CHARS_PER_TOKEN = 4;
 var _CW_PER_EVENT_CHAR_CAP = 80000;
@@ -587,11 +626,44 @@ function _cwScheduleRecompute() {
     });
 }
 
+// ── Fetch dynamique du context_window depuis /api/iris/model-context-window ──
+// Bug 2026-06-02 : valeur périmée en cache. Cet endpoint garantit une
+// réponse fraîche, jamais en cache statique. Appelé au boot + à chaque done event.
+function _loadContextWindowDynamic() {
+    return fetch('/api/iris/model-context-window', {
+        method: 'GET',
+        headers: { 'X-Xsrftoken': window.IRIS_CONFIG?.xsrfToken || '' },
+        credentials: 'same-origin'
+    })
+        .then(function(resp) {
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            return resp.json();
+        })
+        .then(function(snapshot) {
+            if (snapshot && snapshot.context_window != null && snapshot.configured) {
+                // Mettre à jour juste le context_window, préserver les autres
+                // valeurs (usedTokens du done event, notamment).
+                return {
+                    contextWindow: snapshot.context_window,
+                    modelDisplay: snapshot.model_display || null,
+                    // Fail-safe : seul ``true`` explicite confirme ; absent /
+                    // null / false → non vérifié (« à confirmer »).
+                    verified: snapshot.context_window_verified === true
+                };
+            }
+            return null;
+        })
+        .catch(function(err) {
+            console.debug('[Iris] _loadContextWindowDynamic failed (will use config fallback):', err);
+            return null;
+        });
+}
+
 function _cwApplyEstimationRender() {
     if (_cwTotal == null) return;
     var used = _cwLastUsed + Math.round(_cwEstimatedDelta);
     if (used > _cwTotal) used = _cwTotal;
-    _cwRenderToDOM(used, _cwTotal, _cwModelDisplay);
+    _cwRenderToDOM(used, _cwTotal, _cwModelDisplay, _cwVerified);
 }
 
 function _cwResolveRefs() {
@@ -623,15 +695,21 @@ function _cwResolveRefs() {
 // Rendu DOM pur — pas d'effet de bord sur l'état (``_cwLastUsed``, etc.).
 // Appelé à la fois par ``updateContextWindow`` (autoritative serveur) et
 // ``_cwApplyEstimationRender`` (tick estimation locale).
-function _cwRenderToDOM(used, total, modelDisplay) {
+function _cwRenderToDOM(used, total, modelDisplay, verified) {
     var refs = _cwResolveRefs();
     if (!refs) return;
     refs.root.removeAttribute('hidden');
     var pct = (used / total) * 100;
     if (!Number.isFinite(pct) || pct < 0) pct = 0;
     var modelTxt = modelDisplay ? ' (' + modelDisplay + ')' : '';
+    // ``verified === false`` = fenêtre non confirmée : on préfixe le TOTAL par
+    // « ≈ » (le numérateur ``used`` reste exact, c'est le dénominateur qui est
+    // provisoire) et on l'explique dans le title. On ne masque pas la valeur
+    // (l'ordre de grandeur reste utile) mais on ne la présente pas comme sûre.
+    var isUnverified = (verified === false);
+    var totalTxt = (isUnverified ? '≈' : '') + _formatCompact(total);
     if (refs.value) {
-        refs.value.textContent = _formatCompact(used) + '/' + _formatCompact(total);
+        refs.value.textContent = _formatCompact(used) + '/' + totalTxt;
     }
     if (refs.progress) {
         refs.progress.style.width = pct.toFixed(2) + '%';
@@ -639,11 +717,21 @@ function _cwRenderToDOM(used, total, modelDisplay) {
     refs.root.classList.remove('cw-med', 'cw-high', 'cw-critical');
     var zone = _zoneClassForPct(pct);
     if (zone !== 'cw-low') refs.root.classList.add(zone);
-    refs.root.setAttribute(
-        'title',
-        'Contexte LLM' + modelTxt + ' : ' + _formatTokenCount(used) + ' / ' +
-        _formatTokenCount(total) + ' tokens (' + _formatPct(used, total) + ')'
-    );
+    refs.root.classList.toggle('cw-unverified', isUnverified);
+    var title = 'Contexte LLM' + modelTxt + ' : ' + _formatTokenCount(used) + ' / ' +
+        _formatTokenCount(total) + ' tokens (' + _formatPct(used, total) + ')';
+    if (isUnverified) {
+        title += ' — fenêtre non confirmée. Cliquez « Tester » dans '
+            + '/admin/ai-config pour la vérifier auprès du registre LiteLLM.';
+    }
+    refs.root.setAttribute('title', title);
+    // a11y (axe 4) : ``title`` n'est délivré qu'au survol souris — inaccessible
+    // au clavier, au tactile et aux lecteurs d'écran sur un <span> nu. On
+    // expose donc le MÊME contenu (dont « fenêtre non confirmée ») via
+    // role="img" + aria-label, pour que l'avertissement « provisoire » — qui
+    // est le cœur de la feature — soit perçu par tous, pas seulement la souris.
+    refs.root.setAttribute('role', 'img');
+    refs.root.setAttribute('aria-label', title);
 }
 
 function updateContextWindow(opts) {
@@ -665,6 +753,9 @@ function updateContextWindow(opts) {
     _cwLastUsed = used;
     _cwTotal = total;
     if (opts && opts.modelDisplay) _cwModelDisplay = opts.modelDisplay;
+    // ``verified`` : ne mettre à jour que si fourni (défaut true conservé pour
+    // les call-sites legacy qui n'ont pas encore le flag). false → « ≈ / à confirmer ».
+    if (opts && opts.verified != null) _cwVerified = !!opts.verified;
     _cwEstimatedDelta = 0;
     if (_cwRecomputeRaf != null) {
         if (typeof cancelAnimationFrame !== 'undefined') {
@@ -672,7 +763,103 @@ function updateContextWindow(opts) {
         }
         _cwRecomputeRaf = null;
     }
-    _cwRenderToDOM(used, total, _cwModelDisplay);
+    _cwRenderToDOM(used, total, _cwModelDisplay, _cwVerified);
+}
+
+// ──── Puce coût LLM — cumul $ de la conversation (resette à l'effacement) ────
+// Source de vérité du symbole monétaire = <meta name="komptia-pricing-symbol">,
+// injecté globalement par base.html (PRICING_CURRENCY_SYMBOL). Évite le hardcode
+// '$' (règle GÉNÉRICITÉ : une instance en €/autre devise reste correcte). Même
+// mécanisme que /admin/ai-config.
+var _PRICING_SYMBOL = (function () {
+    try {
+        var meta = document.querySelector('meta[name="komptia-pricing-symbol"]');
+        var v = meta && meta.getAttribute('content');
+        return (v && v.trim()) ? v.trim() : '$';
+    } catch (e) { return '$'; }
+})();
+
+var _irisCostRefs = null;
+function _irisCostResolveRefs() {
+    // Re-valide le cache : si le footer était reconstruit, les refs pointeraient
+    // sur des nœuds détachés (la puce gèlerait silencieusement, donnée fausse
+    // muette). ``document.contains`` est négligeable par update.
+    if (_irisCostRefs && document.contains(_irisCostRefs.root)) return _irisCostRefs;
+    _irisCostRefs = null;
+    var root = document.getElementById('irisCostIndicator');
+    if (!root) return null;  // page widget / DOM sans la puce → no-op silencieux
+    _irisCostRefs = {
+        root: root,
+        value: document.getElementById('irisCostValue')
+    };
+    return _irisCostRefs;
+}
+
+/**
+ * Formate un montant USD pour la puce, sans le « $0.00 » trompeur sur les petits
+ * montants (état de l'art : précision dynamique). >= 0.01 → 2 décimales ;
+ * (0, 0.01) → 4 décimales, ou « <$0.0001 » si ça arrondit encore à 0.
+ * @param {number} usd  Montant en dollars (>= 0).
+ * @returns {string} ex. "$1.23", "$0.0042", "<$0.0001".
+ */
+function _formatIrisCost(usd) {
+    var sym = _PRICING_SYMBOL;
+    if (usd >= 0.01) return sym + usd.toFixed(2);
+    var s = usd.toFixed(4);
+    if (parseFloat(s) === 0) return '<' + sym + '0.0001';
+    return sym + s;
+}
+
+/**
+ * Met à jour la puce coût LLM de la conversation (footer /iris).
+ * @param {Object} opts
+ * @param {number|null} opts.costUsd  Cumul $ de la conversation. <= 0 sans
+ *   inconnu → puce masquée (état vide d'une conv neuve / effacée).
+ * @param {boolean} [opts.partial]  True si >=1 appel sur modèle hors registre
+ *   pricing → coût minorant : préfixe « ≥ » (= « au moins »), ou « — » si le
+ *   coût connu vaut 0. « ≥ » et non « ≈ » : le vrai coût est supérieur ou égal,
+ *   jamais inférieur (un lecteur finance lirait « ≈ » comme bilatéral).
+ */
+function updateIrisCost(opts) {
+    var refs = _irisCostResolveRefs();
+    if (!refs) return;
+    var cost = (opts && opts.costUsd != null) ? Number(opts.costUsd) : 0;
+    if (!Number.isFinite(cost) || cost < 0) cost = 0;
+    var partial = !!(opts && opts.partial);
+
+    // Conv neuve / effacée et rien d'inconnu → masquer (pas de bruit « $0.00 »).
+    if (cost <= 0 && !partial) {
+        refs.root.setAttribute('hidden', '');
+        refs.root.classList.remove('cost-partial');
+        return;
+    }
+
+    var text;
+    if (cost <= 0 && partial) {
+        // Des appels ont eu lieu mais AUCUN tarif connu → ne PAS afficher « $0.00 »
+        // (trompeur : laisserait croire à la gratuité). Tiret = « indisponible ».
+        text = '—';
+    } else {
+        text = (partial ? '≥ ' : '') + _formatIrisCost(cost);
+    }
+    if (refs.value) refs.value.textContent = text;
+    // Explication au SURVOL PROLONGÉ (attribut ``title`` natif : le texte apparaît
+    // quand la souris reste un moment sur l'élément) + ``aria-label`` pour les
+    // lecteurs d'écran. Remplace l'icône « i » cliquable (préférence David,
+    // 2026-06-10) : plus discret, pas d'icône qui encombre le footer.
+    var tip = 'Coût LLM estimé de cette conversation (cumulé, tous les outils '
+        + "d'Iris inclus). Se réinitialise quand vous effacez la conversation.";
+    var label = 'Coût LLM de la conversation : ' + text;
+    if (partial) {
+        tip += ' « ≥ » : un appel utilise un modèle sans tarif enregistré — le '
+            + 'montant affiché est un minimum (coût réel supérieur ou égal).';
+        label += ' (minimum — un modèle sans tarif enregistré)';
+    }
+    refs.root.setAttribute('title', tip);
+    refs.root.setAttribute('role', 'img');
+    refs.root.setAttribute('aria-label', label);
+    refs.root.classList.toggle('cost-partial', partial);
+    refs.root.removeAttribute('hidden');
 }
 
 // ──── Smart scroll — ne pas forcer le scroll si l'utilisateur a scrollé vers le haut ────
@@ -770,9 +957,12 @@ function showSqlResultsBannerIfNeeded() {
  * Construit une rangée de feedback (thumbs-up / refresh / thumbs-down) en SVG, compacte et discrète.
  * Le CSS contrôle l'apparition au hover sur la bulle.
  * @param {string} [selectedFeedback] - 'positive' | 'adjust' | 'negative' | undefined
+ * @param {number|string} [messageId] - id du message assistant ciblé (D4/L1O2).
+ *   Présent au replay (chaque tour a sa row) → le backend cible CE message.
+ *   Absent en live (dernier message du tour courant) → fallback backend correct.
  * @returns {HTMLElement}
  */
-function _buildFeedbackRow(selectedFeedback) {
+function _buildFeedbackRow(selectedFeedback, messageId) {
     // Icônes SVG (Lucide-style, 14px) — rendu cohérent cross-platform
     var ICON_UP = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H7V10l4.34-8.68a1 1 0 0 1 1.66.26z"/></svg>';
     var ICON_ADJUST = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 14.83-6.9L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-14.83 6.9L3 16"/><path d="M3 21v-5h5"/></svg>';
@@ -780,6 +970,11 @@ function _buildFeedbackRow(selectedFeedback) {
 
     var row = document.createElement('div');
     row.className = 'iris-feedback-row';
+    // D4 — id du message ciblé (cohérent avec le serveur qui valide qu'il
+    // appartient à la conv). Absent → le serveur retombe sur le dernier message.
+    if (messageId !== undefined && messageId !== null && messageId !== '') {
+        row.dataset.messageId = String(messageId);
+    }
     row.innerHTML =
         '<button type="button" class="iris-feedback-btn" data-feedback="positive" title="Bonne réponse" aria-label="Bonne réponse">' + ICON_UP + '</button>' +
         '<button type="button" class="iris-feedback-btn iris-feedback-btn--adjust" data-feedback="adjust" title="Presque, à ajuster" aria-label="Presque, à ajuster">' + ICON_ADJUST + '</button>' +
@@ -1665,6 +1860,45 @@ function _ensureToolLineLiveTimer() {
     _irisToolLineLiveTimerId = setInterval(_tickToolLineLiveTimers, 250);
 }
 
+// Finalise toute ligne d'outil restée "active" (non ``tool-resolved``) à la fin
+// d'un tour. Sans ça, une ligne dont le ``tool_result`` n'arrive jamais — run
+// terminé/erreur/annulation au milieu d'un outil, ``tool_use`` sans
+// ``tool_result`` apparié, ligne pipeline/exploration jamais résolue, ou
+// coupure WebSocket en plein run — garde son ``data-start-ts`` ; le live timer
+// global (``_tickToolLineLiveTimers``) continue alors d'incrémenter
+// ``.iris-tool-line-time`` INDÉFINIMENT après « Fin du tour » (bug 2026-06-02 :
+// chrono qui monte sans fin). Fix racine générique appelé depuis
+// ``resetAfterResponse`` (chokepoint commun à done/error/cancelled/ws.onclose) :
+// on fige la durée à l'écoulé courant, on coupe l'animation du point, et on
+// retire ``data-start-ts`` pour que le timer s'auto-éteigne.
+function _finalizeDanglingToolLines() {
+    var dangling = document.querySelectorAll(
+        '.iris-tool-line:not(.tool-resolved)[data-start-ts]'
+    );
+    var now = Date.now();
+    for (var i = 0; i < dangling.length; i++) {
+        var ln = dangling[i];
+        var startTs = parseInt(ln.dataset.startTs, 10);
+        var timeEl = ln.querySelector('.iris-tool-line-time');
+        if (timeEl && isFinite(startTs)) {
+            timeEl.textContent = _formatToolElapsedMs(now - startTs);
+        }
+        ln.classList.add('tool-resolved');
+        var dot = ln.querySelector('.iris-tool-line-dot');
+        if (dot) dot.classList.remove('dot-active');
+        delete ln.dataset.startTs;
+    }
+    // Plus aucune ligne active → coupe l'interval tout de suite plutôt que
+    // d'attendre l'auto-clear du prochain tick (250 ms).
+    if (
+        _irisToolLineLiveTimerId &&
+        document.querySelectorAll('.iris-tool-line:not(.tool-resolved)[data-start-ts]').length === 0
+    ) {
+        clearInterval(_irisToolLineLiveTimerId);
+        _irisToolLineLiveTimerId = null;
+    }
+}
+
 /**
  * Compact tool line (Claude Code style) — replaces the old card.
  * @param {string} toolName Tool technical name
@@ -1882,10 +2116,37 @@ function buildResultTable(columns, rows) {
  *   cadenas du classeur. Omis sur les restaurations (turn_events,
  *   msg.sql_data) car ces grilles n'ont jamais de gate de consent
  *   en attente — la conv est déjà marquée consented ou refusée.
+ * @param {boolean} [oraclePrevalidated] - ``false`` STRICT = la requête a
+ *   contourné la pré-validation SGBD (PARSEONLY/FMTONLY) car la base était
+ *   injoignable au moment de la validation (mode oracle fail-open). On
+ *   affiche alors une bannière d'avertissement sur la grille — exigence
+ *   « pas de contournement muet ». ``undefined``/``true`` = chemin normal
+ *   (y compris les conversations persistées avant ce champ).
  */
-function renderSQLResults(columns, rows, sql, totalRowCount, truncated, searchId) {
+function renderSQLResults(columns, rows, sql, totalRowCount, truncated, searchId, oraclePrevalidated) {
     const card = document.createElement('div');
     card.className = 'iris-sql-card';
+
+    // Bannière « non pré-validé par le SGBD » (oracle fail-open). Comparée
+    // STRICTEMENT à false : absent (legacy/normal) ne déclenche rien.
+    // Texte = COPIE SYNCHRONE (reformulée UI) de la constante backend
+    // ORACLE_NOT_PREVALIDATED_WARNING (sql_validator.py) — l'event ne
+    // transporte qu'un booléen ; garder les deux formulations en phase.
+    function _makeOracleWarn() {
+        var w = document.createElement('div');
+        w.className = 'iris-sql-oracle-warning';
+        w.setAttribute('role', 'alert');
+        w.textContent = '⚠️ Résultat non pré-validé par le SGBD : '
+            + 'la base source était injoignable au moment de la validation. '
+            + 'Syntaxe et colonnes n’ont pas été vérifiées avant exécution.';
+        w.title = 'La requête a été exécutée sans la vérification '
+            + 'préalable PARSEONLY/FMTONLY (oracle SQL Server). Le résultat peut être '
+            + 'valide, mais il n’a pas bénéficié du contrôle habituel.';
+        return w;
+    }
+    if (oraclePrevalidated === false) {
+        card.appendChild(_makeOracleWarn());
+    }
 
     try {
         var count = totalRowCount || (rows ? rows.length : 0);
@@ -1925,6 +2186,12 @@ function renderSQLResults(columns, rows, sql, totalRowCount, truncated, searchId
         console.error('[Iris SQL] Erreur SqlResultGrid:', err);
         card.innerHTML = '<div class="iris-sql-card-header">Erreur d\'affichage</div>'
             + '<div class="iris-no-results">Impossible de construire la grille de résultats.</div>';
+        // innerHTML a remplacé TOUS les enfants — y compris la bannière
+        // oracle posée avant le try. La ré-insérer : le signal « non
+        // pré-validé » est encore plus pertinent dans un chemin dégradé.
+        if (oraclePrevalidated === false) {
+            card.prepend(_makeOracleWarn());
+        }
     }
 
     appendToMessages(card);
@@ -1965,6 +2232,17 @@ function renderReportReady(event) {
                 : '')
             + '</div>'
             + '<div class="iris-file-card-hint">Visible sur la page <a href="/reports">Rapports</a></div>';
+        // Oracle fail-open (FAILLE 1) : le SQL du rapport n'a pas été
+        // pré-validé par le SGBD (base injoignable à la validation).
+        // Comparaison STRICTE à false : absent (legacy/normal) = rien.
+        if (event.oracle_prevalidated === false) {
+            var rptOracleWarn = document.createElement('div');
+            rptOracleWarn.className = 'iris-sql-oracle-warning';
+            rptOracleWarn.setAttribute('role', 'alert');
+            rptOracleWarn.textContent = '⚠️ Rapport généré sans pré-validation '
+                + 'SGBD (base injoignable au moment de la validation).';
+            card.appendChild(rptOracleWarn);
+        }
     }
 
     appendToMessages(card);
@@ -2098,6 +2376,29 @@ function renderWorkbookOverview(targetLine, event) {
         });
         sampleTable.appendChild(tbody);
         extras.appendChild(sampleTable);
+        // Légende explicite : sans elle, 3 lignes sous un header annonçant
+        // « 714 ligne(s) » ressemble à une troncation silencieuse (bug vécu
+        // 2026-06-11 — l'utilisateur croit que les lignes manquent).
+        // Si l'onglet a été tronqué au parse (cap cellules backend),
+        // tab.row_count = lignes MATÉRIALISÉES, pas le fichier entier →
+        // formulation « sur N » via row_count_original, jamais un total
+        // définitif faux (doctrine Q5).
+        if ((tab.row_count || 0) > samples.length) {
+            var sampleNote = document.createElement('div');
+            sampleNote.className = 'iris-tool-workbook-note';
+            var totalTxt;
+            if (tab.truncated) {
+                totalTxt = (typeof tab.row_count_original === 'number')
+                    ? tab.row_count + ' ligne(s) lue(s) sur ' + tab.row_count_original
+                        + ' au total (lecture tronquée au parse)'
+                    : 'au moins ' + tab.row_count + ' ligne(s) (lecture tronquée au parse)';
+            } else {
+                totalTxt = tab.row_count + ' ligne(s) au total dans l’onglet';
+            }
+            sampleNote.textContent = samples.length + ' première(s) ligne(s) '
+                + 'en aperçu — ' + totalTxt;
+            extras.appendChild(sampleNote);
+        }
     }
 
     // Multi-sheet note
@@ -2741,6 +3042,18 @@ function openConsentPromptModal() {
     setTimeout(function() { initialFocus.focus(); }, 0);
 }
 
+function handleDataReadConsentExpired(event) {
+    // PIPE consent-modal — la demande de lecture des résultats n'est PLUS en
+    // attente côté serveur : le délai a expiré (timeout) OU le clic « Autoriser »
+    // est arrivé trop tard. On ferme le modal s'il traîne encore et on informe
+    // l'user, au lieu de le laisser avec un bouton « Autoriser » sans effet.
+    try { _closeConsentPromptModal(); } catch (e) { /* defensive */ }
+    addSystemMessage(
+        'La demande de lecture des résultats a expiré (délai dépassé). '
+        + 'Relancez votre requête si besoin.'
+    );
+}
+
 function _closeConsentPromptModal() {
     var existing = document.getElementById('iris-consent-prompt-modal');
     if (existing && existing.parentNode) {
@@ -3129,14 +3442,39 @@ function renderRestoredClarification(question, options) {
  * Affiche un message d'erreur dans le chat.
  * @param {string} message
  */
-function addErrorMessage(message) {
+function addErrorMessage(message, opts) {
+    opts = opts || {};
     const el = document.createElement('div');
     el.className = 'iris-error-message';
     // Task #19 — annoncer aux lecteurs d'écran. role='alert' implique
     // aria-live='assertive' (urgent : interrompt la lecture en cours).
     el.setAttribute('role', 'alert');
     el.setAttribute('aria-atomic', 'true');
-    el.innerHTML = `⚠️ ${escapeHtml(message)}`;
+    // IRIS-3 — message dans un span (même structure que _addUploadErrorWithReport,
+    // CSS .iris-error-message-text déjà supportée) + bouton « Signaler »
+    // conditionnel pour les erreurs reportables (5xx/agent/réseau). textContent
+    // = XSS-safe (équivaut à escapeHtml ; tous les callers passent du texte brut).
+    var msgSpan = document.createElement('span');
+    msgSpan.className = 'iris-error-message-text';
+    msgSpan.textContent = '⚠️ ' + message;
+    el.appendChild(msgSpan);
+    if (opts.reportable && typeof window.komptiaReportFeedback === 'function') {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'iris-error-report-btn';
+        btn.textContent = 'Signaler';
+        btn.title = 'Signaler cet incident au support Komptia';
+        btn.setAttribute('aria-label', 'Signaler cet incident au support Komptia');
+        btn.addEventListener('click', function() {
+            try {
+                window.komptiaReportFeedback({
+                    context: opts.context || 'iris_error',
+                    message: opts.detail || message,
+                });
+            } catch (_) { /* feedback-reporter best-effort — ne jamais bloquer */ }
+        });
+        el.appendChild(btn);
+    }
     appendToMessages(el);
     scrollToBottom();
 }
@@ -3207,6 +3545,25 @@ function _addUploadErrorWithReport(err, fileName, contextKey) {
     scrollToBottom();
 }
 
+// IRIS-4 (a11y) — annonce un statut transitoire aux lecteurs d'écran via la
+// région live SR-only #irisSrStatus (déclarée dans iris.html).
+function announceSr(message) {
+    var el = document.getElementById('irisSrStatus');
+    if (el) el.textContent = message || '';
+}
+
+// IRIS-4 — annonce SR du changement d'état de connexion, DÉDUPLIQUÉ (uniquement
+// sur transition up↔down, pas à chaque onclose pendant le backoff). Initialisé
+// à 'up' pour NE PAS annoncer la 1ʳᵉ connexion au chargement (éviter le bruit).
+var _wsAnnouncedState = 'up';
+function _announceWsState(state) {
+    if (state === _wsAnnouncedState) return;
+    _wsAnnouncedState = state;
+    announceSr(state === 'up'
+        ? 'Connexion au serveur rétablie.'
+        : 'Connexion au serveur perdue, reconnexion en cours.');
+}
+
 function addSystemMessage(message) {
     const el = document.createElement('div');
     el.className = 'iris-system-message';
@@ -3232,6 +3589,78 @@ function addInfoBanner(message) {
     el.innerHTML = `ℹ️ ${escapeHtml(message)}`;
     appendToMessages(el);
     scrollToBottom();
+}
+
+// ──── Avertissement « conversation longue » ────
+//
+// Au-delà du cap de replay serveur, l'historique se recharge tronqué (cf.
+// _CONVERSATION_REPLAY_LIMIT). On prévient l'utilisateur dès qu'on approche le
+// seuil (valeur dans IRIS_CONFIG) et on lui propose d'effacer la conversation
+// (réutilise clearConversation() / endpoint /clear existant). Affiché UNE fois
+// par session. Compteur ancré sur le total serveur au boot, incrémenté
+// UNIQUEMENT sur un vrai envoi live (sendMessage) — JAMAIS pendant la
+// réhydratation (sinon double-comptage = faux positif de la bannière).
+let conversationMessageCount = 0;
+let conversationWarnThreshold = 160;
+let _lengthWarningShown = false;
+
+function maybeShowLengthWarning() {
+    if (_lengthWarningShown) return;
+    if (!conversationWarnThreshold || conversationMessageCount < conversationWarnThreshold) return;
+    _lengthWarningShown = true;
+    showLengthWarningBanner();
+}
+
+function removeLengthWarningBanner() {
+    const b = document.getElementById('iris-length-warning');
+    if (b) b.remove();
+}
+
+function showLengthWarningBanner() {
+    if (!messagesArea) return;
+    if (document.getElementById('iris-length-warning')) return;  // anti-doublon
+
+    const banner = document.createElement('div');
+    banner.id = 'iris-length-warning';
+    banner.className = 'iris-length-warning';
+    banner.setAttribute('role', 'status');
+
+    const text = document.createElement('span');
+    text.className = 'iris-length-warning-text';
+    // textContent → pas de risque XSS, pas d'échappement manuel.
+    text.textContent = 'Cette conversation est longue : au-delà d\u2019un certain '
+        + 'volume, les messages les plus anciens peuvent ne plus s\u2019afficher au '
+        + 'rechargement. Pensez à effacer la conversation quand vous n\u2019en avez '
+        + 'plus besoin.';
+
+    const actions = document.createElement('div');
+    actions.className = 'iris-length-warning-actions';
+
+    const clearAllBtn = document.createElement('button');
+    clearAllBtn.type = 'button';
+    clearAllBtn.className = 'iris-length-warning-btn iris-length-warning-btn-danger';
+    clearAllBtn.textContent = 'Tout effacer';
+    clearAllBtn.addEventListener('click', async function () {
+        const ok = await appConfirm(
+            'Effacer toute la conversation ? Cette action est définitive.',
+            'Tout effacer'
+        );
+        if (ok) clearConversation();
+    });
+
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'iris-length-warning-dismiss';
+    dismiss.setAttribute('aria-label', 'Masquer l\u2019avertissement');
+    dismiss.textContent = '×';
+    dismiss.addEventListener('click', function () { banner.remove(); });
+
+    actions.appendChild(clearAllBtn);
+    banner.appendChild(text);
+    banner.appendChild(actions);
+    banner.appendChild(dismiss);
+    // En tête de la zone de messages — sticky via CSS, reste visible au scroll.
+    messagesArea.insertBefore(banner, messagesArea.firstChild);
 }
 
 // ──── Rendering — Suggestions ────
@@ -3325,11 +3754,19 @@ function renderPipelineRecap(payload) {
     var aggregations = Array.isArray(payload.aggregations) ? payload.aggregations : [];
     var autoAssumptions = Array.isArray(payload.auto_assumptions) ? payload.auto_assumptions : [];
     var userAnswers = Array.isArray(payload.user_answers) ? payload.user_answers : [];
+    // T18 — run « preview » arrêté à une phase intermédiaire : on rend le
+    // récap comme une HYPOTHÈSE à valider (bandeau + bouton « continuer »),
+    // MÊME si les sections sont vides (un stop Phase 1.5 n'a pas encore de
+    // concept_resolution / agrégations).
+    var isHypothesis = payload.is_hypothesis === true;
+    var stoppedPhase = (typeof payload.stopped_after_phase === 'string')
+        ? payload.stopped_after_phase : null;
 
-    // Si le payload est vide (sections toutes vides), ne rien rendre :
-    // le LLM Iris est libre de rédiger un récap textuel sans qu'un
-    // composant vide pollue l'UI.
-    if (interpretations.length === 0
+    // Si le payload est vide ET que ce n'est PAS un preview, ne rien rendre :
+    // le LLM Iris est libre de rédiger un récap textuel sans qu'un composant
+    // vide pollue l'UI.
+    if (!isHypothesis
+        && interpretations.length === 0
         && aggregations.length === 0
         && autoAssumptions.length === 0
         && userAnswers.length === 0) {
@@ -3341,14 +3778,83 @@ function renderPipelineRecap(payload) {
 
     var details = document.createElement('details');
     details.className = 'iris-pipeline-recap';
+    // Un preview est ouvert par défaut (l'utilisatrice doit voir le bandeau +
+    // le bouton sans avoir à déplier) ; un récap de run complet reste compact.
+    if (isHypothesis) {
+        details.open = true;
+        details.classList.add('iris-pipeline-recap-hypothesis');
+    }
 
     var summary = document.createElement('summary');
     summary.className = 'iris-pipeline-recap-summary';
-    summary.textContent = 'Comment Iris a interprété ta demande (' + totalItems + ')';
+    summary.textContent = isHypothesis
+        ? 'Aperçu — Iris s’est arrêté pour validation'
+        : 'Comment Iris a interprété ta demande (' + totalItems + ')';
     details.appendChild(summary);
 
     var body = document.createElement('div');
     body.className = 'iris-pipeline-recap-body';
+
+    // T16/T17 — bandeau « hypothèse à valider » + bouton « continuer vers le
+    // SQL ». Réutilise le chemin d'envoi existant (sendMessage) : Iris reçoit
+    // la demande et appelle pipeline_resume LUI-MÊME (Code > Prompt). Multi-
+    // onglets safe : un simple message dans la conversation de cet onglet.
+    if (isHypothesis) {
+        // B4 — une seule hypothèse active à la fois. L'event pipeline_recap est
+        // PERSISTÉ (rejoué au refresh, présent dans chaque onglet) → plusieurs
+        // cartes hypothèse peuvent coexister. On neutralise les boutons des
+        // cartes ANTÉRIEURES avant d'ajouter la nouvelle, pour éviter qu'un clic
+        // sur une vieille carte relance un resume sur un blueprint périmé.
+        try {
+            var _area = (typeof messagesArea !== 'undefined' && messagesArea)
+                ? messagesArea : document;
+            var prevBtns = _area.querySelectorAll('.iris-recap-continue-btn:not(:disabled)');
+            for (var pb = 0; pb < prevBtns.length; pb++) {
+                prevBtns[pb].disabled = true;
+                prevBtns[pb].textContent = 'Hypothèse précédente';
+            }
+        } catch (e) { /* défensif : ne jamais bloquer le rendu du récap */ }
+
+        var hypo = document.createElement('div');
+        hypo.className = 'iris-recap-hypothesis';
+        var htext = document.createElement('span');
+        htext.className = 'iris-recap-hypothesis-text';
+        htext.textContent = stoppedPhase
+            ? ('Ceci est une hypothèse de mapping (arrêt phase ' + stoppedPhase
+               + ') — vérifie-la avant que je génère le SQL.')
+            : 'Ceci est une hypothèse à valider avant de générer le SQL.';
+        hypo.appendChild(htext);
+        var hbtn = document.createElement('button');
+        hbtn.type = 'button';
+        hbtn.className = 'iris-recap-continue-btn';
+        hbtn.textContent = 'Continuer vers le SQL';
+        hbtn.addEventListener('click', function() {
+            if (typeof sendMessage !== 'function' || !messageInput) return;
+            // B5 — ne PAS envoyer pendant un tour Iris en cours. Le chemin
+            // d'envoi normal (sendBtn) teste stop-mode ; ici on appelle
+            // sendMessage directement → on réplique la garde. AVANT le disable
+            // pour ne pas griser le bouton à tort.
+            if (window.__irisStreamingActive
+                || (typeof sendBtn !== 'undefined' && sendBtn
+                    && sendBtn.classList.contains('stop-mode'))) {
+                return;
+            }
+            hbtn.disabled = true;  // anti double-clic
+            hbtn.textContent = 'Génération en cours…';
+            // B3 — si l'utilisateur a déjà tapé quelque chose (typiquement une
+            // CORRECTION du mapping : « non, plutôt la table FACTURES »), c'est
+            // SA consigne de resume — ne PAS l'écraser, sa correction prime.
+            // Sinon, message générique « continue vers le SQL ».
+            var typed = (messageInput.value || '').trim();
+            if (!typed) {
+                messageInput.value = 'Ok, continue : génère le SQL à partir de ce blueprint.';
+                try { messageInput.dispatchEvent(new Event('input')); } catch (e) {}
+            }
+            sendMessage();
+        });
+        hypo.appendChild(hbtn);
+        body.appendChild(hypo);
+    }
 
     // ── Interprétations ─────────────────────────────────────────────
     if (interpretations.length > 0) {
@@ -3996,6 +4502,9 @@ async function connectWebSocket() {
             dot.classList.add('connected');
             dot.title = 'Connecté au serveur';
         }
+        // IRIS-4 (a11y) — annonce SR (dédupliquée) : silencieuse à la 1ʳᵉ
+        // connexion, « rétablie » seulement après une perte.
+        _announceWsState('up');
 
         // Todo #36 — Replay automatique d'un message stocké en pending
         // pendant que la WS était down. On consomme la clé (clear AVANT
@@ -4026,6 +4535,17 @@ async function connectWebSocket() {
             data = JSON.parse(event.data);
         } catch (e) {
             console.error('[Iris] Message WebSocket non-JSON :', event.data);
+            return;
+        }
+        // WS-1 — drop des events EN VOL d'un run annulé via « Nouvelle
+        // conversation » : sinon ils se rendent dans la conv vidée. Placé
+        // AVANT le traitement ``_seq`` pour ne pas faire avancer
+        // ``lastEventSeq`` (qui vient d'être remis à 0 par le clear). On laisse
+        // le flag se relâcher sur le 1er event terminal, sans le rendre.
+        if (_irisDiscardInflight) {
+            if (_irisIsTerminalEvent(data && data.type)) {
+                _irisDiscardInflight = false;
+            }
             return;
         }
         // Task #15 (M2) — dedup + détection trous via ``_seq`` muté par
@@ -4075,12 +4595,21 @@ async function connectWebSocket() {
 
     ws.onclose = function(event) {
         console.warn('[Iris] WebSocket fermé :', event.code, event.reason);
+        // WS-2 — capturer AVANT resetAfterResponse() (qui clear isStreaming) :
+        // si un run était en cours, une coupure serveur (restart/deploy/proxy)
+        // réinitialise l'UI en silence et la question reste sans réponse, sans
+        // rien dire à l'user. On le préviendra dans le chemin reconnect.
+        var _wasStreaming = isStreaming
+            || (typeof window !== 'undefined' && window.__irisStreamingActive === true);
         ws = null;
         const dot = document.querySelector('.iris-ws-dot');
         if (dot) {
             dot.classList.remove('connected');
             dot.title = 'Déconnecté — reconnexion en cours...';
         }
+        // IRIS-4 (a11y) — annonce SR « connexion perdue » (dédupliquée : une
+        // seule fois par perte, pas à chaque onclose du backoff).
+        _announceWsState('down');
         // Réactiver l'input si la connexion coupe pendant une réponse
         if (typingIndicator) typingIndicator.style.display = 'none';
         cleanupActivity();
@@ -4156,6 +4685,16 @@ async function connectWebSocket() {
         // donc on reset le flag de reload (au cas ou un futur close fatal
         // arrive plus tard apres une periode de fonctionnement normal).
         try { sessionStorage.removeItem('iris.ws.fatalReload'); } catch (e) {}
+        // WS-2 — la coupure est survenue PENDANT une réponse d'Iris : prévenir
+        // l'user (sa question est restée sans réponse) au lieu d'un reset muet.
+        // ``_wasStreaming`` n'est vrai qu'au PREMIER close (resetAfterResponse a
+        // clear isStreaming) → pas de message dupliqué aux reconnexions suivantes.
+        if (_wasStreaming && typeof addSystemMessage === 'function') {
+            addSystemMessage(
+                'La connexion a été interrompue pendant la réponse d\'Iris. '
+                + 'Reconnexion en cours… Si Iris ne reprend pas, renvoyez votre question.'
+            );
+        }
         scheduleReconnect();
     };
 
@@ -4690,7 +5229,8 @@ function handleWebSocketEvent(event) {
                 event.sql,
                 event.row_count || 0,
                 event.truncated || false,
-                event.search_id
+                event.search_id,
+                event.oracle_prevalidated
             );
             break;
 
@@ -4727,6 +5267,12 @@ function handleWebSocketEvent(event) {
             renderInteraction(event);
             break;
 
+        case 'pipeline_ask_user_expired':
+            // La réponse à la question pipeline est arrivée trop tard (timeout
+            // côté pipeline, ou après refresh) — marquer la carte « expirée ».
+            handlePipelineAskUserExpired(event);
+            break;
+
         case 'data_read_consent_request':
             // kind = consent. Iris s'apprête à lire les résultats d'un
             // execute_sql / run_pipeline. Selon la pref user, on ouvre soit
@@ -4735,6 +5281,12 @@ function handleWebSocketEvent(event) {
             // backend bloque jusqu'à notre réponse via la WS action
             // 'data_read_consent_response'.
             renderInteraction(event);
+            break;
+
+        case 'data_read_consent_expired':
+            // La demande de lecture a expiré côté serveur (ou n'est plus en
+            // attente) — fermer le modal qui traîne + informer l'user.
+            handleDataReadConsentExpired(event);
             break;
 
         case 'suggestions':
@@ -4825,7 +5377,14 @@ function handleWebSocketEvent(event) {
             break;
 
         case 'phase_progress':
-            renderActivityStatus(event.phase, event.status || '', {
+            // PIPE progress — le bridge pipeline (agent_service
+            // _stream_pipeline_run_to_chat) envoie le texte intra-phase dans
+            // ``message`` (« concept 2/5 », « Scoring… »), PAS dans ``status``.
+            // L'ancien code lisait ``event.status`` (toujours absent) → la
+            // progression n'était JAMAIS affichée. On lit ``message`` en
+            // priorité, ``status`` en fallback (aucun émetteur ne l'utilise
+            // aujourd'hui, mais on reste rétro-compatible).
+            renderActivityStatus(event.phase, event.message || event.status || '', {
                 sub_current: event.sub_current || 0,
                 sub_total: event.sub_total || 0,
             });
@@ -4836,7 +5395,14 @@ function handleWebSocketEvent(event) {
             flushPendingClarifications();
             // Annuler un éventuel feedback auto en attente (pas pertinent si erreur)
             _pendingExecuteSqlFeedback = false;
-            addErrorMessage(event.message || 'Une erreur est survenue.');
+            // IRIS-3 — bouton « Signaler » sur les erreurs reportables : le
+            // backend pose event.reportable=true pour les 5xx/internes
+            // (INTERNAL_ERROR = crash agent/exception serveur), false pour les
+            // erreurs métier/4xx (rate-limit, message vide, validation).
+            addErrorMessage(event.message || 'Une erreur est survenue.', {
+                reportable: event.reportable === true,
+                context: 'iris_agent_error',
+            });
             collapseThinkingBlocks();
             collapseAnalysisBlocks();
             cleanupActivity();
@@ -4901,7 +5467,22 @@ function handleWebSocketEvent(event) {
                         : 0,
                     contextWindow: event.context_window,
                     modelDisplay: event.model_display || null,
+                    verified: event.context_window_verified === true,
                     skipIfZeroAfterPositive: true
+                });
+            }
+
+            // Puce coût LLM — cumul $ de la conversation. Champ optionnel : un
+            // backend pas encore déployé ne l'envoie pas (rolling deploy) → on
+            // garde alors la dernière valeur affichée plutôt que de la remettre à 0.
+            // ``!__irisReplayMode`` : pendant le rejeu d'historique, c'est la valeur
+            // du boot (initialConversationCostUsd, fraîche via le wrapper SSoT) qui
+            // fait autorité — un done event historique rejoué ne doit pas piloter la
+            // puce (sinon 2 sources pour 1 pixel, axe 13).
+            if (event.conversation_cost_usd != null && !window.__irisReplayMode) {
+                updateIrisCost({
+                    costUsd: event.conversation_cost_usd,
+                    partial: event.conversation_cost_partial === true
                 });
             }
 
@@ -4922,6 +5503,7 @@ function handleWebSocketEvent(event) {
                         ? event.last_input_tokens
                         : 0,
                     contextWindow: event.context_window,
+                    verified: event.context_window_verified === true,
                     skipIfZeroAfterPositive: true
                 });
             }
@@ -4945,6 +5527,50 @@ function handleWebSocketEvent(event) {
             if (typingIndicator) typingIndicator.style.display = 'none';
             addSystemMessage(event.message || 'Génération interrompue.');
             resetAfterResponse();
+            break;
+
+        case 'email_sent':
+            // Confirmation d'envoi d'email par Iris (outil send_email). Persisté
+            // et rejoué au refresh. Avant : aucun case → console.warn, l'utilisateur
+            // ne voyait JAMAIS la confirmation (ni en live ni au refresh).
+            (function() {
+                var to = Array.isArray(event.recipients)
+                    ? event.recipients.join(', ')
+                    : (event.recipients || '');
+                var subj = event.subject ? ' — « ' + event.subject + ' »' : '';
+                addInfoBanner('Email envoyé' + (to ? ' à ' + to : '') + subj + '.');
+            })();
+            break;
+
+        case 'automation_triggered':
+            // Confirmation de déclenchement d'une automatisation par Iris.
+            addInfoBanner(
+                'Automatisation déclenchée : '
+                + (event.name || ('#' + (event.automation_id != null ? event.automation_id : '?')))
+                + '.'
+            );
+            break;
+
+        case 'budget_exceeded':
+            // La conversation a atteint le plafond budgétaire LLM → la génération
+            // s'est arrêtée. Sans ce case, le run stoppait sans explication visible
+            // (denial-of-wallet masqué). cost/cap sont des nombres → formatage $.
+            (function() {
+                var c = (typeof event.cost_usd === 'number') ? event.cost_usd.toFixed(2) : event.cost_usd;
+                var cap = (typeof event.cap_usd === 'number') ? event.cap_usd.toFixed(2) : event.cap_usd;
+                var detail = (c != null && cap != null) ? ' (' + c + ' $ / ' + cap + ' $)' : '';
+                addErrorMessage('Budget atteint' + detail + ' — la génération s\'est arrêtée.');
+            })();
+            break;
+
+        case 'pipeline_failed':
+            // Échec de la pipeline NL→SQL — message déjà formaté côté serveur.
+            addErrorMessage(event.message || 'La pipeline a échoué.');
+            break;
+
+        case 'pipeline_cancelled':
+            // Pipeline annulée (utilisateur ou connexion interrompue) — ⏹ système.
+            addSystemMessage(event.message || 'Pipeline annulée.');
             break;
 
         default:
@@ -4999,6 +5625,9 @@ function resetAfterResponse() {
     currentStreamDiv = null;
     isStreaming = false;
     try { window.__irisStreamingActive = false; } catch (e) { /* defensive */ }
+    // Stoppe tout chrono d'outil resté "actif" : sinon le live timer continue
+    // d'incrémenter après « Fin du tour » (bug chrono qui monte sans fin).
+    _finalizeDanglingToolLines();
     // Le widget plan_update est scopé au turn courant — null la référence
     // pour que le prochain turn créé un widget neuf dans sa propre bulle
     // assistant. Le DOM du widget précédent reste visible dans la
@@ -5437,7 +6066,25 @@ async function _displayXlsxInGrid(fileId, fileName) {
         var rows = Array.isArray(tab.rows) ? tab.rows : [];
         var rowCount = (typeof tab.row_count === 'number') ? tab.row_count : rows.length;
         // 1er tab non-closable (au moins 1 tab toujours présent)
-        tabMgr.addTab(label, cols, rows, null, rowCount, null, i > 0);
+        var tabInfo = tabMgr.addTab(label, cols, rows, null, rowCount, null, i > 0);
+        // Honorer les flags de troncation serveur (cap 1000×50 du
+        // parse-attachment). Sans ça, un fichier de 80 colonnes est
+        // prévisualisé à 50 sans AUCUNE indication (doctrine Q5 — données
+        // fausses silencieuses). Les lignes sont déjà demi-signalées via
+        // « X ligne(s) sur Y » (rowCount serveur = total), le badge ⚠
+        // complète ; les colonnes étaient 100% silencieuses.
+        if (tabInfo && tabInfo.grid) {
+            var changed = false;
+            if (tab.truncated_rows) { tabInfo.grid._truncated = true; changed = true; }
+            if (tab.truncated_cols) {
+                tabInfo.grid._truncatedCols = true;
+                if (typeof tab.column_count === 'number') {
+                    tabInfo.grid._truncatedColsTotal = tab.column_count;
+                }
+                changed = true;
+            }
+            if (changed) { tabInfo.grid._updateHeaderInfo(); }
+        }
     }
     appendToMessages(card);
     scrollToBottom();
@@ -5755,7 +6402,21 @@ async function _selectDatastoreFile(filePath, fileName) {
             headers: { 'X-Xsrftoken': getCookie('_xsrf') },
             body: formData,
         });
-        var data = await upRes.json();
+        // Lecture SÛRE : un 413 nginx (re-upload d'un gros fichier) renvoie du
+        // HTML → ``upRes.json()`` levait une SyntaxError sans ``.status``,
+        // masquée en "panne réseau". On lit le status et on le porte sur
+        // l'erreur pour que ``_addUploadErrorWithReport`` cible le bon message.
+        var r = await window.komptiaReadJson(upRes);
+        var data = r.data || {};
+        if (!r.ok) {
+            var upErr = new Error(
+                r.tooLarge
+                    ? 'Fichier trop volumineux pour l\'envoi.'
+                    : (data.error || r.error || 'Upload échoué')
+            );
+            upErr.status = r.status;
+            throw upErr;
+        }
 
         if (data.success && data.file_id) {
             if (uploadIndicator) {
@@ -5868,6 +6529,20 @@ function _startSyncInChat() {
                 var r = d.result || {};
                 var tables = r.tables_count || r.tables_synced || 0;
                 var dur = (r.duration || 0).toFixed(1);
+                // #36 (2026-06-10) — success:true N'IMPLIQUE PAS complete:true :
+                // des sections (functions/fk/synonymes/vues…) ont pu échouer →
+                // connaissance Iris PARTIELLE (jointures manquantes = SQL faux
+                // possibles). Sans ce message, l'admin croit la sync intégrale.
+                if (r.success !== false && r.complete === false) {
+                    var failedNames = (r.incomplete_sections || [])
+                        .map(function (s) { return s && s.section ? s.section : '?'; })
+                        .join(', ');
+                    finish(true, tables + ' tables synchronisées en ' + dur + 's — ⚠ sync '
+                        + 'INCOMPLÈTE : section(s) en échec (' + (failedNames || 'inconnues')
+                        + '). La connaissance d’Iris est partielle ; relancez ou '
+                        + 'vérifiez les permissions Sage.');
+                    return;
+                }
                 finish(r.success !== false, tables + ' tables synchronisées en ' + dur + 's');
                 return;
             }
@@ -5981,6 +6656,11 @@ function _dismissInterruptedBanner() {
 function sendMessage() {
     if (!messageInput) return;
 
+    // WS-1 — filet : un nouveau tour relâche le drop des events en vol (au cas
+    // où le terminal du run annulé via « Nouvelle conversation » ne serait
+    // jamais arrivé), pour que le nouveau run s'affiche bien.
+    _irisDiscardInflight = false;
+
     let text = messageInput.value.trim();
 
     // Task #13 — Accepter l'envoi avec un fichier attaché même si le
@@ -5997,6 +6677,14 @@ function sendMessage() {
         text = 'Analyse le fichier joint.';
     }
     if (!text) return;
+
+    // TRIM — compteur « conversation longue » : +1 par ENVOI réel de
+    // l'utilisateur. sendMessage n'est JAMAIS appelé pendant la réhydratation
+    // (qui passe par addUserMessage direct) → pas de double-comptage / faux
+    // positif. On sous-compte (on ignore la réponse assistant/tool) → la
+    // bannière n'apparaît jamais trop tôt.
+    conversationMessageCount += 1;
+    maybeShowLengthWarning();
 
     // Le bandeau "run précédent interrompu" (cf. _renderInterruptedRunBanner)
     // instruit l'utilisateur d'« envoyer un message pour reprendre ». Dès qu'il
@@ -6047,6 +6735,8 @@ function sendMessage() {
 
     // Afficher l'indicateur de frappe
     if (typingIndicator) typingIndicator.style.display = 'flex';
+    // IRIS-4 (a11y) — le dot animé est invisible aux lecteurs d'écran : annoncer.
+    announceSr('Iris réfléchit…');
 
     // Désactiver l'input et afficher le bouton stop
     if (messageInput) messageInput.disabled = true;
@@ -6302,16 +6992,23 @@ function postIrisFeedback(feedback, opts) {
     opts = opts || {};
     var controller = new AbortController();
     var timer = setTimeout(function() { controller.abort(); }, 10000);
+    // D4 — corps de base ; message_id ajouté SEULEMENT s'il est fourni (numérique
+    // valide). Absent → le backend cible le dernier message assistant (legacy).
+    var _payload = {
+        conversation_id: currentConversationId,
+        feedback: feedback
+    };
+    var _mid = parseInt(opts.messageId, 10);
+    if (!isNaN(_mid)) {
+        _payload.message_id = _mid;
+    }
     return fetch('/api/iris/feedback', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'X-Xsrftoken': getCookie('_xsrf')
         },
-        body: JSON.stringify({
-            conversation_id: currentConversationId,
-            feedback: feedback
-        }),
+        body: JSON.stringify(_payload),
         signal: controller.signal
     }).then(function(response) {
         clearTimeout(timer);
@@ -6378,6 +7075,7 @@ function sendAutoFeedback(text) {
     addUserMessage(text);
     if (welcomeState) welcomeState.style.display = 'none';
     if (typingIndicator) typingIndicator.style.display = 'flex';
+    announceSr('Iris réfléchit…');  // IRIS-4 (a11y)
     if (messageInput) messageInput.disabled = true;
     setSendButtonMode('stop');
     var inputWrapper = document.querySelector('.iris-input-wrapper');
@@ -6423,13 +7121,19 @@ function sendClarificationResponse(response) {
         action: 'clarification_response',
         conversation_id: currentConversationId,
         response: response,
-        source: 'page'
+        source: 'page',
+        // R1 (L0O1) — joindre le mode courant : un reconnect WS reset `_last_mode`
+        // côté serveur à execution ; sans ce champ, répondre à une clarification en
+        // mode « Expliquer » relancerait l'agent en mode execution (outils à effets
+        // de bord). Le toggle front survit au reconnect → source de vérité fiable.
+        mode: currentMode
     }));
 
     // Montrer la réponse choisie comme message utilisateur
     addUserMessage(response);
 
     if (typingIndicator) typingIndicator.style.display = 'flex';
+    announceSr('Iris réfléchit…');  // IRIS-4 (a11y)
     if (messageInput) messageInput.disabled = true;
     setSendButtonMode('stop');
     const inputWrapperClarif = document.querySelector('.iris-input-wrapper');
@@ -6528,6 +7232,35 @@ function renderPipelineAskUser(runId, askId, question, context) {
     requestAnimationFrame(function() { input.focus(); });
 }
 
+function handlePipelineAskUserExpired(event) {
+    // PIPE ask_user-stale — la réponse à une question pipeline n'a PAS été prise
+    // en compte (ask_id plus en attente : timeout 2min côté pipeline, ou refresh
+    // + reclick). La pipeline a déjà continué avec une valeur par défaut. On
+    // marque la carte « expirée » au lieu de la laisser « répondu » (trompeur).
+    var askId = event && event.ask_id;
+    if (!askId) return;
+    var cards = document.querySelectorAll('.iris-pipeline-ask');
+    var card = null;
+    for (var i = 0; i < cards.length; i++) {
+        if (cards[i].dataset && cards[i].dataset.askId === askId) { card = cards[i]; break; }
+    }
+    if (!card) return;
+    card.classList.remove('responded');
+    card.classList.add('expired');
+    var input = card.querySelector('.iris-clarif-freetext-input');
+    var btn = card.querySelector('.iris-clarif-freetext-send');
+    if (input) input.disabled = true;
+    if (btn) { btn.disabled = true; btn.textContent = 'Expirée'; }
+    if (!card.querySelector('.iris-pipeline-ask-expired-note')) {
+        var note = document.createElement('div');
+        note.className = 'iris-pipeline-ask-expired-note';
+        note.style.cssText = 'font-size:0.78rem;color:var(--text-muted,#6b7280);margin-top:0.4rem;';
+        note.textContent = 'Cette question a expiré — la pipeline a déjà continué. '
+            + 'Votre réponse n\'a pas été prise en compte.';
+        card.appendChild(note);
+    }
+}
+
 function sendPipelineAskUserResponse(runId, askId, response) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
         addErrorMessage(
@@ -6551,6 +7284,21 @@ function sendPipelineAskUserResponse(runId, askId, response) {
  * Efface la conversation courante via l'API et réinitialise l'état local.
  */
 async function clearConversation() {
+    // WS-1 — si un run est EN COURS, l'annuler AVANT de vider l'UI et activer
+    // le drop des events en vol (cf. ws.onmessage). Sans ça, l'agent continue
+    // et son texte/SQL réapparaît dans la conversation « neuve », puis est
+    // perdu au refresh (conv supprimée). On envoie le cancel directement (sans
+    // dépendre du stop-mode du bouton) pour être robuste à tous les états.
+    var _runActive = isStreaming
+        || (typeof window !== 'undefined' && window.__irisStreamingActive === true);
+    if (_runActive) {
+        try {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'cancel' }));
+            }
+        } catch (e) { /* defensive */ }
+        _irisDiscardInflight = true;
+    }
     // Reset de l'indicateur context-window AVANT le early-return : le bar
     // doit retomber à 0 dans les 2 branches (avec/sans conversation active),
     // sinon une UI rechargée avec un initial_context_tokens > 0 garderait
@@ -6560,8 +7308,14 @@ async function clearConversation() {
         updateContextWindow({
             usedTokens: 0,
             contextWindow: _cfgClear.contextWindow || null,
-            modelDisplay: _cfgClear.modelDisplay || null
+            modelDisplay: _cfgClear.modelDisplay || null,
+            verified: _cfgClear.contextWindowVerified === true
         });
+        // Puce coût : retombe à 0 (masquée) immédiatement, avant l'early-return —
+        // couvre les 2 branches (avec/sans conv active). Le backend repart de 0
+        // pour la conv neuve grâce au filtre ``created_after`` (anti-réutilisation
+        // d'id), donc l'UI et la BDD restent cohérentes.
+        updateIrisCost({ costUsd: 0, partial: false });
     } catch (e) { /* defensive */ }
 
     // Note (fix C — bug refresh) : on POST TOUJOURS /api/iris/clear même
@@ -6612,6 +7366,19 @@ async function clearConversation() {
 
         // Reset état local
         currentConversationId = null;
+        // TRIM — retirer la bannière « conversation longue » + reset son état,
+        // sinon elle reste collée sur une conversation vidée (et, _lengthWarningShown
+        // restant true, ne se ré-afficherait plus de la session).
+        removeLengthWarningBanner();
+        conversationMessageCount = 0;
+        _lengthWarningShown = false;
+        // #54 (revue adversariale) — reset l'état load-more « plus ancien » :
+        // sinon le curseur minRenderedSeq + les flags d'une conv précédente
+        // fuiraient dans la suivante (bouton affiché à tort / mauvais before_seq).
+        minRenderedSeq = Infinity;
+        _hasMoreOlderEvents = true;
+        _isLoadingOlder = false;
+        _maybeShowLoadOlderButton();
         // Task #15 (M2) — reset le tracking _seq : nouvelle conv = flux frais.
         // Sinon, la 1ère event de la nouvelle conv (avec _seq potentiellement
         // bas) déclencherait un faux warning "dup".
@@ -6820,7 +7587,15 @@ function _restoreTurnEvents(events) {
                             // #39 (A5-F4) — l'event sql_results persisté porte
                             // ``truncated`` (cf. agent_service) → badge cohérent
                             // avec le replay live (renderSQLResults primaire).
-                            evt.truncated || false
+                            // #18a (2026-06-10) — OR avec la dérivation : si les
+                            // rows disponibles sont plus courtes que row_count
+                            // (cap de restore en amont), la donnée affichée est
+                            // partielle — badge + toast export doivent le dire.
+                            !!(evt.truncated || totalRows > rows.length),
+                            // searchId omis volontairement au replay (cf. JSDoc).
+                            undefined,
+                            // Parité bannière oracle fail-open live↔replay.
+                            evt.oracle_prevalidated
                         );
                     }
                 }
@@ -6953,17 +7728,166 @@ var _REPLAY_SKIP_EVENT_TYPES = {
 // Cohérent avec l'ordre live : les tool msgs sont créés au moment où le
 // résultat SQL arrive, AVANT l'event sql_results dans le même tour.
 function _buildSqlDataQueueFromMessages(savedMessages) {
+    // C1 (L4O0) — renvoie la file FIFO (fallback legacy) ET un index par
+    // ``result_uid`` (clé stable posée par le backend sur le _restore_data ET
+    // l'event sql_results). L'appariement par clé évite le mélange cross-turn
+    // du FIFO global (grille affichant les données d'un AUTRE résultat =
+    // corruption silencieuse). Conversations persistées avant le fix : pas
+    // d'uid → byUid vide → 100% fallback FIFO (comportement inchangé).
     var queue = [];
-    if (!Array.isArray(savedMessages)) return queue;
+    var byUid = {};
+    if (!Array.isArray(savedMessages)) return { queue: queue, byUid: byUid };
     for (var i = 0; i < savedMessages.length; i++) {
         var msg = savedMessages[i];
         if (msg && msg.role === 'tool' && msg.sql_data
             && Array.isArray(msg.sql_data.columns)
             && Array.isArray(msg.sql_data.rows)) {
             queue.push(msg.sql_data);
+            if (msg.sql_data.result_uid) {
+                byUid[msg.sql_data.result_uid] = msg.sql_data;
+            }
         }
     }
-    return queue;
+    return { queue: queue, byUid: byUid };
+}
+
+// ════════════════════════════════════════════════════════════════════
+// IRIS-events-loadmore (#54) — « charger l'historique plus ancien »
+// ════════════════════════════════════════════════════════════════════
+let _isLoadingOlder = false;
+let _hasMoreOlderEvents = true;
+let _loadOlderWired = false;
+
+// Affiche le bouton SSI la conv a (probablement) des events au-delà du cap de
+// rendu : le plus ancien event rendu (minRenderedSeq) n'est pas le tout premier
+// seq. ``_hasMoreOlderEvents`` (raffiné par has_more_older du serveur) le cache
+// une fois le début atteint.
+function _maybeShowLoadOlderButton() {
+    var container = document.getElementById('loadOlderContainer');
+    if (!container) return;
+    var show = _hasMoreOlderEvents
+        && minRenderedSeq !== Infinity
+        && minRenderedSeq > 1
+        && currentConversationId != null;
+    container.style.display = show ? '' : 'none';
+}
+
+function _wireLoadOlderButton() {
+    if (_loadOlderWired) return;
+    var btn = document.getElementById('loadOlderBtn');
+    if (!btn) return;
+    // CSP : addEventListener, jamais onclick inline.
+    btn.addEventListener('click', function () { loadAndPrependOlderEvents(); });
+    _loadOlderWired = true;
+}
+
+async function loadAndPrependOlderEvents() {
+    if (_isLoadingOlder || !_hasMoreOlderEvents) return;
+    if (minRenderedSeq === Infinity || minRenderedSeq <= 1) return;
+    if (currentConversationId == null) return;
+    // #54 (revue adversariale) — mémorise la conv au DÉBUT : l'user peut
+    // changer/clear de conversation (in-page) PENDANT le fetch async. On
+    // refuse alors de prepend les events de l'ancienne conv dans la nouvelle vue.
+    var _convAtStart = currentConversationId;
+    var btn = document.getElementById('loadOlderBtn');
+    var statusEl = document.getElementById('loadOlderStatus');
+    _isLoadingOlder = true;
+    if (btn) btn.disabled = true;
+    if (statusEl) statusEl.textContent = 'Chargement…';
+
+    var beforeSeq = minRenderedSeq;
+    var data = null;
+    try {
+        var url = '/api/iris/conversation/' + _convAtStart
+            + '/older-events?before_seq=' + beforeSeq + '&limit=50';
+        var res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        // komptiaReadJson ne throw JAMAIS sur une page HTML d'erreur (AUTO-5).
+        var parsed = await window.komptiaReadJson(res);
+        data = parsed.data || {};
+        if (!res.ok || data.success === false) {
+            throw new Error(data.error || parsed.error || 'Erreur de chargement');
+        }
+    } catch (err) {
+        if (statusEl) statusEl.textContent = 'Échec du chargement. Réessayez.';
+        if (btn) btn.disabled = false;
+        _isLoadingOlder = false;
+        return;
+    }
+
+    // #54 (revue) — la conversation a-t-elle changé pendant le fetch ? Si oui,
+    // ABANDONNER : prepend les events de l'ancienne conv dans la nouvelle =
+    // donnée fausse à l'écran.
+    if (currentConversationId !== _convAtStart) {
+        if (btn) btn.disabled = false;
+        _isLoadingOlder = false;
+        return;
+    }
+
+    var older = Array.isArray(data.events) ? data.events : [];
+    if (older.length === 0) {
+        _hasMoreOlderEvents = false;
+        if (statusEl) statusEl.textContent = 'Début de la conversation.';
+        _maybeShowLoadOlderButton();
+        _isLoadingOlder = false;
+        return;
+    }
+
+    // PREPEND : rendre les events anciens dans un FRAGMENT (hors-flux), insérer
+    // en TÊTE, puis ancrer le scroll par le delta de hauteur (pas de saut). La
+    // boucle de rendu est SYNCHRONE → aucun event live ne s'interleave dans le
+    // fragment (pas d'await entre _prependTarget set et reset).
+    var prevScrollHeight = messagesArea ? messagesArea.scrollHeight : 0;
+    var prevScrollTop = messagesArea ? messagesArea.scrollTop : 0;
+
+    var fragment = document.createDocumentFragment();
+    _prependTarget = fragment;
+    window.__irisReplayMode = true;
+    if (document.documentElement) document.documentElement.classList.add('iris-replay-mode');
+    try {
+        for (var i = 0; i < older.length; i++) {
+            var entry = older[i];
+            if (!entry || typeof entry.payload !== 'string' || !entry.payload) continue;
+            var evt = null;
+            try { evt = JSON.parse(entry.payload); } catch (e) { continue; }
+            if (!evt || typeof evt !== 'object') continue;
+            if (_REPLAY_SKIP_EVENT_TYPES[evt.type]) continue;  // pas de side-effect réseau
+            try { handleWebSocketEvent(evt); } catch (e) {
+                console.error('[Iris loadmore] dispatch threw seq=' + entry.seq, e);
+            }
+        }
+    } finally {
+        _prependTarget = null;
+        window.__irisReplayMode = false;
+        if (document.documentElement) document.documentElement.classList.remove('iris-replay-mode');
+        resetPlanGroup();
+    }
+
+    // Insérer le fragment APRÈS le bouton + le welcome (caché), AVANT le 1er
+    // message existant → les events anciens apparaissent en TÊTE du flux.
+    if (messagesArea && fragment.childNodes.length > 0) {
+        var anchor = document.getElementById('welcomeState')
+            || document.getElementById('loadOlderContainer');
+        var insertBefore = anchor ? anchor.nextSibling : messagesArea.firstChild;
+        messagesArea.insertBefore(fragment, insertBefore);
+        // Ancrage scroll : préserver la position visuelle (le contenu ajouté
+        // AU-DESSUS ne doit PAS faire sauter la vue vers le haut).
+        var newScrollHeight = messagesArea.scrollHeight;
+        messagesArea.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+    }
+
+    // Curseur : nouveau plus ancien seq rendu (events ASC → older[0], mais on
+    // calcule le min réel par robustesse aux trous).
+    var newMin = minRenderedSeq;
+    for (var j = 0; j < older.length; j++) {
+        if (typeof older[j].seq === 'number' && older[j].seq < newMin) newMin = older[j].seq;
+    }
+    minRenderedSeq = newMin;
+    _hasMoreOlderEvents = data.has_more_older === true;
+
+    if (statusEl) statusEl.textContent = _hasMoreOlderEvents ? '' : 'Début de la conversation.';
+    if (btn) btn.disabled = false;
+    _isLoadingOlder = false;
+    _maybeShowLoadOlderButton();
 }
 
 function replayConversationEvents(events, savedMessages) {
@@ -6976,21 +7900,33 @@ function replayConversationEvents(events, savedMessages) {
     // charge seq 1-10, WS reprend, live envoie seq=11 puis serveur replay
     // seq=10 → onglet réaffiche un bubble qu'on avait déjà).
     var _maxReplaySeq = 0;
+    var _minReplaySeq = Infinity;
     for (var _i = 0; _i < events.length; _i++) {
         var _s = events[_i] && events[_i].seq;
-        if (typeof _s === 'number' && _s > _maxReplaySeq) _maxReplaySeq = _s;
+        if (typeof _s === 'number') {
+            if (_s > _maxReplaySeq) _maxReplaySeq = _s;
+            if (_s < _minReplaySeq) _minReplaySeq = _s;
+        }
     }
     if (_maxReplaySeq > 0) {
         lastEventSeq = _maxReplaySeq;
         console.info('[Iris replay] lastEventSeq init depuis replay = ' + _maxReplaySeq);
     }
+    // IRIS-events-loadmore (#54) — curseur du plus ancien event rendu (before_seq).
+    if (_minReplaySeq !== Infinity) minRenderedSeq = _minReplaySeq;
 
     // Masquer le welcome
     if (welcomeState) welcomeState.style.display = 'none';
 
     // Pré-construit la queue des rows SQL pour les ré-injecter dans les
     // events sql_results dont les rows ont été strip (confidentialité).
-    var sqlDataQueue = _buildSqlDataQueueFromMessages(savedMessages || []);
+    // C1 (L4O0) — file FIFO (fallback) + index par result_uid (appariement
+    // stable) + Set des items déjà consommés (un item matché par uid ne doit
+    // pas être re-shifté par un event legacy ensuite).
+    var _sqlDataBundle = _buildSqlDataQueueFromMessages(savedMessages || []);
+    var sqlDataQueue = _sqlDataBundle.queue;
+    var sqlDataByUid = _sqlDataBundle.byUid;
+    var _consumedSqlData = new Set();
 
     // Activer le mode replay : désactive scrollToBottom + transitions CSS
     window.__irisReplayMode = true;
@@ -7015,18 +7951,47 @@ function replayConversationEvents(events, savedMessages) {
             // Skip les events à side-effect réseau pour ne pas relancer
             // de vrais fetch/EventSource au refresh.
             if (_REPLAY_SKIP_EVENT_TYPES[evt.type]) continue;
-            // Ré-injecte les rows SQL strippées par le backend (confidentialité)
-            // depuis la queue pré-construite. FIFO car cohérent avec l'ordre
-            // d'apparition live (tool msg créé AVANT event sql_results).
-            if (evt.type === 'sql_results' && evt._rows_stripped
-                && sqlDataQueue.length > 0) {
-                var sqlData = sqlDataQueue.shift();
-                evt.rows = sqlData.rows;
-                if (!Array.isArray(evt.columns) || evt.columns.length === 0) {
-                    evt.columns = sqlData.columns;
+            // Ré-injecte les rows SQL strippées par le backend (confidentialité).
+            // C1 (L4O0) — appariement par ``result_uid`` (clé stable) en
+            // priorité ; fallback FIFO (conversations legacy sans uid, ou uid
+            // orphelin). Le FIFO seul mélangeait les turns au replay → une
+            // grille pouvait afficher les données d'un AUTRE résultat (donnée
+            // fausse silencieuse, classe #53/#65).
+            if (evt.type === 'sql_results' && evt._rows_stripped) {
+                var sqlData = null;
+                var _uid = evt.result_uid;
+                if (_uid && sqlDataByUid[_uid] && !_consumedSqlData.has(sqlDataByUid[_uid])) {
+                    sqlData = sqlDataByUid[_uid];
+                    _consumedSqlData.add(sqlData);
+                } else {
+                    // Fallback FIFO : shift en sautant les items déjà consommés
+                    // par un appariement uid précédent.
+                    while (sqlDataQueue.length > 0) {
+                        var _cand = sqlDataQueue.shift();
+                        if (!_consumedSqlData.has(_cand)) {
+                            sqlData = _cand;
+                            _consumedSqlData.add(_cand);
+                            break;
+                        }
+                    }
                 }
-                if (!evt.row_count) {
-                    evt.row_count = sqlData.row_count || sqlData.rows.length;
+                if (sqlData) {
+                    evt.rows = sqlData.rows;
+                    if (!Array.isArray(evt.columns) || evt.columns.length === 0) {
+                        evt.columns = sqlData.columns;
+                    }
+                    if (!evt.row_count) {
+                        evt.row_count = sqlData.row_count || sqlData.rows.length;
+                    }
+                    // #18a (2026-06-10) — les rows ré-injectées viennent du
+                    // _restore_data cappé (_RESTORE_ROWS_CAP backend) : si ce cap
+                    // a coupé, le flag truncated de l'event (cap admin uniquement)
+                    // ment. OR avec la troncature de restore + dérivation legacy
+                    // (row_count > rows ré-injectées).
+                    if (sqlData.restore_truncated
+                        || (evt.row_count && evt.row_count > sqlData.rows.length)) {
+                        evt.truncated = true;
+                    }
                 }
             }
             // Le dispatcher live est appelé EXACTEMENT comme en streaming.
@@ -7158,15 +8123,44 @@ document.addEventListener('DOMContentLoaded', function() {
     if (config.conversationId) {
         currentConversationId = parseInt(config.conversationId) || null;
     }
+    // TRIM — compteur de messages + seuil d'alerte « conversation longue ».
+    conversationMessageCount = parseInt(config.conversationMessageCount) || 0;
+    if (config.conversationWarnThreshold) {
+        conversationWarnThreshold = parseInt(config.conversationWarnThreshold)
+            || conversationWarnThreshold;
+    }
+    // Vérifie le seuil au boot (la bannière s'insère en tête de messagesArea ;
+    // la réhydratation qui suit appende sous elle, elle reste donc visible).
+    maybeShowLengthWarning();
     // Rôle auto-détecté par le backend
 
-    // Initialiser l'indicateur context-window depuis la config serveur. Le
-    // numérateur est l'estimation pré-turn (heuristique 4 chars/token sur
-    // l'historique) — corrigé exactement par le 1er done event ensuite.
-    updateContextWindow({
-        usedTokens: config.initialContextTokens || 0,
-        contextWindow: config.contextWindow || null,
-        modelDisplay: config.modelDisplay || null
+    // Initialiser l'indicateur context-window depuis l'endpoint dynamique.
+    // Bug 2026-06-02 : le snapshot initial dans config.contextWindow peut
+    // être périmé (cache stale). Cet appel garantit la valeur fraîche du
+    // modèle actif via /api/iris/model-context-window.
+    // Fallback sur config.contextWindow si l'endpoint échoue (compat legacy).
+    _loadContextWindowDynamic().then(function(dynamicCw) {
+        var contextWindowValue = config.contextWindow || null;
+        var modelDisplay = config.modelDisplay || null;
+        var verified = config.contextWindowVerified === true;
+        if (dynamicCw) {
+            contextWindowValue = dynamicCw.contextWindow;
+            modelDisplay = dynamicCw.modelDisplay || modelDisplay;
+            verified = dynamicCw.verified;
+        }
+        updateContextWindow({
+            usedTokens: config.initialContextTokens || 0,
+            contextWindow: contextWindowValue,
+            modelDisplay: modelDisplay,
+            verified: verified
+        });
+    });
+
+    // Init de la puce coût LLM depuis la valeur réhydratée (le live la rafraîchit
+    // ensuite via l'event ``done``). 0 → puce masquée (conv neuve ou effacée).
+    updateIrisCost({
+        costUsd: config.initialConversationCostUsd || 0,
+        partial: config.initialConversationCostPartial === true
     });
 
     // ── Restaurer la conversation précédente ──
@@ -7190,6 +8184,9 @@ document.addEventListener('DOMContentLoaded', function() {
         } catch (err) {
             console.error('[Iris] replayConversationEvents failed:', err);
         }
+        // IRIS-events-loadmore (#54) — câbler le bouton + l'afficher si la conv
+        // a des events au-delà du cap de rendu (500).
+        try { _wireLoadOlderButton(); _maybeShowLoadOlderButton(); } catch (e) { /* defensive */ }
         // Pas de fallback sur le legacy ici — si le replay a partiellement
         // restauré, mélanger avec le legacy créerait des doublons. Le replay
         // est censé être complet par construction.
@@ -7340,10 +8337,21 @@ document.addEventListener('DOMContentLoaded', function() {
                             sqlRows,
                             msg.sql_data.sql || '',
                             totalRows > sqlRows.length ? totalRows : 0,
-                            // #39 (A5-F4) — propager le flag de troncature pour
-                            // afficher le badge « ⚠ limité » comme au replay live.
-                            // Absent des conversations legacy → false (pas de badge).
-                            msg.sql_data.truncated || false
+                            // #39 (A5-F4) — flag cap admin, comme au replay live.
+                            // #18a (2026-06-10) — OR avec la troncature de
+                            // RESTORE (cap _RESTORE_ROWS_CAP côté backend) :
+                            // sans elle, une grille restaurée de 200/800 lignes
+                            // n'affichait ni badge ni toast d'export partiel
+                            // (export CSV faux silencieux). La dérivation
+                            // row_count > rows.length couvre les conversations
+                            // persistées AVANT le flag restore_truncated.
+                            !!(msg.sql_data.truncated
+                                || msg.sql_data.restore_truncated
+                                || totalRows > sqlRows.length),
+                            // searchId omis volontairement au restore (cf. JSDoc).
+                            undefined,
+                            // Parité bannière oracle fail-open live↔restore.
+                            msg.sql_data.oracle_prevalidated
                         );
                     }
 
@@ -7429,7 +8437,9 @@ document.addEventListener('DOMContentLoaded', function() {
                             // avoir de feedback row.
                             var parentBubble = bubble.parentElement;
                             if (parentBubble && _lastAsstIdxSet[_mi]) {
-                                var feedbackRow = _buildFeedbackRow(msg.feedback);
+                                // D4 — passe msg.id pour cibler CE tour précis
+                                // (sinon le backend retombe sur le dernier message).
+                                var feedbackRow = _buildFeedbackRow(msg.feedback, msg.id);
                                 parentBubble.appendChild(feedbackRow);
                             }
                         }
@@ -7942,7 +8952,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
         // Send to API — SSoT ``postIrisFeedback`` (partagé avec la carte de
         // validation auto-feedback). ``onError`` ré-active les boutons pour retry.
+        // D4 — ciblage par message_id si la row le porte (replay multi-tours).
         postIrisFeedback(feedback, {
+            messageId: row.dataset.messageId,
             onError: function(err) {
                 var msg = err && err.name === 'AbortError'
                     ? 'Délai dépassé pour le feedback. Réessayez.'
@@ -7961,7 +8973,34 @@ document.addEventListener('DOMContentLoaded', function() {
 
     const clearBtn = document.getElementById('clearConversationBtn');
     if (clearBtn) {
-        clearBtn.addEventListener('click', clearConversation);
+        clearBtn.addEventListener('click', async function() {
+            // IRIS-effacer — confirmation avant un effacement DESTRUCTIF (pas
+            // d'undo : la conversation et ses résultats SQL sont perdus). On ne
+            // demande pas si la conversation est déjà vide (rien à perdre).
+            var hasSomethingToLose =
+                currentConversationId !== null
+                || isStreaming
+                || (messagesArea && messagesArea.querySelector('.iris-message-row') !== null);
+            if (hasSomethingToLose) {
+                var _msg = 'Effacer cette conversation ? Cette action est '
+                    + 'définitive — la conversation et ses résultats seront '
+                    + 'perdus (pas d\'annulation).';
+                var _title = 'Effacer la conversation';
+                var ok;
+                // Jamais détruire sans confirmation : modal Komptia stylé en
+                // priorité, fallback natif si non chargé. Seul un environnement
+                // sans aucun confirm (test headless) passe en direct.
+                if (typeof window.appConfirm === 'function') {
+                    ok = await window.appConfirm(_msg, _title);
+                } else if (typeof window.confirm === 'function') {
+                    ok = window.confirm(_msg);
+                } else {
+                    ok = true;
+                }
+                if (!ok) return;
+            }
+            clearConversation();
+        });
     }
 
     // ── Boutons d'exemples de questions ──

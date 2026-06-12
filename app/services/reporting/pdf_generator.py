@@ -25,6 +25,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from xml.sax.saxutils import escape as xml_escape
 
 from app.core import clock
+from app.services.reporting.number_format import format_number_preserving_nonzero
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -321,8 +322,11 @@ class PDFGenerator:
             elements.append(Spacer(1, 0.2 * cm))
             elements.append(Paragraph(xml_escape(description), self.styles["Normal"]))
 
-        # Date de génération
-        date_str = clock.now().strftime("%d/%m/%Y à %H:%M")
+        # Date de génération — heure SERVEUR (config.server.timezone) : un PDF est
+        # une sortie backend (pas de navigateur pour convertir), cf. doctrine
+        # d'affichage. clock.now_local() applique machine_tz (SSoT), au lieu de
+        # clock.now() qui rendait l'UTC brut (+4h pour America/Guadeloupe).
+        date_str = clock.now_local().strftime("%d/%m/%Y à %H:%M")
         elements.append(Spacer(1, 0.3 * cm))
         elements.append(Paragraph(f"<i>Généré le {date_str}</i>", self.styles["CustomSubtitle"]))
 
@@ -450,7 +454,9 @@ class PDFGenerator:
             # Formatter avec 2 décimales si nombre décimal
             if value % 1 == 0:
                 return str(int(value))
-            return f"{value:.2f}"
+            # #142 — SSoT anti-zéro-trompeur : un non-zéro ne doit JAMAIS s'afficher
+            # « 0.00 » (perte de donnée silencieuse pour le lecteur du PDF).
+            return format_number_preserving_nonzero(value, 2)
 
         return str(value)
 
@@ -569,7 +575,14 @@ class PDFGenerator:
             )
 
             if section.get("description"):
-                story.append(Paragraph(xml_escape(section["description"]), self.styles["Normal"]))
+                # Split sur \n\n (parité avec introduction/commentary) : sinon
+                # une note ajoutée en fin de description (ex. marqueur #87
+                # « N graphiques non affichés ») se collait inline au texte au
+                # lieu d'apparaître sur sa propre ligne.
+                for para in str(section["description"]).split("\n\n"):
+                    if para.strip():
+                        story.append(Paragraph(xml_escape(para.strip()), self.styles["Normal"]))
+                        story.append(Spacer(1, 0.2 * cm))
 
             story.append(Spacer(1, 0.3 * cm))
 

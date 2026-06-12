@@ -89,6 +89,7 @@ async def drain_agent_events(
     per_event_timeout_s: float,
     total_timeout_s: float,
     monotonic: Awaitable[float] | None = None,
+    interactive_event_types: "frozenset[str] | None" = None,
 ) -> AsyncIterator[AgentEvent]:
     """Yield les events du ``agent_generator`` avec timeouts.
 
@@ -124,6 +125,15 @@ async def drain_agent_events(
 
     _now = monotonic if monotonic is not None else time.monotonic
     start = _now()
+    _interactive = interactive_event_types or frozenset()
+    # L'event PRÉCÉDENT attend-il une réponse de l'utilisateur (consentement,
+    # clarification, question pipeline) ? Si oui, le prochain event peut tarder
+    # le temps que l'user réponde → on NE lui applique PAS le per-event timeout
+    # (sinon le run est tué à ``per_event_timeout_s`` avec un message « requête
+    # trop longue » trompeur ; cf. audit UX PIPE-2). On défère au wall-clock cap
+    # — les timeouts backend de chaque gate (consent 300s, ask_user 120s)
+    # ferment de toute façon avant.
+    last_was_interactive = False
 
     async with contextlib.aclosing(agent_generator) as _gen:
         _iter = _gen.__aiter__()
@@ -132,13 +142,13 @@ async def drain_agent_events(
             remaining_total = total_timeout_s - elapsed
             if remaining_total <= 0:
                 raise AgentRunWallClockTimeout(total_timeout_s, elapsed)
-            # Le wait_for effectif = min(per-event, restant total).
-            # Si le restant total est plus petit que per-event, on
-            # garde la promesse du wall-clock cap. Si l'event hit
-            # ce timeout réduit, on lève AgentEventTimeout mais
-            # avec la valeur effective (pas la constante per-event)
-            # — le caller peut log cette valeur si utile.
-            effective_timeout = min(per_event_timeout_s, remaining_total)
+            # Le wait_for effectif = min(per-event, restant total). Après un
+            # event interactif, ``base`` = restant total (pas de cap per-event)
+            # → l'user a jusqu'au wall-clock pour répondre. Si l'event hit ce
+            # timeout réduit, on lève AgentEventTimeout (sauf si le restant total
+            # dominait → wall-clock déguisé).
+            base = remaining_total if last_was_interactive else per_event_timeout_s
+            effective_timeout = min(base, remaining_total)
             try:
                 event = await asyncio.wait_for(
                     _iter.__anext__(),
@@ -154,6 +164,7 @@ async def drain_agent_events(
                 if effective_timeout == remaining_total:
                     raise AgentRunWallClockTimeout(total_timeout_s, _now() - start)
                 raise AgentEventTimeout(per_event_timeout_s)
+            last_was_interactive = str(event.get("type", "")) in _interactive
             yield event
 
 

@@ -225,7 +225,7 @@ async def send_workflow_step_email(
 
         from app.services.email.template_names import EmailTemplate
 
-        await smtp_client.send_email(
+        _send_res = await smtp_client.send_email(
             to_emails=valid,
             subject=subject,
             body_html=body_html,
@@ -235,6 +235,22 @@ async def send_workflow_step_email(
             sent_by_user_id=automation_user_id,
             template_name=EmailTemplate.DAG_EMAIL_STEP.value,
         )
+        # #52 — une pièce jointe SKIPPÉE (rapport trop volumineux, fichier
+        # purgé/symlink…) est sinon un angle mort : le mail part sans le
+        # fichier et le step est « success ». On remonte au caller via la
+        # liste `warnings` mutable (lue par l'executor → visible dans le
+        # détail du run / monitor) pour que David sache que le rapport
+        # configuré n'a PAS été joint.
+        for _sk in (_send_res or {}).get("skipped_attachments") or []:
+            _nm = _sk.get("name") if isinstance(_sk, dict) else None
+            _rs = _sk.get("reason") if isinstance(_sk, dict) else None
+            warnings.append(f"Pièce jointe NON envoyée : {_nm} ({_rs})")
+            logger.warning(
+                "Automation %d : pièce jointe non envoyée (%s) — %s",
+                automation_id,
+                _rs,
+                _nm,
+            )
     except Exception:
         logger.error(
             "Erreur envoi email workflow (automation %d)",
@@ -325,11 +341,14 @@ async def send_legacy_pipeline_email(
 
         renderer = get_renderer()
         duration = f"{execution_duration_seconds:.1f}s" if execution_duration_seconds else "N/A"
+        # Heure SERVEUR (config.server.timezone via clock.to_local) : un email est
+        # une sortie backend (aucun navigateur pour convertir). Avant : strftime
+        # sur l'UTC brut (+4h pour America/Guadeloupe). `or clock.now_local()` =
+        # filet mypy/runtime (to_local ne renvoie None que pour une valeur
+        # illisible, jamais le cas ici — execution_finished_at est un datetime).
         execution_date = (
-            execution_finished_at.strftime("%d/%m/%Y à %H:%M")
-            if execution_finished_at
-            else clock.now().strftime("%d/%m/%Y à %H:%M")
-        )
+            clock.to_local(execution_finished_at or clock.now()) or clock.now_local()
+        ).strftime("%d/%m/%Y à %H:%M")
 
         try:
             # Cluster-D 2026-05-26 — injecter company_name dans le contexte
@@ -422,8 +441,14 @@ async def send_execution_notification(
     fallback_owner_email: Optional[str],
     owner_is_active: bool,
     execution_id: Optional[int] = None,
+    paused_reason: Optional[str] = None,
 ) -> None:
     """Envoie une notification email sur succès ou échec d'exécution.
+
+    ENGINE-1 — si ``paused_reason`` est fourni, l'email inclut une bannière
+    « Automatisation mise en pause » en tête + un sujet ⏸ explicite. Le caller
+    DOIT forcer l'envoi dans ce cas (même si ``notify_on_failure=False``) : une
+    auto-pause silencieuse laisse l'owner croire que tout tourne.
 
     Best-effort : les erreurs de notification ne remontent JAMAIS au
     pipeline (catch-all + log). Le pipeline ne doit pas casser à cause
@@ -542,6 +567,53 @@ async def send_execution_notification(
             f'<td style="padding:6px 0">{exec_date}</td></tr>',
         ]
 
+        # ENGINE-1 — bannière de PAUSE AUTO en tête du contenu (index 3 = juste
+        # après l'ouverture du content div, avant le nom) : l'owner doit savoir
+        # que l'automatisation a été DÉSACTIVÉE, pas juste qu'un run a échoué.
+        if paused_reason == "once_completed":
+            # ENGINE-1-once (#50) — fin de vie ATTENDUE d'une automation « une
+            # fois » : cadrage NEUTRE/positif (bleu), PAS l'alerte jaune des
+            # pauses-erreur (qui alarmerait à tort sur un run RÉUSSI).
+            body_parts.insert(
+                3,
+                '<div style="margin:0 0 16px;padding:12px 14px;background:#eff6ff;'
+                "border:1px solid #bfdbfe;border-left:4px solid #2563eb;"
+                'border-radius:6px;font-size:13px;color:#1e40af">'
+                "<strong>&#10003; Automatisation « une fois » terminée.</strong> "
+                "Elle s'est exécutée comme prévu et est maintenant désactivée. "
+                "Réactivez-la depuis la page Automatisations pour la relancer."
+                "</div>",
+            )
+        elif paused_reason:
+            # Revue [3] — PAS de hardcode du nom d'app (white-label, axe 6) :
+            # on interpole le nom dynamique (get_company_name, même SSoT que le
+            # footer ci-dessous).
+            from app.services.branding import get_company_name as _get_company_name
+
+            _pause_app = _get_company_name()
+            _pause_labels = {
+                "too_many_failures": (
+                    f"Trop d'échecs consécutifs — {_pause_app} l'a désactivée "
+                    "pour éviter de répéter des exécutions ou envois en erreur."
+                ),
+                "data_access_denied": (
+                    "Un accès aux données requis a été retiré."
+                ),
+            }
+            _pause_label = _pause_labels.get(
+                paused_reason, "L'automatisation a été mise en pause automatiquement."
+            )
+            body_parts.insert(
+                3,
+                '<div style="margin:0 0 16px;padding:12px 14px;background:#fffbeb;'
+                "border:1px solid #fcd34d;border-left:4px solid #d97706;"
+                'border-radius:6px;font-size:13px;color:#92400e">'
+                "<strong>&#9888; Automatisation mise en pause.</strong> "
+                f"{html_escape(_pause_label)} "
+                "Réactivez-la depuis la page Automatisations après diagnostic."
+                "</div>",
+            )
+
         if success and execution_result_rows is not None:
             body_parts.append(
                 f'<tr><td style="padding:6px 0;color:#6b7280">Lignes</td>'
@@ -590,7 +662,12 @@ async def send_execution_notification(
         body_parts.append("</div></div>")
         body_html = "\n".join(body_parts)
 
-        subject = f"[{company_name}] {status_label} — {automation_name}"
+        if paused_reason and paused_reason != "once_completed":
+            subject = f"[{company_name}] ⏸ EN PAUSE — {automation_name}"
+        else:
+            # ENGINE-1-once (#50) — once_completed est un SUCCÈS attendu : garder
+            # le sujet de statut normal, PAS l'alarme « ⏸ EN PAUSE ».
+            subject = f"[{company_name}] {status_label} — {automation_name}"
 
         from app.services.email.smtp_factory import build_smtp_client_from_dict
 

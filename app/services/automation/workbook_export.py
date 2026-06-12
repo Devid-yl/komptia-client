@@ -178,13 +178,19 @@ def write_excel_multi_tabs(output_path: Path, tabs: List[Dict[str, Any]]) -> Non
             ws["A1"] = "(vide)"
             continue
         headers = list(tab.get("columns") or list(dict_rows[0].keys()))
+        # #30 fix 2026-06-11 (revue adv. → SSoT) — injection de formule (CWE-1236)
+        # neutralisée via ``excel_safe_cell`` (SSoT output_safety, partagée CSV/
+        # XLSX) : préfixe `'` sur =,+,-,@,tab,CR (pas seulement `=`), types natifs
+        # préservés. Avant : `data_type='f'→'s'` ne couvrait que `=`.
+        from app.utils.output_safety import excel_safe_cell
+
         for col_idx, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell = ws.cell(row=1, column=col_idx, value=excel_safe_cell(header))
             cell.font = Font(bold=True)
             cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         for row_idx, r in enumerate(dict_rows, 2):
             for col_idx, header in enumerate(headers, 1):
-                ws.cell(row=row_idx, column=col_idx, value=r.get(header))
+                ws.cell(row=row_idx, column=col_idx, value=excel_safe_cell(r.get(header)))
 
     if not wb.sheetnames:
         wb.create_sheet(title="Vide")

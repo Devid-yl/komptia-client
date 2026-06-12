@@ -58,7 +58,7 @@
                 <span class="text-sm text-gray-500 dark:text-gray-400">{{ (sync.get('error_message') or 'Erreur inconnue')[:80] }}</span>
                 {% end %}
             </div>
-            <span class="text-xs text-gray-500 dark:text-gray-400">{{ sync.created_at_formatted if hasattr(sync, 'created_at_formatted') else '-' }}</span>
+            <span class="text-xs text-gray-500 dark:text-gray-400"><time datetime="{{ sync.created_at if (hasattr(sync, 'created_at') and sync.created_at) else '' }}" data-fmt-local="datetime">{{ sync.created_at_formatted if hasattr(sync, 'created_at_formatted') else '-' }}</time></span>
         </div>
         {% end %}
     </div>
@@ -100,10 +100,12 @@
         <div class="flex items-center gap-2">
             <select id="filter-type" class="input text-sm">
                 <option value="">Tous les types</option>
-                <option value="ddl" {% if current_type == 'ddl' %}selected{% end %}>DDL (Tables/Vues)</option>
+                <option value="ddl" {% if current_type == 'ddl' %}selected{% end %}>DDL (Tables)</option>
+                <option value="view" {% if current_type == 'view' %}selected{% end %}>Vues SQL</option>
                 <option value="documentation" {% if current_type == 'documentation' %}selected{% end %}>Documentation</option>
                 <option value="question_sql" {% if current_type == 'question_sql' %}selected{% end %}>Question-SQL</option>
                 <option value="business_context" {% if current_type == 'business_context' %}selected{% end %}>Contexte métier</option>
+                <option value="pinned" {% if current_type == 'pinned' %}selected{% end %}>Connaissances épinglées</option>
             </select>
         </div>
     </div>
@@ -115,11 +117,17 @@
             <div class="p-4">
                 <div class="flex items-start justify-between gap-3">
                     {% set is_bc = item.data_type == 'documentation' and item.category == 'business_context' %}
+                    {% set is_pinned = item.data_type == 'documentation' and item.category == 'pinned_knowledge' %}
                     <div class="flex-1 min-w-0">
                         <!-- Ligne 1 : type + identifiant principal -->
                         <div class="flex items-center gap-2 mb-1 flex-wrap">
                             {% if item.data_type == 'ddl' %}
                             <span class="badge badge-neutral text-xs">DDL</span>
+                            {% if item.table_name %}
+                            <span class="font-semibold text-gray-900 dark:text-gray-100">{{ item.table_name }}</span>
+                            {% end %}
+                            {% elif item.data_type == 'view' %}
+                            <span class="badge badge-neutral text-xs" title="Vue SQL synchronisée depuis la base source">Vue</span>
                             {% if item.table_name %}
                             <span class="font-semibold text-gray-900 dark:text-gray-100">{{ item.table_name }}</span>
                             {% end %}
@@ -149,6 +157,8 @@
                             {% if bc_priority %}
                             <span class="text-xs text-gray-500 dark:text-gray-400">prio {{ bc_priority }}</span>
                             {% end %}
+                            {% elif is_pinned %}
+                            <span class="badge badge-primary text-xs" title="Toujours injectée dans le prompt d'Iris">Épinglée</span>
                             {% elif item.data_type == 'documentation' %}
                             <span class="badge badge-success text-xs">Doc</span>
                             {% if item.category %}
@@ -171,9 +181,15 @@
                         {% elif item.data_type == 'ddl' %}
                             {% set ddl_val = item.content or '' %}
                             <pre class="text-xs text-gray-500 bg-gray-50 rounded px-2 py-1 overflow-x-auto max-h-20 dark:bg-gray-900 dark:text-gray-400" style="white-space: pre-wrap; word-break: break-all;">{{ ddl_val[:200] }}{% if len(ddl_val) > 200 %}...{% end %}</pre>
+                        {% elif item.data_type == 'view' %}
+                            {% set view_val = item.content or '' %}
+                            <pre class="text-xs text-gray-500 bg-gray-50 rounded px-2 py-1 overflow-x-auto max-h-24 dark:bg-gray-900 dark:text-gray-400" style="white-space: pre-wrap; word-break: break-all;">{{ view_val[:300] }}{% if len(view_val) > 300 %}...{% end %}</pre>
                         {% elif is_bc %}
                             {% set bc_val = item.content or '' %}
                             <p class="text-sm text-gray-700 whitespace-pre-wrap dark:text-gray-300">{{ bc_val[:400] }}{% if len(bc_val) > 400 %}...{% end %}</p>
+                        {% elif is_pinned %}
+                            {% set pin_val = item.content or '' %}
+                            <pre class="text-xs text-gray-500 bg-gray-50 rounded px-2 py-1 overflow-x-auto max-h-32 dark:bg-gray-900 dark:text-gray-400" style="white-space: pre-wrap; word-break: break-word;">{{ pin_val[:400] }}{% if len(pin_val) > 400 %}...{% end %}</pre>
                         {% elif item.data_type == 'documentation' %}
                             {% set doc_val = item.content or '' %}
                             {% if doc_val.startswith('{') or doc_val.startswith('[') %}
@@ -217,20 +233,8 @@
         {% end %}
     </div>
 
-    <!-- Pagination -->
-    {% if training_data %}
-    <div class="flex items-center justify-center gap-2 pt-4 mt-4 border-t border-gray-200 dark:border-gray-800">
-        {% if current_page > 1 %}
-        <a href="?type={{ current_type or '' }}&page={{ current_page - 1 }}" class="btn btn-secondary text-xs py-1 px-2">Prec.</a>
-        {% end %}
-        <span class="text-sm text-gray-600 dark:text-gray-400">
-            Page {{ current_page }}{% if total_pages %} / {{ total_pages }}{% end %}
-        </span>
-        {% if current_page < total_pages %}
-        <a href="?type={{ current_type or '' }}&page={{ current_page + 1 }}" class="btn btn-secondary text-xs py-1 px-2">Suiv.</a>
-        {% end %}
-    </div>
-    {% end %}
+    {# Pagination unifiée (UIModule, cf. app/ui_modules.py) #}
+    {% module Pagination(page=current_page, total_pages=total_pages) %}
 </div>
 
 <!-- Datalist pour autocomplete des tables (alimentée au chargement) -->
@@ -255,6 +259,7 @@
                     <option value="question_sql">Question-SQL</option>
                     <option value="ddl">DDL (Table)</option>
                     <option value="business_context">Contexte métier (règle par tables)</option>
+                    <option value="pinned">Connaissance épinglée (toujours injectée)</option>
                 </select>
             </div>
 
@@ -514,6 +519,10 @@ function setModalMode(type, opts = {}) {
     const isQSQL = type === 'question_sql';
     const isDDL = type === 'ddl';
     const isDoc = type === 'documentation';
+    // Épinglée : aucun champ spécifique (ni catégorie, ni tags, ni tables) —
+    // seul le textarea « Contenu » est requis. Les groupes ci-dessous sont tous
+    // masqués car isQSQL/isBc/isDDL/isDoc sont faux pour ce type.
+    const isPinned = type === 'pinned';
 
     document.getElementById('questionField').style.display = isQSQL ? 'block' : 'none';
     document.getElementById('businessContextFields').style.display = isBc ? 'block' : 'none';
@@ -534,6 +543,8 @@ function setModalMode(type, opts = {}) {
             contentArea.placeholder = "CREATE TABLE clients (id INT PRIMARY KEY, nom VARCHAR(100), actif BIT);";
         } else if (isQSQL) {
             contentArea.placeholder = "SELECT * FROM clients WHERE actif = 1";
+        } else if (isPinned) {
+            contentArea.placeholder = "Fait critique TOUJOURS injecté dans le prompt d'Iris (indépendant du RAG). Décris le concept ET donne le SQL de référence. Ex : « Le CA d'une entité s'obtient via la vue viewGroupes01 : SELECT ... FROM Factures ... »";
         } else {
             contentArea.placeholder = "Explication libre d'une règle métier ou d'un concept.";
         }
@@ -545,6 +556,7 @@ function setModalMode(type, opts = {}) {
         'documentation': 'Modifier la documentation',
         'ddl': 'Modifier le DDL',
         'question_sql': 'Modifier la paire Question-SQL',
+        'pinned': 'Modifier la connaissance épinglée',
     };
     const title = opts.title
         || (opts.editing ? (defaultEditTitles[type] || 'Modifier la donnée') : "Ajouter des données d'entraînement");
@@ -578,7 +590,21 @@ function openEditModal(id) {
     // Déterminer le "type effectif" pour l'UI :
     // un documentation avec category == business_context est édité comme BC.
     const isBcRecord = item.category === 'business_context';
-    const effectiveType = isBcRecord ? 'business_context' : (item.data_type || 'documentation');
+    const isPinnedRecord = item.category === 'pinned_knowledge';
+    const effectiveType = isBcRecord
+        ? 'business_context'
+        : (isPinnedRecord ? 'pinned' : (item.data_type || 'documentation'));
+
+    // Les vues sont synchronisées depuis la base source : read-only ici. Les
+    // éditer n'aurait aucun effet sur SQL Server et serait écrasé au prochain
+    // sync — on bloque l'ouverture du modal plutôt que de laisser un état confus
+    // (le formulaire n'a pas de type "view"). Reset editingId pour ne pas laisser
+    // d'état d'édition pendouillant.
+    if (effectiveType === 'view') {
+        editingId = null;
+        showToast('Les vues sont synchronisées depuis la base source — non éditables ici.', 'info');
+        return;
+    }
 
     const dataTypeEl = document.getElementById('dataType');
     dataTypeEl.value = effectiveType;
@@ -695,6 +721,15 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {
             body.table_name = tableName;
         }
         if (isEdit) body.tags = tagsList;  // tags non exposés à la création DDL
+    } else if (dataType === 'pinned') {
+        if (!content) {
+            showToast('Le contenu est requis', 'error');
+            return;
+        }
+        body.content = content;
+        // Catégorie réservée (forcée aussi côté serveur) ; envoyée explicitement
+        // pour que l'édition ne « dé-épingle » pas la connaissance.
+        body.category = 'pinned_knowledge';
     } else {
         // documentation
         if (!content) {
@@ -1069,7 +1104,7 @@ document.addEventListener('click', (e) => {
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'admin_ai_training_v1',
+                key: 'admin_ai_training_v2',
                 title: 'Entraîner Iris sur votre base',
                 steps: [
                     {
@@ -1080,17 +1115,17 @@ document.addEventListener('click', (e) => {
                     {
                         icon: 'zap',
                         title: 'Synchronisation du schéma',
-                        text: 'Iris garde automatiquement à jour la structure de votre base (tables, colonnes, relations). La synchronisation s\'exécute selon la planification définie dans « Configuration IA » (/admin/ai-config), où vous pouvez aussi la déclencher manuellement. L\'historique en bas de cette page trace les synchronisations passées.'
+                        text: 'Iris garde automatiquement à jour la structure de votre base (tables, colonnes, relations). La synchronisation s\'exécute selon la planification définie dans « Configuration IA » (/admin/ai-config), où le bouton « Synchroniser maintenant » permet aussi de la déclencher à la demande. L\'« Historique des synchronisations » en bas de cette page trace les passages réussis ou en échec.'
                     },
                     {
                         icon: 'chart',
-                        title: 'Ajouter de la documentation métier',
-                        text: 'Le bouton « Ajouter des données » permet d\'enrichir Iris avec trois types d\'éléments : documentation métier (« le compte 411 désigne les clients »), DDL personnalisé (vues, contraintes), et paires question/SQL d\'exemple (« Top 10 clients par CA » → le SQL correspondant). Plus vous en ajoutez, plus Iris est précis.'
+                        title: 'Ajouter de la connaissance métier',
+                        text: 'Le bouton « Ajouter des données » ouvre un formulaire à quatre types : documentation (« le compte 411 désigne les clients »), paire Question-SQL d\'exemple (« Top 10 clients par CA » → le SQL correspondant), DDL d\'une table, et contexte métier — une règle injectée automatiquement dès qu\'Iris utilise une des tables que vous y associez. Plus vous en ajoutez, plus Iris est précis.'
                     },
                     {
                         icon: 'shield',
                         title: 'Modérer les apprentissages automatiques',
-                        text: 'Quand un utilisateur valide une réponse Iris (👍), elle arrive ici en « En attente d\'approbation ». Vous pouvez l\'approuver (Iris l\'utilisera comme référence) ou la rejeter (Iris l\'oubliera). Cela évite que des cas particuliers soient pris pour des règles générales.'
+                        text: 'Quand un utilisateur valide une réponse Iris (👍), la paire question/SQL arrive ici dans « En attente de validation ». Vous pouvez l\'« Approuver » (Iris l\'utilisera comme référence) ou la « Rejeter » (elle est désactivée). Cela évite qu\'un cas particulier soit pris pour une règle générale.'
                     }
                 ]
             });

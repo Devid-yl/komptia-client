@@ -74,6 +74,25 @@ from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Ce module est un DÉTECTEUR de « données fausses silencieuses » (cf. docstring) :
+# s'il se désactive lui-même EN SILENCE, on perd le filet sans le savoir — le pire
+# scénario. ``sqlglot`` est une dépendance (requirements) ; s'il manque (deploy
+# cassé), TOUTES les fonctions d'analyse AST renvoient ``[]`` et le cross-check est
+# SKIP silencieusement. On SIGNALE l'absence UNE FOIS au boot pour que la
+# désactivation du filet soit visible côté ops (les imports paresseux par fonction
+# restent en place pour une dégradation gracieuse).
+try:
+    import sqlglot as _sqlglot_probe  # noqa: F401
+
+    _SQLGLOT_AVAILABLE = True
+except ImportError:
+    _SQLGLOT_AVAILABLE = False
+    logger.warning(
+        "cross_check_post_execution : sqlglot INDISPONIBLE — le détecteur de "
+        "résultats SQL faux (cross-check post-exécution) est DÉSACTIVÉ. Installer "
+        "sqlglot (requirements) pour réactiver ce filet de sécurité."
+    )
+
 
 # ════════════════════════════════════════════════════════════════════════
 # Constants — surchargables au call site (audit-friendly ici)

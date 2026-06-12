@@ -58,7 +58,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.config import get_config
 from app.core.database import get_session
 from app.handlers.base import BaseHandler, admin_required
-from app.models.base import ensure_utc
+from app.models.base import ensure_utc, iso_or_none
 from app.models.session import Session as SessionModel
 from app.models.user import User, UserRole
 from app.services.admin_service import (
@@ -70,6 +70,7 @@ from app.services.admin_service import (
     purge_user_owned_data,
     revoke_user_sessions,
 )
+from app.core.constants_auth import PASSWORD_MAX_BYTES, password_exceeds_bcrypt_limit
 from app.models.audit import AuditAction
 from app.services.audit import audit_event, record_audit_best_effort
 from app.services.auth.password_hasher import PasswordHasher
@@ -227,6 +228,16 @@ def _validate_create_user(data: dict[str, Any]) -> list[dict[str, str]]:
                 "message": (f"Le mot de passe doit faire au moins {_PASSWORD_MIN_LEN} caractères"),
             }
         )
+    elif password_exceeds_bcrypt_limit(password):
+        # bcrypt n'utilise que les 72 premiers octets — au-delà, rejet explicite
+        # (cf. app.core.constants_auth.PASSWORD_MAX_BYTES, SSoT).
+        errors.append(
+            {
+                "field": "password",
+                "error": "Invalid password",
+                "message": (f"Le mot de passe ne peut pas dépasser {PASSWORD_MAX_BYTES} octets."),
+            }
+        )
 
     role_raw = _coerce_str(data.get("role", "user")).lower() or "user"
     try:
@@ -299,8 +310,12 @@ class AdminHandler(BaseHandler):
         # Le ``search`` est ensuite envoyé comme ``%search%`` à SQLite ;
         # sans cap, 100KB → full-scan + log spam.
         search = _coerce_str(self.get_argument("search", ""), max_len=_QUERY_PARAM_MAX_LEN)
-        role_filter = _coerce_str(self.get_argument("role", ""), max_len=_QUERY_PARAM_MAX_LEN).lower()
-        status_filter = _coerce_str(self.get_argument("status", ""), max_len=_QUERY_PARAM_MAX_LEN).lower()
+        role_filter = _coerce_str(
+            self.get_argument("role", ""), max_len=_QUERY_PARAM_MAX_LEN
+        ).lower()
+        status_filter = _coerce_str(
+            self.get_argument("status", ""), max_len=_QUERY_PARAM_MAX_LEN
+        ).lower()
 
         sort_by = _coerce_str(self.get_argument("sort", "created_at"))
         if sort_by not in _SORT_ALLOWED:
@@ -360,9 +375,7 @@ class AdminHandler(BaseHandler):
                 total_users = int(
                     (
                         await asyncio.wait_for(
-                            session.execute(
-                                select(func.count()).select_from(count_subquery)
-                            ),
+                            session.execute(select(func.count()).select_from(count_subquery)),
                             timeout=_ADMIN_SELECT_TIMEOUT_S,
                         )
                     ).scalar()
@@ -370,8 +383,7 @@ class AdminHandler(BaseHandler):
                 )
             except (asyncio.TimeoutError, SQLAlchemyError):
                 logger.warning(
-                    "AdminHandler.get: COUNT total_users a timeout/error — "
-                    "dégradé total_users=0"
+                    "AdminHandler.get: COUNT total_users a timeout/error — " "dégradé total_users=0"
                 )
                 stats_degraded = True
                 total_users = 0
@@ -381,15 +393,18 @@ class AdminHandler(BaseHandler):
 
             try:
                 users_orm = (
-                    await asyncio.wait_for(
-                        session.execute(paged_query),
-                        timeout=_ADMIN_SELECT_TIMEOUT_S,
+                    (
+                        await asyncio.wait_for(
+                            session.execute(paged_query),
+                            timeout=_ADMIN_SELECT_TIMEOUT_S,
+                        )
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
             except (asyncio.TimeoutError, SQLAlchemyError):
                 logger.warning(
-                    "AdminHandler.get: SELECT users a timeout/error — "
-                    "dégradé liste vide"
+                    "AdminHandler.get: SELECT users a timeout/error — " "dégradé liste vide"
                 )
                 stats_degraded = True
                 users_orm = []
@@ -827,6 +842,20 @@ class UserAPIHandler(BaseHandler):
                                 }
                             )
                             return
+                        if password_exceeds_bcrypt_limit(password):
+                            # bcrypt ignore les octets au-delà du 72e (SSoT :
+                            # app.core.constants_auth.PASSWORD_MAX_BYTES).
+                            self.set_status(400)
+                            self.write(
+                                {
+                                    "error": "Invalid password",
+                                    "message": (
+                                        f"Le mot de passe ne peut pas dépasser "
+                                        f"{PASSWORD_MAX_BYTES} octets."
+                                    ),
+                                }
+                            )
+                            return
                         user.password_hash = PasswordHasher().hash_password(password)
                         # Changement de mot de passe ⇒ sessions à révoquer
                         # (best practice OWASP : forcer re-login après rotation).
@@ -1028,9 +1057,7 @@ class UserBulkAPIHandler(BaseHandler):
             self.write(
                 {
                     "error": "Bad request",
-                    "message": (
-                        f"Action invalide. Attendu : {sorted(_USER_BULK_ACTIONS)}."
-                    ),
+                    "message": (f"Action invalide. Attendu : {sorted(_USER_BULK_ACTIONS)}."),
                 }
             )
             return
@@ -1091,10 +1118,10 @@ class UserBulkAPIHandler(BaseHandler):
         try:
             async with get_session() as session:
                 rows = (
-                    await session.execute(
-                        select(User).where(User.id.in_(user_ids))
-                    )
-                ).scalars().all()
+                    (await session.execute(select(User).where(User.id.in_(user_ids))))
+                    .scalars()
+                    .all()
+                )
                 found_map = {u.id: u for u in rows}
 
                 missing = [uid for uid in user_ids if uid not in found_map]
@@ -1103,9 +1130,7 @@ class UserBulkAPIHandler(BaseHandler):
                     self.write(
                         {
                             "error": "Not found",
-                            "message": (
-                                f"{len(missing)} utilisateur(s) introuvable(s)."
-                            ),
+                            "message": (f"{len(missing)} utilisateur(s) introuvable(s)."),
                             "missing_user_ids": missing,
                         }
                     )
@@ -1115,9 +1140,7 @@ class UserBulkAPIHandler(BaseHandler):
                 # qui SERAIENT touchés ; si on en supprime/désactive tous, on
                 # garde au moins 1 admin actif après le batch. ``ensure_not_last_admin``
                 # est par-row, donc on doit l'orchestrer ici.
-                admin_targets = [
-                    u for u in rows if u.role == UserRole.ADMIN and u.is_active
-                ]
+                admin_targets = [u for u in rows if u.role == UserRole.ADMIN and u.is_active]
                 if admin_targets:
                     total_active_admins = (
                         await session.execute(
@@ -1274,9 +1297,9 @@ class UserSessionsAPIHandler(BaseHandler):
                 sessions_data = [
                     {
                         "id": s.id,
-                        "created_at": s.created_at.isoformat(),
-                        "expires_at": s.expires_at.isoformat(),
-                        "last_activity": s.last_activity.isoformat() if s.last_activity else None,
+                        "created_at": iso_or_none(s.created_at),
+                        "expires_at": iso_or_none(s.expires_at),
+                        "last_activity": iso_or_none(s.last_activity),
                         "ip_address": s.ip_address,
                         "user_agent": s.user_agent,
                         "is_active": s.is_active,

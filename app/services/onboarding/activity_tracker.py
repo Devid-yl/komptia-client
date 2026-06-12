@@ -521,13 +521,12 @@ def cleanup_orphan_activity_summaries_sync() -> int:
     Retourne le nombre de lignes supprimées (pour log/monitoring).
     Sync car APScheduler crée son propre engine.
     """
-    from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    from app.core.database import get_db_url
+    from app.core.database import make_sync_engine
 
     try:
-        engine = create_engine(get_db_url())
+        engine = make_sync_engine()
         try:
             with Session(engine) as session:
                 # Supprime les rows dont user_id n'est pas dans users.id.

@@ -497,6 +497,36 @@ async def format_workbook_for_automation(
             "dans la sortie copilot."
         )
 
+    # **Garde workbook vide (fix 2026-06-10, consequences.md axe 5)** : un
+    # onglet transforme avec columns non vides mais rows=[] (« filtre
+    # total » : aucune ligne ne matche) traversait le DAG comme un SUCCES —
+    # les steps suivants (rapport PDF, export, email) operaient sur du vide
+    # sans aucun signal. Doctrine :
+    #  * TOUS les onglets sortants vides → erreur explicite (le DAG n'a
+    #    plus AUCUNE donnee a traiter, continuer n'a pas de sens) ;
+    #  * onglet transforme vide mais d'autres onglets ont des donnees →
+    #    warning structure dans le rapport d'execution (SSoT
+    #    output_workbook["warnings"], surface par l'executor).
+    transformed_rows_count = len(transformed_tab.get("rows") or [])
+    all_tabs_empty = all(
+        not (t.get("rows") or []) for t in output_workbook["tabs"] if isinstance(t, dict)
+    )
+    if transformed_rows_count == 0 and all_tabs_empty:
+        raise CopilotAutomationError(
+            f"format_copilot : l'onglet transforme '{active_label}' est VIDE "
+            "(0 ligne — l'instruction a probablement filtre toutes les lignes) "
+            "et aucun autre onglet du classeur ne contient de donnees. "
+            "Execution interrompue plutot que de produire un rapport/export vide. "
+            "Verifiez l'instruction de transformation ou les donnees sources."
+        )
+    if transformed_rows_count == 0:
+        output_workbook["warnings"].append(
+            f"format_copilot : l'onglet transforme '{active_label}' est VIDE "
+            "(0 ligne apres transformation — filtre total ?). Les steps "
+            "suivants opereront sur les autres onglets ; verifiez que c'est "
+            "intentionnel."
+        )
+
     metrics = result.get("metrics") or {}
     # Gate sur metrics non-vide : sinon le warning ne contient que des "?"
     # qui pollue l'UI sans information utile (le copilot peut ne pas

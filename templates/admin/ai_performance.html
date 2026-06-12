@@ -324,7 +324,7 @@
     <div class="card">
         <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between dark:border-gray-800">
             <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Requêtes récentes</h2>
-            <span class="text-xs text-gray-500 dark:text-gray-400">20 dernières · toutes périodes</span>
+            <span class="text-xs text-gray-500 dark:text-gray-400">{{ recent_total }} requête{% if recent_total > 1 %}s{% end %} · toutes périodes</span>
         </div>
         <div class="overflow-x-auto">
             <table class="w-full text-sm">
@@ -370,6 +370,8 @@
                 </tbody>
             </table>
         </div>
+        {# Pagination unifiée du tableau « Requêtes récentes » (UIModule, préserve ?days=) #}
+        {% module Pagination(page=current_page, total_pages=total_pages) %}
     </div>
 
 </div>
@@ -479,7 +481,7 @@ _aipCharts.push(_ragChart);
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'admin_ai_performance_v1',
+                key: 'admin_ai_performance_v2',
                 title: 'Surveiller les performances d\'Iris',
                 steps: [
                     {
@@ -490,17 +492,17 @@ _aipCharts.push(_ragChart);
                     {
                         icon: 'chart',
                         title: 'Comparer les modèles',
-                        text: 'Le tableau « Comparaison des modèles » montre, pour chaque modèle utilisé, le volume de requêtes, le taux de satisfaction et le coût moyen. Utile pour décider s\'il vaut mieux basculer sur un modèle moins cher ou plus performant.'
+                        text: 'Le tableau « Comparaison des modèles LLM » montre, pour chaque modèle utilisé, le volume de requêtes, le taux de réussite, la satisfaction, le temps moyen de génération et le nombre de tokens par requête. Utile pour décider s\'il vaut mieux basculer sur un modèle moins cher ou plus performant.'
                     },
                     {
                         icon: 'bell',
                         title: 'Suivre le budget',
-                        text: 'Le graphique « Coûts estimés par modèle » affiche les dépenses sur la période sélectionnée. Si vous avez configuré un budget mensuel, un bandeau d\'alerte apparaît automatiquement quand vous approchez de la limite.'
+                        text: 'Le tableau « Coûts estimés par modèle » affiche les dépenses sur la période sélectionnée (7, 30 ou 90 jours, via le sélecteur en haut à droite). Si un modèle consommé n\'a pas de tarif configuré, le KPI « Coût estimé » vous alerte que le total est sous-estimé, avec un lien direct pour corriger le tarif.'
                     },
                     {
                         icon: 'shield',
                         title: 'Détecter les pannes externes',
-                        text: 'La carte « Santé des fournisseurs » teste régulièrement la disponibilité des fournisseurs IA. Un statut rouge signifie que les utilisateurs vont avoir des erreurs côté Iris — pensez à vérifier la page d\'état du fournisseur et à prévenir si nécessaire.'
+                        text: 'La carte « Santé des fournisseurs » teste la disponibilité des fournisseurs IA (résultat mis en cache 5 min, rechargez pour rafraîchir). Un badge rouge « Indisponible » signifie que les utilisateurs vont avoir des erreurs côté Iris — pensez à vérifier la page d\'état du fournisseur et à prévenir si nécessaire.'
                     }
                 ]
             });

@@ -324,7 +324,7 @@
             </div>
 
             <!-- Toolbar -->
-            <div class="flex items-center gap-2 mb-3">
+            <div class="flex flex-wrap items-center gap-2 mb-3">
                 <button id="ds-btn-back" class="hidden px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-600 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-400" title="Dossier parent">
                     <svg class="w-3.5 h-3.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18"/></svg>
                     Retour
@@ -337,7 +337,20 @@
                     <svg class="w-3.5 h-3.5 inline mr-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4 7c0-1.657 3.582-3 8-3s8 1.343 8 3-3.582 3-8 3-8-1.343-8-3z"/><path stroke-linecap="round" stroke-linejoin="round" d="M4 7v5c0 1.657 3.582 3 8 3 1.084 0 2.121-.082 3.072-.232M20 7v4"/><path stroke-linecap="round" stroke-linejoin="round" d="M18 14v6m3-3h-6"/></svg>
                     Nouveau SQL
                 </button>
-                <input id="ds-search" type="text" placeholder="Filtrer..." class="ml-auto px-2.5 py-1 text-xs border border-gray-200 rounded-md w-40 focus:outline-none focus:ring-1 focus:ring-gray-300 dark:border-gray-800">
+                {# Groupe droit (tri + recherche) : ml-auto STRUCTUREL sur le
+                   conteneur (pas épinglé à un bouton) → l'alignement à droite
+                   survit si un contrôle est masqué. flex-wrap de la toolbar +
+                   w-full sm:w-40 sur la recherche = pas d'overflow sur mobile. #}
+                <div class="ml-auto flex items-center gap-2 min-w-0">
+                    <button id="ds-btn-sort" type="button" aria-haspopup="menu" aria-expanded="false"
+                            class="px-2.5 py-1 text-xs border border-gray-200 rounded-md hover:bg-gray-50 text-gray-600 dark:hover:bg-gray-800 dark:border-gray-800 dark:text-gray-400 inline-flex items-center gap-1"
+                            title="Trier les fichiers et dossiers" aria-label="Trier les fichiers et dossiers">
+                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7.5h11M3 12h7M3 16.5h4M17 5.25v13.5m0 0l-3-3m3 3l3-3"/></svg>
+                        Trier
+                        <span id="ds-sort-dir" class="w-2 text-center" aria-hidden="true"></span>
+                    </button>
+                    <input id="ds-search" type="text" placeholder="Filtrer..." class="px-2.5 py-1 text-xs border border-gray-200 rounded-md w-32 sm:w-40 focus:outline-none focus:ring-1 focus:ring-gray-300 dark:border-gray-800">
+                </div>
             </div>
 
             <!-- Drop zone / File list -->
@@ -520,6 +533,27 @@
     <button id="ctx-delete" role="menuitem" class="w-full text-left px-3 py-1.5 hover:bg-red-50 text-red-600 dark:text-red-400 dark:hover:bg-red-900/20">Supprimer</button>
 </div>
 
+<!-- Sort menu (déroulant ancré au bouton « Trier ») — même style que le menu
+     contextuel (.ctx-menu, dark-mode). role=menu + menuitemradio (a11y). -->
+<div id="ds-sort-menu" role="menu" aria-label="Trier par" class="ctx-menu fixed z-50 hidden bg-white border border-gray-200 rounded-md py-1 min-w-[210px] text-xs dark:bg-gray-900 dark:border-gray-800">
+    <div class="px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">Trier par</div>
+    <button data-sort-key="name" role="menuitemradio" aria-checked="true" class="ds-sort-item w-full flex items-center justify-between gap-4 px-3 py-1.5 text-left hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">
+        <span>Nom</span><span class="ds-sort-arrow text-brand-600 dark:text-brand-400" aria-hidden="true"></span>
+    </button>
+    <button data-sort-key="modified" role="menuitemradio" aria-checked="false" class="ds-sort-item w-full flex items-center justify-between gap-4 px-3 py-1.5 text-left hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">
+        <span>Date de modification</span><span class="ds-sort-arrow text-brand-600 dark:text-brand-400" aria-hidden="true"></span>
+    </button>
+    <button data-sort-key="size" role="menuitemradio" aria-checked="false" class="ds-sort-item w-full flex items-center justify-between gap-4 px-3 py-1.5 text-left hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">
+        <span>Taille</span><span class="ds-sort-arrow text-brand-600 dark:text-brand-400" aria-hidden="true"></span>
+    </button>
+    <button data-sort-key="type" role="menuitemradio" aria-checked="false" class="ds-sort-item w-full flex items-center justify-between gap-4 px-3 py-1.5 text-left hover:bg-gray-50 text-gray-700 dark:hover:bg-gray-800 dark:text-gray-300">
+        <span>Type</span><span class="ds-sort-arrow text-brand-600 dark:text-brand-400" aria-hidden="true"></span>
+    </button>
+    <div class="mt-1 pt-1 border-t border-gray-100 dark:border-gray-800 px-3 py-1 text-[10px] leading-snug text-gray-400 dark:text-gray-500">
+        Astuce : re-cliquez sur le critère actif pour inverser l'ordre (↑ / ↓).
+    </div>
+</div>
+
 <!-- Move Modal -->
 <div id="modal-move" class="fixed inset-0 z-50 hidden">
     <div class="modal-backdrop absolute inset-0"></div>
@@ -542,12 +576,9 @@
 {% include "partials/external_sheets_modal.html" %}
 
 <script src="{{ static_url('js/components/external_sheets_picker.js') }}" nonce="{{ handler.csp_nonce }}"></script>
-{# Tokenizer d'anonymisation — miroir Py↔JS partagé. Charger AVANT
-   iris-grid.js (qui y délègue tokenize/auto-pseudo via window.AnonTokenizer). #}
-<script src="{{ static_url('js/anonymization/tokenizer.js') }}" nonce="{{ handler.csp_nonce }}"></script>
-{# Helpers de save anonymisation (validation client + format state_errors).
-   Source de vérité unique consommée par iris-grid.js ET privacy-page.js. #}
-<script src="{{ static_url('js/anonymization/save-helpers.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# Hard-deps du grid (tokenizer + save-helpers + grid-store), ordre garanti.
+   SSoT : templates/partials/_grid_deps.html (idem iris/dashboard/automations). #}
+{% include "partials/_grid_deps.html" %}
 {# Détail d'un terme anonymisé (coverage + audit). Chargé sur /datastore pour
    que le modal "Confidentialité" d'iris-grid puisse ouvrir le panneau détail.
    Le composant crée son DOM à la volée — pas de markup côté template. #}
@@ -565,6 +596,21 @@ const DS = {
     pendingFiles: [],
     previewPath: null,
     ctxPath: null,
+
+    // ─── Tri (préférence d'affichage) ───────────────────
+    // Tri PUREMENT côté client : la liste n'est pas paginée, elle est déjà en
+    // mémoire dans this.items → tri instantané, zéro round-trip, zéro surface
+    // backend (le serveur garde son ordre par défaut folders-first + alpha).
+    // Persisté par utilisateur dans localStorage (clé scopée user-id — doctrine
+    // anti cross-user leak). Folders-first est un INVARIANT (norme explorateur
+    // de fichiers, == défaut serveur) appliqué DANS _compareItems.
+    sortKey: 'name',   // 'name' | 'modified' | 'size' | 'type'
+    sortDir: 'asc',    // 'asc' | 'desc'
+    // WHITELIST des clés de tri valides (seules les CLÉS comptent — validation
+    // de la pref chargée + de selectSort). Les libellés VISIBLES canoniques
+    // vivent dans le DOM du menu (#ds-sort-menu) : l'aria-label du bouton en
+    // est dérivé → une seule source d'affichage, pas de doublon à resynchroniser.
+    _SORT_LABELS: { name: 1, modified: 1, size: 1, type: 1 },
 
     // ─── Workbook detection ─────────────────────────────
     // Convention serveur (`_list_classeurs_sync`) : fichier .json dont le nom
@@ -694,6 +740,11 @@ const DS = {
     renderList() {
         const container = document.getElementById('ds-file-list');
         const empty = document.getElementById('ds-empty');
+        // Masque « Trier » quand il n'y a AUCUN item (rien à trier) — cohérent
+        // avec ds-btn-selectall. Basé sur this.items (pas filtered) : si un
+        // filtre masque tout, le tri reste pertinent et le bouton reste visible.
+        const sortBtn = document.getElementById('ds-btn-sort');
+        if (sortBtn) sortBtn.classList.toggle('hidden', this.items.length === 0);
         const filter = (document.getElementById('ds-search')?.value || '').toLowerCase();
         const filtered = filter ? this.items.filter(i => i.name.toLowerCase().includes(filter)) : this.items;
 
@@ -704,7 +755,13 @@ const DS = {
         }
         empty.classList.add('hidden');
 
-        container.innerHTML = filtered.map(item => {
+        // Tri d'affichage sur une COPIE (slice) : ne mute pas this.items.
+        // Sélection (this.selected), preview et drag sont indexés par PATH —
+        // l'ordre d'affichage est donc purement cosmétique et sûr à réordonner.
+        // Folders-first est garanti par _compareItems (invariant explorateur).
+        const sorted = filtered.slice().sort((a, b) => this._compareItems(a, b, this.sortKey, this.sortDir));
+
+        container.innerHTML = sorted.map(item => {
             const sel = this.selected.has(item.path) ? 'selected' : '';
             const isWb = !item.is_dir && this.isWorkbookFile(item);
             const isSql = !item.is_dir && this.isSqlFile(item);
@@ -817,6 +874,238 @@ const DS = {
     },
 
     filter(val) { this.renderList(); },
+
+    // ─── Tri : comparateur + persistance + menu ─────────
+
+    // Comparateur PUR (ne lit pas `this` → testable isolément, cf.
+    // tests/js/test_datastore_sort.mjs). Retourne <0, 0 ou >0.
+    // Invariants : (1) dossiers TOUJOURS avant fichiers, quel que soit le
+    // champ/direction ; (2) tri stable et déterministe via un tiebreak sur le
+    // nom (ascendant) ; (3) tolérance aux champs absents (jamais d'exception).
+    // === DATASTORE_SORT_COMPARATOR_START ===
+    _compareItems(a, b, sortKey, sortDir) {
+        // (1) Dossiers d'abord (norme explorateur = défaut serveur). is_dir
+        // coercé en booléen : un item synthétique sans is_dir (futur) ne casse
+        // pas l'invariant. Retour NON multiplié par dir → tient en asc ET desc.
+        var ad = !!a.is_dir, bd = !!b.is_dir;
+        if (ad !== bd) return ad ? -1 : 1;
+        var dir = (sortDir === 'desc') ? -1 : 1;
+        // Collation 'fr' explicite → ordre déterministe et stable cross-navigateur
+        // (sinon la locale runtime varie). C'est de la collation d'AFFICHAGE,
+        // pas une règle métier liée à une BDD (généricité respectée).
+        var primary = 0;
+        if (sortKey === 'modified') {
+            // ISO 8601 → timestamp ; champ absent/illisible → 0 (epoch).
+            primary = (Date.parse(a.modified) || 0) - (Date.parse(b.modified) || 0);
+        } else if (sortKey === 'size') {
+            primary = (a.size || 0) - (b.size || 0);
+        } else if (sortKey === 'type') {
+            // Par extension (insensible à la casse/accents). Les dossiers
+            // (extension '') sont déjà séparés par le groupe ci-dessus.
+            primary = String(a.extension || '').localeCompare(
+                String(b.extension || ''), 'fr', { sensitivity: 'base' });
+        } else { // 'name' (défaut)
+            primary = String(a.name || '').localeCompare(
+                String(b.name || ''), 'fr', { numeric: true, sensitivity: 'base' });
+        }
+        if (primary !== 0) return primary * dir;
+        // (2) Tiebreak déterministe : nom ascendant, tri naturel (file2<file10).
+        return String(a.name || '').localeCompare(
+            String(b.name || ''), 'fr', { numeric: true, sensitivity: 'base' });
+    },
+    // === DATASTORE_SORT_COMPARATOR_END ===
+
+    // Clé localStorage SCOPÉE par user-id (anti cross-user leak — doctrine
+    // feedback_localstorage_cross_user_leak). Lit le meta injecté par base.html.
+    _sortStorageKey() {
+        var uid = 'anon';
+        try {
+            var meta = document.querySelector('meta[name="komptia-user-id"]');
+            if (meta && meta.content) uid = String(meta.content);
+        } catch (e) { /* defensive */ }
+        return 'komptia_datastore_sort_u' + uid;
+    },
+
+    _loadSortPref() {
+        try {
+            var raw = localStorage.getItem(this._sortStorageKey());
+            if (!raw) return;
+            var parsed = JSON.parse(raw);
+            // Validation stricte : clé dans la whitelist + direction connue.
+            // Donnée corrompue / clé obsolète → on garde le défaut (name asc).
+            if (parsed && this._SORT_LABELS[parsed.key]) this.sortKey = parsed.key;
+            if (parsed && (parsed.dir === 'asc' || parsed.dir === 'desc')) this.sortDir = parsed.dir;
+        } catch (e) { /* absent / JSON cassé / mode privé → défaut */ }
+    },
+
+    _saveSortPref() {
+        try {
+            localStorage.setItem(
+                this._sortStorageKey(),
+                JSON.stringify({ key: this.sortKey, dir: this.sortDir })
+            );
+        } catch (e) { /* quota / mode privé → non persisté, non bloquant */ }
+    },
+
+    // Applique un choix de tri. Même clé → bascule la direction ; nouvelle
+    // clé → direction ascendante. Persiste, met à jour l'UI, re-rend, ferme.
+    selectSort(key) {
+        if (!this._SORT_LABELS[key]) return;
+        if (this.sortKey === key) {
+            this.sortDir = (this.sortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+            this.sortKey = key;
+            this.sortDir = 'asc';
+        }
+        this._saveSortPref();
+        this._updateSortMenuUI();
+        this.renderList();
+        this.hideSortMenu();
+    },
+
+    _updateSortMenuUI() {
+        var self = this;  // ne pas dépendre du global DS dans le forEach
+        var arrow = (this.sortDir === 'asc') ? '↑' : '↓';
+        var sens = (this.sortDir === 'asc') ? 'croissant' : 'décroissant';
+        var btn = document.getElementById('ds-btn-sort');
+        // Indicateur bouton = flèche SEULE (largeur fixe → ne casse pas le
+        // rythme de la toolbar, pas d'overflow mobile). Le champ courant est
+        // visible dans le menu (ligne active) + annoncé via aria-label.
+        var dirEl = document.getElementById('ds-sort-dir');
+        if (dirEl) dirEl.textContent = arrow;
+        var items = document.querySelectorAll('#ds-sort-menu .ds-sort-item');
+        items.forEach(function (it) {
+            var k = it.getAttribute('data-sort-key');
+            var ar = it.querySelector('.ds-sort-arrow');
+            var active = (k === self.sortKey);
+            it.setAttribute('aria-checked', active ? 'true' : 'false');
+            if (ar) ar.textContent = active ? arrow : '';
+            it.classList.toggle('bg-gray-50', active);
+            it.classList.toggle('dark:bg-gray-800', active);
+            // aria-label du bouton dérivé du libellé VISIBLE du menu (source
+            // unique) + sens — annonce l'état courant aux lecteurs d'écran,
+            // sans dupliquer les libellés ni encombrer la toolbar.
+            if (active && btn) {
+                var lbl = it.querySelector('span');
+                btn.setAttribute(
+                    'aria-label',
+                    'Trier les fichiers et dossiers (tri actuel : '
+                    + (lbl ? lbl.textContent : '') + ', ' + sens + ')'
+                );
+            }
+        });
+    },
+
+    toggleSortMenu() {
+        var menu = document.getElementById('ds-sort-menu');
+        if (!menu) return;
+        if (!menu.classList.contains('hidden')) { this.hideSortMenu(); return; }
+        this._showSortMenu();
+    },
+
+    // Ouvre le menu de tri ancré sous le bouton « Trier ». Pattern aligné sur
+    // le menu contextuel (OverlayManager dropdown : Escape LIFO + dismiss des
+    // autres dropdowns ; anti-overflow viewport ; click-outside via mousedown ;
+    // close on scroll/resize). Handlers DÉDIÉS (≠ ceux du menu contextuel) pour
+    // ne pas se clobber mutuellement.
+    _showSortMenu() {
+        var menu = document.getElementById('ds-sort-menu');
+        var btn = document.getElementById('ds-btn-sort');
+        if (!menu || !btn) return;
+        this._removeSortHandlers();
+        this._updateSortMenuUI();
+
+        var r = btn.getBoundingClientRect();
+        menu.style.left = r.left + 'px';
+        menu.style.top = (r.bottom + 4) + 'px';
+        menu.classList.remove('hidden');
+
+        if (window.OverlayManager && typeof window.OverlayManager.open === 'function') {
+            // onClose : OverlayManager.close() (déclenché par Escape OU par le
+            // dismiss-previous d'un autre dropdown) ne masque PAS l'élément et
+            // ne retire pas nos handlers — ce callback s'en charge. close()
+            // retire l'entrée du stack AVANT d'appeler onClose → le re-close
+            // dans hideSortMenu() est un no-op : aucune récursion.
+            try { window.OverlayManager.open(menu, { layer: 'dropdown', onClose: () => this.hideSortMenu() }); }
+            catch (e) { /* dégradation : le menu reste fonctionnel sans OM */ }
+        }
+        btn.setAttribute('aria-expanded', 'true');
+
+        // Anti-overflow (après affichage, sinon getBoundingClientRect = 0).
+        var rect = menu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) {
+            menu.style.left = Math.max(0, window.innerWidth - rect.width - 4) + 'px';
+        }
+        if (rect.bottom > window.innerHeight) {
+            menu.style.top = Math.max(0, r.top - rect.height - 4) + 'px';
+        }
+
+        var self = this;
+        var closeOnOutside = function (e) {
+            if (!menu.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+                self.hideSortMenu();
+            }
+        };
+        this._sortOutsideHandler = closeOnOutside;
+        // setTimeout(0) : ne pas capter le mousedown qui vient d'ouvrir le menu.
+        setTimeout(function () { document.addEventListener('mousedown', closeOnOutside); }, 0);
+
+        var closeOnViewportChange = function () { self.hideSortMenu(); };
+        this._sortViewportHandler = closeOnViewportChange;
+        window.addEventListener('scroll', closeOnViewportChange, { once: true, capture: true, passive: true });
+        window.addEventListener('resize', closeOnViewportChange, { once: true, passive: true });
+
+        // a11y : focus le 1er item. ↑/↓/Home/Fin naviguent (cf. _onSortMenuKey,
+        // câblé en init) ; Escape ferme via OverlayManager (onClose → hideSortMenu).
+        var first = menu.querySelector('.ds-sort-item');
+        if (first) { try { first.focus(); } catch (e) { /* ignore */ } }
+    },
+
+    // Navigation clavier WAI-ARIA du menu de tri (role=menu) : ↑/↓ déplacent le
+    // focus entre options (roving), Home/Fin aux extrémités, Escape ferme.
+    // Enter/Espace activent nativement (ce sont des <button>).
+    _onSortMenuKey(e) {
+        var items = Array.prototype.slice.call(
+            document.querySelectorAll('#ds-sort-menu .ds-sort-item'));
+        if (!items.length) return;
+        var idx = items.indexOf(document.activeElement);
+        var self = this;
+        var focusAt = function (i) {
+            var n = items.length;
+            var t = items[((i % n) + n) % n];
+            if (t) { try { t.focus(); } catch (e2) { /* ignore */ } }
+        };
+        if (e.key === 'ArrowDown') { e.preventDefault(); focusAt(idx + 1); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); focusAt(idx - 1); }
+        else if (e.key === 'Home') { e.preventDefault(); focusAt(0); }
+        else if (e.key === 'End') { e.preventDefault(); focusAt(items.length - 1); }
+        else if (e.key === 'Escape') { e.preventDefault(); self.hideSortMenu(); }
+    },
+
+    hideSortMenu() {
+        var menu = document.getElementById('ds-sort-menu');
+        var btn = document.getElementById('ds-btn-sort');
+        this._removeSortHandlers();
+        if (menu) {
+            menu.classList.add('hidden');
+            if (window.OverlayManager && typeof window.OverlayManager.close === 'function') {
+                try { window.OverlayManager.close(menu); } catch (e) { /* ignore */ }
+            }
+        }
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+    },
+
+    _removeSortHandlers() {
+        if (this._sortOutsideHandler) {
+            document.removeEventListener('mousedown', this._sortOutsideHandler);
+            this._sortOutsideHandler = null;
+        }
+        if (this._sortViewportHandler) {
+            window.removeEventListener('scroll', this._sortViewportHandler, { capture: true });
+            window.removeEventListener('resize', this._sortViewportHandler);
+            this._sortViewportHandler = null;
+        }
+    },
 
     // ─── Selection ──────────────────────────────────────
     clickItem(event, path) {
@@ -1140,7 +1429,7 @@ const DS = {
     async openSqlEditor(path, prefilledSql) {
         if (typeof window.openSqlEditorModal !== 'function') {
             if (typeof window.showToast === 'function') {
-                window.showToast('error', 'Éditeur SQL indisponible.');
+                window.showToast('Éditeur SQL indisponible.', 'error');
             }
             return;
         }
@@ -1432,8 +1721,18 @@ const DS = {
         try {
             form.append('_xsrf', getCookie('_xsrf'));
             const res = await fetch('/api/datastore/upload', { method: 'POST', body: form });
-            const data = await res.json();
-            if (data.errors?.length) {
+            // Lecture SÛRE : ne plante pas sur le HTML d'un 413 nginx (import
+            // d'un fichier > cap) — c'est le cas d'usage littéral de cet écran.
+            const r = await window.komptiaReadJson(res);
+            const data = r.data || {};
+            if (!r.ok) {
+                this.showToast(
+                    r.tooLarge
+                        ? 'Fichier trop volumineux pour être importé.'
+                        : (data.error || r.error || 'Erreur lors de l\'import'),
+                    'error'
+                );
+            } else if (data.errors?.length) {
                 this.showToast('Erreurs : ' + data.errors.slice(0, 3).join(', '), 'error');
             } else if (data.success) {
                 this.showToast('Fichier(s) importé(s)', 'success');
@@ -1805,7 +2104,11 @@ const DS = {
         // Enregistrement OverlayManager (layer dropdown : Escape LIFO gratuit,
         // dismiss-previous des autres dropdowns, pas de scroll-lock).
         if (window.OverlayManager && typeof window.OverlayManager.open === 'function') {
-            try { window.OverlayManager.open(menu, { layer: 'dropdown' }); }
+            // onClose : sans ça, Escape ou un dismiss-previous (ex. ouverture du
+            // menu de tri) retire l'entrée du stack mais laisse le menu VISIBLE
+            // + ses handlers attachés. close() splice avant onClose → le re-close
+            // dans hideContextMenu() est un no-op (pas de récursion).
+            try { window.OverlayManager.open(menu, { layer: 'dropdown', onClose: () => this.hideContextMenu() }); }
             catch (e) { console.warn('[datastore] OverlayManager.open failed:', e); }
         }
 
@@ -2396,8 +2699,12 @@ const DS = {
     },
 
     init() {
-        this.navigate(''); 
-        
+        // Charger la préférence de tri AVANT le 1er rendu (navigate → loadDir →
+        // renderList) pour que la liste s'affiche d'emblée triée selon le choix
+        // persisté de l'utilisateur (sinon flash de l'ordre serveur puis re-tri).
+        this._loadSortPref();
+        this.navigate('');
+
         // Event listeners for static buttons
         document.getElementById('ds-btn-refresh')?.addEventListener('click', () => this.refresh());
         document.getElementById('ds-btn-upload')?.addEventListener('click', () => this.showUploadModal());
@@ -2548,6 +2855,28 @@ const DS = {
         // Bloque le menu contextuel natif quand l'utilisateur fait clic droit
         // DANS notre menu (le menu Komptia étant en position fixed hors card).
         document.getElementById('ds-context-menu')?.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // ─── Tri : bouton « Trier » + items du menu ───
+        document.getElementById('ds-btn-sort')?.addEventListener('click', () => this.toggleSortMenu());
+        document.querySelectorAll('#ds-sort-menu .ds-sort-item').forEach((it) => {
+            it.addEventListener('click', () => this.selectSort(it.getAttribute('data-sort-key')));
+        });
+        document.getElementById('ds-sort-menu')?.addEventListener('contextmenu', (e) => e.preventDefault());
+        // Navigation clavier (↑/↓/Home/Fin/Escape) — contrat role=menu.
+        document.getElementById('ds-sort-menu')?.addEventListener('keydown', (e) => this._onSortMenuKey(e));
+        // Sync cross-onglets (axe 22) : si la pref de tri change dans un autre
+        // onglet du MÊME user, on ré-applique sans reload. Aligné sur le thème
+        // (base.html écoute aussi l'évènement 'storage').
+        window.addEventListener('storage', (e) => {
+            if (e && e.key === this._sortStorageKey()) {
+                this._loadSortPref();
+                this._updateSortMenuUI();
+                this.renderList();
+            }
+        });
+        // Synchronise la flèche du bouton + indicateurs du menu avec la pref
+        // chargée, dès l'init.
+        this._updateSortMenuUI();
         
         // Workbook viewer modal wire-up
         document.getElementById('btn-workbook-close')?.addEventListener('click', () => this.closeWorkbook());
@@ -2597,28 +2926,28 @@ document.addEventListener('DOMContentLoaded', () => DS.init());
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'datastore_v1',
+                key: 'datastore_v2',
                 title: 'Bienvenue dans votre Datastore',
                 steps: [
                     {
                         icon: 'sparkle',
-                        title: 'Vos classeurs au même endroit',
-                        text: 'Le Datastore regroupe tous les fichiers Excel et CSV que vous voulez analyser. Ils restent stockés localement sur votre espace Komptia — pas de cloud externe, pas de partage involontaire.'
+                        title: 'Vos fichiers au même endroit',
+                        text: 'Le Datastore regroupe tous les fichiers que vous voulez garder sous la main — Excel et CSV à analyser, mais aussi requêtes SQL, PDF ou images. Ils sont stockés localement sur votre espace Komptia, isolés des autres utilisateurs : pas de cloud externe, pas de partage involontaire.'
                     },
                     {
                         icon: 'zap',
                         title: 'Importer un fichier',
-                        text: 'Glissez-déposez vos fichiers sur la zone centrale, ou cliquez sur « Importer ». Vous pouvez organiser vos classeurs en dossiers et les renommer comme dans un explorateur classique.'
+                        text: 'Glissez-déposez vos fichiers sur la zone centrale, ou cliquez sur « Importer ». Vous pouvez organiser vos fichiers en dossiers avec « Nouveau dossier », les renommer ou les déplacer via le clic droit, comme dans un explorateur classique.'
                     },
                     {
                         icon: 'chart',
                         title: 'Aperçu et actions',
-                        text: 'Cliquez sur un fichier pour le voir dans le panneau de droite. Vous pouvez ensuite le télécharger, l\'analyser avec l\'IA, ou — s\'il s\'agit d\'une requête SQL enregistrée — l\'exécuter directement contre la base de données.'
+                        text: 'Cliquez sur un fichier pour le visualiser dans le panneau de droite. De là, vous pouvez le télécharger ; et s\'il s\'agit d\'une requête SQL enregistrée, la « Modifier » puis l\'« Exécuter » directement contre la base de données. Le clic droit ajoute d\'autres actions, dont « Analyser avec Iris ».'
                     },
                     {
-                        icon: 'rocket',
-                        title: 'Iris interroge vos fichiers',
-                        text: 'Une fois vos fichiers importés, allez sur Iris et posez vos questions en français (« Top 10 lignes par montant dans clients.xlsx »). Iris travaille directement sur vos classeurs locaux, sans rien envoyer à l\'extérieur.'
+                        icon: 'shield',
+                        title: 'Analyser avec Iris en confiance',
+                        text: 'Le clic droit « Analyser avec Iris » vous emmène sur la page Iris pour interroger un classeur en français (« Top 10 lignes par montant dans clients.xlsx »). Iris lit vos fichiers locaux ; pour comprendre les données, il n\'envoie au modèle qu\'un petit échantillon anonymisé (quelques lignes, valeurs masquées). Définissez vos pseudonymes dans « Confidentialité » pour renforcer encore cette protection.'
                     }
                 ]
             });

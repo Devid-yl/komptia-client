@@ -26,25 +26,58 @@ from app.utils.output_safety import excel_safe_cell
 
 logger = get_logger(__name__)
 
+# #134 / #18f verdict #42 — marqueur de troncature pour les fichiers CSV/Excel
+# envoyés en pièce jointe (parité avec la bannière PDF, pdf_generator). Sans
+# lui, un collaborateur calcule des totaux sur un fichier amputé au cap admin
+# SANS aucun signal (donnée fausse silencieuse côté destinataire).
+TRUNCATION_MARKER = (
+    "⚠ RÉSULTATS TRONQUÉS AU CAP ADMIN — DONNÉES PARTIELLES "
+    "(les lignes au-delà de la limite ne sont PAS dans ce fichier)"
+)
 
-def generate_csv(output_path: Path, results: List[Dict[str, Any]]) -> Path:
+
+def generate_csv(
+    output_path: Path, results: List[Dict[str, Any]], *, truncated: bool = False
+) -> Path:
     """Génère un fichier CSV UTF-8 BOM (compat Excel double-clic).
 
     Délègue au service unifié :func:`app.services.export.csv_export.to_csv_bytes`
     pour la sanitisation OWASP-CSV-Injection et le BOM — replicate du
     fallback ``Aucun résultat`` historique via ``empty_placeholder``.
 
+    Args:
+        truncated: #134 — la source a-t-elle été tronquée au cap admin ? Si oui
+            on append une ligne-marqueur explicite en fin de fichier (1re colonne)
+            pour que le destinataire voie que les données sont partielles.
+
     Returns:
         Le chemin écrit (identique à ``output_path`` — utile pour les
         fallbacks qui changent le suffixe).
     """
-    fieldnames = list(results[0].keys()) if results else None
-    payload = to_csv_bytes(results, columns=fieldnames, empty_placeholder="Aucun résultat")
+    augmented = results
+    if truncated:
+        if results:
+            # Ligne-marqueur : warning en 1re colonne, vide ailleurs (les colonnes
+            # numériques restent vides → non sommées par erreur côté destinataire).
+            fieldnames0 = list(results[0].keys())
+            marker_row = {fn: "" for fn in fieldnames0}
+            marker_row[fieldnames0[0]] = TRUNCATION_MARKER
+            augmented = [*results, marker_row]
+        else:
+            # Empty + truncated : un filtre post-fetch (RLS/anonymisation) a pu
+            # vider `results` alors que la source était cappée. Émettre quand
+            # même le marqueur — sinon fichier « Aucun résultat » trompeur alors
+            # que des lignes existent au-delà du cap (donnée fausse silencieuse).
+            augmented = [{"avertissement": TRUNCATION_MARKER}]
+    fieldnames = list(augmented[0].keys()) if augmented else None
+    payload = to_csv_bytes(augmented, columns=fieldnames, empty_placeholder="Aucun résultat")
     output_path.write_bytes(payload)
     return output_path
 
 
-def _reserve_and_write_csv_fallback(output_path: Path, results: List[Dict[str, Any]]) -> Path:
+def _reserve_and_write_csv_fallback(
+    output_path: Path, results: List[Dict[str, Any]], *, truncated: bool = False
+) -> Path:
     """Réserve atomiquement le chemin CSV de fallback (O_EXCL, anti-collision
     avec un autre node) PUIS écrit le CSV — en nettoyant le fichier 0-byte
     réservé si l'écriture lève (#64 / A7-F9-résidu).
@@ -54,10 +87,13 @@ def _reserve_and_write_csv_fallback(output_path: Path, results: List[Dict[str, A
     un orphelin 0-byte dans ``automation_reports/`` jusqu'au TTL cleanup. On
     libère immédiatement. L'exception est re-levée (comportement inchangé : le
     caller décide). SSoT partagé avec ``executor._safe_output_path``.
+
+    ``truncated`` est forwardé pour que le fallback CSV (openpyxl absent)
+    conserve le marqueur de troncature au lieu de le perdre silencieusement.
     """
     fallback_path = reserve_unique_output_path(output_path.with_suffix(".csv"))
     try:
-        return generate_csv(fallback_path, results)
+        return generate_csv(fallback_path, results, truncated=truncated)
     except Exception:
         # Le writer a levé après la réservation atomique → libérer le 0-byte
         # orphelin tout de suite (pas dans 30 j). ``missing_ok`` : robuste si le
@@ -73,12 +109,18 @@ def _reserve_and_write_csv_fallback(output_path: Path, results: List[Dict[str, A
         raise
 
 
-def generate_excel(output_path: Path, results: List[Dict[str, Any]]) -> Path:
+def generate_excel(
+    output_path: Path, results: List[Dict[str, Any]], *, truncated: bool = False
+) -> Path:
     """Génère un fichier Excel .xlsx.
 
     Fallback CSV si openpyxl indisponible. Le path retourné peut donc
     avoir un suffixe différent de l'entrée — le caller doit utiliser
     la valeur retournée.
+
+    Args:
+        truncated: #134 — si la source a été tronquée au cap admin, on écrit
+            une ligne-marqueur (rouge gras) en fin de feuille.
     """
     try:
         import openpyxl
@@ -90,6 +132,10 @@ def generate_excel(output_path: Path, results: List[Dict[str, Any]]) -> Path:
 
         if not results:
             ws["A1"] = "Aucun résultat"
+            # Empty + truncated : émettre quand même le marqueur (cf. generate_csv).
+            if truncated:
+                warn_cell = ws.cell(row=2, column=1, value=TRUNCATION_MARKER)
+                warn_cell.font = Font(bold=True, color="CC0000")
             wb.save(output_path)
             return output_path
 
@@ -110,6 +156,12 @@ def generate_excel(output_path: Path, results: List[Dict[str, Any]]) -> Path:
             for col_idx, header in enumerate(headers, 1):
                 ws.cell(row=row_idx, column=col_idx, value=excel_safe_cell(row_data.get(header)))
 
+        # #134 — ligne-marqueur de troncature (rouge gras), après les données.
+        # Notre constante ne commence pas par =/+/-/@ → pas de risque formule.
+        if truncated:
+            warn_cell = ws.cell(row=len(results) + 2, column=1, value=TRUNCATION_MARKER)
+            warn_cell.font = Font(bold=True, color="CC0000")
+
         # Ajuster largeur colonnes
         for col in ws.columns:
             max_length = 0
@@ -127,7 +179,7 @@ def generate_excel(output_path: Path, results: List[Dict[str, Any]]) -> Path:
         logger.warning("openpyxl non installe, generation CSV a la place")
         # A7-F9 (+ #64) — réserve atomique du path CSV de fallback PUIS écrit,
         # avec nettoyage immédiat du 0-byte orphelin si l'écriture lève.
-        return _reserve_and_write_csv_fallback(output_path, results)
+        return _reserve_and_write_csv_fallback(output_path, results, truncated=truncated)
     except Exception:
         # Catch-all volontaire (cohérent avec generate_pdf) : une donnée
         # hostile — caractère XML-illégal d'un BLOB Sage casté en string →
@@ -139,13 +191,15 @@ def generate_excel(output_path: Path, results: List[Dict[str, Any]]) -> Path:
         logger.error("Erreur generation Excel, fallback CSV", exc_info=True)
         # A7-F9 (+ #64) — réserve atomique du path CSV de fallback PUIS écrit,
         # avec nettoyage immédiat du 0-byte orphelin si l'écriture lève.
-        return _reserve_and_write_csv_fallback(output_path, results)
+        return _reserve_and_write_csv_fallback(output_path, results, truncated=truncated)
 
 
 def generate_pdf(
     output_path: Path,
     automation: Any,
     results: List[Dict[str, Any]],
+    *,
+    truncated: bool = False,
 ) -> Path:
     """Génère un PDF professionnel via :class:`PDFGenerator`.
 
@@ -157,6 +211,10 @@ def generate_pdf(
     Args:
         automation: Object avec attributs ``.name``, ``.description``
             (typiquement :class:`Automation`).
+        truncated: #133 — si ``True``, la source SQL a été tronquée au cap
+            admin. On préfixe la description du rapport d'une bannière pour
+            que l'utilisateur sache que les totaux/agrégats portent sur un
+            sous-ensemble (sinon données fausses silencieuses).
     """
     try:
         from app.services.reporting.pdf_generator import PDFGenerator
@@ -176,13 +234,25 @@ def generate_pdf(
             "subject": f"Rapport automatisé: {automation.name}",
         }
 
+        # #133 — bannière de troncature SOURCE en tête de description (lossless,
+        # ne corrompt pas les colonnes du tableau, contrairement à une ligne
+        # injectée dans un CSV/Excel). Sans nom de table/colonne (générique).
+        description = automation.description or ""
+        if truncated:
+            banner = (
+                "⚠ Données tronquées à la source : le cap de lignes (configuré par "
+                "l'administrateur) a été atteint. Les totaux et agrégats de ce rapport "
+                "portent sur un sous-ensemble des données, pas sur leur intégralité."
+            )
+            description = f"{banner}\n\n{description}" if description else banner
+
         # Générer le PDF
         pdf_gen.generate_from_query_result(
             output_path=output_path,
             title=automation.name,
             results=results,
             metadata=metadata,
-            description=automation.description,
+            description=description,
         )
         return output_path
 
@@ -190,7 +260,7 @@ def generate_pdf(
         logger.warning("ReportLab non installe, generation CSV a la place")
         # A7-F9 (+ #64) — réserve atomique du path CSV de fallback PUIS écrit,
         # avec nettoyage immédiat du 0-byte orphelin si l'écriture lève.
-        return _reserve_and_write_csv_fallback(output_path, results)
+        return _reserve_and_write_csv_fallback(output_path, results, truncated=truncated)
     except Exception:
         # Catch-all volontaire : le pipeline ne doit JAMAIS crasher pour
         # un échec de format. Fallback CSV. Cohérent avec la version
@@ -199,7 +269,7 @@ def generate_pdf(
         logger.error("Erreur generation PDF", exc_info=True)
         # A7-F9 (+ #64) — réserve atomique du path CSV de fallback PUIS écrit,
         # avec nettoyage immédiat du 0-byte orphelin si l'écriture lève.
-        return _reserve_and_write_csv_fallback(output_path, results)
+        return _reserve_and_write_csv_fallback(output_path, results, truncated=truncated)
 
 
 __all__ = (
@@ -207,3 +277,5 @@ __all__ = (
     "generate_excel",
     "generate_pdf",
 )
+# Note : ``TRUNCATION_MARKER`` est importable directement (pas dans ``__all__``
+# qui ne régit que ``import *`` et que le test garde restreint aux fonctions).

@@ -24,6 +24,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,23 @@ MAX_INTRO_LEN = 4000
 #: Cap dur sur la longueur d'un titre (cohérent avec
 #: ``llm_report_planner._MAX_TITLE_LEN``).
 MAX_TITLE_LEN = 200
+
+
+def _cap_with_notice(text: str, limit: int) -> str:
+    """Tronque ``text`` à ``limit`` en SIGNALANT la coupe (#55 review).
+
+    Le mode agent pré-coupait intro/titre EN SILENCE ici ; le marqueur n'arrivait
+    donc jamais (la valeur arrivait déjà ≤ limit au validateur aval). On signale
+    dès la pré-coupe avec le marqueur SSoT partagé de ``llm_report_planner``.
+    Le double-marquage éventuel au ``_validate_plan`` aval se résout en UN seul
+    marqueur : ``value[:limit]`` strip le marqueur posé au-delà de ``limit`` puis
+    le ré-appose. Import paresseux pour éviter tout cycle au chargement module.
+    """
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    from app.services.reporting.llm_report_planner import TRUNCATION_NOTICE
+
+    return text[:limit] + TRUNCATION_NOTICE
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +308,12 @@ class ReportAgentState:
     # Signal terminal : finalize_report appelé → boucle break
     finalized: bool = False
 
+    # #56 review (Moyen f) — nombre de sections que le LLM a tenté d'émettre mais
+    # qui ont été REFUSÉES au cap MAX_SECTIONS_EMITTED. En mode agent, c'est le
+    # vrai limiteur (≠ cut de _validate_plan) ; on le propage en sections_omitted
+    # pour que la note « rapport partiel » du PDF s'affiche aussi dans ce mode.
+    sections_refused: int = 0
+
     # Compteurs de progression (info / debugging — pas critique fonctionnellement)
     turn_count: int = 0
     tool_call_counts: Dict[str, int] = field(default_factory=dict)
@@ -371,7 +395,7 @@ def _detect_column_type(values: List[Any]) -> str:
     for v in non_null:
         if isinstance(v, bool):  # bool est sous-classe de int — exclure
             continue
-        if isinstance(v, (int, float)):
+        if isinstance(v, (int, float, Decimal)):  # Decimal = colonnes MONEY/DECIMAL Sage (#139)
             numeric_count += 1
             continue
         if isinstance(v, str):
@@ -418,7 +442,7 @@ def handle_inspect_dataset(tool_input: Dict[str, Any], state: ReportAgentState) 
             for v in non_null_vals:
                 if isinstance(v, bool):
                     continue
-                if isinstance(v, (int, float)):
+                if isinstance(v, (int, float, Decimal)):  # Decimal = MONEY/DECIMAL (#139)
                     numeric_vals.append(float(v))
                 elif isinstance(v, str):
                     try:
@@ -544,7 +568,11 @@ def _coerce_numeric(value: Any) -> Optional[float]:
         return None
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    # ``Decimal`` : les colonnes monétaires SQL Server (DECIMAL/MONEY/NUMERIC)
+    # arrivent en ``decimal.Decimal`` via pyodbc. Sans cette branche, elles
+    # tombaient dans ``return None`` final → droppées des agrégats sum/avg/min/max
+    # (somme d'argent = 0.0 SILENCIEUX dans les rapports). #139 (WF-1).
+    if isinstance(value, (int, float, Decimal)):
         return float(value)
     if isinstance(value, str):
         try:
@@ -624,7 +652,13 @@ def handle_aggregate_dataset(tool_input: Dict[str, Any], state: ReportAgentState
                 if len(distinct_keys_over_cap) < 5000:
                     distinct_keys_over_cap.add(key)
                 continue
-            groups[key] = {"_count": 0, "_sum": 0.0, "_min": None, "_max": None}
+            groups[key] = {
+                "_count": 0,
+                "_numeric_count": 0,
+                "_sum": 0.0,
+                "_min": None,
+                "_max": None,
+            }
 
         bucket = groups[key]
         bucket["_count"] += 1
@@ -634,6 +668,11 @@ def handle_aggregate_dataset(tool_input: Dict[str, Any], state: ReportAgentState
             if num is None:
                 numeric_skipped += 1
                 continue
+            # ``_numeric_count`` = nb de valeurs RÉELLEMENT numériques (≠ ``_count``
+            # qui compte toutes les lignes du groupe). avg DOIT diviser par
+            # ``_numeric_count`` sinon la moyenne est diluée par les lignes
+            # non-numériques/NULL (avg silencieusement faux). #140 (WF-2).
+            bucket["_numeric_count"] += 1
             bucket["_sum"] += num
             bucket["_min"] = num if bucket["_min"] is None else min(bucket["_min"], num)
             bucket["_max"] = num if bucket["_max"] is None else max(bucket["_max"], num)
@@ -647,7 +686,13 @@ def handle_aggregate_dataset(tool_input: Dict[str, Any], state: ReportAgentState
         elif agg == "sum":
             value = bucket["_sum"]
         elif agg == "avg":
-            value = (bucket["_sum"] / bucket["_count"]) if bucket["_count"] else None
+            # Diviser par le nb de valeurs NUMÉRIQUES, pas par le nb de lignes
+            # (sinon moyenne diluée par les non-numériques/NULL — #140 WF-2).
+            value = (
+                (bucket["_sum"] / bucket["_numeric_count"])
+                if bucket["_numeric_count"]
+                else None
+            )
         elif agg == "min":
             value = bucket["_min"]
         elif agg == "max":
@@ -754,7 +799,7 @@ def handle_emit_report_intro(tool_input: Dict[str, Any], state: ReportAgentState
         logger.warning(
             "report_planner_agent: emit_report_intro appelé 2 fois, intro précédente écrasée"
         )
-    state.emitted_intro = text[:MAX_INTRO_LEN]
+    state.emitted_intro = _cap_with_notice(text, MAX_INTRO_LEN)
     return {
         "ok": True,
         "stored_chars": len(state.emitted_intro),
@@ -771,6 +816,8 @@ def handle_emit_report_section(
     tool_input: Dict[str, Any], state: ReportAgentState
 ) -> Dict[str, Any]:
     if len(state.emitted_sections) >= MAX_SECTIONS_EMITTED:
+        # #56 review — compter le refus pour le surfacer dans le PDF final.
+        state.sections_refused += 1
         return {"ok": False, "reason": f"max_sections_reached ({MAX_SECTIONS_EMITTED})"}
 
     title = tool_input.get("title")
@@ -797,7 +844,7 @@ def handle_emit_report_section(
     # de llm_report_planner._validate_section nettoiera et tronquera lors
     # de la construction finale du ReportPlan.
     section = {
-        "title": title.strip()[:MAX_TITLE_LEN],
+        "title": _cap_with_notice(title.strip(), MAX_TITLE_LEN),
         "dataset_id": dataset_id,
         "description": tool_input.get("description"),
         "charts": charts,
@@ -820,7 +867,7 @@ def handle_finalize_report(tool_input: Dict[str, Any], state: ReportAgentState) 
             "ok": False,
             "reason": "Aucune section émise — appelle emit_report_section au moins une fois avant finalize_report",
         }
-    state.emitted_title = title.strip()[:MAX_TITLE_LEN]
+    state.emitted_title = _cap_with_notice(title.strip(), MAX_TITLE_LEN)
     state.finalized = True
     return {
         "ok": True,

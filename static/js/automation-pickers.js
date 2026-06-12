@@ -190,7 +190,11 @@
 
             lists.forEach(function (l) {
                 var label = l.name || ('Liste #' + l.id);
-                var count = (l.member_count !== undefined) ? (' — ' + l.member_count + ' membre(s)') : '';
+                // DLIST-1 — la réponse /api/distribution-lists sérialise le compte
+                // sous la clé ``contact_count`` (Contact.to_dict, SSoT, comme
+                // contacts.js). On lisait ``member_count`` (le label SQL interne)
+                // → toujours undefined → « N membre(s) » jamais affiché.
+                var count = (l.contact_count !== undefined) ? (' — ' + l.contact_count + ' membre(s)') : '';
                 var opt = el('option', { value: String(l.id), text: label + count });
                 if (Number(value) === l.id) opt.selected = true;
                 sel.appendChild(opt);
@@ -589,6 +593,35 @@
                 emit();
             }
         });
+
+        // CHIPS-1 — recherche SERVEUR débouncée. Le datalist initial ne contient
+        // que les 100 premiers contacts (cf. fetch plus bas) : un contact au-delà
+        // était introuvable, sans aucune indication. On interroge
+        // ``/api/contacts?q=`` au fil de la frappe (le backend filtre en ilike sur
+        // email/prénom/nom/société) pour rendre TOUS les contacts atteignables.
+        var searchTimer = null;
+        var lastSearchQuery = null;
+        input.addEventListener('input', function () {
+            var q = input.value.trim();
+            if (q === lastSearchQuery) return;  // dedup (le change/clear re-fire 'input')
+            lastSearchQuery = q;
+            if (searchTimer) clearTimeout(searchTimer);
+            if (q.length < 2) return;  // pas de requête serveur sur 0-1 caractère
+            searchTimer = setTimeout(function () {
+                var ck = 'contacts:q:' + q.toLowerCase();
+                var cachedQ = cacheGet(ck);
+                if (cachedQ) { populateDatalist(datalist, cachedQ); return; }
+                fetchJson('/api/contacts?per_page=50&q=' + encodeURIComponent(q)).then(function (data) {
+                    if (!data || data.success === false) return;
+                    var contacts = data.contacts || [];
+                    cachePut(ck, contacts);
+                    populateDatalist(datalist, contacts);
+                }, function () {
+                    // Silencieux : l'autocomplete reste une amélioration ; l'user
+                    // peut toujours taper l'email complet.
+                });
+            }, 250);
+        });
         input.addEventListener('blur', function () {
             if (input.value.trim() !== '') {
                 if (addItem(input.value)) {
@@ -810,14 +843,32 @@
                 checkboxes.push(cb);
             });
 
+            // TABS-1 — avertissement quand « Tous » est décoché ET aucun onglet
+            // n'est sélectionné : sinon l'utilisateur croit « ne rien exporter »
+            // alors que l'ancien comportement exportait TOUT en silence.
+            var warnNone = el('p', {
+                class: 'komptia-field-help',
+                text: '⚠ Aucun onglet sélectionné — l\'export échouera. '
+                    + 'Cochez « Tous » ou au moins un onglet.',
+            });
+            warnNone.style.color = 'var(--danger, #dc2626)';
+            warnNone.style.display = 'none';
+
             function emit() {
                 if (allCb.checked) {
+                    warnNone.style.display = 'none';
                     onChange('all');
                 } else {
                     var picked = checkboxes
                         .filter(function (cb) { return cb.checked; })
                         .map(function (cb) { return cb.value; });
-                    onChange(picked.length ? picked.join(',') : '');
+                    // TABS-1 — « tout décoché » DOIT être distinct de « tous » :
+                    // on émet le sentinel 'none' (rejeté fail-closed côté backend)
+                    // au lieu de '' qui était interprété comme « tous » → export
+                    // silencieux de TOUT (donnée fausse).
+                    var noneSelected = picked.length === 0;
+                    warnNone.style.display = noneSelected ? 'block' : 'none';
+                    onChange(noneSelected ? 'none' : picked.join(','));
                 }
             }
             allCb.addEventListener('change', function () {
@@ -830,6 +881,12 @@
 
             setContent(wrap, allBox);
             wrap.appendChild(list);
+            wrap.appendChild(warnNone);
+            // État initial : une config rechargée sans « all » ni index valide
+            // (ex. 'none', ou un legacy '') = rien de sélectionné → avertir.
+            if (!initialAll && Object.keys(initialIdx).length === 0) {
+                warnNone.style.display = 'block';
+            }
         }
 
         var cacheKey = 'tabs:' + path;

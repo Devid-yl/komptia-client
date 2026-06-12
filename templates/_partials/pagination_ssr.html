@@ -1,0 +1,44 @@
+{#
+  Barre de pagination SERVEUR — rendue exclusivement par
+  ``app.ui_modules.Pagination`` (UIModule). NE JAMAIS dupliquer ce markup :
+  tout pager côté serveur passe par ``{% module Pagination(page=..., total_pages=...) %}``.
+  Le pendant client (listes AJAX) est ``static/js/pagination.js`` (même fenêtrage).
+
+  Variables injectées par le module :
+    items        : list[int|None]  — None = ellipse « … »
+    current      : int             — page courante (1-based)
+    total_pages  : int             — total (> 1, sinon le module ne rend rien)
+    href         : callable(int)->str — URL préservant les filtres courants
+
+  A11y : <nav aria-label>, aria-current sur la page active, aria-label FR sur
+  chaque contrôle, bornes via <button disabled> (non focusable / non cliquable).
+#}
+{% set _base = "inline-flex items-center justify-center px-2.5 py-1 text-xs border border-gray-300 rounded text-gray-700 dark:text-gray-300 dark:border-gray-700" %}
+{% set _hover = "hover:bg-gray-50 dark:hover:bg-gray-800" %}
+{% set _off = "disabled:opacity-40 disabled:cursor-not-allowed" %}
+{% set _cur = "inline-flex items-center justify-center px-2.5 py-1 text-xs border rounded bg-gray-900 text-white border-gray-900 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-100" %}
+{% set _ell = "inline-flex items-center px-1 text-xs text-gray-400 dark:text-gray-500 select-none" %}
+<nav role="navigation" aria-label="Pagination" class="flex items-center justify-center gap-1 flex-wrap pt-4 mt-4 border-t border-gray-200 dark:border-gray-800">
+  {# ── Première page ⏮ ── #}
+  {% if current > 1 %}<a href="{{ href(1) }}" class="{{ _base }} {{ _hover }}" aria-label="Première page" title="Première page">{% else %}<button type="button" disabled class="{{ _base }} {{ _off }}" aria-label="Première page">{% end %}<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5"/></svg>{% if current > 1 %}</a>{% else %}</button>{% end %}
+
+  {# ── Page précédente ‹ ── #}
+  {% if current > 1 %}<a href="{{ href(current - 1) }}" class="{{ _base }} {{ _hover }}" aria-label="Page précédente" title="Page précédente">{% else %}<button type="button" disabled class="{{ _base }} {{ _off }}" aria-label="Page précédente">{% end %}<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.75 19.5L8.25 12l7.5-7.5"/></svg>{% if current > 1 %}</a>{% else %}</button>{% end %}
+
+  {# ── Numéros de page (fenêtrés) ── #}
+  {% for it in items %}
+    {% if it is None %}
+  <span class="{{ _ell }}" aria-hidden="true">…</span>
+    {% elif it == current %}
+  <span class="{{ _cur }}" aria-current="page" aria-label="Page {{ it }}, page courante">{{ it }}</span>
+    {% else %}
+  <a href="{{ href(it) }}" class="{{ _base }} {{ _hover }}" aria-label="Page {{ it }}">{{ it }}</a>
+    {% end %}
+  {% end %}
+
+  {# ── Page suivante › ── #}
+  {% if current < total_pages %}<a href="{{ href(current + 1) }}" class="{{ _base }} {{ _hover }}" aria-label="Page suivante" title="Page suivante">{% else %}<button type="button" disabled class="{{ _base }} {{ _off }}" aria-label="Page suivante">{% end %}<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.25 4.5l7.5 7.5-7.5 7.5"/></svg>{% if current < total_pages %}</a>{% else %}</button>{% end %}
+
+  {# ── Dernière page ⏭ ── #}
+  {% if current < total_pages %}<a href="{{ href(total_pages) }}" class="{{ _base }} {{ _hover }}" aria-label="Dernière page" title="Dernière page">{% else %}<button type="button" disabled class="{{ _base }} {{ _off }}" aria-label="Dernière page">{% end %}<svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.25 4.5l7.5 7.5-7.5 7.5m-6-15l7.5 7.5-7.5 7.5"/></svg>{% if current < total_pages %}</a>{% else %}</button>{% end %}
+</nav>

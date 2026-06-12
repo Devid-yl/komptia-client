@@ -33,6 +33,8 @@
     <div class="flex items-center justify-between gap-4">
         <div class="flex-1">
             <label for="user-select" class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Utilisateur cible</label>
+            <input type="search" id="user-search" placeholder="Rechercher (nom ou email)…" autocomplete="off" aria-label="Rechercher un utilisateur"
+                   class="w-full mb-2 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
             <select id="user-select" class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:border-gray-900 bg-white text-gray-900 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:focus:border-gray-100">
                 <option value="">— Choisir un utilisateur —</option>
             </select>
@@ -458,14 +460,31 @@ async function fetchJson(url, options) {
 // l'admin n'a pas besoin d'un badge "ACTIVÉ" pour comprendre que la page
 // fait ce qu'elle dit qu'elle fait).
 
-async function loadUsers() {
-    const { res, data } = await fetchJson('/api/admin/data-access/users');
+let _loadUsersSeq = 0;
+async function loadUsers(query) {
+    // Recherche serveur (typeahead) : ``query`` est optionnel ; sans lui, on
+    // récupère tous les users actifs (comportement initial du dropdown).
+    const seq = ++_loadUsersSeq;
+    const qs = query ? ('?q=' + encodeURIComponent(query)) : '';
+    const { res, data } = await fetchJson('/api/admin/data-access/users' + qs);
+    // Garde anti-race (pattern reqId du reste de la codebase) : une réponse
+    // lente d'une frappe ANTÉRIEURE ne doit pas écraser une plus récente
+    // (sinon le <select> afficherait un résultat qui ne matche plus la saisie).
+    if (seq !== _loadUsersSeq) return;
     if (!res.ok || !data || !Array.isArray(data.users)) {
         showStatus('status-msg', 'Erreur de chargement des utilisateurs.', 'error');
         return;
     }
     state.users = data.users;
     const select = document.getElementById('user-select');
+    const prev = select.value;
+    // Capture le libellé de l'option sélectionnée AVANT de vider : si la
+    // recherche la fait sortir de la liste, on l'« épingle » pour garder la
+    // cohérence select ↔ state.currentUserId ↔ panneau de règles. Sans ça, le
+    // <select> retomberait sur « — Choisir — » alors que currentUserId pointe
+    // toujours sur cet user → on pourrait créer une règle sur le MAUVAIS user.
+    const prevOpt = prev ? select.querySelector('option[value="' + prev + '"]') : null;
+    const prevText = prevOpt ? prevOpt.textContent : '';
     select.innerHTML = '<option value="">— Choisir un utilisateur —</option>';
     state.users.forEach(u => {
         const opt = document.createElement('option');
@@ -474,6 +493,17 @@ async function loadUsers() {
         opt.textContent = `${u.username} (${u.email})${adminTag}`;
         select.appendChild(opt);
     });
+    const stillPresent = prev && state.users.some(u => String(u.id) === prev);
+    if (prev && !stillPresent && prevText) {
+        // User sélectionné hors résultats de recherche → option épinglée.
+        const pinned = document.createElement('option');
+        pinned.value = prev;
+        pinned.textContent = prevText;
+        select.appendChild(pinned);
+    }
+    if (prev && (stillPresent || prevText)) {
+        select.value = prev;
+    }
 }
 
 async function loadTables() {
@@ -1289,6 +1319,19 @@ async function loadMatrix() {
     const denied = data.denied || {};
     const s = data.stats || {};
     stats.textContent = `— ${s.user_count || 0} utilisateurs, ${s.total_denies || 0} table${(s.total_denies || 0) > 1 ? 's' : ''} interdite${(s.total_denies || 0) > 1 ? 's' : ''}`;
+    // #18f (verdict #25, 2026-06-10) — le backend envoie users_truncated/
+    // tables_truncated depuis toujours, mais l'UI les JETAIT : avec >200
+    // users ou >50 tables, l'admin audite une matrice PARTIELLE en croyant
+    // tout voir (faux sentiment de couverture des permissions).
+    if (s.users_truncated || s.tables_truncated) {
+        const truncBits = [];
+        if (s.users_truncated) truncBits.push(`${s.users_max || 200} premiers utilisateurs`);
+        if (s.tables_truncated) truncBits.push(`${s.tables_max || 50} tables les plus restreintes`);
+        const warn = document.createElement('span');
+        warn.className = 'ml-2 text-xs text-amber-600 dark:text-amber-400';
+        warn.textContent = `⚠ Vue PARTIELLE (limitée aux ${truncBits.join(' et ')}) — utilisez la sélection par utilisateur pour le détail complet.`;
+        stats.appendChild(warn);
+    }
 
     if (tables.length === 0 || users.length === 0) {
         empty.classList.remove('hidden');
@@ -1385,6 +1428,20 @@ function toggleMatrix() {
 // ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
     Promise.all([loadUsers(), loadTables()]).catch(console.error);
+
+    // Recherche serveur (typeahead) du picker user — debounce 250 ms pour ne
+    // pas marteler l'endpoint à chaque frappe.
+    const userSearch = document.getElementById('user-search');
+    if (userSearch) {
+        let _userSearchTimer = null;
+        userSearch.addEventListener('input', () => {
+            const v = userSearch.value.trim().slice(0, 100);
+            clearTimeout(_userSearchTimer);
+            _userSearchTimer = setTimeout(() => {
+                loadUsers(v).catch(console.error);
+            }, 250);
+        });
+    }
 
     document.getElementById('user-select').addEventListener('change', async (e) => {
         const v = e.target.value;
@@ -1504,23 +1561,19 @@ document.addEventListener('DOMContentLoaded', () => {
 {# Onboarding tour 1ère visite admin sur /admin/data-access. 4 steps. #}
 <script nonce="{{ handler.csp_nonce }}">
     // **P1 (#133)** — Tour réutilisable (auto au 1er passage + replay
-    // manuel via bouton "↺ Revoir le tour"). ``forceReplay=true`` réinit
-    // le localStorage du tour pour permettre la rejouer.
+    // manuel via bouton "↺ Revoir le tour") via ``force`` de l'API
+    // KomptiaOnboarding (onboarding-tour.js).
     function _startDataAccessTour(forceReplay) {
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
-            if (forceReplay) {
-                // KomptiaOnboarding utilise localStorage avec clé
-                // ``komptia_onboarding_<key>`` ou similaire. On nettoie
-                // toute clé qui contient notre key pour permettre le replay.
-                Object.keys(window.localStorage).forEach(function(k) {
-                    if (k.indexOf('admin_data_access_v') !== -1) {
-                        window.localStorage.removeItem(k);
-                    }
-                });
-            }
+            // L'état « déjà vu » vit côté SERVEUR (BDD, _serverStateLoaded) ;
+            // l'ancien hack qui purgeait localStorage ne le réinitialisait
+            // pas, donc start() sortait silencieusement et le bouton
+            // « Revoir le tour » ne faisait RIEN. ``force`` est le contrat
+            // documenté pour le replay.
             window.KomptiaOnboarding.start({
-                key: 'admin_data_access_v2',
+                key: 'admin_data_access_v3',
+                force: !!forceReplay,
                 title: 'Restreindre l\'accès aux données par utilisateur',
                 steps: [
                     {
@@ -1531,16 +1584,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     {
                         icon: 'zap',
                         title: 'Choisir un utilisateur',
-                        // **P0 (#128)** — référence au "bandeau d'état" retirée :
-                        // le bandeau a été retiré le 2026-05-20 (cf. commentaire
-                        // ligne 325). Le tour faisait mention d'un élément
-                        // inexistant — confusion pour l'admin novice.
                         text: 'Sélectionnez la personne concernée dans la liste « Utilisateur cible ». Les règles existantes apparaissent. Sans règle configurée, l\'utilisateur a un accès total par défaut (les administrateurs ne sont jamais filtrés).'
                     },
                     {
                         icon: 'shield',
                         title: 'Ajouter une règle',
-                        text: 'Cliquez sur « + Ajouter une règle ». Vous choisissez la portée (table entière, colonne précise, valeurs filtrées), puis l\'effet (autoriser, refuser, limiter à certaines valeurs). Exemple : « autoriser la table CLIENTS uniquement pour les comptes commençant par 411 ».'
+                        text: 'Cliquez sur « + Ajouter une règle ». Vous choisissez la portée (table entière, colonne précise, lignes filtrées), puis l\'effet (refuser l\'accès, ou autoriser explicitement certaines valeurs), avant de cliquer « Créer la règle ». Exemple : « autoriser la table CLIENTS uniquement pour les comptes commençant par 411 ».'
                     },
                     {
                         icon: 'sparkle',
@@ -1548,9 +1597,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         text: 'Une règle « refuser » ne se contente pas de bloquer l\'accès — elle rend la table totalement invisible pour l\'utilisateur. Elle disparaît d\'Iris, des dashboards, des rapports PDF et de l\'historique de conversation. Si une vue ou une fonction dépend d\'une table refusée, elle est cachée aussi (closure transitive). L\'utilisateur ne voit pas un message « accès refusé » : la table n\'existe simplement plus pour lui.'
                     },
                     {
-                        icon: 'bell',
-                        title: 'Tester avant de diffuser',
-                        text: 'Après avoir ajouté des règles, demandez à l\'utilisateur de tester une requête Iris habituelle. S\'il voit « Accès refusé » ou un résultat inattendu, ajustez la règle. Pour révoquer entièrement l\'accès, supprimez la règle (elle ne sera plus appliquée).'
+                        icon: 'shield',
+                        title: 'Mesurer l\'impact avant de confirmer',
+                        text: 'Dans la fenêtre d\'ajout, le bouton « 👁 Voir l\'impact » indique combien d\'automations, de dashboards, de requêtes et de conversations cette règle va affecter — avant même de la créer. Vérifiez ce résumé pour éviter de casser un usage existant. Pour rétablir l\'accès plus tard, il suffit de supprimer la règle : elle cesse alors d\'être appliquée et la table redevient visible.'
                     }
                 ]
             });

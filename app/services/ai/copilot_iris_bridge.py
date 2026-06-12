@@ -34,7 +34,9 @@ Design choices :
 
 Fail-safe :
 - Schema non synchronisé → error claire, pas de cold-start sync 600s.
-- Timeout exécution (30s) → error, pas d'exception propagée.
+- Timeout exécution → error, pas d'exception propagée. Le délai est celui
+  configuré par l'admin sur ``/admin/database`` (``connector.timeout``), pas
+  un hardcode : on hérite du défaut de ``QueryExecutor.execute``.
 - SQL invalide → dict error avec suggestions (INFORMATION_SCHEMA).
 """
 
@@ -255,6 +257,29 @@ async def ask_iris(
         draft_sql = new_sql
         result["sql"] = draft_sql
 
+        # Déduplication DÉTERMINISTE des colonnes de sortie en double. Le LLM
+        # d'élargissement (« Charger toutes les colonnes ») peut re-projeter une
+        # colonne déjà présente sur une requête large → SQL Server 8156
+        # (incident 2026-06-03 : ``facVerrouillee`` projeté 2×). Le système
+        # corrige AVANT validation/exécution (doctrine « le système mâche le
+        # travail ») au lieu de faire échouer le bouton. Transparence : les
+        # colonnes retirées sont loggées + exposées dans ``deduped_columns``
+        # (jamais une modification SILENCIEUSE de la requête). Bénéficie aussi
+        # au copilot (une projection en double est toujours invalide).
+        from app.services.ai.iris_oneshot import dedupe_duplicate_output_columns
+
+        _deduped_sql, _dropped_cols = dedupe_duplicate_output_columns(draft_sql)
+        if _dropped_cols:
+            logger.info(
+                "ask_iris: %d colonne(s) de sortie en double retirée(s) du SQL "
+                "transformé (garde la 1re occurrence) : %s",
+                len(_dropped_cols),
+                ", ".join(_dropped_cols[:20]),
+            )
+            draft_sql = _deduped_sql
+            result["sql"] = draft_sql
+            result["deduped_columns"] = _dropped_cols
+
     # 1. Désanonymisation du draft_sql si le copilot est en mode pseudonymisé.
     #    Le schéma BDD (INFORMATION_SCHEMA, colonnes réelles) est en clair,
     #    donc les tokens `§…§` doivent être résolus avant d'arriver aux
@@ -331,11 +356,15 @@ async def ask_iris(
     # **DataAccessDeniedError** pour les refus RLS).
     if not execute:
         try:
+            # Pas de ``timeout=`` explicite : on hérite du timeout admin
+            # (``DatabaseConnection.timeout`` via ``connector.timeout``). Le coût
+            # du dry-run est déjà borné par ``max_rows=_DRY_RUN_ROW_LIMIT`` (TOP 5).
+            # Hardcoder 30s ici rejetait à tort des requêtes valides sur une Sage
+            # lente où l'admin a délibérément configuré plus (doctrine no-double-cap).
             await executor.execute(
                 sql_cleartext,
                 max_rows=_DRY_RUN_ROW_LIMIT,
                 add_limit=True,
-                timeout=30,
                 user=user,
                 rls_source="copilot_iris_bridge.ask_iris.dry_run",
             )
@@ -400,11 +429,14 @@ async def ask_iris(
     # « contactez votre administrateur », pas de mention du nom bloqué.
     # ``DataAccessDeniedError`` est déjà importé plus haut (path dry-run).
     try:
+        # Pas de ``timeout=`` explicite : le timeout admin (``connector.timeout``,
+        # configuré sur ``/admin/database``) est l'unique source de vérité. Le
+        # hardcode 30s tuait la requête réelle avant la limite admin (même bug
+        # que l'incident dashboard 2026-06-08).
         query_result = await executor.execute(
             sql_cleartext,
             max_rows=max_rows,
             add_limit=True,
-            timeout=30,
             user=user,
             rls_source="copilot_iris_bridge.ask_iris",
         )

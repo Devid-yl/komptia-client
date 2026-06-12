@@ -49,6 +49,14 @@ Garanties senior (OWASP API Security Top 10 2023 + ASVS v5 + CLAUDE.md)
    dans ``app/main.py``).
 10. **Logs sanitisés (CWE-117)** — nom d'automation injecté dans les
     logs passe par :func:`_log_safe` (défense-in-depth CRLF).
+11. **Signature HMAC-SHA256 (FAILLE 2, 2026-06-12)** — opt-in par webhook
+    (``require_signature: true`` à la création). Secret partagé généré côté
+    serveur (``secrets.token_urlsafe``), stocké en BDD (SQLCipher), montré
+    UNE fois (show-once). Inbound : en-têtes ``X-Komptia-Timestamp`` +
+    ``X-Komptia-Signature`` (``sha256=HMAC_SHA256(secret, "{ts}.{body}")``),
+    vérif :func:`hmac.compare_digest`, fenêtre anti-rejeu (défaut 300 s,
+    env ``WEBHOOK_HMAC_TOLERANCE_SECONDS``), 401 uniforme si absente /
+    invalide / hors fenêtre. Le token UUID4 reste exigé en complément.
 
 Notes de compat ascendante
 --------------------------
@@ -62,6 +70,12 @@ au ``RateLimiter`` partagé et aux constantes ``Final[int]`` justifiées.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import math
+import os
+import secrets
+import time
 import uuid
 from typing import Any, Final
 
@@ -124,6 +138,46 @@ _INBOUND_RATE_WINDOW: Final[int] = 60
 _MUTATION_RATE_MAX: Final[int] = 30
 _MUTATION_RATE_WINDOW: Final[int] = 60
 
+# ── Signature HMAC-SHA256 (FAILLE 2, 2026-06-12) ──────────────────────────
+#
+# Le token UUID4 dans l'URL reste le 1er facteur (lookup + anti-énumération),
+# la signature est le 2e : un émetteur qui possède l'URL mais pas le secret
+# (URL leakée dans des logs proxy, historique navigateur, repo CI) ne peut
+# plus déclencher l'automatisation. Schéma signé : ``"{timestamp}.{body}"``
+# → couvre le corps ET l'horodatage (anti-rejeu par fenêtre temporelle,
+# pattern Stripe/GitHub). Secret PAR WEBHOOK, généré côté serveur
+# (``secrets.token_urlsafe``), stocké en BDD locale chiffrée SQLCipher,
+# montré UNE SEULE FOIS à la création/rotation — jamais en dur dans le code.
+
+_SIGNATURE_HEADER: Final[str] = "X-Komptia-Signature"
+_TIMESTAMP_HEADER: Final[str] = "X-Komptia-Timestamp"
+
+#: Entropie du secret généré : 32 octets = 256 bits, aligné sur la taille de
+#: bloc de HMAC-SHA256 (un secret plus court affaiblirait la construction,
+#: plus long n'ajoute rien). Encodé urlsafe → ~43 chars (fits VARCHAR(128)).
+_HMAC_SECRET_BYTES: Final[int] = 32
+
+#: Fenêtre anti-rejeu par défaut (secondes). 300 s = standard industrie
+#: (Stripe webhooks) : assez large pour la dérive d'horloge d'émetteurs mal
+#: synchronisés NTP, assez courte pour borner la fenêtre d'une requête
+#: capturée. Un rejeu DANS la fenêtre reste borné par le rate-limit inbound.
+_HMAC_TOLERANCE_SECONDS_DEFAULT: Final[int] = 300
+
+
+def _hmac_tolerance_seconds() -> int:
+    """Fenêtre anti-rejeu effective — override ops ``WEBHOOK_HMAC_TOLERANCE_SECONDS``.
+
+    Lecture dynamique (pas figée à l'import) : ajustable sans redéploiement et
+    testable par monkeypatch d'env. Valeur invalide/négative → défaut (fail-safe
+    vers le comportement documenté, jamais vers une fenêtre infinie).
+    """
+    raw = os.environ.get("WEBHOOK_HMAC_TOLERANCE_SECONDS", "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _HMAC_TOLERANCE_SECONDS_DEFAULT
+    return value if value > 0 else _HMAC_TOLERANCE_SECONDS_DEFAULT
+
 #: Instance partagée entre tous les handlers (thread-safe, sliding window).
 #: Cf. ``app/utils/rate_limiter.py``. La clé encode l'action pour qu'un
 #: user saturant les mutations ne bloque pas ses propres lectures.
@@ -159,6 +213,11 @@ class _Messages:
     INVALID_FIELD_TYPE: Final[str] = "Un champ du body n'est pas du bon type."
     INVALID_CRLF: Final[str] = "Les retours à la ligne dans ce champ sont interdits."
     INVALID_JSON: Final[str] = "Le corps de la requête doit être du JSON valide."
+
+    # CWE-209 : UN SEUL message pour signature absente / invalide / timestamp
+    # hors fenêtre — un attaquant ne doit pas savoir QUELLE partie a échoué
+    # (sinon il distingue « secret faux » de « horloge décalée » et affine).
+    SIGNATURE_INVALID: Final[str] = "Signature de webhook absente ou invalide."
 
     RATE_LIMITED_INBOUND: Final[str] = (
         f"Trop de déclenchements ({_INBOUND_RATE_MAX}/minute) — patientez."
@@ -256,6 +315,76 @@ def _check_rate(*, key: str, max_requests: int, window_seconds: int, message: st
     """Lève HTTP 429 si la clé a dépassé sa fenêtre glissante."""
     if not _rate_limiter.check(key, max_requests=max_requests, window_seconds=window_seconds):
         raise tornado.web.HTTPError(429, message)
+
+
+def _verify_webhook_signature(
+    secret: str,
+    timestamp_header: str | None,
+    signature_header: str | None,
+    body: bytes,
+    *,
+    now_epoch: float | None = None,
+    tolerance_seconds: int | None = None,
+) -> bool:
+    """Vérifie la signature HMAC-SHA256 d'une requête webhook entrante.
+
+    Contrat émetteur (documenté dans la réponse de création du webhook) :
+
+    * ``X-Komptia-Timestamp`` : epoch Unix en secondes (entier) au moment de
+      l'envoi.
+    * ``X-Komptia-Signature`` : ``sha256=<hex>`` (préfixe optionnel) où
+      ``<hex> = HMAC_SHA256(secret, f"{timestamp}.{body_brut}")`` en
+      hexadécimal minuscule.
+
+    Garanties :
+
+    * **Anti-rejeu** : ``|now - timestamp| > tolérance`` → rejet. Le timestamp
+      étant DANS le payload signé, il ne peut pas être réécrit sans le secret.
+      (Une horloge émetteur EN AVANCE est aussi rejetée — symétrique, évite
+      qu'un attaquant pré-date des requêtes utilisables plus tard.)
+    * **Timing-safe** : ``hmac.compare_digest`` (CWE-208).
+    * **Fail-closed** : tout header absent/malformé → ``False``, jamais
+      d'exception propagée (un body exotique ne doit pas produire un 500
+      qui bypasserait le 401).
+
+    Pure (injectable ``now_epoch``/``tolerance_seconds``) → testable sans
+    handler ni horloge réelle.
+    """
+    if not secret or not timestamp_header or not signature_header:
+        return False
+    try:
+        ts = float(str(timestamp_header).strip())
+    except (TypeError, ValueError):
+        return False
+    # ``float('nan')`` parse sans exception MAIS toute comparaison avec NaN
+    # vaut False → ``abs(now - ts) > tolerance`` serait traversé : la fenêtre
+    # anti-rejeu serait annulée pour ce timestamp. ``inf`` est rejeté par la
+    # comparaison, NaN doit l'être explicitement (revue adversariale 2026-06-12).
+    if not math.isfinite(ts):
+        return False
+    now = time.time() if now_epoch is None else now_epoch
+    tolerance = _hmac_tolerance_seconds() if tolerance_seconds is None else tolerance_seconds
+    if abs(now - ts) > tolerance:
+        return False
+
+    received = str(signature_header).strip()
+    if received.lower().startswith("sha256="):
+        received = received[len("sha256=") :]
+    # Décodage hex AVANT compare : ``hmac.compare_digest`` sur des str lève
+    # TypeError si un caractère non-ASCII s'y trouve (Tornado décode les
+    # headers en latin-1 → octet >= 0x80 possible). Un header malformé doit
+    # produire ``False`` (→ 401), JAMAIS une exception (→ 500 + oracle
+    # 500-vs-401, CWE-209). ``bytes.fromhex`` rejette non-hex, non-ASCII et
+    # longueur impaire d'un coup, et tolère la casse.
+    try:
+        received_bytes = bytes.fromhex(received)
+    except ValueError:
+        return False
+    # La signature couvre le timestamp TEL QU'ENVOYÉ (pas re-normalisé) :
+    # l'émetteur signe f"{son_ts}.{body}" — on reconstruit à l'identique.
+    signed_payload = str(timestamp_header).strip().encode("utf-8") + b"." + (body or b"")
+    expected = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, received_bytes)
 
 
 def _parse_description_or_error(body: dict[str, Any]) -> str | None:
@@ -523,6 +652,48 @@ class WebhookInboundHandler(BaseHandler):
                 # martèlement non rate-limité (1 lookup User/req) était possible.
                 # Placé APRÈS le lookup pour qu'un attaquant tapant des tokens
                 # aléatoires (404 ci-dessus) ne pollue pas le store du limiter.
+                # ── Signature HMAC-SHA256 (FAILLE 2) ──
+                # Vérifiée AVANT tout oracle d'état (is_active 403, automation
+                # 404…) ET AVANT le rate-limit par token : sinon un porteur de
+                # l'URL SANS le secret pourrait épuiser le budget 60/min du
+                # token avec des requêtes non signées → 429 pour l'émetteur
+                # signé LÉGITIME (DoS, revue adversariale 2026-06-12). Le coût
+                # d'un HMAC-SHA256 sur un body ≤ 1 Mio est négligeable ; les
+                # échecs répétés sont bornés par un limiteur DÉDIÉ (clé
+                # ``sigfail:<token>``) qui ne touche pas le budget légitime.
+                # Webhooks sans secret (NULL) = compat token-seul, inchangés.
+                # 401 uniforme (CWE-209) pour absente / invalide / hors fenêtre.
+                if webhook.hmac_secret:
+                    if not _verify_webhook_signature(
+                        webhook.hmac_secret,
+                        self.request.headers.get(_TIMESTAMP_HEADER),
+                        self.request.headers.get(_SIGNATURE_HEADER),
+                        self.request.body or b"",
+                    ):
+                        if not _rate_limiter.check(
+                            f"webhook:sigfail:{token}",
+                            max_requests=_INBOUND_RATE_MAX,
+                            window_seconds=_INBOUND_RATE_WINDOW,
+                        ):
+                            raise tornado.web.HTTPError(
+                                429, _Messages.RATE_LIMITED_INBOUND
+                            )
+                        logger.warning(
+                            "webhook signature rejetee",
+                            extra={
+                                "request_id": self.request_id,
+                                "webhook_id": webhook.id,
+                                "has_signature": bool(
+                                    self.request.headers.get(_SIGNATURE_HEADER)
+                                ),
+                                "has_timestamp": bool(
+                                    self.request.headers.get(_TIMESTAMP_HEADER)
+                                ),
+                                "remote_ip": self.request.remote_ip,
+                            },
+                        )
+                        raise tornado.web.HTTPError(401, _Messages.SIGNATURE_INVALID)
+
                 if not _check_rate_limit(token):
                     raise tornado.web.HTTPError(429, _Messages.RATE_LIMITED_INBOUND)
 
@@ -680,6 +851,14 @@ class WebhookListAPIHandler(AuthenticatedHandler):
         body = _parse_body_or_error(self)
         description = _parse_description_or_error(body)
 
+        # Signature HMAC opt-in : ``require_signature: true`` → secret généré
+        # côté serveur, retourné UNE SEULE FOIS dans la réponse de création
+        # (show-once — jamais relisible via la liste). Défaut False : les
+        # intégrations existantes (token-seul) ne cassent pas.
+        require_signature = body.get("require_signature", False)
+        if not isinstance(require_signature, bool):
+            raise tornado.web.HTTPError(400, _Messages.INVALID_FIELD_TYPE)
+
         try:
             async with self.db_session() as session:
                 await _fetch_automation_or_404(
@@ -709,13 +888,28 @@ class WebhookListAPIHandler(AuthenticatedHandler):
                     automation_id=aid,
                     token=str(uuid.uuid4()),
                     description=description,
+                    hmac_secret=(
+                        secrets.token_urlsafe(_HMAC_SECRET_BYTES) if require_signature else None
+                    ),
                 )
                 session.add(webhook)
                 await session.flush()
                 await session.refresh(webhook)
 
                 base_url = _base_url(self)
-                payload = webhook.to_dict(include_url=True, base_url=base_url)
+                # include_secret : show-once à la création uniquement.
+                payload = webhook.to_dict(
+                    include_url=True, base_url=base_url, include_secret=True
+                )
+                if require_signature:
+                    payload["signature_help"] = (
+                        f"Envoyez les en-têtes {_TIMESTAMP_HEADER} (epoch Unix en "
+                        f"secondes) et {_SIGNATURE_HEADER} = sha256=HEX où HEX = "
+                        "HMAC_SHA256(secret, '{timestamp}.{corps brut}') en "
+                        "hexadécimal minuscule. Fenêtre anti-rejeu : "
+                        f"{_hmac_tolerance_seconds()} s. Ce secret ne sera plus "
+                        "jamais affiché — notez-le maintenant."
+                    )
         except tornado.web.HTTPError:
             raise
         except SQLAlchemyError:
@@ -809,6 +1003,25 @@ class WebhookRegenerateAPIHandler(AuthenticatedHandler):
         aid = self._parse_int_or_400(automation_id, "automation_id")
         wid = self._parse_int_or_400(webhook_id, "webhook_id")
 
+        # ``require_signature`` optionnel au body : True = (ré)génère un
+        # secret, False = désactive la signature, absent = conserve l'état
+        # actuel (un webhook signé reste signé, secret ROTATIONNÉ avec le
+        # token — « regenerate » invalide TOUTES les anciennes créances).
+        # Compat ascendante : avant 2026-06-12 ce endpoint IGNORAIT le body —
+        # un caller legacy qui poste un body non-JSON ne doit pas recevoir
+        # 400 (body optionnel ici) ; on le traite comme vide. Le 413
+        # (payload trop volumineux) reste levé.
+        try:
+            body = _parse_body_or_error(self)
+        except tornado.web.HTTPError as _body_exc:
+            if _body_exc.status_code == 400:
+                body = {}
+            else:
+                raise
+        require_signature = body.get("require_signature")
+        if require_signature is not None and not isinstance(require_signature, bool):
+            raise tornado.web.HTTPError(400, _Messages.INVALID_FIELD_TYPE)
+
         try:
             async with self.db_session() as session:
                 await _fetch_automation_or_404(
@@ -821,6 +1034,14 @@ class WebhookRegenerateAPIHandler(AuthenticatedHandler):
 
                 old_token = webhook.token
                 webhook.token = str(uuid.uuid4())
+                keep_signature = (
+                    require_signature
+                    if require_signature is not None
+                    else bool(webhook.hmac_secret)
+                )
+                webhook.hmac_secret = (
+                    secrets.token_urlsafe(_HMAC_SECRET_BYTES) if keep_signature else None
+                )
                 await session.flush()
                 await session.refresh(webhook)
 
@@ -828,7 +1049,10 @@ class WebhookRegenerateAPIHandler(AuthenticatedHandler):
                 _rate_limiter._requests.pop(old_token, None)
 
                 base_url = _base_url(self)
-                payload = webhook.to_dict(include_url=True, base_url=base_url)
+                # include_secret : show-once à la rotation (nouveau secret).
+                payload = webhook.to_dict(
+                    include_url=True, base_url=base_url, include_secret=True
+                )
         except tornado.web.HTTPError:
             raise
         except SQLAlchemyError:
@@ -874,9 +1098,15 @@ __all__ = [
     "_Messages",
     "_RATE_LIMIT_MAX",
     "_RATE_LIMIT_WINDOW",
+    "_HMAC_SECRET_BYTES",
+    "_HMAC_TOLERANCE_SECONDS_DEFAULT",
+    "_SIGNATURE_HEADER",
+    "_TIMESTAMP_HEADER",
     "_build_trigger_data",
     "_check_rate_limit",
     "_execute_webhook_automation",
+    "_hmac_tolerance_seconds",
+    "_verify_webhook_signature",
     "_log_safe",
     "_parse_body_or_error",
     "_parse_description_or_error",

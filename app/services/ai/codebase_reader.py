@@ -95,6 +95,11 @@ ALLOWED_ROOTS: Final[tuple[str, ...]] = (
     # Documentation knowledge graph (utile à l'agent pour répondre aux
     # questions d'architecture). Le SOUS-DOSSIER ``cache/`` est
     # explicitement denylisté plus bas (regenerable, gros volume).
+    # ⚠️ Artefact de DEV : exclu de l'image client (.dockerignore) comme tests/
+    # et docs/ → ABSENT en production. ``ALLOWED_ROOTS`` étant purement informatif
+    # (pas un gate), le garder ici n'ouvre rien ; mais ne PAS le présenter au LLM
+    # comme garanti-lisible (cf. formulation générique des tools de lecture de
+    # code dans agent_tools.py / agent_roles.py).
     "graphify-out",
 )
 
@@ -906,9 +911,12 @@ def _grep_with_ripgrep(
         "--no-heading",
         # Respecte .gitignore (couvre déjà data/, outputs/, backups/, etc.).
         "--no-messages",
-        # Limite matches par fichier (surcouche en plus de notre own cap)
+        # Limite matches par fichier (surcouche en plus de notre own cap).
+        # #18f (verdict #33) : +1 = sentinelle — sans elle, rg ne sort jamais
+        # plus de MAX par fichier, l'overflow n'est JAMAIS observé et
+        # ``truncated`` reste False (le LLM croit la liste exhaustive).
         "--max-count",
-        str(MAX_GREP_MATCHES_PER_FILE),
+        str(MAX_GREP_MATCHES_PER_FILE + 1),
     ]
     # Exclusion forte de ``data/`` au niveau ripgrep — défense en profondeur
     # en plus de la deny logique côté ``is_path_safe``. Si user fourni, on
@@ -967,6 +975,10 @@ def _grep_with_ripgrep(
         # Cap par fichier (au cas où rg en aurait laissé passer plus)
         per_file[rel] = per_file.get(rel, 0) + 1
         if per_file[rel] > MAX_GREP_MATCHES_PER_FILE:
+            # #18f (verdict #33) — l'occurrence-sentinelle est COMPTÉE
+            # (total) mais pas retournée : truncated/notice deviennent
+            # honnêtes en bout de chaîne (tool_result search_codebase).
+            total += 1
             continue
         total += 1
         if len(matches) < max_matches:
@@ -1043,6 +1055,7 @@ def _grep_python_fallback(
                         continue
                     per_file[rel] = per_file.get(rel, 0) + 1
                     if per_file[rel] > MAX_GREP_MATCHES_PER_FILE:
+                        total += 1  # #18f (verdict #33) — overflow compté
                         break
                     total += 1
                     if len(matches) < max_matches:

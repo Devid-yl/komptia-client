@@ -32,9 +32,7 @@ logger = get_logger(__name__)
 _IRIS_EXEC_TASKS: "set[asyncio.Task[Any]]" = set()
 
 
-async def _run_automation_via_iris(
-    automation_id: int, user_id: int | None, auto_name: str
-) -> None:
+async def _run_automation_via_iris(automation_id: int, user_id: int | None, auto_name: str) -> None:
     """Exécute réellement l'automation en arrière-plan (fire-and-forget).
 
     Délègue à l'API publique ``execute_automation`` — MÊME point d'entrée
@@ -58,7 +56,10 @@ async def _run_automation_via_iris(
     except Exception:  # noqa: BLE001 — fire-and-forget : on log tout
         logger.exception(
             "Iris: échec de l'exécution d'automation en arrière-plan",
-            extra={"automation_id": automation_id, "name": auto_name},
+            # ``name`` est un attribut RÉSERVé de LogRecord → ``extra={"name":...}``
+            # lève ``KeyError: Attempt to overwrite 'name'`` et MASQUERAIT
+            # l'exception d'origine. On utilise une clé non réservée.
+            extra={"automation_id": automation_id, "automation_name": auto_name},
         )
 
 
@@ -298,9 +299,7 @@ async def _handle_manage_automations(tool_input: Dict[str, Any], user: Any, cont
             # (costume-sans-corps + ligne bloquée « en cours » à vie). Désormais
             # c'est ``execute_automation`` qui crée et réconcilie SA PROPRE
             # ligne d'exécution, comme le bouton « Exécuter » et le scheduler.
-            task = asyncio.create_task(
-                _run_automation_via_iris(automation_id, user_id, auto_name)
-            )
+            task = asyncio.create_task(_run_automation_via_iris(automation_id, user_id, auto_name))
             _IRIS_EXEC_TASKS.add(task)
             task.add_done_callback(_IRIS_EXEC_TASKS.discard)
 
@@ -699,9 +698,21 @@ async def _load_smtp_config() -> dict | None:
     return await load_smtp_config_dict()
 
 
+def _redact_url_credentials(value: object) -> str:
+    """Masque les credentials d'un token URL-like avant de l'écho dans un message
+    d'erreur (#145 — défense leak). ``https://user:pass@host`` → ``https://[redacted]@host``.
+    Sans ``://`` ou sans ``@`` : passthrough (un email invalide normal n'est pas
+    altéré)."""
+    s = str(value)
+    scheme, sep, rest = s.partition("://")
+    if not sep or "@" not in rest:
+        return s
+    return f"{scheme}://[redacted]@{rest.split('@', 1)[1]}"
+
+
 async def _handle_send_email(tool_input: Dict[str, Any], user: Any, context: Dict) -> Dict:
     """Envoie un email via le service SMTP configuré."""
-    import re
+    from app.utils.validators import is_valid_email
 
     recipients = tool_input.get("recipients", [])
     subject = (tool_input.get("subject") or "").strip()
@@ -739,13 +750,17 @@ async def _handle_send_email(tool_input: Dict[str, Any], user: Any, context: Dic
     if not body_html:
         return {"success": False, "error": "Le corps du message est requis."}
 
-    # Validate email format for all recipients
-    _email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    invalid = [r for r in recipients if not isinstance(r, str) or not _email_re.match(r.strip())]
+    # Validate email format for all recipients — validateur SSoT ``is_valid_email``
+    # (le MÊME que le filtre SMTP ``_filter_valid_emails``). Avant, un regex local
+    # permissif acceptait les URLs (``https://...@x.com``) que le SMTP droppait
+    # ensuite EN SILENCE → ``recipients_count`` surévalué (#145). En rejetant en
+    # amont, on donne un message clair (cohérent avec le rejet des autres emails
+    # invalides) et plus aucun destinataire n'est silencieusement perdu.
+    invalid = [r for r in recipients if not is_valid_email(r)]
     if invalid:
         return {
             "success": False,
-            "error": f"Emails invalides : {', '.join(str(e) for e in invalid[:3])}",
+            "error": f"Emails invalides : {', '.join(_redact_url_credentials(e) for e in invalid[:3])}",
         }
     recipients = [r.strip() for r in recipients]
 
@@ -785,9 +800,15 @@ async def _handle_send_email(tool_input: Dict[str, Any], user: Any, context: Dic
         )
 
         if result.get("success"):
+            # Compter les destinataires RÉELLEMENT acceptés par le SMTP (#145) :
+            # défense en profondeur — si un filtre aval écarte des adresses, le
+            # count reste vrai (jamais > ce qui est parti). Fallback sur la liste
+            # validée si le client ne renvoie pas la clé (mock/sous-classe).
+            sent_recipients = result.get("recipients") or recipients
+
             logger.info(
                 "Email sent via Iris to %d recipients",
-                len(recipients),
+                len(sent_recipients),
             )
 
             # Store for agent_service to yield email_sent event
@@ -795,14 +816,14 @@ async def _handle_send_email(tool_input: Dict[str, Any], user: Any, context: Dic
                 context["emails_sent"] = []
             context["emails_sent"].append(
                 {
-                    "recipients": recipients,
+                    "recipients": sent_recipients,
                     "subject": subject,
                 }
             )
 
             return {
                 "success": True,
-                "recipients_count": len(recipients),
+                "recipients_count": len(sent_recipients),
                 "subject": subject,
             }
         else:
@@ -966,6 +987,10 @@ async def _handle_manage_users(tool_input: Dict[str, Any], user: Any, context: D
             }
 
         elif action == "create":
+            from app.core.constants_auth import (
+                PASSWORD_MAX_BYTES,
+                password_exceeds_bcrypt_limit,
+            )
             from app.services.auth.password_hasher import get_password_hasher
 
             username = (tool_input.get("username") or "").strip()
@@ -979,6 +1004,14 @@ async def _handle_manage_users(tool_input: Dict[str, Any], user: Any, context: D
                 return {"success": False, "error": "Email invalide."}
             if not password or len(password) < 8:
                 return {"success": False, "error": "Mot de passe min 8 caractères."}
+            # bcrypt ignore les octets au-delà du 72e — rejet explicite (SSoT :
+            # app.core.constants_auth.PASSWORD_MAX_BYTES) plutôt que troncature
+            # silencieuse / ValueError selon la version de bcrypt.
+            if password_exceeds_bcrypt_limit(password):
+                return {
+                    "success": False,
+                    "error": f"Mot de passe : max {PASSWORD_MAX_BYTES} octets (limite bcrypt).",
+                }
 
             hasher = get_password_hasher()
             hashed = hasher.hash_password(password)

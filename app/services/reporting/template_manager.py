@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
+from app.core import clock
+from app.services.reporting.number_format import format_number_preserving_nonzero
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -270,25 +272,36 @@ class TemplateManager:
         format_type = col_config.get("format", "text")
 
         try:
+            # #142 — SSoT anti-zéro-trompeur : un montant/pourcentage/décimal NON
+            # NUL ne doit jamais s'afficher « 0.00 » (perte de donnée silencieuse
+            # pour le lecteur). ``format_number_preserving_nonzero`` révèle le
+            # premier chiffre significatif quand l'arrondi collapse en zéro.
             if format_type == "currency":
                 suffix = col_config.get("suffix", " €")
-                return f"{float(value):,.2f}{suffix}".replace(",", " ")
+                return f"{format_number_preserving_nonzero(float(value), 2, grouping=True)}{suffix}"
 
             elif format_type == "percentage":
-                return f"{float(value):.2f}%"
+                return f"{format_number_preserving_nonzero(float(value), 2)}%"
 
             elif format_type == "integer":
                 return str(int(float(value)))
 
             elif format_type == "decimal":
                 decimals = min(max(int(col_config.get("decimals", 2)), 0), 10)
-                return f"{float(value):.{decimals}f}"
+                return format_number_preserving_nonzero(float(value), decimals)
 
             elif format_type == "date":
                 if isinstance(value, str):
                     value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                format_string = col_config.get("format_string", "%d/%m/%Y")
-                return value.strftime(format_string)
+                # ``or`` (pas un simple défaut de .get) : un template qui met
+                # explicitement format_string=null ou "" retombe sur le défaut
+                # au lieu de propager None à strftime_fr (robustesse template).
+                format_string = col_config.get("format_string") or "%d/%m/%Y"
+                # strftime_fr : un format_string de template avec %B/%A (ex.
+                # ca_mensuel.json : "%B %Y") doit rendre « juin 2026 », PAS
+                # « June 2026 » — l'image prod (python:slim) n'a pas de locale
+                # fr_FR. SSoT des noms FR : app.core.clock (zéro paquet locales).
+                return clock.strftime_fr(value, format_string)
 
             else:  # text
                 return str(value)

@@ -77,11 +77,25 @@ def build_pdf_from_plan(
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
+    # #56 — si des sections ont été droppées au cap serveur, le PDF ne doit pas
+    # paraître complet : on PRÉFIXE une note « rapport partiel » à l'introduction
+    # (canal déjà rendu en tête de document), au lieu d'un drop silencieux.
+    introduction = plan.introduction
+    _omitted = int(getattr(plan, "sections_omitted", 0) or 0)
+    if _omitted > 0:
+        _note = (
+            f"⚠ Rapport PARTIEL : {_omitted} section(s) proposée(s) par l'analyse "
+            "n'ont pas pu être incluses (limite serveur de sections ou section "
+            "invalide). Pour un rapport complet, demandez à regrouper l'analyse "
+            "ou réduire le périmètre."
+        )
+        introduction = f"{_note}\n\n{introduction}" if introduction else _note
+
     try:
         generator.generate_multi_section_report(
             output_path=tmp_path,
             title=plan.title,
-            introduction=plan.introduction,
+            introduction=introduction,
             sections=sections_for_pdf,
         )
         return tmp_path.read_bytes()

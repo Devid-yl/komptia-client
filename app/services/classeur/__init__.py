@@ -5,7 +5,7 @@ datastore et reports partagent le même code de lecture des classeurs.
 """
 
 from app.services.classeur.reader import (
-    MAX_CLASSEUR_SIZE,
+    decode_afz_bytes,
     extract_source_data,
     list_classeurs_sync,
     read_classeur,
@@ -14,7 +14,7 @@ from app.services.classeur.reader import (
 )
 
 __all__ = [
-    "MAX_CLASSEUR_SIZE",
+    "decode_afz_bytes",
     "extract_source_data",
     "list_classeurs_sync",
     "read_classeur",

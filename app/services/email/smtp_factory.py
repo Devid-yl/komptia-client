@@ -218,6 +218,69 @@ def build_smtp_client_from_dict(
     )
 
 
+def smtp_config_dict_from_row_or_env(
+    smtp_row: Any, config: Any, *, source: str = "smtp_config"
+) -> Optional[dict]:
+    """SSoT du dict de config SMTP — partagée par le loader ASYNC
+    (:func:`load_smtp_config_dict`) ET le loader SYNC APScheduler
+    (``delivery_service._load_smtp_config_sync``).
+
+    Avant cette factorisation (#124), les 2 loaders dupliquaient la logique →
+    drift garanti : le loader SYNC OUBLIAIT la **priorité 0** — un admin qui
+    désactive SMTP en BDD (``enabled=False``, mode incident pour stopper une
+    fuite d'emails) voyait les ENVOIS PLANIFIÉS continuer via le fallback
+    ``.env`` (kill-switch admin ignoré). Idem le decrypt du password (#69).
+    UNE seule fonction → plus de divergence possible.
+
+    Priorités (identiques aux 2 chemins) :
+      0. ``smtp_row`` présente mais ``enabled=False`` → ``None`` (PAS de
+         fallback ``.env`` : l'admin a coupé SMTP, on respecte le single
+         source of truth — sinon les emails continueraient à partir).
+      1. ``smtp_row`` ``enabled=True`` → dict BDD (password DÉCHIFFRÉ).
+      2. fallback ``.env`` si ``host`` + ``username``.
+      3. sinon ``None``.
+
+    Ne lève jamais — le caller assume ``None`` / fallback fichier.
+    """
+    if smtp_row is not None and not smtp_row.enabled:
+        logger.warning(
+            "SMTPGlobalConfig présente mais enabled=False — aucun mail ne "
+            "partira jusqu'à réactivation (%s) ; PAS de fallback .env "
+            "(single source of truth, mode incident).",
+            source,
+            extra={"host": smtp_row.host, "username": smtp_row.username},
+        )
+        return None
+
+    if smtp_row is not None and smtp_row.enabled:
+        return {
+            "host": smtp_row.host,
+            "port": smtp_row.port,
+            "username": smtp_row.username,
+            "password": decrypt_smtp_password_lenient(smtp_row.password),
+            "use_tls": smtp_row.use_tls,
+            "from_email": smtp_row.from_email,
+            "from_name": smtp_row.from_name,
+            "max_retries": smtp_row.max_retries,
+            "retry_delay": smtp_row.retry_delay,
+        }
+
+    if config.smtp.host and config.smtp.username:
+        return {
+            "host": config.smtp.host,
+            "port": config.smtp.port,
+            "username": config.smtp.username,
+            "password": config.smtp.password,
+            "use_tls": config.smtp.use_tls,
+            "from_email": config.smtp.from_email,
+            "from_name": config.smtp.from_name,
+            "max_retries": 3,
+            "retry_delay": 5,
+        }
+
+    return None
+
+
 async def load_smtp_config_dict(
     session=None,
 ) -> Optional[dict]:
@@ -271,51 +334,12 @@ async def load_smtp_config_dict(
         )
         smtp_row = None
 
-    # Priorité 0 : admin a explicitement désactivé en BDD — on NE fallback PAS
-    # sur .env. Sinon un admin qui appuie sur « désactiver SMTP » pour stopper
-    # une fuite d'emails (mode incident) verrait ses automations continuer à
-    # partir via la config .env héritée du setup initial — brisant le contrat
-    # *single source of truth* (axe 7 CLAUDE.md). Pattern aligné sur
-    # ``build_smtp_client_from_db`` (L287-299) pour garantir la parité de
-    # comportement entre les 2 helpers de chargement SMTP.
-    if smtp_row is not None and not smtp_row.enabled:
-        logger.warning(
-            "SMTPGlobalConfig présente mais enabled=False — "
-            "aucun mail ne partira jusqu'à réactivation (load_smtp_config_dict)",
-            extra={"host": smtp_row.host, "username": smtp_row.username},
-        )
-        return None
-
-    # Priorité 1 : config BDD active (admin a explicitement configuré)
-    if smtp_row is not None and smtp_row.enabled:
-        return {
-            "host": smtp_row.host,
-            "port": smtp_row.port,
-            "username": smtp_row.username,
-            "password": decrypt_smtp_password_lenient(smtp_row.password),
-            "use_tls": smtp_row.use_tls,
-            "from_email": smtp_row.from_email,
-            "from_name": smtp_row.from_name,
-            "max_retries": smtp_row.max_retries,
-            "retry_delay": smtp_row.retry_delay,
-        }
-
-    # Priorité 2 : fallback .env (mode dev / pas encore d'admin SMTP)
-    if config.smtp.host and config.smtp.username:
-        return {
-            "host": config.smtp.host,
-            "port": config.smtp.port,
-            "username": config.smtp.username,
-            "password": config.smtp.password,
-            "use_tls": config.smtp.use_tls,
-            "from_email": config.smtp.from_email,
-            "from_name": config.smtp.from_name,
-            "max_retries": 3,
-            "retry_delay": 5,
-        }
-
-    # Priorité 3 : pas de config — caller décide quoi faire
-    return None
+    # Priorités 0→3 (disabled / BDD / .env / None) : SSoT partagée avec le loader
+    # SYNC APScheduler pour garantir la parité (cf. #124 — la divergence avait
+    # fait oublier la priorité 0 côté sync → kill-switch admin ignoré).
+    return smtp_config_dict_from_row_or_env(
+        smtp_row, config, source="load_smtp_config_dict"
+    )
 
 
 async def build_smtp_client_from_db(

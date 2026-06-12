@@ -7,8 +7,11 @@ external_sheets.
 
 Sécurité (anti path-traversal) : :func:`_safe_path` du module datastore
 bloque les chemins absolus, traversals (``..``) et symlinks. Cap mémoire
-50 MB par fichier (aligné avec ``MAX_CLASSEUR_SIZE`` du module
-classeur.reader) pour prévenir les OOM sur fichiers malicieux.
+50 MB par fichier sur la taille COMPRESSÉE (``MAX_LOAD_WORKBOOK_BYTES``,
+configurable) pour prévenir les OOM au PARSING openpyxl/CSV (axe distinct).
+La décompression des ``.afz.json`` est, elle, bornée par le quota de stockage
+admin (SSoT) via le helper partagé ``decode_afz_bytes`` — plus aucun cap de
+décompression hardcodé.
 
 Formats supportés :
 * ``.afz.json`` / ``.json`` : format natif Komptia multi-onglets
@@ -25,14 +28,13 @@ from typing import Any, Dict, List
 
 from app.utils.logger import get_logger
 
-# Cluster-J 2026-05-26 — cap mémoire défense-en-profondeur sur load
-# workbook. Avant : 1 TiB (effectivement infini), un .afz.json de 5 GB
-# malicieux était lu en RAM puis gzip-décompressé → OOM Tornado cross-tenant.
-# Maintenant : 50 MB par défaut (aligné avec la docstring du module et
-# avec MAX_CLASSEUR_SIZE de classeur.reader). Cap technique de défense,
-# PAS un plafond admin (le quota stockage user reste piloté par /admin/
-# performance — cf. ``feedback_no_double_cap``). Configurable via env
-# pour les cabinets clients ayant des workbooks volumineux légitimes.
+# Cluster-J 2026-05-26 — cap mémoire défense-en-profondeur sur la taille
+# COMPRESSÉE du fichier avant PARSING (openpyxl/CSV). Protège contre un .xlsx/
+# .csv malicieux qui exploserait en RAM au parsing. ⚠️ Axe DISTINCT du quota
+# admin : pour les ``.afz.json``, la borne de DÉCOMPRESSION est désormais le
+# quota de stockage admin (SSoT) via ``decode_afz_bytes`` — plus aucun cap de
+# décompression hardcodé. Ce cap-ci reste un garde-fou parsing technique, PAS un
+# plafond admin (cf. ``feedback_no_double_cap``). Configurable via env.
 MAX_LOAD_WORKBOOK_BYTES = int(os.environ.get("KOMPTIA_WORKBOOK_LOAD_MAX_MB", "50")) * 1024 * 1024
 
 logger = get_logger(__name__)
@@ -91,7 +93,8 @@ async def load_workbook_from_datastore(
         )
 
     # Cap mémoire AVANT tout parsing : évite OOM sur fichier malicieux.
-    # Aligné avec MAX_CLASSEUR_SIZE de classeur.reader (50 MB).
+    # Porte sur la taille COMPRESSÉE (MAX_LOAD_WORKBOOK_BYTES = 50 MB par défaut) ;
+    # la borne décompressée est gérée en aval par decode_afz_bytes.
     try:
         file_size = target.stat().st_size
     except OSError as exc:
@@ -113,30 +116,21 @@ async def load_workbook_from_datastore(
 
     if is_json:
         try:
-            # Lecture binaire + détection gzip (magic bytes 0x1f 0x8b).
-            # Permet de lire les .afz.json gzippés (post-refacto 2026-05-14)
-            # ET les anciens en clair (rétrocompat). Single source of truth
-            # = classeur/reader.py:_load_json_sync, dupliqué ici car
-            # workbook_loader est appelé par l'executor automation hors
-            # du flow handler /api/workbooks.
-            import gzip as _gzip
+            # SINGLE SOURCE OF TRUTH : ``classeur.reader.decode_afz_bytes`` —
+            # détection gzip (magic bytes 0x1f 0x8b), décompression BORNÉE +
+            # TOLÉRANTE aux octets de queue, puis json.loads. Auparavant ce code
+            # ré-implémentait ``_load_json_sync`` inline avec ``gzip.decompress``
+            # (sans borne RAM + fragile aux octets de queue → BadGzipFile sur un
+            # classeur pourtant valide). On délègue désormais au helper partagé.
+            from app.services.classeur.reader import decode_afz_bytes
 
             raw_bytes = await asyncio.to_thread(target.read_bytes)
 
-            # Cluster-J (J2) 2026-05-26 — gzip.decompress + json.loads
-            # peuvent bloquer l'event loop 100-500ms sur un workbook
-            # 50 MB. On les déporte dans un thread worker pour ne pas
-            # bloquer Tornado (autres handlers + WS preview restent
-            # réactifs).
-            def _decompress_and_parse(buf: bytes) -> Any:
-                if buf[:2] == b"\x1f\x8b":
-                    text = _gzip.decompress(buf).decode("utf-8")
-                else:
-                    text = buf.decode("utf-8")
-                return _json.loads(text)
-
-            data = await asyncio.to_thread(_decompress_and_parse, raw_bytes)
-        except (OSError, _json.JSONDecodeError, _gzip.BadGzipFile) as exc:
+            # gzip.decompress + json.loads peuvent bloquer l'event loop
+            # 100-500ms sur un workbook volumineux → thread worker pour ne pas
+            # bloquer Tornado (autres handlers + WS preview restent réactifs).
+            data = await asyncio.to_thread(decode_afz_bytes, raw_bytes, source=relative_path)
+        except (OSError, _json.JSONDecodeError, ValueError) as exc:
             raise ValueError(
                 f"Etape '{step_name}' (load_workbook): impossible de lire "
                 f"'{relative_path}' ({exc.__class__.__name__})"
@@ -158,6 +152,12 @@ async def load_workbook_from_datastore(
                     "columns": list(t.get("columns") or []),
                     "rows": list(t.get("rows") or []),
                     "sql": t.get("sql") or "",
+                    # #133 — préserver la troncature SOURCE persistée dans le .afz.json.
+                    # Les branches .xlsx/.csv posent déjà `truncated` (l.202/237) ; cette
+                    # whitelist de reload le DROPPAIT → un classeur sauvegardé tronqué
+                    # rechargé en automation perdait le flag → agrégats du rapport faux
+                    # silencieux (la whitelist ne doit pas raboter un booléen structurel).
+                    "truncated": bool(t.get("truncated")),
                 }
             )
         if not tabs_norm:
@@ -260,6 +260,16 @@ def parse_tabs_selector(raw: Any, all_tabs: List[Dict[str, Any]]) -> List[Dict[s
         return list(all_tabs)
     if isinstance(raw, str):
         value = raw.strip().lower()
+        # TABS-1 — sentinel explicite « tout décoché » émis par le picker
+        # frontend (workbook_tabs_multi_picker). DOIT être distinct de « tous » :
+        # on refuse fail-closed au lieu d'exporter silencieusement TOUS les
+        # onglets. (``""`` legacy reste « tous » pour compat des configs
+        # existantes ; le picker n'émet plus jamais ``""``.)
+        if value == "none":
+            raise ValueError(
+                "Aucun onglet sélectionné pour l'export. Cochez « Tous » ou au "
+                "moins un onglet dans la configuration de l'étape."
+            )
         if value in ("", "all", "*"):
             return list(all_tabs)
         try:

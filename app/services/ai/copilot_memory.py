@@ -68,6 +68,7 @@ Sécurité
 from __future__ import annotations
 
 import logging
+import functools
 import re
 import unicodedata
 from typing import Any
@@ -187,6 +188,64 @@ Retourne directement le résumé, rien d'autre.
 #: Komptia précis) — on l'utilise pour détecter et filtrer les tokens
 #: orphelins (hallucinations du LLM).
 _PSEUDO_TOKEN_RE: re.Pattern[str] = re.compile(r"§[^§\s]*§")
+
+
+#: Préfixe de namespace appliqué aux placeholders PII éphémères dans la
+#: mémoire persistée : ``[EMAIL_1]`` → ``[MEM_EMAIL_1]``. ``MEM_…`` n'est
+#: pas un kind PII → il ne peut JAMAIS collisionner avec un placeholder
+#: vivant d'un run futur, ni être « restauré » vers une mauvaise valeur
+#: par le walk PII (qui ne mappe que les clés exactes de son mapping).
+_EPHEMERAL_PII_NAMESPACE = "MEM_"
+
+
+@functools.lru_cache(maxsize=1)
+def _ephemeral_pii_token_re() -> "re.Pattern[str]":
+    """Regex des placeholders PII built-in (``[EMAIL_3]``, ``[IBAN_1]``…),
+    avec le kind capturé.
+
+    SSoT : les kinds viennent de :func:`iter_pii_kinds` (patterns.py) — un
+    nouveau pattern PII est automatiquement couvert ici sans duplication.
+    Cache lru : kinds immuables au runtime, une seule compilation.
+    """
+    from app.services.anonymization.patterns import iter_pii_kinds
+
+    kinds = "|".join(re.escape(k) for k in iter_pii_kinds())
+    return re.compile(r"\[(" + kinds + r")_(\d+)\]")
+
+
+def strip_ephemeral_pii_tokens(text: str) -> str:
+    """Re-namespace les placeholders PII built-in dans la mémoire persistée
+    (fix 2026-06-11, tâche #21 — cohérence des couches d'anonymisation).
+
+    Les tokens ``§…§`` du pseudonymizer sont PERSISTANTS (mapping en BDD,
+    re-résolus à chaque run) — les stocker est voulu. Les placeholders
+    ``[EMAIL_3]``/``[IBAN_1]`` de la couche PII regex sont ÉPHÉMÈRES : le
+    mapping vit dans le run et meurt avec lui. Les stocker tels quels
+    produisait deux pathologies au run suivant :
+
+    1. **Collision silencieuse** : le run N+1 régénère ses propres
+       ``[EMAIL_1]``… avec un mapping FRAIS — le ``[EMAIL_1]`` hérité de
+       la mémoire (autre valeur !) est conflé par le LLM avec celui des
+       onglets courants → conclusions fausses sans erreur visible.
+    2. **Restauration fausse** : si le LLM recopie le token hérité dans un
+       emit, ``_full_restore`` le mappe vers la valeur du run COURANT →
+       donnée fausse matérialisée dans le classeur.
+
+    Renommage NAMESPACÉ (``[MEM_EMAIL_1]``) plutôt que marqueur neutre
+    (review #21) : préserve la corrélation intra-mémoire (deux mentions du
+    même email restent liées) ET la nature de la donnée (email vs date vs
+    montant) — la mémoire garde son utilité de continuité — tout en
+    offrant les mêmes garanties (``MEM_…`` n'est ni un kind générable, ni
+    une clé de mapping restaurable, ni re-tokenisable par les regex PII).
+    Idempotent : ``[MEM_EMAIL_1]`` ne re-matche pas (le ``[`` doit précéder
+    directement le kind).
+    """
+    if not text:
+        return text
+    return _ephemeral_pii_token_re().sub(
+        r"[" + _EPHEMERAL_PII_NAMESPACE + r"\1_\2]",
+        text,
+    )
 
 
 def filter_unknown_pseudonym_tokens(
@@ -498,4 +557,8 @@ async def summarize_copilot_run(ctx: Any, manager: Any) -> str:
     if not raw_summary or not isinstance(raw_summary, str):
         return ""
 
-    return sanitize_memory_for_prompt(raw_summary)
+    # Strip des placeholders PII ÉPHÉMÈRES avant persistance (tâche #21) :
+    # leur mapping meurt avec le run — stockés, ils collisionnent avec les
+    # placeholders frais du run suivant (cf. strip_ephemeral_pii_tokens).
+    # Les tokens §…§ persistants, eux, restent (contrat de cette fonction).
+    return strip_ephemeral_pii_tokens(sanitize_memory_for_prompt(raw_summary))

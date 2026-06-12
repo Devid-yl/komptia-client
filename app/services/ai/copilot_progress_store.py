@@ -80,6 +80,31 @@ _INFLIGHT_TTL_SECONDS: float = 1800.0  # 30 min, parité avec _tasks
 # de timeout LLM = 20min worst-case. On prend 30min pour marge.
 _TASKS_TTL_SECONDS: float = 1800.0
 
+# Tombstones de cancellation (fix 2026-06-11, tâche #14) : un cancel qui
+# arrive AVANT register_task (fenêtre claim_run → register_task, ex:
+# on_connection_close immédiat) ne trouvait rien à canceller → le run
+# continuait à brûler des tokens. On mémorise l'intention ; register_task
+# la consomme et cancel immédiatement le Task qui s'inscrit. TTL court :
+# la fenêtre couverte est de quelques ms — au-delà, un tombstone périmé
+# ne doit pas tuer un futur run légitime.
+#
+# Hypothèse cliente (documentée, review #14) : le frontend génère un
+# run_id NEUF (crypto.randomUUID) à CHAQUE submit — un retry/resubmit ne
+# réutilise jamais le run_id d'un run cancellé. Un client qui violerait
+# ce contrat dans les 60s d'un cancel verrait son run tué à l'inscription
+# (defense-in-depth assumée : TTL court + clé scoped user).
+_cancel_requested: Dict[tuple, float] = {}
+_CANCEL_TOMBSTONE_TTL_SECONDS: float = 60.0
+
+
+def _cleanup_tombstones_unlocked() -> None:
+    """Purge les tombstones expirés. Doit être appelé sous ``_lock``."""
+    now = time.time()
+    expired = [k for k, ts in _cancel_requested.items() if now - ts > _CANCEL_TOMBSTONE_TTL_SECONDS]
+    for k in expired:
+        _cancel_requested.pop(k, None)
+
+
 # Cap dur sur le nombre d'entrées pour empêcher un DoS par accumulation
 # (user malveillant qui POSTe 10k fois sans attendre TTL). Au-delà, on
 # evict la plus vieille entrée (LRU via updated_at).
@@ -88,6 +113,21 @@ _MAX_STORE_ENTRIES: int = 2000
 # Lock pour tous les accès mutants. asyncio.Lock suffit car tous les callers
 # sont async (Tornado + copilot_agent). Pas de thread pool côté copilot.
 _lock = asyncio.Lock()
+
+
+def _mark_exception_retrieved(fut: Any) -> None:
+    """Consomme l'exception d'une Future résolue par le store lui-même
+    (purge TTL, eviction LRU) — fix review #14 : si AUCUN doublon n'a
+    jamais await cette Future (cas le plus fréquent), asyncio loggue
+    « Future exception was never retrieved » à son GC, exactement le
+    bruit de logs que cette tâche vise à réduire. ``fut.exception()``
+    marque l'exception comme lue SANS la consommer pour d'éventuels
+    awaiters réels (ils la reçoivent toujours)."""
+    try:
+        if fut is not None and fut.done() and not fut.cancelled():
+            fut.exception()
+    except Exception:  # noqa: BLE001 — best-effort, jamais bloquant
+        pass
 
 
 def _make_key(user_id: Any, run_id: str) -> Optional[tuple]:
@@ -227,6 +267,12 @@ async def get_tool_in_use(user_id: Any, run_id: str) -> Optional[str]:
     if key is None:
         return None
     async with _lock:
+        # Cleanup TTL (fix 2026-06-11, tâche #14) : parité avec
+        # get_progress. Sans lui, un run crashé sans clear_progress
+        # continuait d'exposer un tool_in_use FANTÔME (« Exécution de
+        # aggregate… » affiché des heures après la mort du run) tant
+        # qu'aucun autre accès ne purgait l'entrée.
+        _cleanup_expired_unlocked()
         entry = _store.get(key)
         if entry is None:
             return None
@@ -336,12 +382,38 @@ async def register_task(user_id: Any, run_id: str, task: "asyncio.Task[Any]") ->
             except ValueError:
                 pass  # dict vide entre-temps
         _tasks[key] = (task, time.time())
+        # Tombstone : un cancel est arrivé AVANT cette inscription
+        # (fenêtre claim→register). Honore l'intention immédiatement —
+        # sans ça le run tournait jusqu'au bout, incancellable.
+        _cleanup_tombstones_unlocked()
+        if _cancel_requested.pop(key, None) is not None:
+            logger.info(
+                "register_task: cancel demandé avant l'inscription "
+                "(user=%s, run=%s) — cancellation immédiate.",
+                user_id,
+                run_id,
+            )
+            try:
+                task.cancel()
+            except Exception:  # noqa: BLE001
+                logger.debug("cancel tombstone a levé", exc_info=True)
 
 
-async def unregister_task(user_id: Any, run_id: str) -> None:
-    """Retire le Task du registry SI l'entrée pointe encore vers ce Task
-    (compare par identité). Sinon, on a été remplacé par un nouveau run —
-    ne pas purger l'entrée du successeur. Silent si absent — double-purge OK.
+async def unregister_task(
+    user_id: Any,
+    run_id: str,
+    task: Optional["asyncio.Task[Any]"] = None,
+) -> None:
+    """Retire le Task du registry. Silent si absent — double-purge OK.
+
+    Fix 2026-06-11 (tâche #14) : la docstring promettait la comparaison
+    par identité mais le code popait INCONDITIONNELLEMENT — le finally
+    d'un run A remplacé (collision register_task → A cancellé, B inscrit)
+    purgeait l'entrée du SUCCESSEUR B, qui devenait incancellable via
+    l'API (Stop sans effet, tokens brûlés jusqu'au bout). Le caller passe
+    désormais sa référence de Task : si l'entrée pointe vers un AUTRE
+    Task encore vivant, on ne touche pas (c'est l'entrée du successeur).
+    ``task=None`` (legacy) garde l'ancien comportement.
     """
     key = _make_key(user_id, run_id)
     if key is None:
@@ -350,16 +422,12 @@ async def unregister_task(user_id: Any, run_id: str) -> None:
         entry = _tasks.get(key)
         if entry is None:
             return
-        # On ne peut pas comparer par identité dans le general case (le
-        # caller n'a pas le Task ref), mais on peut au moins purger si
-        # l'entry est done (cas normal de fin de run).
-        if isinstance(entry, tuple):
-            t = entry[0]
-            if t is None or (hasattr(t, "done") and t.done()):
-                _tasks.pop(key, None)
+        current = entry[0] if isinstance(entry, tuple) else entry
+        if task is not None and current is not None and current is not task:
+            # L'entrée appartient à un autre Task (successeur). On ne la
+            # purge que s'il est déjà fini (entrée morte de toute façon).
+            if not (hasattr(current, "done") and current.done()):
                 return
-        # Fin de run "normale" : le Task courant est en train de retourner.
-        # On purge.
         _tasks.pop(key, None)
 
 
@@ -381,6 +449,13 @@ async def cancel_task(user_id: Any, run_id: str) -> bool:
         _cleanup_tasks_unlocked()
         entry = _tasks.get(key)
         if entry is None:
+            # Tombstone (fix 2026-06-11, tâche #14) : le run a peut-être
+            # été claim mais pas encore register (fenêtre de quelques ms).
+            # Mémorise l'intention — register_task la consommera et
+            # cancellera immédiatement. Sans run en vol, le tombstone
+            # expire en _CANCEL_TOMBSTONE_TTL_SECONDS sans effet.
+            _cleanup_tombstones_unlocked()
+            _cancel_requested[key] = time.time()
             return False
         if isinstance(entry, tuple):
             task = entry[0]
@@ -401,7 +476,14 @@ async def cancel_task(user_id: Any, run_id: str) -> bool:
 
 def _cleanup_inflight_unlocked() -> None:
     """Purge les Futures orphelines (done sans release, ou TTL dépassé).
-    Doit être appelé sous ``_lock``."""
+    Doit être appelé sous ``_lock``.
+
+    Fix 2026-06-11 (tâche #14) : une Future TTL-expirée mais PAS done a
+    encore potentiellement des awaiters (POSTs doublons). La purger sans
+    la résoudre les laissait suspendus jusqu'à leur propre timeout — on
+    leur set une exception explicite (même pattern que l'eviction LRU de
+    ``claim_run``).
+    """
     now = time.time()
     dead = []
     for k, val in _inflight.items():
@@ -415,7 +497,14 @@ def _cleanup_inflight_unlocked() -> None:
         elif registered_at > 0 and now - registered_at > _INFLIGHT_TTL_SECONDS:
             dead.append(k)
     for k in dead:
-        _inflight.pop(k, None)
+        evicted = _inflight.pop(k, None)
+        fut = evicted[0] if isinstance(evicted, tuple) else evicted
+        if fut is not None and hasattr(fut, "done") and not fut.done():
+            try:
+                fut.set_exception(RuntimeError("inflight Future expirée (TTL) sans release_run"))
+                _mark_exception_retrieved(fut)
+            except Exception:  # noqa: BLE001 — Future cancellée entre-temps
+                pass
 
 
 async def claim_run(
@@ -479,6 +568,7 @@ async def claim_run(
                             evicted_fut.set_exception(
                                 RuntimeError("inflight Future evicted (LRU cap reached)")
                             )
+                            _mark_exception_retrieved(evicted_fut)
                         except Exception:  # noqa: BLE001
                             pass
             except ValueError:
@@ -525,6 +615,40 @@ async def release_run(
         )
 
 
+async def finalize_run(
+    user_id: Any,
+    run_id: str,
+    result: Any = None,
+    task: Optional["asyncio.Task[Any]"] = None,
+) -> None:
+    """Cleanup de fin de run en UNE séquence garantie (fix 2026-06-11,
+    tâche #14) : release_run → unregister_task → clear_progress, chaque
+    étape isolée dans son try/except — un échec n'empêche pas les
+    suivantes.
+
+    Conçu pour être lancé comme Task INDÉPENDANTE depuis le finally du
+    handler (``asyncio.create_task`` + ``shield``) : une cancellation
+    ré-entrante du handler (2e clic Stop pendant le finally) n'atteint
+    pas cette coroutine — les trois stores sont nettoyés dans tous les
+    cas. L'ancien pattern (3 awaits shieldés successifs dans le finally,
+    chacun suivi de ``except CancelledError: raise``) sautait les
+    cleanups restants dès la première ré-entrance — exactement la fuite
+    ``_tasks``/``_store`` qu'il prétendait empêcher.
+    """
+    try:
+        await release_run(user_id, run_id, result=result)
+    except Exception:  # noqa: BLE001
+        logger.debug("finalize_run: release_run a levé", exc_info=True)
+    try:
+        await unregister_task(user_id, run_id, task=task)
+    except Exception:  # noqa: BLE001
+        logger.debug("finalize_run: unregister_task a levé", exc_info=True)
+    try:
+        await clear_progress(user_id, run_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("finalize_run: clear_progress a levé", exc_info=True)
+
+
 # Helpers de test / debug — pas utilisés en production.
 
 
@@ -534,6 +658,7 @@ async def _reset_for_tests() -> None:
         _store.clear()
         _tasks.clear()
         _inflight.clear()
+        _cancel_requested.clear()
 
 
 async def _snapshot_for_tests() -> Dict[str, Dict[str, Any]]:

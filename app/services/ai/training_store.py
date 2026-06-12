@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional
 from collections import Counter
 
 import numpy as np
-from sqlalchemy import delete, select, func, text, update
+from sqlalchemy import delete, select, func, or_, text, update
 
 from app.core import clock
 from app.models.training_data import TrainingData, TrainingDataType
@@ -191,6 +191,18 @@ _MAX_TAGS_LEN = 500  # TrainingData.tags : String(500)
 # Le matching se fait en STRICT equality (pas LIKE) pour éviter collisions
 # avec d'éventuelles catégories préfixées du type "business_context:xxx".
 BUSINESS_CONTEXT_CATEGORY = "business_context"
+
+# ── Connaissances ÉPINGLÉES (toujours injectées en tête du prompt Iris) ──
+# Petit set curé de faits critiques sur la base connectée (ex: comment accéder
+# à une « entité ») que l'admin veut TOUJOURS présents dans le prompt, peu
+# importe le RAG by-correspondence (qui ne matche que des paires validées et a
+# déjà laissé passer des faux silencieux). Stockées comme DOCUMENTATION de cette
+# catégorie. Curé et BORNÉ — ce N'EST PAS le dump catalogue inconditionnel
+# supprimé en task #93 (qui dumpait TOUTES les tables sans correspondance).
+# Généricité : zéro fait hardcodé dans le code ; la donnée (spécifique au
+# cabinet) vit en BDD, éditée via /admin/ai-training — même doctrine que
+# /data-privacy.
+PINNED_KNOWLEDGE_CATEGORY = "pinned_knowledge"
 
 # Fallback de dernier recours (utilisé uniquement quand la BDD AIConfig est
 # inaccessible — au boot avant ``ensure_seed_configs`` ou panne SQLite).
@@ -1141,13 +1153,17 @@ class TrainingStore:
 
         try:
             # add_limit=True → wrap TOP N : force parse + plan sans ramener un
-            # gros résultat. timeout=15 : cap dur (slow plan, lock wait).
+            # gros résultat. Pas de ``timeout=`` explicite : le coût est borné
+            # par ``max_rows=1``, donc on hérite du timeout admin
+            # (``connector.timeout``). Un cap dur (ex: 15s) rejetait à tort une
+            # paire Q/SQL VALIDE sur une Sage lente où l'admin a configuré plus
+            # → corruption silencieuse du corpus d'entraînement (même bug de
+            # double-cap que l'incident dashboard 2026-06-08).
             executor = get_query_executor()
             await executor.execute(
                 sql,
                 max_rows=1,
                 add_limit=True,
-                timeout=15,
                 rls_source=rls_source,
             )
         except _SageConnectionError:
@@ -2126,6 +2142,14 @@ class TrainingStore:
         Returns:
             Liste de paires Q/SQL triées par pertinence (filtrée si user fourni).
         """
+        # FIX (hunt it.49, BF9) : court-circuit sur une question VIDE / whitespace —
+        # aucun signal RAG. Sans ce guard, le fallback TF-IDF tokenise → tokens vides
+        # → scores tous nuls → le filet de sécurité renvoyait le tour le plus RÉCENT
+        # (created_at DESC) comme few-shot, PAS le plus pertinent. Évite aussi le scan
+        # BDD inutile. (Le cas « ??? » non-vide mais tokenisé-à-vide est traité par la
+        # garde de signal sur le filet de sécurité, plus bas.)
+        if not question or not question.strip():
+            return []
         # Bug 2026-05-26 (Agent 4 brainstorm AT-C3 critique) : avant le
         # fix, ce SELECT chargeait la TABLE COMPLÈTE en RAM à chaque
         # appel ``get_similar_question_sql``. À 50K paires (objectif
@@ -2301,7 +2325,14 @@ class TrainingStore:
                 break
 
         # 2) Filet de sécurité: garantir un minimum d'exemples few-shot
-        if len(results) < min_examples:
+        # FIX (hunt it.49, BF9) : ne déclencher le filet QUE s'il existe un VRAI signal
+        # de pertinence (au moins un score > 0). Sinon (tous scores == 0 : query « ??? »
+        # tokenisée à vide, ou couverture nulle), le tri stable renvoie le tour le plus
+        # RÉCENT (created_at DESC) — un MAUVAIS few-shot, pas le plus pertinent. Un signal
+        # faible mais réel (0 < score < min_score) déclenche bien le filet (comportement
+        # inchangé pour les vraies queries).
+        _has_relevance_signal = any(_score > 0 for _pair, _score in scored)
+        if _has_relevance_signal and len(results) < min_examples:
             for pair, score in scored:
                 if pair.id in selected_ids:
                     continue
@@ -2949,12 +2980,26 @@ class TrainingStore:
                 )
             )
 
-            # Compter les vues SQL
+            # Compter les vues SQL — nombre de vues DISTINCTES, robuste au double
+            # stockage. Historique : la migration `reclassify_views_from_ddl`
+            # (database.py) a été un NO-OP jusqu'au 2026-06-09 (elle comparait
+            # la value enum `'ddl'` minuscule alors que SQLAlchemy stocke le NOM
+            # du membre = `'DDL'` majuscule) → chaque vue existait EN DOUBLE :
+            # legacy `data_type=DDL` + `source='auto_sync_view'` (ancien
+            # add_ddl) ET `data_type=VIEW` (add_view actuel). La migration est
+            # corrigée et `dedup_active_view_rows` résorbe les doublons au boot,
+            # mais on GARDE le comptage par `table_name` DISTINCT couvrant les
+            # DEUX formes : robuste sur une BDD pas encore re-bootée (doublons
+            # présents) et sans régresser à 0 sur une BDD legacy-only (compter
+            # `VIEW` seul renverrait 0 alors que les vues existent en
+            # `DDL/auto_sync_view`).
             views_count = await session.execute(
-                select(func.count()).where(
-                    TrainingData.data_type == TrainingDataType.DDL,
+                select(func.count(func.distinct(TrainingData.table_name))).where(
                     TrainingData.is_active == True,  # noqa: E712
-                    TrainingData.source == "auto_sync_view",
+                    or_(
+                        TrainingData.data_type == TrainingDataType.VIEW,
+                        TrainingData.source.like("auto_sync_view%"),
+                    ),
                 )
             )
 
@@ -3878,6 +3923,117 @@ class TrainingStore:
             if norm:
                 seen.add(norm)
         return sorted(seen)
+
+    async def get_pinned_knowledge(self, token_budget: int = 2000) -> str:
+        """Connaissances ÉPINGLÉES — texte injecté en TÊTE du system prompt d'Iris.
+
+        Contrat (demande David 2026-06-10) : un PETIT set curé de faits critiques
+        sur la base connectée (ex: comment accéder à une « entité ») doit être
+        TOUJOURS présent dans le prompt, indépendamment du RAG by-correspondence
+        (qui ne matche que des paires validées et a déjà laissé passer des faux
+        silencieux). Ce n'est PAS le dump catalogue inconditionnel supprimé en
+        task #93 : ici le contenu est curé par un admin via /admin/ai-training
+        (type "pinned").
+
+        GÉNÉRICITÉ : le code ne contient AUCUN nom de table/colonne. La donnée
+        (spécifique au cabinet) vit en BDD — même doctrine que /data-privacy.
+
+        Source = DOCUMENTATION de catégorie ``PINNED_KNOWLEDGE_CATEGORY``, actives.
+        Tri déterministe (id ASC) pour un préfixe de prompt STABLE (cache Anthropic
+        non invalidé entre messages). Borné par ``token_budget`` : chaque entrée
+        est incluse entièrement ou exclue (jamais de SQL coupé en plein milieu).
+        Fail-closed : toute exception → "" (ne bloque jamais la construction du
+        prompt).
+
+        Args:
+            token_budget: Plafond d'estimation tokens (~4 chars/token). <=0 → "".
+
+        Returns:
+            Texte concaténé des connaissances épinglées, ou "" si aucune.
+        """
+        try:
+            budget = int(token_budget)
+        except (TypeError, ValueError):
+            return ""
+        if budget <= 0:
+            return ""
+        try:
+            async with get_session() as session:
+                result = await session.execute(
+                    select(TrainingData)
+                    .where(
+                        TrainingData.data_type == TrainingDataType.DOCUMENTATION,
+                        TrainingData.category == PINNED_KNOWLEDGE_CATEGORY,
+                        TrainingData.is_active.is_(True),
+                    )
+                    .order_by(TrainingData.id.asc())
+                )
+                records = result.scalars().all()
+            if not records:
+                return ""
+            blocks: List[str] = []
+            used = 0
+            for rec in records:
+                content = (rec.content or "").strip()
+                if not content:
+                    continue
+                est_tokens = max(1, len(content) // 4)  # ~4 chars/token
+                # Revue adversariale 2026-06-10 : on injecte TOUJOURS au moins la
+                # 1ʳᵉ épingle (id le plus bas = la plus prioritaire, typiquement la
+                # recette critique), même si elle dépasse seule le budget — l'exclure
+                # silencieusement serait un « costume sans corps » (l'admin voit le
+                # badge « Épinglée » mais Iris ne reçoit rien). On ne borne QUE les suivantes.
+                # Pas de cap silencieux (CLAUDE.md axe 21) : on log ce qui saute.
+                if blocks and used + est_tokens > budget:
+                    logger.warning(
+                        "get_pinned_knowledge: budget %d tokens atteint — "
+                        "connaissance épinglée id=%s NON injectée (les précédentes "
+                        "ont rempli le budget)",
+                        budget,
+                        rec.id,
+                    )
+                    continue
+                used += est_tokens
+                blocks.append(content)
+            return "\n\n".join(blocks)
+        except Exception as exc:  # fail-closed — ne jamais casser le prompt
+            logger.warning("get_pinned_knowledge a échoué (fail-closed): %s", exc)
+            return ""
+
+    async def is_cached_view(self, table_name: str) -> bool:
+        """SSoT — l'objet ``table_name`` est-il une VUE selon le cache schéma ?
+
+        Tâche #20 (revue adversariale) : unifie la détection « est-ce une vue ? »
+        entre ``introspect_table`` (#10) et ``recommend_join`` (#9a), qui
+        divergeaient (cache ``TrainingData`` vs ``INFORMATION_SCHEMA`` live → en
+        mode dégradé, Sage down, les deux donnaient des conseils CONTRADICTOIRES
+        sur le même objet, rouvrant le bug « entité »). Cache-only = robuste
+        hors-ligne. Couvre ``VIEW`` + legacy ``auto_sync_view``. Normalise le nom
+        (strip schéma/crochets, ``lower()``). Fail-closed → ``False`` sur erreur.
+        """
+        norm = (table_name or "").split(".")[-1].strip("[] ").lower()
+        if not norm:
+            return False
+        try:
+            async with get_session() as session:
+                row = (
+                    await session.execute(
+                        select(TrainingData.id)
+                        .where(
+                            TrainingData.is_active == True,  # noqa: E712
+                            or_(
+                                TrainingData.data_type == TrainingDataType.VIEW,
+                                TrainingData.source.like("auto_sync_view%"),
+                            ),
+                            func.lower(TrainingData.table_name) == norm,
+                        )
+                        .limit(1)
+                    )
+                ).first()
+            return row is not None
+        except Exception as exc:  # fail-closed
+            logger.warning("is_cached_view a échoué (fail-closed): %s", exc)
+            return False
 
     async def add_business_context(
         self,

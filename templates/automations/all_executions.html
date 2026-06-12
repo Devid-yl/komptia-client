@@ -83,7 +83,7 @@
                     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
                         {# UTC stocke en BDD ; converti en heure locale par
                            static/js/local-datetime.js qui lit le `datetime` ISO. #}
-                        <time datetime="{{ execution.started_at.isoformat() }}+00:00"
+                        <time datetime="{{ iso_utc(execution.started_at) }}"
                               data-fmt-local="short"
                               title="{{ execution.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC">
                             {{ execution.started_at.strftime('%d/%m %H:%M') }} UTC
@@ -118,29 +118,8 @@
         {% end %}
     </div>
 
-    <!-- Pagination -->
-    {% if total_pages > 1 %}
-    <div class="flex items-center justify-center gap-2 mt-6">
-        {% if page > 1 %}
-        <a href="/executions?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" 
-           class="px-3 py-2 text-sm border border-gray-300 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-700">&larr; Pr&eacute;c&eacute;dent</a>
-        {% end %}
-        
-        <div class="flex items-center gap-1">
-            {% for p in range(max(1, page - 2), min(total_pages + 1, page + 3)) %}
-            <a href="/executions?page={{ p }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}"
-               class="px-3 py-2 text-sm rounded {% if p == page %}bg-brand-600 text-white{% else %}border border-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800{% end %} dark:border-gray-700">{{ p }}</a>
-            {% end %}
-        </div>
-        
-        {% if page < total_pages %}
-        <a href="/executions?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" 
-           class="px-3 py-2 text-sm border border-gray-300 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-700">Suivant &rarr;</a>
-        {% end %}
-    </div>
-    
-    <p class="text-center text-xs text-gray-500 mt-3 dark:text-gray-400">Page {{ page }} sur {{ total_pages }}</p>
-    {% end %}
+    {# Pagination unifiée (UIModule, cf. app/ui_modules.py) #}
+    {% module Pagination(page=page, total_pages=total_pages) %}
 
     {% else %}
     <div class="card px-4 py-12 text-center">
@@ -313,5 +292,44 @@ document.querySelectorAll('.step-toggle').forEach(function(btn) {
         });
     });
 });
+</script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding automations_executions_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'automations_executions_v1',
+                title: 'Le journal de vos automatisations',
+                steps: [
+                    {
+                        icon: 'bell',
+                        title: 'Suivre toutes vos exécutions',
+                        text: 'Cette page rassemble l\'historique de toutes vos automatisations au même endroit. Chaque ligne montre d\'un coup d\'œil si l\'exécution a réussi, échoué, est partielle ou encore en cours, avec la date, la durée et le nombre de lignes traitées. C\'est votre tableau de supervision pour vérifier que tout tourne sans surveiller chaque automatisation une par une.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Filtrer pour retrouver l\'essentiel',
+                        text: 'Les deux menus en haut filtrent par statut (Réussi, Échec, En cours…) et par période (dernières 24h, 7, 30 ou 90 jours). Pratique pour isoler rapidement les échecs récents. Le lien « Réinitialiser » remet la liste complète quand un filtre est actif.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Comprendre chaque exécution en détail',
+                        text: 'Cliquez sur « Voir les étapes » pour déplier le déroulé maillon par maillon : type d\'étape, statut, lignes en entrée/sortie, durée et messages d\'erreur éventuels. Quand un fichier a été produit, « Télécharger » le récupère directement, et « Détail » ouvre la vue complète de l\'exécution.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'En cas d\'échec, agir vite',
+                        text: 'Une exécution en rouge affiche le message d\'erreur pour comprendre ce qui a coincé. Ouvrez « Détail » puis utilisez le bouton « Relancer » pour rejouer l\'automatisation avec les données actuelles. Pour corriger l\'étape fautive, retournez dans la liste de vos automatisations et ouvrez son éditeur. Vous ne voyez ici que vos propres automatisations, jamais celles des autres utilisateurs.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
 </script>
 {% end %}

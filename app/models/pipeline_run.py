@@ -61,6 +61,11 @@ class PipelineRunStatus(str, enum.Enum):
     SUCCESS = "success"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # Arrêt volontaire à une phase intermédiaire (feature « preview » Iris —
+    # docs/design/iris_stop_at_phase.md). TERMINAL (run terminé sur le scope
+    # demandé, sans SQL final) mais resumable via pipeline_resume. Distinct de
+    # SUCCESS (pas de final_sql) et de PAUSED (suspension mid-run).
+    STOPPED_EARLY = "stopped_early"
 
     @classmethod
     def terminal(cls) -> "frozenset[PipelineRunStatus]":
@@ -72,7 +77,7 @@ class PipelineRunStatus(str, enum.Enum):
         plus de liste ``(success, failed, cancelled)`` dupliquée qui divergerait
         silencieusement.
         """
-        return frozenset({cls.SUCCESS, cls.FAILED, cls.CANCELLED})
+        return frozenset({cls.SUCCESS, cls.FAILED, cls.CANCELLED, cls.STOPPED_EARLY})
 
     @classmethod
     def active_volatile(cls) -> "frozenset[PipelineRunStatus]":
@@ -168,6 +173,22 @@ class PipelineRun(BaseModel):
         Boolean, default=True, insert_default=True, nullable=False
     )
 
+    # Arrêt volontaire à une phase intermédiaire (feature « preview » Iris —
+    # docs/design/iris_stop_at_phase.md). NULL = run complet jusqu'au SQL.
+    # Quand non-NULL, le run se termine en statut STOPPED_EARLY après cette
+    # phase (sans final_sql). Le « pourquoi terminal » reste porté par
+    # ``status`` (SSoT PipelineRunStatus) — PAS de colonne ``terminal_reason``
+    # dupliquée ; le ``terminal_reason`` niveau script (run.json) est traduit
+    # en statut par le runner.
+    stop_after_phase: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    # B6 — lien run preview → run de continuation. Posé par ``resume_pipeline_run``
+    # sur le NOUVEAU run créé. Permet de refuser un 2e resume depuis la même
+    # source tant qu'un enfant NON-terminal existe (idempotence déterministe
+    # anti double-resume — backstop backend de la mitigation frontend B4). Plain
+    # Integer indexé (pas de FK : on requête seulement par valeur, pas de cascade).
+    resumed_from_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+
     # Cycle de vie
     status: Mapped[PipelineRunStatus] = mapped_column(
         SQLEnum(PipelineRunStatus), nullable=False, default=PipelineRunStatus.PENDING
@@ -243,7 +264,25 @@ class PipelineRun(BaseModel):
     def mark_paused(self) -> None:
         self.status = PipelineRunStatus.PAUSED
 
-    def mark_success(self, final_sql: str, *, row_count_warning: bool = False) -> None:
+    # B2 (bug hunt) — FAIL-CLOSED des transitions terminales. Les `mark_*`
+    # terminaux ne doivent JAMAIS écraser un statut DÉJÀ terminal : sinon une
+    # race (ex: « Annuler » cliqué entre la fin de la dernière phase et le
+    # mark terminal du runner) ferait passer un run CANCELLED en SUCCESS/
+    # STOPPED_EARLY — un run annulé présenté comme arrêt propre/succès (viole
+    # CRIT-B). Sous sérialisation des écritures SQLite + re-read frais de
+    # `_update_run_status`, le PREMIER statut terminal committé gagne (pas de
+    # lost-update, pas de corruption — les deux issues sont des terminaux
+    # valides). `mark_running`/`mark_paused` ne sont PAS gardés (transitions
+    # depuis pending/running légitimes).
+
+    # Les mark_* terminaux retournent ``bool`` : True si la transition a PRIS,
+    # False si le run était DÉJÀ terminal (garde B2 → no-op). B8 : le caller
+    # (runner) gate la publication de l'event terminal sur ce retour, pour ne
+    # pas émettre un event « complete » sur un run déjà CANCELLED par une race
+    # (cohérence event ↔ BDD).
+    def mark_success(self, final_sql: str, *, row_count_warning: bool = False) -> bool:
+        if self.is_terminal():
+            return False
         self.status = PipelineRunStatus.SUCCESS
         self.final_sql = final_sql
         self.row_count_warning = row_count_warning
@@ -251,8 +290,11 @@ class PipelineRun(BaseModel):
         if self.started_at:
             delta = self.finished_at - ensure_utc(self.started_at)
             self.duration_seconds = delta.total_seconds()
+        return True
 
-    def mark_failed(self, message: str, traceback_text: Optional[str] = None) -> None:
+    def mark_failed(self, message: str, traceback_text: Optional[str] = None) -> bool:
+        if self.is_terminal():
+            return False
         self.status = PipelineRunStatus.FAILED
         self.error_message = message
         self.error_traceback = traceback_text
@@ -260,14 +302,39 @@ class PipelineRun(BaseModel):
         if self.started_at:
             delta = self.finished_at - ensure_utc(self.started_at)
             self.duration_seconds = delta.total_seconds()
+        return True
 
-    def mark_cancelled(self, by_user_id: Optional[int] = None) -> None:
+    def mark_cancelled(self, by_user_id: Optional[int] = None) -> bool:
+        if self.is_terminal():
+            return False
         self.status = PipelineRunStatus.CANCELLED
         self.cancelled_by_user_id = by_user_id
         self.finished_at = clock.now()
         if self.started_at:
             delta = self.finished_at - ensure_utc(self.started_at)
             self.duration_seconds = delta.total_seconds()
+        return True
+
+    def mark_stopped_early(self) -> bool:
+        """Run arrêté volontairement à une phase intermédiaire (preview Iris).
+
+        Statut TERMINAL distinct de SUCCESS (aucun SQL final produit) et de
+        PAUSED (suspension mid-run). ``stop_after_phase`` (posé à la création
+        du run) indique la phase cible. Resumable via ``pipeline_resume`` qui
+        crée un NOUVEAU run depuis le snapshot tronqué — ce run-ci reste
+        terminal. Appelé par le runner quand ``state.terminal_reason ==
+        "stopped_clean"`` (jamais inféré de l'absence de final_sql — CRIT-B).
+        Fail-closed (B2) : n'écrase pas un statut déjà terminal (race cancel).
+        Retourne True si la transition a pris, False si déjà terminal (B8).
+        """
+        if self.is_terminal():
+            return False
+        self.status = PipelineRunStatus.STOPPED_EARLY
+        self.finished_at = clock.now()
+        if self.started_at:
+            delta = self.finished_at - ensure_utc(self.started_at)
+            self.duration_seconds = delta.total_seconds()
+        return True
 
     def is_terminal(self) -> bool:
         """Run dans un état final (immutable). SSoT : ``PipelineRunStatus.terminal()``."""
@@ -283,6 +350,8 @@ class PipelineRun(BaseModel):
             "mode": self.mode.value if isinstance(self.mode, enum.Enum) else self.mode,
             "block_all_views": self.block_all_views,
             "use_sage": self.use_sage,
+            "stop_after_phase": self.stop_after_phase,
+            "resumed_from_run_id": self.resumed_from_run_id,
             "status": (self.status.value if isinstance(self.status, enum.Enum) else self.status),
             "current_phase": self.current_phase,
             "last_completed_phase": self.last_completed_phase,

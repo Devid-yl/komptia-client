@@ -2,15 +2,17 @@
  * format-helpers.js — Single source of truth pour les formatters JS Komptia.
  *
  * Expose ``window.KomptiaFormat`` (objet global, pattern non-module compat
- * avec le reste de la codebase). 9 methodes pures :
+ * avec le reste de la codebase). 11 methodes pures :
  *
  *   dateTimeFr(input, opts)      "DD/MM/YYYY HH:MM" locale fr-FR
+ *   dateFr(input, opts)          "DD/MM/YYYY" (date seule, tz navigateur)
  *   numberFr(value, opts)        "1 234,56" (espace fine + virgule)
  *   compactNumber(value)         "1.2k" / "1.5m" / "2g"
  *   percent(used, total)         "12,3%" / "<0,1%" / "100%"
  *   durationSeconds(s)           "~30 secondes" / "~5 min" / "~2h 15min"
  *   durationMs(ms)               "234ms" / "12.40s" / "2m 15s"
  *   timeOfDay(input)             "HH:MM:SS" timezone locale
+ *   timeHm(input)                "HH:MM" timezone locale (sans secondes)
  *   fileSize(bytes)              "12 B" / "1,5 Ko" / "1,2 Mo" / "3,4 Go"
  *   tokenCount(value)            "1 234" (alias numberFr avec 0 decimale)
  *
@@ -106,6 +108,31 @@
             return dd + '/' + mm + '/' + yyyy;
         }
         return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + mi;
+    };
+
+    /**
+     * dateFr(input, opts) — "DD/MM/YYYY" (date seule, timezone navigateur).
+     *
+     * Miroir de dateTimeFr SANS l'heure : mêmes primitives locales
+     * (_toDate + getDate/getMonth/getFullYear), donc même conversion vers le
+     * fuseau du navigateur. Pour les affichages date-only (remplace les
+     * ``new Date(x).toLocaleDateString('fr-FR')`` ad-hoc ; backe le mode
+     * 'date' de local-datetime.js). NB timezone : voir dateTimeFr (un ISO sans
+     * offset est parsé en local — fournir de l'UTC horodaté ``+00:00``).
+     *
+     * opts.onInvalid : 'dash' (default) | 'preserve' | 'null'.
+     */
+    api.dateFr = function (input, opts) {
+        opts = opts || {};
+        var d = _toDate(input);
+        if (!d) {
+            if (opts.onInvalid === 'preserve') {
+                return String(input == null ? '' : input);
+            }
+            if (opts.onInvalid === 'null') return null;
+            return DASH;
+        }
+        return _pad2(d.getDate()) + '/' + _pad2(d.getMonth() + 1) + '/' + d.getFullYear();
     };
 
     /**
@@ -213,6 +240,30 @@
         var d = _toDate(input);
         if (!d) return DASH;
         return _pad2(d.getHours()) + ':' + _pad2(d.getMinutes()) + ':' + _pad2(d.getSeconds());
+    };
+
+    /**
+     * timeHm(input, opts) — "HH:MM" timezone locale (sans secondes).
+     * Variante de timeOfDay pour le mode 'time' de local-datetime.js et les
+     * affichages HH:MM (tableaux denses). Miroir de timeOfDay sans les secondes.
+     *
+     * opts.onInvalid : 'dash' (default) | 'preserve' | 'null'. La parité avec
+     * dateFr/dateTimeFr est NÉCESSAIRE : local-datetime.js appelle timeHm avec
+     * {onInvalid:'null'} pour respecter son contrat « null → skip le <time> »
+     * (sinon un DASH serait gravé dans la balise + aria-label, détruisant le
+     * fallback SSR — cf. revue adversariale 2026-06-09).
+     */
+    api.timeHm = function (input, opts) {
+        opts = opts || {};
+        var d = _toDate(input);
+        if (!d) {
+            if (opts.onInvalid === 'preserve') {
+                return String(input == null ? '' : input);
+            }
+            if (opts.onInvalid === 'null') return null;
+            return DASH;
+        }
+        return _pad2(d.getHours()) + ':' + _pad2(d.getMinutes());
     };
 
     /**

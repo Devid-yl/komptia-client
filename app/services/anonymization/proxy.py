@@ -104,7 +104,7 @@ Règles strictes :
 - **N'invente PAS** de nouveaux placeholders (pas de `§CLIENT_B§` non fourni, pas de `[EMAIL_99]` arbitraire). Utilise UNIQUEMENT ceux qui apparaissent dans le contexte.
 - **Ne devine pas** le cleartext derrière un placeholder. Le label suggère la catégorie (utile pour ton raisonnement : « `§EMAIL_4b3a§` est un email ») mais le système n'expose pas la valeur d'origine.
 - Le système retraduit chaque placeholder en cleartext avant affichage à l'utilisateur. Si tu construis une phrase qui mentionne 3 personnes, place les 3 tokens distincts ; ils seront remplacés à l'envoi.
-- Les nombres, dates et labels structurels (titres de colonnes, en-têtes) qui n'ont **pas** été remplacés restent en clair — ils sont structurels, pas confidentiels.
+- Les nombres et labels structurels (titres de colonnes, en-têtes) qui n'ont **pas** été remplacés restent en clair — ils sont structurels, pas confidentiels. ⚠️ Les **dates** ne font PAS partie de cette catégorie : une valeur ressemblant à une date est remplacée par `[DATE_N]` — un `[DATE_N]` est une vraie date masquée, pas un littéral lisible.
 """
 
 

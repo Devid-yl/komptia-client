@@ -31,12 +31,52 @@ erreurs (axe 5 Komptia).
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
+
+
+def _canonical_for_echo(s: str) -> str:
+    """Forme canonique pour comparer un label et un terme : minuscules, accents
+    retirés, et tout ce qui n'est pas ``[a-z0-9]`` supprimé (``_``, espaces,
+    ponctuation). ``"Fusionne"`` et ``"FUSIONNE"`` → ``"fusionne"`` ;
+    ``"Multi-source"`` et ``"MULTI_SOURCE"`` → ``"multisource"``.
+    """
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _label_echoes_term(label: str, term: str) -> bool:
+    """True si le ``label`` n'est qu'une RECOPIE du ``term`` au lieu d'une vraie
+    catégorie sémantique.
+
+    **Pourquoi (fix confidentialité 2026-06-09)** : un petit modèle local (3B)
+    recopie souvent le terme comme « catégorie » — terme ``"extractions"`` →
+    ``"1=extractions"`` → label ``"EXTRACTIONS"``. Ça passe la regex (majuscules
+    valides) mais le pseudonyme ``§EXTRACTIONS_xxx§`` RÉVÈLE le terme au LLM
+    cloud → ce n'est PLUS de l'anonymisation (mesuré : 44 % des pseudos d'un
+    dictionnaire réel recopiaient le terme). On compare les formes canoniques
+    (casse + accents + séparateurs ignorés). **Bias confidentialité** : au
+    moindre recouvrement substantiel, on rejette → fallback vers le label
+    opaque ``TXT``/``NUM`` (cf. ``extract._auto_pseudo_middle``).
+    """
+    ct = _canonical_for_echo(term)
+    cl = _canonical_for_echo(label)
+    if not ct or not cl:
+        return False
+    if ct == cl:
+        return True
+    # Un terme « substantiel » (≥ 3 caractères canoniques) contenu dans le label
+    # — ou l'inverse — est une recopie quasi-certaine (``communes`` →
+    # ``CUMUL_COMMUNES``, ``email`` → ``EMAIL``). Sous 3 car, trop de faux
+    # positifs sur des catégories légitimes courtes.
+    if len(ct) >= 3 and (ct in cl or cl in ct):
+        return True
+    return False
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +301,7 @@ async def compute_dynamic_batch_size_async() -> Tuple[int, str]:
     # Le ``{tokens_json}`` sera remplacé par un JSON ``["term1","term2",...]``
     # dont chaque terme apporte son propre budget — on retire son placeholder
     # de la mesure pour éviter de le compter 2 fois.
-    template_chars = len(_PROMPT_TEMPLATE) - len("{tokens_json}")
+    template_chars = len(_PROMPT_TEMPLATE) - len("{numbered_values}")
     prompt_overhead_tokens = template_chars // _CHARS_PER_TOKEN
 
     # Estimation neutre 8 chars/terme. Couvre la majorité des cas Komptia
@@ -308,23 +348,33 @@ async def compute_dynamic_batch_size_async() -> Tuple[int, str]:
 # ─── Prompt LLM ─────────────────────────────────────────────────────────────
 
 
+# Refonte 2026-06-08 — prompt « matching par NUMÉRO ». Le LLM reçoit des valeurs
+# NUMÉROTÉES et répond UNE LIGNE par valeur au format « numéro=CATEGORIE ». Il ne
+# recopie JAMAIS la valeur → un petit modèle (3B/CPU) ne peut plus tronquer un nom
+# propre rare (« BORDIER » → « BORD ») et faire échouer l'anti-hallucination par
+# match exact. Le format ligne est aussi bien plus robuste que le JSON imbriqué
+# pour les petits modèles : pas d'accolades à fermer, naturellement tolérant à la
+# troncature (dernière ligne coupée = 1 item perdu, le reste intact).
 _PROMPT_TEMPLATE: str = """\
-Classifie chaque valeur en label UPPERCASE (A-Z et _ uniquement, max 30 chars).
+Classe chaque valeur NUMÉROTÉE dans une catégorie en MAJUSCULES (lettres A-Z et _ uniquement, max 30 caractères).
+Une catégorie est un terme qui décrit la valeur de manière générale, sans être une recopie du terme lui-même.
 
-Exemples :
-"DUPONT" -> "NOM_FAMILLE"
-"jean@x.fr" -> "EMAIL"
-"0612345678" -> "TELEPHONE"
-"75001" -> "CODE_POSTAL"
-"12345678901234" -> "SIRET"
-"Cabinet SARL" -> "ENTREPRISE"
+Réponds avec UNE LIGNE par valeur, au format exact « numéro=CATEGORIE », et RIEN d'autre.
+N'écris JAMAIS la valeur elle-même — seulement son numéro et sa catégorie.
 
-Réponds UNIQUEMENT en JSON valide, aucun texte autour :
-{{"items":[{{"term":"<valeur exacte>","label":"<LABEL>"}}]}}
+Exemple de catégories : TEXTE, NOMBRE, DATE, HEURE, DATE_HEURE, BOOLEAN, EMAIL, URL, TELEPHONE, IDENTIFIANT, CODE, DEVISE, POURCENTAGE, MESURE, NOM_COMMUN, NOM_PROPRE, VERBE, ADJECTIF, ADVERBE, PRONOM, DETERMINANT, PREPOSITION, CONJONCTION, INTERJECTION, SIGLE, ACRONYME, ABREVIATION, ACTION, ETAT, QUALITE, PROPRIETE, OBJET, PERSONNE, ORGANISATION, LIEU, EVENEMENT, TEMPS, QUANTITE, INFORMATION, COMMUNICATION, DOCUMENT, SYSTEME, PROCESSUS, RELATION, GROUPE, ROLE, ACTIVITE, RESSOURCE, PHENOMENE, CONCEPT, EMOTION, OPINION, CONDITION, RESULTAT, CAUSE, CONSEQUENCE, ANALYSE, DETECTION, IDENTIFICATION, CLASSIFICATION, VERIFICATION, VALIDATION, CONTROLE, SURVEILLANCE, ALERTE, SECURITE, RISQUE, ANOMALIE, ERREUR, QUALITE_DONNEE, STATISTIQUE, INDICATEUR, METRIQUE, VALEUR, VARIABLE, PARAMETRE, CONFIGURATION, PERFORMANCE, COMMUNICATION_NUMERIQUE, MESSAGERIE, FORMAT_FICHIER, BASE_DE_DONNEES, RESEAU, APPLICATION, MATERIEL, LOGICIEL, FINANCE, COMMERCE, SANTE, EDUCATION, TRANSPORT, ENERGIE, ENVIRONNEMENT, JURIDIQUE, ADMINISTRATION, SCIENCE, TECHNOLOGIE
 
-Valeurs à classifier :
-{tokens_json}
+Valeurs :
+{numbered_values}
+Réponse :
 """
+
+# Parse une ligne de réponse « numéro<séparateur>label ». Tolérances (petits
+# modèles varient le format) : préfixe de puce/gras markdown (``- ``, ``* ``,
+# ``> ``, ``# ``) absorbé ; séparateurs (=, :, ., ), -, espace) ; numéro jusqu'à
+# 6 chiffres (chunks > 9999 termes possibles sur gros context window). DOIT
+# rester cohérent avec le format demandé dans _PROMPT_TEMPLATE.
+_LINE_REGEX: re.Pattern[str] = re.compile(r"^[\s\-*>•]*#?\s*(\d{1,6})[=:.)\s-]+(.+)$")
 
 
 # ─── Fonction principale ────────────────────────────────────────────────────
@@ -333,287 +383,119 @@ Valeurs à classifier :
 def _parse_response(
     content: str, tokens_list: List[str]
 ) -> Tuple[Dict[str, str], List[Dict[str, str]]]:
-    """Parse la réponse JSON du LLM et applique validate_suggested_label.
+    """Parse la réponse LIGNE du LLM (« numéro=CATEGORIE ») et valide chaque label.
+
+    Refonte 2026-06-08 — matching par NUMÉRO (index 1-based) au lieu d'une
+    recopie du terme. Avant, le prompt demandait au LLM de renvoyer la valeur
+    exacte (``{"items":[{"term":"<valeur>","label":...}]}``) et on matchait
+    ``term in candidate_set``. Un petit modèle (3B/CPU) tronque les noms propres
+    rares (« BORDIER » → « BORD ») → rejeté par l'anti-hallucination → 0 amélioré.
+    Désormais le LLM ne renvoie JAMAIS la valeur, seulement son **numéro** ; le
+    mapping numéro → terme se fait LOCALEMENT, donc une troncature/déformation du
+    nom propre est impossible. Bonus : le format ligne est nativement tolérant au
+    bruit (prose, code-fences, troncature de la dernière ligne), ce qui rend
+    inutile l'ancienne logique de réparation JSON (~200 lignes supprimées).
 
     Retourne ``(improved, invalid_labels)`` où :
 
-    - ``improved`` : map ``term → label_validé`` (labels qui passent
-      validate_suggested_label).
-    - ``invalid_labels`` : liste des rejets pour observabilité.
+    - ``improved`` : map ``term → label_validé``.
+    - ``invalid_labels`` : rejets (label invalide / sentinelle) pour observabilité.
 
-    **Anti-hallucination** :
-
-    - Ignore tout ``term`` qui n'est pas dans ``candidate_set`` (le LLM
-      ne peut pas inventer de nouveaux termes).
-    - Ignore tout ``label`` qui ne passe pas validate_suggested_label.
-
-    Si le JSON est totalement invalide, retourne ``({}, [])`` — le caller
-    interprétera ça comme un échec parse (status="error").
+    **Anti-hallucination par ID** : un numéro hors de ``[1, len(tokens_list)]`` =
+    entrée inventée par le LLM (le terme réel n'existe pas) → ignoré.
     """
     if not isinstance(content, str) or not content.strip():
         return {}, []
 
-    # Strip markdown code fences si le LLM en ajoute (Phi-3 / Llama font ça
-    # parfois malgré la consigne).
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        # Retire ```json\n…\n```
-        lines = stripped.split("\n")
-        if len(lines) > 2:
-            stripped = "\n".join(lines[1:-1]).strip()
-
-    # Parser tolérant (fix 2026-05-19) : si le LLM a entouré le JSON d'un
-    # texte explicatif (« Here are the labels: {…} »), extrait le 1ʳᵉ objet
-    # JSON via balance d'accolades. Plus permissif que ``json.loads`` direct
-    # mais reste safe : l'extraction commence à la 1ʳᵉ ``{`` et finit à
-    # l'``}`` correspondante (sans regex globale qui matcherait n'importe
-    # quoi).
-    def _extract_first_json_object(text: str) -> Optional[str]:
-        start = text.find("{")
-        if start < 0:
-            return None
-        depth = 0
-        in_string = False
-        escape = False
-        for i in range(start, len(text)):
-            c = text[i]
-            if escape:
-                escape = False
-                continue
-            if c == "\\":
-                escape = True
-                continue
-            if c == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-        return None
-
-    payload = None
-    try:
-        payload = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        # Retry avec extraction d'objet JSON balanced (LLM a peut-être
-        # ajouté un préfixe explicatif).
-        extracted = _extract_first_json_object(stripped)
-        if extracted:
-            try:
-                payload = json.loads(extracted)
-            except (json.JSONDecodeError, ValueError):
-                payload = None
-
-    # Fix 2026-05-20 — Récupération JSON tronqué :
-    # qwen2.5:3b a un EOS imprévisible et peut hitter le max_output
-    # tokens au milieu d'un ``{"term":"X","label":"Y"}, {"term":"Z"...``.
-    # On tente de fermer le tableau ``items`` au dernier item complet
-    # avant le tronquage. Best-effort, defense-in-depth — si ça rate, on
-    # retombe sur payload=None (path d'erreur existant).
-    if payload is None and stripped.startswith("{"):
-        # Cherche la position du dernier objet d'item COMPLET dans le tableau.
-        # Pattern : ``"label":"..."}`` (close-quote + close-brace) — la garantie
-        # que cet item est entier (clé label posée + objet refermé).
-        # On reconstruit ensuite ``...lastCompleteItem]}`` pour avoir un JSON
-        # syntaxiquement valide.
-        items_start = stripped.find('"items"')
-        if items_start > 0:
-            arr_open = stripped.find("[", items_start)
-            if arr_open > 0:
-                # Trouve le dernier ``}`` qui termine un item d'array
-                # (= ``}`` immédiatement suivi d'une ``,`` OU rien d'utile).
-                # On scanne en avant en respectant les strings (anti-faux-positifs
-                # type ``"label":"FOO}BAR"``).
-                last_item_end = -1
-                depth = 0
-                in_string = False
-                escape = False
-                for idx in range(arr_open + 1, len(stripped)):
-                    ch = stripped[idx]
-                    if escape:
-                        escape = False
-                        continue
-                    if ch == "\\":
-                        escape = True
-                        continue
-                    if ch == '"':
-                        in_string = not in_string
-                        continue
-                    if in_string:
-                        continue
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            last_item_end = idx  # ferme un item de l'array
-                if last_item_end > 0:
-                    repaired = stripped[: last_item_end + 1] + "]}"
-                    try:
-                        payload = json.loads(repaired)
-                        logger.warning(
-                            "improve_pseudo._parse_response: JSON tronqué "
-                            "réparé (cap max_output_tokens probable) — %d items "
-                            "récupérés sur les %d demandés.",
-                            repaired.count('"term"'),
-                            len(tokens_list),
-                        )
-                    except (json.JSONDecodeError, ValueError):
-                        payload = None
-
-    if payload is None:
-        # Log debug tronqué — utile pour diagnostiquer les LLM locaux qui
-        # produisent du texte au lieu de JSON. Pas de risque PII fort sur
-        # le LOCAL (machine du user) ; on cap à 200 chars + niveau DEBUG
-        # (pas INFO/WARNING qui pollueraient les logs prod).
-        preview = stripped[:200].replace("\n", " ")
-        logger.warning(
-            "improve_pseudo._parse_response: JSON invalide (%d chars) — " "preview: %r",
-            len(stripped),
-            preview,
-        )
-        return {}, []
-
-    candidate_set: Set[str] = set(tokens_list)
-    if not isinstance(payload, dict):
-        logger.warning(
-            "improve_pseudo._parse_response: payload n'est pas un dict " "(type=%s) — preview: %r",
-            type(payload).__name__,
-            stripped[:200].replace("\n", " "),
-        )
-        return {}, []
-    items = payload.get("items")
-    if not isinstance(items, list):
-        # Fallback positionnel — fix 2026-05-20 sur logs serveur :
-        # les petits modèles (qwen2.5:3b, phi3:mini) ne suivent pas
-        # toujours le schéma ``{"items":[{"term":..., "label":...}]}``.
-        # qwen a observé répondre ``{"data": ["AMOUNT","NOM_FAMILLE",...]}``
-        # aligné par position. On accepte si :
-        # (a) une seule liste dans le payload a EXACTEMENT len(tokens_list)
-        # (b) tous les éléments sont des labels valides
-        # Anti-hallucination préservée : on ne peut pas inventer un terme,
-        # juste mal le classer (le user voit et corrige).
-        candidate_lists = [
-            (k, v) for k, v in payload.items() if isinstance(v, list) and len(v) == len(tokens_list)
-        ]
-        if len(candidate_lists) == 1:
-            key, labels = candidate_lists[0]
-            improved_pos: Dict[str, str] = {}
-            invalid_pos: List[Dict[str, str]] = []
-            for i, raw in enumerate(labels):
-                term = tokens_list[i]
-                if term in improved_pos:
-                    continue
-                raw_label = str(raw) if not isinstance(raw, str) else raw
-                is_valid, reason = validate_suggested_label(raw_label)
-                if not is_valid or "§" in raw_label:
-                    invalid_pos.append(
-                        {
-                            "term": term,
-                            "raw_label": raw_label,
-                            "reason": reason
-                            or ("contains_sentinel" if "§" in raw_label else "unknown"),
-                        }
-                    )
-                    continue
-                improved_pos[term] = raw_label
-            if improved_pos:
-                logger.warning(
-                    "improve_pseudo._parse_response: fallback positionnel "
-                    "engagé (clé '%s' au lieu de 'items', %d/%d labels valides). "
-                    "Le LLM (probablement un modèle 3B) ne suit pas le schéma "
-                    "``items:[{term,label}]`` — mapping par position appliqué.",
-                    key,
-                    len(improved_pos),
-                    len(tokens_list),
-                )
-                return improved_pos, invalid_pos
-        logger.warning(
-            "improve_pseudo._parse_response: clé 'items' absente ou non-list "
-            "(keys=%s) et fallback positionnel inapplicable — preview: %r. "
-            "Le LLM a répondu en JSON valide mais n'a pas suivi le schéma "
-            'attendu {"items":[{"term":...,"label":...}]}.',
-            sorted(payload.keys())[:10],
-            stripped[:200].replace("\n", " "),
-        )
-        return {}, []
-
+    n_terms = len(tokens_list)
     improved: Dict[str, str] = {}
     invalid_labels: List[Dict[str, str]] = []
-    # Compteurs observabilité — fix audit logs 2026-05-20 :
-    # le user a vu un cas updated=0 sans diag, on tracke maintenant les
-    # raisons de drop pour qu'un futur audit n'ait pas besoin de re-runner.
-    dropped_not_dict = 0
-    dropped_bad_types = 0
-    dropped_anti_halluc = 0
+    # Compteurs d'observabilité — même intention que l'ancien parseur :
+    # diagnostiquer un « 0 amélioré » sans avoir à re-runner.
+    matched_lines = 0
+    dropped_out_of_range = 0
     dropped_duplicate = 0
-    for entry in items:
-        if not isinstance(entry, dict):
-            dropped_not_dict += 1
+
+    for raw_line in content.splitlines():
+        m = _LINE_REGEX.match(raw_line)
+        if m is None:
+            # Ligne hors-format (prose, ```fence```, ligne vide, « Réponse : ») →
+            # ignorée silencieusement. C'est ce qui remplace toute la logique de
+            # nettoyage JSON : le bruit ne matche simplement pas la regex.
             continue
-        term = entry.get("term")
-        raw_label = entry.get("label")
-        if not isinstance(term, str) or not isinstance(raw_label, str):
-            dropped_bad_types += 1
+        matched_lines += 1
+        idx = int(m.group(1))  # regex garantit \d{1,4}
+
+        # Anti-hallucination par ID : le numéro DOIT être un index 1-based valide.
+        # Hors-borne = le LLM a inventé une ligne → on refuse (équivalent de
+        # l'ancien ``term not in candidate_set``, mais sans dépendre d'une
+        # recopie de chaîne que les petits modèles ratent).
+        if idx < 1 or idx > n_terms:
+            dropped_out_of_range += 1
             continue
-        if term not in candidate_set:
-            # Anti-hallucination : le LLM ne peut pas inventer un terme.
-            dropped_anti_halluc += 1
-            continue
+
+        term = tokens_list[idx - 1]
         if term in improved:
-            # Doublon dans la réponse — on garde la 1ère.
+            # Le LLM a renvoyé 2 lignes pour le même numéro — on garde la 1ʳᵉ.
             dropped_duplicate += 1
             continue
-        is_valid, reason = validate_suggested_label(raw_label)
+
+        # Normalisation tolérante AVANT validation. Un 3B sort souvent :
+        #  - une glose explicative (« NOM_FAMILLE (probable) », « ENTREPRISE, SARL »)
+        #    → on coupe à la 1ʳᵉ parenthèse/virgule/point-virgule pour récupérer le
+        #    label utile (sinon rejeté par la regex à cause du « ( » / « , »).
+        #  - du gras markdown (« **NOM** ») → on strip ``*`` et backtick en bord.
+        #  - des minuscules / des espaces (« nom famille ») → upper + espaces→``_``.
+        # La garde finale reste ``validate_suggested_label`` (regex ^[A-Z_]{1,30}$ +
+        # blacklist anti-injection) + le check sentinelle ``§`` — aucun label
+        # dangereux ne passe (la normalisation n'introduit aucun caractère
+        # hors [A-Z_] : elle ne fait que couper, strip, upper et espaces→``_``).
+        raw_label = re.split(r"[(,;]", m.group(2))[0].strip(" *`")
+        label = re.sub(r"\s+", "_", raw_label).upper()
+
+        is_valid, reason = validate_suggested_label(label)
         if not is_valid:
             invalid_labels.append(
-                {
-                    "term": term,
-                    "raw_label": raw_label,
-                    "reason": reason or "unknown",
-                }
+                {"term": term, "raw_label": raw_label, "reason": reason or "unknown"}
             )
             continue
-        # Fix #1 (review adversariale 2026-05-19) — Defense in depth :
-        # ``_LABEL_REGEX`` interdit déjà le caractère sentinelle ``§`` (hors
-        # [A-Z_]), mais on assert explicitement pour qu'un futur élargissement
-        # de la regex (ex: autoriser accents) ne casse pas silencieusement
-        # le ``Pseudonymizer.add_mapping`` qui refuse ``§`` en fail-closed.
-        if "§" in raw_label:  # noqa: PLR2004 — sentinelle §
+        # **Garde anti-recopie (fix confidentialité 2026-06-09)** : le label
+        # passe la regex (majuscules valides) MAIS n'est que le terme recopié
+        # (``extractions`` → ``EXTRACTIONS``). Un tel pseudo révèle la valeur au
+        # cloud → on le rejette. ``term`` est traité en ``invalid_labels`` →
+        # le terme garde son label opaque ``TXT``/``NUM`` (sûr) au lieu de fuiter.
+        if _label_echoes_term(label, term):
             invalid_labels.append(
-                {
-                    "term": term,
-                    "raw_label": raw_label,
-                    "reason": "contains_sentinel",
-                }
+                {"term": term, "raw_label": raw_label, "reason": "echoes_term"}
             )
             continue
-        improved[term] = raw_label
+        # Defense in depth (cf. ancien fix 2026-05-19) : ``§`` est la sentinelle
+        # refusée fail-closed par ``Pseudonymizer.add_mapping``. ``_LABEL_REGEX``
+        # l'interdit déjà ([A-Z_] only), on re-check pour qu'un futur
+        # élargissement de la regex ne casse rien en silence.
+        if "§" in label:  # noqa: PLR2004 — sentinelle §
+            invalid_labels.append(
+                {"term": term, "raw_label": raw_label, "reason": "contains_sentinel"}
+            )
+            continue
+        improved[term] = label
 
-    # Diagnostic warning si le LLM a répondu en JSON valide avec items[]
-    # mais 0 mapping retenu — symptôme classique d'un modèle 3B qui :
-    # (a) renvoie des termes légèrement modifiés (case, quotes) ne matchant
-    #     pas candidate_set → dropped_anti_halluc > 0
-    # (b) renvoie {"items":[]} → tous compteurs à 0
-    # (c) renvoie items avec mauvaises clés → dropped_bad_types > 0
-    # Sans ce log, l'admin voit "updated=0" sans savoir pourquoi.
-    if items and not improved and not invalid_labels:
+    # Diagnostic : aucune amélioration ni rejet (modèle hors-format / réponse
+    # vide / que des numéros hors-borne) — symptôme d'un modèle local trop
+    # faible. Sans ce log, l'admin voit « updated=0 » sans savoir pourquoi.
+    if not improved and not invalid_labels:
+        # Anti-leak PII (fix revue adversariale) : NE PAS logger le ``content``
+        # brut du LLM. Un petit modèle hors-format peut recopier des valeurs en
+        # clair dans sa réponse, et ce log se déclenche précisément dans ce cas
+        # (0 ligne valide). Les compteurs suffisent au diagnostic « 0 amélioré »
+        # sans exposer de PII.
         logger.warning(
-            "improve_pseudo._parse_response: %d items reçus du LLM mais 0 "
-            "retenu (candidate_set=%d). Drops: not_dict=%d, bad_types=%d, "
-            "anti_halluc=%d, duplicate=%d. Preview JSON: %r",
-            len(items),
-            len(candidate_set),
-            dropped_not_dict,
-            dropped_bad_types,
-            dropped_anti_halluc,
+            "improve_pseudo._parse_response: 0 mapping retenu "
+            "(lignes_matchées=%d, hors_borne=%d, doublons=%d, termes=%d).",
+            matched_lines,
+            dropped_out_of_range,
             dropped_duplicate,
-            stripped[:300].replace("\n", " "),
+            n_terms,
         )
 
     return improved, invalid_labels
@@ -680,7 +562,6 @@ async def improve_pseudos_chunk(
     # sans rejet artificiel côté serveur. La seule limite réelle = ce que
     # le modèle peut techniquement encaisser (ctx_window + max_output_tokens).
     tokens_list = list(candidate_tokens)
-    set(tokens_list)
 
     # Import tardif (mêmes raisons qu'auto_classify).
     try:
@@ -875,7 +756,20 @@ async def improve_pseudos_chunk(
             chunk_max_output = min(max_output, estimated_output)
         else:
             chunk_max_output = estimated_output
-        prompt = _PROMPT_TEMPLATE.format(tokens_json=json.dumps(chunk_now, ensure_ascii=False))
+        # Entrée NUMÉROTÉE (1-based) — le LLM répondra par numéro, jamais par
+        # recopie de la valeur (cf. _PROMPT_TEMPLATE / _parse_response). Les
+        # vraies valeurs ne quittent donc le code que vers le LLM LOCAL, et le
+        # mapping numéro → terme reste 100 % côté serveur.
+        # Garde déterministe anti « donnée fausse silencieuse » (fix revue
+        # adversariale) : on neutralise tout retour à la ligne DANS un terme,
+        # sinon il créerait 2 lignes dans le prompt → décalage de toute la
+        # numérotation → label appliqué au MAUVAIS terme. Le résultat reste
+        # mappé au terme ORIGINAL via l'index (chunk_now n'est pas modifié).
+        numbered_values = "\n".join(
+            f"{i + 1}. {t.replace(chr(10), ' ').replace(chr(13), ' ')}"
+            for i, t in enumerate(chunk_now)
+        )
+        prompt = _PROMPT_TEMPLATE.format(numbered_values=numbered_values)
         try:
             response = await call_llm(
                 CallProfile(
@@ -887,15 +781,54 @@ async def improve_pseudos_chunk(
                 LLMRequest(
                     prompt=prompt,
                     system=(
-                        "Tu classifies des valeurs en labels UPPERCASE. "
-                        "Tu réponds UNIQUEMENT en JSON valide, aucun texte autour."
+                        "Tu classes des valeurs numérotées en catégories "
+                        "UPPERCASE. Tu réponds UNIQUEMENT par des lignes "
+                        "« numéro=CATEGORIE », aucun autre texte, et tu ne "
+                        "recopies jamais la valeur."
                     ),
                     temperature=local_temp,
                     max_tokens=chunk_max_output,
-                    options={"response_format": {"type": "json_object"}},
+                    # NB : plus de ``response_format: json_object`` — on attend
+                    # un format LIGNE, pas du JSON (forcer le JSON casserait le
+                    # nouveau parseur et réintroduirait la fragilité d'accolades).
                 ),
             )
         except LLMCallError as exc:
+            # **LLM injoignable (service éteint) → FAIL-FAST** : inutile de
+            # réduire le chunk ou de retenter, réduire la taille ne fait pas
+            # réapparaître un Ollama arrêté. Sans ce court-circuit, les 4 tours
+            # adaptatifs × (3 retries provider) = ~28 s de grind pour rien (le
+            # vrai bug prod observé). On abandonne immédiatement, avec retour
+            # PARTIEL si des tours précédents ont déjà produit des mappings.
+            if exc.kind == "unreachable":
+                logger.warning(
+                    "improve_pseudos_chunk: LLM local injoignable au tour %d — "
+                    "abandon immédiat (pas de réduction adaptive). (%d/%d traités)",
+                    attempt + 1,
+                    len(all_improved) + len(all_invalid),
+                    len(tokens_list),
+                )
+                if all_improved or all_invalid:
+                    return ImprovePseudoResult(
+                        improved=all_improved,
+                        invalid_labels=all_invalid,
+                        unprocessed=_compute_unprocessed(),
+                        status="ok",
+                        message="LLM local injoignable — résultat partiel.",
+                    )
+                # status="unreachable" DISTINCT de "error"/"timeout"/
+                # "not_configured" : le service est configuré mais ÉTEINT. Le
+                # frontend doit STOPPER la boucle et afficher un message
+                # ACTIONNABLE (« démarre le LLM local »), pas un « Terminé : 0/N »
+                # trompeur. ``unprocessed`` peuplé (fix M1) → recap honnête.
+                return ImprovePseudoResult(
+                    status="unreachable",
+                    unprocessed=_compute_unprocessed(),
+                    message=(
+                        "Le LLM local est configuré mais ne répond pas "
+                        "(service arrêté ?). Démarre-le puis réessaie."
+                    ),
+                )
             # Erreur réseau/timeout : adaptive backoff si on a encore
             # de la marge sur la taille du chunk. Sinon retour partiel.
             if exc.kind == "network":

@@ -1,43 +1,56 @@
 # Komptia v2.0 - Dépendances Python
 
 # Framework Web
-tornado>=6.4.0
+tornado>=6.5.4
+
+# Templating e-mail (app/services/email/template_renderer.py importe Jinja2).
+# Déclaré EXPLICITEMENT : il n'était présent dans l'image que par accident
+# transitif (via torch) — si torch change/disparaît, le rendu des e-mails
+# casserait silencieusement. Dépendance directe → doit être contractuelle.
+jinja2>=3.1.6  # >=3.1.6 : corrige les CVE sandbox/XSS cumulées sur 3.1.3→3.1.6
 
 # Base de données
-SQLAlchemy>=2.0.25
-# sqlcipher3==0.5.2  # OPTIONNEL: chiffrement BDD – nécessite sqlcipher (brew install sqlcipher)
-aiosqlite>=0.19.0
-greenlet>=3.0.0
+SQLAlchemy>=2.0.48,<2.1
+# Chiffrement BDD locale at-rest (SQLCipher 4.x). Wheel cp312 manylinux_2_28
+# (x86_64 + aarch64 + musllinux) STATIQUEMENT liée → embarque libsqlcipher,
+# ZÉRO compilation, ZÉRO apt. Le binding aiosqlite/pysqlite→sqlcipher3 vit dans
+# app/core/database.py (_bind_sqlcipher_if_configured), conditionnel à
+# SQLCIPHER_KEY (no-op total en mode clair). NB: PAS « sqlcipher3-binary »
+# (n'existe pas sur PyPI). Pins SQLAlchemy/aiosqlite : le binding dépend de
+# l'API import_dbapi, qu'un bump majeur pourrait changer silencieusement.
+sqlcipher3==0.6.2
+aiosqlite>=0.22.1,<0.23
+greenlet>=3.3.2
 
 # Authentification & Chiffrement
-bcrypt>=4.1.0
-cryptography>=42.0.0
+bcrypt>=4.1.0,<5  # <5 = borne CONSERVATRICE (plus load-bearing depuis 2026-06-05) : le code est désormais 72o-safe (verify_password TRONQUE à 72o via constants_auth.encode_password_for_bcrypt, tous les chemins set REJETTENT au-delà via password_exceeds_bcrypt_limit). bcrypt 5.x est donc OK ; le cap est gardé le temps de valider 5.x en prod, puis SAFE À LEVER. (garde: test_requirements_split.test_bcrypt_has_upper_bound)
+cryptography>=42.0.8  # plancher sécurité (CVE-2024-26130). PAS de plafond VOLONTAIRE : usage = Fernet seul (API stable, l'image tourne déjà en 48.x sans souci) → un plafond bloquerait les correctifs CVE d'une lib de sécurité. (garde: test_requirements_split.test_security_libs_not_capped)
 
 # Connexion SQL Server (BDD source)
 # Nécessite: brew install unixodbc
-pyodbc>=5.1.0
+pyodbc>=5.3.0
 
 # IA - Client HTTP async
-httpx>=0.25.2
+httpx>=0.28.1  # pré-1.0. PAS de plafond VOLONTAIRE : usage = AsyncClient+Timeout (API stable), aucun SDK qui le contraindrait. Une rupture d'API serait bruyante (appels LLM tombent) ; une rupture de DÉFAUT (timeout/redirect) serait silencieuse → le vrai filet est le LOCK (à activer), pas un cap qui bloquerait les correctifs CVE. (garde: test_requirements_split.test_security_libs_not_capped)
 
 # IA - Embeddings vectoriels (local, gratuit, aucun appel API)
-sqlite-vec>=0.1.6
-sentence-transformers>=3.0.0
+sqlite-vec>=0.1.6  # 0.x : déjà la dernière publiée (0.1.6) au 2026-06-04
+sentence-transformers>=3.0.0  # majeure suivante = tire un nouveau torch → à valider par un dev
 
 # SQL Parsing & Validation
 sqlparse==0.5.5
-sqlglot>=26.0
+sqlglot>=26.0  # 30.x résolu par le build ; critique (parsing/translation SQL) → montée de majeure à valider par un dev
 
 # Génération PDF
-reportlab>=4.0.9
-weasyprint>=60.2
+reportlab>=4.4.10
+weasyprint>=60.2  # 68.x résolu par le build ; montée de majeure (rendu PDF) à valider par un dev
 
 # Graphiques
-matplotlib>=3.8.2
-plotly>=5.18.0
+matplotlib>=3.10.8
+plotly>=5.18.0  # 6.x résolu par le build ; montée de majeure à valider par un dev
 
 # Import/Export Excel (obligatoire pour feuilles externes)
-openpyxl>=3.1.0
+openpyxl>=3.1.5
 
 # Lecture CSV/Excel pour les outils Iris/copilot manipulant des uploads
 # (`analyze_attachment`, `transform_uploaded_file`, exports automation).
@@ -53,15 +66,35 @@ pandas>=2.0,<3.0  # <3.0 : pandas 3.0 (Copy-on-Write par défaut) introduit des 
 defusedxml>=0.7.1
 
 # Scheduler
-APScheduler>=3.10.4
+# Plafond <4 : APScheduler 4.x est une RÉÉCRITURE d'API (scheduler/jobstore
+# incompatibles), non encore publiée sur PyPI au 2026-06-04. Le plafond évite
+# qu'une reconstruction future ne tire 4.x silencieusement (lock vide → pip
+# résout « la dernière compatible »). Montée 3.x→4.x = chantier à valider par un dev.
+APScheduler>=3.11.2,<4
 
 # Email
 email-validator>=2.2.0  # 2.1.0 retirée de PyPI (yanked : oubli de drop py3.7)
 
 # Utilitaires
-python-dotenv>=1.0.0
-pyyaml>=6.0.1
-python-dateutil>=2.8.2
+python-dotenv>=1.2.2
+pyyaml>=6.0.3
+python-dateutil>=2.9.0
+
+# Données de fuseaux horaires — REQUIS : app/core/clock.py résout des fuseaux
+# NOMMÉS via zoneinfo.ZoneInfo("Europe/Paris", ...). python:3.12-slim ne livre
+# PAS /usr/share/zoneinfo ; sans ce paquet ZoneInfo lève ZoneInfoNotFoundError
+# (fail-fast au boot dès qu'un TZ nommé est configuré). Pur data, cross-platform.
+tzdata>=2025.1  # données IANA pures (aucune API) → plancher relevé pour des règles de fuseau récentes
+
+# Dépendances DIRECTEMENT importées par le code mais qui n'étaient présentes que
+# par transitivité (numpy←pandas/matplotlib, pytz/tzlocal←pandas/APScheduler,
+# typing-extensions←SQLAlchemy/cryptography, charset-normalizer←httpx). Déclarées
+# explicitement pour ne pas dépendre d'un graphe transitif qui peut changer.
+numpy>=1.26  # 2.x résolu par le build ; rupture ABI (extensions C recompilées) → montée à valider par un dev
+pytz>=2025.1
+tzlocal>=5.3.1
+typing-extensions>=4.12.2
+charset-normalizer>=3.4.4
 
 # Tests & outils de dev → requirements-dev.txt
 # (séparés volontairement pour que l'image de production reste légère et

@@ -48,9 +48,17 @@ logger = logging.getLogger(__name__)
 # Caps & budgets
 # ──────────────────────────────────────────────────────────────────────
 
-#: Budget tokens en sortie. Un SELECT élargi avec ~200 colonnes tient
-#: largement dans 8K. ``clamped_max_tokens`` borne au cap modèle.
-ONESHOT_MAX_TOKENS_SOFT: Final[int] = 8_000
+#: Budget tokens en sortie. **Doit pouvoir contenir le SQL transformé EN
+#: ENTIER** : pour « Charger toutes les colonnes », le LLM réémet TOUTE la
+#: requête (qui peut atteindre ``MAX_DRAFT_SQL_CHARS`` ≈ 16K tokens) + les
+#: colonnes ajoutées. Un cap trop bas (ancien 8K) tronquait la réponse → JSON
+#: incomplet → « réponse non parseable » (incident prod 2026-06-02 : requête
+#: large + grosse liste VALUES, 46s puis 400). On vise donc large et on laisse
+#: ``clamped_max_tokens`` borner au cap RÉEL du modèle (registre BDD — pas un
+#: magic number figé). La troncature résiduelle (modèle déjà à son cap) est
+#: détectée explicitement via ``stop_reason == "max_tokens"`` puis remontée en
+#: erreur ACTIONNABLE (« requête trop volumineuse »), pas « non parseable ».
+ONESHOT_MAX_TOKENS_SOFT: Final[int] = 64_000
 
 #: Max DDL inclus en contexte. Au-delà, on tronque (warning loggé). Borne
 #: le coût input du prompt (50 tables × ~50 cols ≈ encadrable en 100K tokens).
@@ -71,6 +79,15 @@ MAX_TASK_CHARS: Final[int] = 4_000
 #: ``_extract_json_sql`` (parse de JSON très imbriqué). Une réponse SELECT
 #: élargi tient largement en 200 KB ; au-delà on rejette.
 MAX_LLM_RESPONSE_CHARS: Final[int] = 200_000
+
+#: Timeout (s) de l'appel LLM du DRILL-DOWN uniquement (« Voir le détail »).
+#: Le drill-down est une action SYNCHRONE déclenchée par un clic sur une
+#: cellule : un LLM lent (l'incident prod du 2026-06-02 montrait 46 s) figerait
+#: le clic. Au-delà de ce délai, ``call_llm`` lève → on bascule sur le générateur
+#: programmatique (instantané). Latence bornée + dégradation gracieuse (S2).
+#: ``transform_sql_via_llm`` (« Charger toutes les colonnes ») n'en hérite PAS :
+#: c'est un bouton explicite/lourd, pas un clic. Tunable.
+_DRILLDOWN_LLM_TIMEOUT_S: Final[float] = 20.0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -156,6 +173,90 @@ Exclus les colonnes de types incompatibles avec MAX() en cas de GROUP BY : `text
 Si la requête est de type UNION / EXCEPT / INTERSECT, applique l'élargissement à chaque sous-SELECT en gardant la cohérence des colonnes entre les branches. Si une harmonisation complète n'est pas possible sans casser l'union, élargis seulement la première branche et laisse les autres telles quelles.
 
 Si une table mentionnée dans la requête n'a pas de DDL fourni, ne tente pas d'ajouter de colonnes pour cette table : ne devine pas."""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Drill-down (« Voir le détail ») — génération SQL via LLM
+# ──────────────────────────────────────────────────────────────────────
+
+#: Marqueur que le LLM place dans la clause WHERE de détail. Le SYSTÈME le
+#: remplace par les prédicats de dimension construits LOCALEMENT à partir des
+#: valeurs de la ligne cliquée (qui ne sont JAMAIS envoyées au LLM —
+#: confidentialité Niveau 4/5). Choisi unique + improbable dans un vrai SQL.
+_DRILL_FILTERS_SENTINEL: Final[str] = "@@KOMPTIA_DRILL_FILTERS@@"
+
+
+DRILLDOWN_SYSTEM_PROMPT = (
+    """Tu es un expert SQL Server (T-SQL). Ta mission : produire la requête de DÉTAIL (« drill-down ») derrière UNE cellule agrégée sur laquelle l'utilisateur a cliqué.
+
+Contexte : la « requête d'origine » agrège des données (GROUP BY, fonctions d'agrégat, fenêtrage, ou CTE agrégées). L'utilisateur veut voir les LIGNES INDIVIDUELLES qui composent la valeur de la cellule cliquée, restreintes aux dimensions de la ligne cliquée.
+
+Règles strictes :
+
+1. Tu produis une requête de LECTURE (SELECT/WITH uniquement) qui :
+   - retire l'agrégation pertinente (GROUP BY / fonctions d'agrégat / fenêtrage) pour exposer les lignes de détail ;
+   - PRÉSERVE les tables sources, les JOIN et les filtres WHERE/HAVING existants de la requête d'origine ;
+   - projette des colonnes de détail utiles (au minimum `SELECT *` sur les tables de base si tu ne sais pas lesquelles privilégier).
+
+2. **Filtres de dimension — TU N'ÉCRIS JAMAIS LES VALEURS.** Pour des raisons de confidentialité tu ne reçois PAS les valeurs de la ligne cliquée. À la place :
+   - place le marqueur littéral `"""
+    + _DRILL_FILTERS_SENTINEL
+    + """` à l'endroit EXACT de la clause WHERE de détail où les conditions de dimension doivent être injectées. Le scope doit être celui où les colonnes de dimension sont visibles : l'outer query, ou le corps de la CTE agrégée si la cellule provient d'une CTE.
+   - écris la clause sous la forme `WHERE <filtres existants éventuels> """
+    + _DRILL_FILTERS_SENTINEL
+    + """`, ou `WHERE 1=1 """
+    + _DRILL_FILTERS_SENTINEL
+    + """` s'il n'existe aucun filtre.
+   - fournis le dictionnaire `dimensions` : pour CHAQUE colonne de RÉSULTAT qui est une dimension de regroupement de la cellule cliquée, donne l'EXPRESSION SQL exacte (qualifiée par alias de table) à laquelle elle correspond dans TA requête de détail. Exemple : si le résultat a une colonne `annee` issue de `YEAR(f.dateCol)`, alors `"annee": "YEAR(f.dateCol)"`. Le SYSTÈME remplacera le marqueur par ` AND <expression> = <valeur réelle>` (ou `IS NULL`) pour chaque dimension, en gérant l'échappement et les NULL. N'inclus PAS la colonne de mesure cliquée (un agrégat type SUM/COUNT) dans `dimensions`.
+
+3. Tu utilises EXCLUSIVEMENT les tables et colonnes présentes dans le DDL fourni et dans la requête d'origine. Aucune invention : si tu hésites sur une colonne, ne l'utilise pas.
+
+4. Cas limites :
+   - Si la cellule a une agrégation à retirer mais AUCUNE dimension de regroupement (rien à filtrer), retourne la requête de détail avec `"dimensions": {}` et SANS marqueur.
+   - Si la cellule est DÉJÀ au niveau ligne (rien à détailler), retourne `{"sql": "", "dimensions": {}}`.
+   - Toute demande d'écriture (DELETE/UPDATE/INSERT/DROP/ALTER/TRUNCATE/MERGE/EXEC) → `{"sql": "", "dimensions": {}}`.
+
+5. **Format de réponse : JSON STRICT** `{"sql": "...", "dimensions": {"<colonne_resultat>": "<expression_sql>", ...}}`. Aucun texte avant ou après. Aucun markdown. JSON pur."""
+)
+
+
+#: Template du prompt user pour le drill-down. Assemblé via ``str.replace`` (PAS
+#: ``str.format``) car la requête T-SQL peut contenir des accolades littérales
+#: (ODBC ``{ts '...'}`` / ``{d '...'}``) qui feraient lever ``KeyError``.
+DRILLDOWN_USER_TEMPLATE = """## Contexte d'exécution
+
+- **Date** : __CURRENT_DATE__
+- **Rôle utilisateur** : __USER_ROLE__
+- **Moteur cible** : __SQL_SERVER_VERSION__
+
+## DDL des tables impliquées
+
+__DDL_BLOCK__
+
+## Requête d'origine (agrégée) — c'est elle qui a produit la cellule cliquée
+
+```sql
+__ORIGINAL_SQL__
+```
+
+## Colonnes du résultat (clés de dimension candidates — noms uniquement, AUCUNE valeur)
+
+__RESULT_COLUMNS__
+
+## Cellule cliquée
+
+- **Colonne cliquée** (index __COL_INDEX__) : `__CLICKED_COLUMN__`
+- **Analyse système de cette colonne** (indices calculés par le système — peuvent être partiels) :
+
+__CLICKED_METADATA__
+
+## Dimensions de regroupement à mapper OBLIGATOIREMENT
+
+__EXPECTED_DIMENSIONS__
+
+## Réponse
+
+Réponds UNIQUEMENT avec un JSON strict `{"sql": "...", "dimensions": {...}}`. Pas de markdown, pas de prose. La consigne du système prime : place le marqueur de filtre et n'écris JAMAIS de valeur de ligne."""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -361,26 +462,14 @@ async def _build_ddl_context(
     return body, missing
 
 
-_MONTHS_FR: Tuple[str, ...] = (
-    "janvier",
-    "février",
-    "mars",
-    "avril",
-    "mai",
-    "juin",
-    "juillet",
-    "août",
-    "septembre",
-    "octobre",
-    "novembre",
-    "décembre",
-)
-
-
 def _format_french_datetime() -> str:
-    """Date/heure courante en français, format compact pour LLM."""
-    now = clock.now_local()
-    return f"{now.day} {_MONTHS_FR[now.month - 1]} {now.year}, {now.strftime('%H:%M')}"
+    """Date/heure courante en français, format compact pour LLM.
+
+    Délègue à la SSoT :func:`app.core.clock.format_date_fr` (noms FR
+    locale-indépendants) — l'ancien ``_MONTHS_FR`` local dupliquait cette
+    table, désormais centralisée dans ``clock``.
+    """
+    return clock.format_date_fr(clock.now_local(), with_time=True)
 
 
 def _build_oneshot_prompt(
@@ -425,14 +514,86 @@ def _try_parse_json_sql(candidate: str) -> Optional[str]:
     return sql_stripped or None
 
 
-def _extract_json_sql(text: str) -> Optional[str]:
-    """Parse la réponse LLM pour en extraire le champ ``sql``.
+def _strip_code_fences(text: str) -> str:
+    """Retire un fence markdown ``` ```json … ``` ``` autour d'un payload.
 
-    Tolère le JSON pur, ou enveloppé dans un bloc markdown ``` ```json … ``` ```.
-    Refuse au-delà de ``MAX_LLM_RESPONSE_CHARS`` (anti-DoS sur JSON très
-    imbriqué). Pas de fallback "premier { ... dernier }" : trop laxiste,
-    le system prompt impose déjà du JSON pur — un LLM qui s'en écarte
-    significativement doit fail-loud, pas être deviné.
+    Robuste à l'ABSENCE de fence de fermeture : un LLM dont la réponse est
+    tronquée (cap ``max_tokens``) ouvre ``` ```json ``` mais ne referme jamais.
+    On retire le fence d'ouverture s'il existe, et le fence de fermeture s'il
+    existe — sans exiger les deux (contrairement à l'ancienne regref qui
+    échouait sur réponse tronquée). N'altère rien si aucun fence détecté.
+
+    **Sécurité (F6, ReDoS)** : le retrait du fence de FERMETURE est fait via
+    ``rstrip()`` + ``endswith`` — PAS un ``re.sub`` ancré ``$`` avec ``[ \\t]*``.
+    L'ancien regex ``r"\\r?\\n?[ \\t]*```[ \\t]*$"`` avait un backtracking
+    catastrophique (≈60-79 s de CPU sur 200 Ko terminés par des tabs/fences) et
+    tournait inline dans l'event loop Tornado. ``rstrip`` est O(n), sans
+    backtracking. Le fence d'OUVERTURE reste un ``re.match`` ancré ``^`` avec
+    des classes disjointes (alnum vs espaces) → pas de backtracking possible.
+    """
+    s = text.strip()
+    m = re.match(r"^```[A-Za-z0-9_+-]*[ \t]*\r?\n?", s)
+    if m:
+        s = s[m.end() :].rstrip()
+        if s.endswith("```"):
+            s = s[:-3]
+    return s.strip()
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """Extrait le PREMIER objet JSON ``{…}`` équilibré du texte.
+
+    Scanne caractère par caractère en RESPECTANT les chaînes JSON (et leurs
+    échappements ``\\``) : un ``}`` à l'intérieur d'une string ne ferme pas
+    l'objet — c'était le bug de l'ancienne regex non-greedy ``\\{.*?\\}`` qui
+    s'arrêtait au premier ``}`` rencontré, même au milieu d'une valeur SQL.
+
+    Tolère du texte/markdown autour de l'objet. Retourne ``None`` si aucun
+    ``{`` n'est trouvé OU si l'objet n'est jamais refermé (réponse tronquée) —
+    dans ce dernier cas, ``transform_sql_via_llm`` a déjà détecté la troncature
+    en amont via ``stop_reason`` et remonté un message clair.
+    """
+    if not isinstance(text, str):
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    return None
+
+
+def _extract_json_payload(text: str) -> Optional[Dict[str, Any]]:
+    """Parse la réponse LLM en un dict JSON, de façon robuste.
+
+    Stratégie en cascade (la plus stricte d'abord) :
+      1. JSON pur ``json.loads`` direct.
+      2. JSON après retrait d'un fence markdown ``` ```json … ``` ``` (même
+         tronqué, sans fence de fin).
+      3. Scan du premier objet ``{…}`` équilibré (tolère prose/fence autour et
+         les ``}`` à l'intérieur des strings).
+
+    Refuse au-delà de ``MAX_LLM_RESPONSE_CHARS`` (anti-DoS). Retourne ``None``
+    si rien d'exploitable (réponse vide, tronquée non refermée, ou non-objet).
     """
     if not isinstance(text, str):
         return None
@@ -446,21 +607,40 @@ def _extract_json_sql(text: str) -> Optional[str]:
     if not stripped:
         return None
 
-    # Tentative 1 : JSON pur
-    sql = _try_parse_json_sql(stripped)
-    if sql is not None:
-        return sql
+    candidates: List[str] = [stripped]
+    unfenced = _strip_code_fences(stripped)
+    if unfenced and unfenced != stripped:
+        candidates.append(unfenced)
+    balanced = _extract_first_json_object(stripped)
+    if balanced:
+        candidates.append(balanced)
 
-    # Tentative 2 : JSON dans un bloc markdown ```json...```
-    fence_match = re.search(
-        r"```(?:json)?\s*(\{.*?\})\s*```",
-        stripped,
-        re.DOTALL,
-    )
-    if fence_match:
-        return _try_parse_json_sql(fence_match.group(1))
-
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
     return None
+
+
+def _extract_json_sql(text: str) -> Optional[str]:
+    """Parse la réponse LLM pour en extraire le champ ``sql`` (str non-vide).
+
+    Délègue le parsing robuste à :func:`_extract_json_payload` (gère JSON pur,
+    fence markdown même tronqué, et ``}`` dans les strings). Le system prompt
+    impose du JSON pur ``{"sql": "..."}`` ; un LLM qui s'en écarte trop doit
+    fail-loud (retour ``None``), pas être deviné.
+    """
+    payload = _extract_json_payload(text)
+    if payload is None:
+        return None
+    sql = payload.get("sql")
+    if not isinstance(sql, str):
+        return None
+    sql_stripped = sql.strip()
+    return sql_stripped or None
 
 
 #: Mots-clés DML/DDL bannis dans la sortie LLM. Couvre l'écriture
@@ -501,6 +681,25 @@ def _is_safe_select(sql: str) -> bool:
     return first_word in {"SELECT", "WITH"}
 
 
+def _llm_response_truncated(response: Any) -> bool:
+    """True si la réponse LLM a été coupée parce que le cap de sortie est atteint.
+
+    Lit ``stop_reason`` (Anthropic) ou ``finish_reason`` (OpenAI-compat) dans
+    ``response.raw_response``. Best-effort : si l'info n'est pas disponible
+    (provider sans ``raw_response``), retourne ``False`` — le scan JSON
+    équilibré + l'erreur « non parseable » restent le filet de secours. Ne
+    lève jamais (un faux négatif dégrade au pire vers l'ancien message).
+    """
+    raw = getattr(response, "raw_response", None)
+    if not isinstance(raw, dict):
+        return False
+    for key in ("stop_reason", "finish_reason"):
+        reason = raw.get(key)
+        if isinstance(reason, str) and reason.strip().lower() in {"max_tokens", "length"}:
+            return True
+    return False
+
+
 def _resolve_sql_server_version_label() -> str:
     """Retourne le label SQL Server (cache sync) ou un fallback générique."""
     try:
@@ -516,9 +715,426 @@ def _resolve_sql_server_version_label() -> str:
     return "SQL Server"
 
 
+def _render_result_columns(result_columns: Optional[List[str]]) -> str:
+    """Rend la liste des colonnes de résultat (NOMS uniquement, aucune valeur)."""
+    cols = [c for c in (result_columns or []) if isinstance(c, str) and c]
+    if not cols:
+        return "(colonnes de résultat inconnues)"
+    return "\n".join(f"- `{c}`" for c in cols)
+
+
+def _render_clicked_metadata(
+    column_metadata: Optional[List[Dict[str, Any]]], col_index: int
+) -> str:
+    """Rend les indices d'``analyze_columns`` pour la colonne cliquée.
+
+    N'expose que des éléments STRUCTURELS (type de colonne, dimensions de
+    regroupement = NOMS de colonnes, CTE source) — jamais une valeur de
+    donnée. Le système « mâche le travail » du LLM en lui passant son analyse.
+    """
+    if not isinstance(column_metadata, list) or col_index < 0 or col_index >= len(column_metadata):
+        return "(pas de métadonnée disponible pour cette colonne)"
+    meta = column_metadata[col_index]
+    if not isinstance(meta, dict):
+        return "(pas de métadonnée disponible pour cette colonne)"
+    lines: List[str] = []
+    for key in ("type", "is_drillable", "filter_dimensions", "source_cte", "source_ctes"):
+        if key in meta and meta[key] not in (None, [], {}):
+            lines.append(f"  - {key}: {meta[key]}")
+    if not lines:
+        return "(pas de métadonnée exploitable pour cette colonne)"
+    return "\n".join(lines)
+
+
+def _render_expected_dimensions(expected_dimensions: Optional[List[str]]) -> str:
+    """Rend les dimensions de regroupement (NOMS de colonnes de résultat) que le
+    système exige que le LLM mappe. Vérité-terrain calculée par ``analyze_columns``
+    (``filter_dimensions``). Le binding final est fail-closed côté caller : si une
+    de ces dimensions n'est pas couverte, on bascule en mode programmatique."""
+    dims = [d for d in (expected_dimensions or []) if isinstance(d, str) and d]
+    if not dims:
+        return (
+            "(le système n'a pas pu déterminer les dimensions de regroupement ; "
+            "déduis-les toi-même du GROUP BY / PARTITION BY de la requête d'origine)"
+        )
+    listed = "\n".join(f"- `{d}`" for d in dims)
+    return (
+        "Tu DOIS fournir une expression dans `dimensions` pour CHACUNE de ces "
+        "colonnes (le système refusera et basculera en mode dégradé s'il en "
+        "manque une) :\n" + listed
+    )
+
+
+#: Noeuds sqlglot toujours interdits dans une expression de dimension, où qu'ils
+#: apparaissent (sous-requête / union → lecture détournée, casse du scoping).
+_FORBIDDEN_DIM_EXPR_NODES: Final[tuple] = (
+    sqlglot_exp.Select,
+    sqlglot_exp.Subquery,
+    sqlglot_exp.Union,
+)
+
+#: Noeuds sqlglot interdits À LA RACINE d'une expression de dimension : une
+#: vraie dimension est une valeur scalaire (Column, Func, CASE, arithmétique),
+#: PAS un prédicat booléen. Une racine booléenne (``1=1 OR 1``) splicée comme LHS
+#: d'un ``= <valeur>`` casse la précédence T-SQL → sur-filtrage silencieux (F4/F5).
+_FORBIDDEN_DIM_ROOT_NODES: Final[tuple] = (
+    sqlglot_exp.And,
+    sqlglot_exp.Or,
+    sqlglot_exp.Not,
+    sqlglot_exp.EQ,
+    sqlglot_exp.NEQ,
+    sqlglot_exp.GT,
+    sqlglot_exp.GTE,
+    sqlglot_exp.LT,
+    sqlglot_exp.LTE,
+    sqlglot_exp.Is,
+    sqlglot_exp.In,
+    sqlglot_exp.Like,
+    sqlglot_exp.Between,
+)
+
+
+def _strip_sql_string_literals(s: str) -> str:
+    """Neutralise les SPANS « quotés » T-SQL pour ne laisser qu'un squelette de
+    CODE, scanné ensuite pour des tokens dangereux (``;`` ``--`` ``/*``) sans
+    faux positif (R2) NI désynchronisation (R5).
+
+    T-SQL a TROIS contextes de quoting, pas un seul — c'était le bug R5 : un
+    ``'`` n'est un délimiteur de chaîne QUE hors identifiant. À l'intérieur d'un
+    ``[identifiant]`` (ou ``"identifiant"``) un ``'`` est un caractère littéral,
+    pas un délimiteur. On reconnaît donc :
+
+      * littéral chaîne ``'…'`` (échappement ``''``) — remplacé par ``''`` ;
+      * identifiant crochet ``[…]`` (échappement ``]]``) — opaque, sauté ;
+      * identifiant guillemets ``"…"`` (échappement ``""``) — opaque, sauté.
+
+    Un token ``;`` / ``--`` / ``/*`` à l'intérieur d'un de ces spans est
+    inoffensif (T-SQL ne l'interprète pas) → il disparaît du squelette. Un token
+    HORS span (vrai séparateur / commentaire) reste → détecté par l'appelant.
+
+    **Garde-fou (R5)** : un ``'`` à l'intérieur d'un identifiant crochet/guillemets
+    n'apparaît JAMAIS dans un vrai nom de colonne — c'est le signe d'une
+    expression forgée pour désynchroniser le scan. On émet alors ``--`` dans le
+    squelette pour FORCER le rejet (ex. ``[a';b]--x`` ne doit pas passer)."""
+    out: List[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "'":
+            # Littéral chaîne — saute jusqu'au ``'`` de fermeture (gère ``''``).
+            out.append("''")
+            i += 1
+            while i < n:
+                if s[i] == "'":
+                    if i + 1 < n and s[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "[" or ch == '"':
+            # Identifiant crochet/guillemets — OPAQUE (son contenu est un nom,
+            # pas du code). On saute jusqu'au closer (gère le doublement
+            # d'échappement ``]]`` / ``""``).
+            closer = "]" if ch == "[" else '"'
+            i += 1
+            body_has_quote = False
+            while i < n:
+                if s[i] == closer:
+                    if i + 1 < n and s[i + 1] == closer:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                if s[i] == "'":
+                    body_has_quote = True
+                i += 1
+            out.append("--" if body_has_quote else "x")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def marker_outer_scope_over_cte(sql_with_marker: str) -> bool:
+    """True si ``_DRILL_FILTERS_SENTINEL`` est dans la requête la PLUS EXTERNE
+    (profondeur de parenthèses == 0) ET que cette requête sélectionne DEPUIS une
+    CTE — le seul cas où il FAUT binder la colonne de SORTIE plutôt que
+    l'expression interne du LLM.
+
+    Enjeu (root-cause incident 2026-06-03) : pour une requête
+    ``WITH cte AS (… Col01.x AS sortie … FROM … JOIN Collaborateurs Col01 …)
+    SELECT * FROM cte WHERE … <marker>``, le LLM renvoie la dimension comme
+    l'expression INTERNE ``Col01.x``. Mais dans la requête externe, l'alias de
+    table ``Col01`` (vivant DANS la CTE) n'est PAS visible → SQL Server 4104
+    « multi-part identifier cannot be bound ». La référence valide dans ce scope
+    est la COLONNE DE SORTIE de la CTE (``[sortie]``). Le caller binde alors
+    ``[colonne_de_sortie]``.
+
+    On NE normalise PAS les requêtes PLATES (``SELECT … FROM TableBase WHERE
+    <marker>``) : là, l'expression du LLM (``f.col``) est le bon référent, et la
+    colonne de sortie peut être un simple alias de SELECT non référençable en
+    WHERE (dualité documentée dans ``drilldown._build_where_conditions`` R4). Ni
+    les marqueurs DANS le corps d'une CTE (profondeur > 0) : l'expression interne
+    y est correcte.
+
+    Robuste : neutralise chaînes/identifiants quotés (``_strip_sql_string_literals``)
+    pour le comptage de parenthèses ; parse sqlglot pour confirmer que la table
+    du FROM externe est bien une CTE déclarée. Tout échec (parse KO, pas de CTE,
+    FROM non-CTE) → ``False`` (conserve l'expression LLM ; l'oracle reste le
+    filet de sécurité). Aucun nom de table/colonne en dur — purement structurel.
+    """
+    if not isinstance(sql_with_marker, str):
+        return False
+    idx = sql_with_marker.find(_DRILL_FILTERS_SENTINEL)
+    if idx == -1:
+        return False
+    # 1. Marqueur dans la requête la plus externe (profondeur parenthèses 0) ?
+    prefix_code = _strip_sql_string_literals(sql_with_marker[:idx])
+    if (prefix_code.count("(") - prefix_code.count(")")) > 0:
+        return False  # marqueur dans une CTE/sous-requête → expression LLM correcte
+    # 2. La requête externe sélectionne-t-elle DEPUIS une CTE déclarée ?
+    probe = sql_with_marker.replace(_DRILL_FILTERS_SENTINEL, "")
+    try:
+        ast = sqlglot.parse_one(probe, dialect="tsql")
+    except Exception:  # noqa: BLE001 — T-SQL exotique → on garde l'expression LLM
+        return False
+    if ast is None:
+        return False
+    cte_names = {
+        cte.alias_or_name.upper()
+        for cte in ast.find_all(sqlglot_exp.CTE)
+        if isinstance(cte.alias_or_name, str) and cte.alias_or_name
+    }
+    if not cte_names:
+        return False  # requête plate → expression LLM correcte
+    outer = ast if isinstance(ast, sqlglot_exp.Select) else ast.find(sqlglot_exp.Select)
+    if outer is None:
+        return False
+    # Une table RÉFÉRENCÉE DIRECTEMENT dans le SELECT externe (``parent_select is
+    # outer``, API stable inter-versions sqlglot — évite la dépendance au nom de
+    # clé ``args['from']`` vs ``'from_'``) est-elle une CTE déclarée ? Gère
+    # ``FROM cte`` et ``FROM cte JOIN base``. Les tables des corps de CTE ont
+    # ``parent_select`` = le SELECT interne → exclues.
+    for tbl in outer.find_all(sqlglot_exp.Table):
+        if (
+            isinstance(tbl.name, str)
+            and tbl.name.upper() in cte_names
+            and tbl.parent_select is outer
+        ):
+            return True
+    return False
+
+
+def outer_select_computed_aliases(sql_with_marker: str) -> Dict[str, str]:
+    """Map ``alias_de_sortie(lower) → expression`` des projections ALIASÉES
+    (``<expr> AS alias``) de la requête EXTERNE du skeleton drill-down.
+
+    Complément de :func:`marker_outer_scope_over_cte`. Quand le marqueur est en
+    scope externe sur une CTE, une dimension peut correspondre :
+      * à une colonne MATÉRIALISÉE de la CTE → référençable ``[alias]`` ;
+      * OU à un alias CALCULÉ DANS la requête externe (``YEAR(c.d) AS annee``).
+        Ce dernier n'est PAS référençable par son nom en WHERE (SQL Server 207),
+        et PIRE : s'il existe une colonne de base homonyme jointe en externe,
+        ``[annee]`` se lierait à ELLE → filtre faux SILENCIEUX (doctrine Q5).
+
+    On résout donc l'alias calculé vers son EXPRESSION (valide dans le scope
+    externe car issue de cette même requête). Mirror exact de la résolution
+    programmatique ``drilldown._build_alias_to_real`` (R4) — même doctrine,
+    appliquée au chemin LLM pour éliminer l'asymétrie. Le caller fait
+    ``map.get(col) or [col]`` : alias calculé → expression, sinon (colonne
+    matérialisée / ``SELECT *``) → ``[col]``.
+
+    Parse-fail / aucun alias → map vide (fallback ``[col]``, correct pour les
+    colonnes matérialisées). Aucun nom de table/colonne en dur.
+    """
+    if not isinstance(sql_with_marker, str):
+        return {}
+    probe = sql_with_marker.replace(_DRILL_FILTERS_SENTINEL, "")
+    try:
+        ast = sqlglot.parse_one(probe, dialect="tsql")
+    except Exception:  # noqa: BLE001 — T-SQL exotique → fallback [col]
+        return {}
+    if ast is None:
+        return {}
+    outer = ast if isinstance(ast, sqlglot_exp.Select) else ast.find(sqlglot_exp.Select)
+    if outer is None:
+        return {}
+    mapping: Dict[str, str] = {}
+    for proj in outer.expressions:
+        # Uniquement les projections de la requête EXTERNE elle-même
+        # (``parent_select is outer``) et qui sont des ALIAS (``<expr> AS x``).
+        if isinstance(proj, sqlglot_exp.Alias) and proj.parent_select is outer:
+            try:
+                mapping[proj.alias.lower()] = proj.this.sql(dialect="tsql")
+            except Exception:  # noqa: BLE001 — rendu défensif d'une projection
+                continue
+    return mapping
+
+
+def dedupe_duplicate_output_columns(sql: str) -> Tuple[str, List[str]]:
+    """Retire les colonnes de SORTIE en double de CHAQUE ``SELECT`` (garde la 1ʳᵉ).
+
+    SQL Server rejette une projection contenant deux colonnes au même nom de
+    sortie (erreur 8156 « column … specified multiple times »). Le LLM
+    d'élargissement (« Charger toutes les colonnes ») peut re-projeter une
+    colonne déjà présente sur une requête à ~150 colonnes — slip de
+    déduplication observé en prod (2026-06-03 : ``facVerrouillee`` projeté 2×).
+    Le SYSTÈME déduplique ici de façon DÉTERMINISTE (doctrine « le système mâche
+    le travail, le LLM ne devine rien »), AVANT validation/exécution.
+
+    Comparaison par nom de sortie *insensible à la casse* (SQL Server l'est sur
+    les identifiants). Les ``SELECT *`` sont laissés intacts (une étoile ne peut
+    pas se dédupliquer). Parcourt tous les ``SELECT`` (CTE + sous-requêtes
+    incluses) car la duplication peut vivre dans n'importe lequel.
+
+    Returns:
+        ``(sql_dédupliqué, colonnes_retirées)``. Si sqlglot échoue à parser
+        (SQL exotique) → ``(sql, [])`` inchangé : on ne réécrit JAMAIS un SQL
+        qu'on ne comprend pas (l'oracle reportera l'erreur proprement). Aucun
+        nom de table/colonne en dur — purement structurel.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return sql, []
+    try:
+        ast = sqlglot.parse_one(sql, dialect="tsql")
+    except Exception as exc:  # noqa: BLE001 — sqlglot peut lever sur T-SQL exotique
+        logger.debug("dedupe_duplicate_output_columns: parse sqlglot échoué (%s)", exc)
+        return sql, []
+    if ast is None:
+        return sql, []
+
+    dropped: List[str] = []
+    any_changed = False
+    for select in ast.find_all(sqlglot_exp.Select):
+        # NE PAS dédupliquer un membre d'une opération ensembliste
+        # (UNION/EXCEPT/INTERSECT) : retirer une colonne d'UNE seule branche
+        # casse la parité d'arité entre branches (SQL Server 205) — on
+        # fabriquerait une erreur PIRE qu'un 8156 déjà reporté proprement par
+        # l'oracle. On laisse donc ces branches intactes.
+        if (
+            select.find_ancestor(sqlglot_exp.Union, sqlglot_exp.Except, sqlglot_exp.Intersect)
+            is not None
+        ):
+            continue
+        seen: set = set()
+        new_exprs: List[Any] = []
+        sel_changed = False
+        for proj in select.expressions:
+            # Expansion étoile (``SELECT *`` / ``t.*``) : pas de nom de sortie
+            # unique → on garde tel quel. NB : on NE saute PAS ``COUNT(*) AS x``
+            # (qui CONTIENT une étoile mais a un nom de sortie unique
+            # dédupliquable) — d'où le test ciblé sur le NŒUD étoile, pas sur
+            # « contient une étoile ».
+            if isinstance(proj, sqlglot_exp.Star) or (
+                isinstance(proj, sqlglot_exp.Column) and isinstance(proj.this, sqlglot_exp.Star)
+            ):
+                new_exprs.append(proj)
+                continue
+            out_name = proj.alias_or_name
+            key = out_name.lower() if isinstance(out_name, str) and out_name else None
+            if key is not None and key in seen:
+                dropped.append(out_name)
+                sel_changed = True
+                any_changed = True
+                continue
+            if key is not None:
+                seen.add(key)
+            new_exprs.append(proj)
+        if sel_changed:
+            select.set("expressions", new_exprs)
+
+    if not any_changed:
+        return sql, []
+    try:
+        return ast.sql(dialect="tsql"), dropped
+    except Exception as exc:  # noqa: BLE001 — re-render défensif
+        logger.warning("dedupe_duplicate_output_columns: re-render sqlglot échoué (%s)", exc)
+        return sql, []
+
+
+def _is_safe_dimension_expr(expr: str) -> bool:
+    """True si ``expr`` est une expression SCALAIRE seule, sûre à splicer comme
+    membre gauche d'un prédicat de drill-down (F4/F5).
+
+    Le membre gauche vient du LLM et est inséré verbatim dans le WHERE. Le filtre
+    par mots-clés (``_FORBIDDEN_KEYWORDS_RE``) ne suffit pas : une tautologie
+    ``1=1 OR 1`` ou une sous-requête ``(SELECT ...)`` y survivent. On parse donc
+    l'expression via sqlglot et on REJETTE :
+
+      * tout séparateur de statement / commentaire (``;`` ``--`` ``/* */``) ;
+      * toute sous-requête / Select / Union (lecture détournée, RLS partielle) ;
+      * toute racine booléenne / prédicat (And/Or/Not/comparaisons) — une vraie
+        dimension est une valeur, pas un booléen.
+
+    Un ``expr`` rejeté est droppé → la dimension n'est pas bindée → le garde de
+    couverture côté caller bascule en mode programmatique (fail-closed). Générique :
+    aucun nom de table/colonne en dur.
+    """
+    if not isinstance(expr, str) or not expr.strip():
+        return False
+    # R2 — le scan ;/--/* doit IGNORER le contenu des string literals : un
+    # ``--`` dans ``'A--Z'`` n'est pas un commentaire. On scanne le squelette de
+    # code (chaînes vidées) pour ne pas rejeter une dimension légitime tout en
+    # gardant la détection de séparateur de statement / commentaire hors chaîne.
+    code_skeleton = _strip_sql_string_literals(expr)
+    if ";" in code_skeleton or "--" in code_skeleton or "/*" in code_skeleton:
+        return False
+    try:
+        node = sqlglot.parse_one(expr, dialect="tsql")
+    except Exception:
+        return False
+    if node is None:
+        return False
+    for bad in _FORBIDDEN_DIM_EXPR_NODES:
+        if node.find(bad) is not None:
+            return False
+    if isinstance(node, _FORBIDDEN_DIM_ROOT_NODES):
+        return False
+    return True
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────
+
+
+def _oneshot_input_within_budget(prompt_text: str) -> bool:
+    """B-3 (audit 2026-06-09) — ``True`` si ``prompt_text`` (system + user) tient
+    dans le budget d'INPUT du modèle primary, AVANT l'appel LLM. Permet un
+    fail-fast (message actionnable « réduis le périmètre ») au lieu d'envoyer un
+    appel voué au 400 context-overflow / à la troncature détectée trop tard.
+
+    Fail-OPEN (``True``) si le budget est incalculable (manager non initialisé,
+    registre BDD indispo) : ce pré-flight est une OPTIMISATION UX, jamais un gate
+    de correction — les gardes post-appel (troncature, 400, 429) restent
+    l'autorité. Dynamique : budget dérivé du registre modèle, zéro hardcode.
+
+    Estimation via ``estimate_token_count`` (len/4) et PAS la variante
+    conservatrice ×1.6 : cette marge est calibrée pour la dérive CJK/emoji,
+    or le payload ici est de l'ASCII (SQL + DDL + system prompt) qui tokenise
+    à ~len/4. Un sur-estimé ×1.6 bloquerait à tort des requêtes qui TIENNENT
+    (faux positif = pire cas d'un fail-fast). Revue B3-1.
+    """
+    try:
+        from app.constants_ai import (
+            clamped_max_tokens,
+            estimate_token_count,
+            get_context_window_for_model,
+        )
+        from app.services.ai.llm_providers import get_llm_manager
+
+        model = get_llm_manager().default_model_name
+        input_budget = get_context_window_for_model(model) - clamped_max_tokens(
+            ONESHOT_MAX_TOKENS_SOFT, model_name=model
+        )
+        if input_budget <= 0:
+            return True
+        return estimate_token_count(prompt_text) <= input_budget
+    except Exception:  # noqa: BLE001 — budget incalculable → fail-open
+        return True
 
 
 async def transform_sql_via_llm(
@@ -671,6 +1287,21 @@ async def transform_sql_via_llm(
 
         _user_for_gate = _SimpleNamespace(id=user_id, role=None)
 
+    # B-3 — pré-flight INPUT : fail-fast si le prompt dépasse le budget d'entrée
+    # du modèle, AVANT d'appeler le LLM (sinon appel envoyé pour rien → 400
+    # context-overflow ou réponse tronquée détectée trop tard). Fail-open si le
+    # budget est incalculable (les gardes post-appel restent l'autorité).
+    if not _oneshot_input_within_budget(final_system_prompt + "\n" + anon_user_prompt):
+        logger.warning(
+            "iris_oneshot: prompt input au-delà du budget du modèle — fail-fast "
+            "avant appel LLM (réduire le périmètre)."
+        )
+        return None, [
+            "La requête est trop volumineuse pour être transformée d'un seul "
+            "tenant par l'IA (contexte d'entrée au-delà du budget du modèle). "
+            "Réduis le périmètre (moins de colonnes ou de tables) puis réessaie."
+        ]
+
     try:
         response = await call_llm(
             CallProfile(
@@ -699,6 +1330,23 @@ async def transform_sql_via_llm(
         # détails internes (clé API, headers, URLs). Log côté serveur seul.
         logger.warning("iris_oneshot: LLM call failed", exc_info=True)
         return None, ["Échec de l'appel au LLM (voir logs serveur)."]
+
+    # Troncature explicite (cap ``max_tokens`` du modèle atteint) → message
+    # ACTIONNABLE. Sans ça, un SQL trop volumineux produit un JSON incomplet et
+    # l'utilisateur voit « réponse non parseable » (incident prod 2026-06-02)
+    # au lieu de comprendre que la requête dépasse le budget de sortie du
+    # modèle. À détecter AVANT le parsing (qui échouerait de toute façon).
+    if _llm_response_truncated(response):
+        logger.warning(
+            "iris_oneshot: réponse LLM tronquée (stop_reason=max_tokens) — "
+            "SQL trop volumineux pour le budget de sortie du modèle (caller=%s).",
+            "iris_oneshot",
+        )
+        return None, [
+            "La requête est trop volumineuse pour être transformée d'un seul "
+            "tenant par l'IA (réponse tronquée au plafond du modèle). Réduis le "
+            "périmètre (moins de colonnes ou de tables) puis réessaie."
+        ]
 
     raw_content = response.content or ""
     sql_out = _extract_json_sql(raw_content)
@@ -781,3 +1429,279 @@ async def transform_sql_via_llm(
             raise DataAccessLeakDetectedError(leak_msg)
 
     return sql_out, []
+
+
+async def build_drilldown_sql_via_llm(
+    *,
+    original_sql: str,
+    clicked_column: str,
+    result_columns: List[str],
+    col_index: int = -1,
+    column_metadata: Optional[List[Dict[str, Any]]] = None,
+    expected_dimensions: Optional[List[str]] = None,
+    user_role: str = "user",
+    sql_server_version: Optional[str] = None,
+    user_id: Optional[int] = None,
+) -> Tuple[Optional[str], Dict[str, str], List[str]]:
+    """Construit le SQL de détail (« Voir le détail ») d'une cellule agrégée via
+    un appel LLM one-shot — sibling de :func:`transform_sql_via_llm`.
+
+    Le LLM reçoit TOUTE la STRUCTURE nécessaire pour remplir la fonction :
+    requête d'origine agrégée, DDL des tables impliquées (via training_store),
+    colonne cliquée + métadonnées d'analyse système, et les NOMS des colonnes de
+    résultat. Il ne reçoit JAMAIS les valeurs de la ligne cliquée
+    (confidentialité — Niveau 4/5 : « l'IA ne voit que le SQL »). Il renvoie :
+
+      * ``sql`` : la requête de détail, avec le marqueur
+        ``_DRILL_FILTERS_SENTINEL`` à l'emplacement où le SYSTÈME injectera les
+        prédicats de dimension ;
+      * ``dimensions`` : ``{colonne_resultat: expression_sql}`` — le caller
+        binde localement ``row_values[colonne_resultat]`` sur ``expression_sql``.
+
+    Returns:
+        ``(sql_skeleton, dimensions, errors)`` :
+          * Drillable : ``sql_skeleton`` non-vide (contient le marqueur si
+            ``dimensions`` non-vide), ``errors == []``.
+          * Rien à détailler : ``("", {}, [])`` (succès « non drillable »).
+          * Échec : ``(None, {}, errors)`` — le caller bascule sur le fallback
+            programmatique ``build_drilldown_query``.
+
+    Raises:
+        DataAccessLeakDetectedError: si le SQL LLM contient un nom de table
+            interdit (mode invisible) — le caller le transforme en refus, sans
+            fallback (le nom hallucinné ne doit pas réapparaître).
+
+    Réutilise (PAS de duplication) : ``_extract_tables_from_sql``,
+    ``_build_ddl_context``, le proxy d'anonymisation, ``_is_safe_select``,
+    ``assert_safe_llm_response`` — exactement comme ``transform_sql_via_llm``.
+    """
+    if not isinstance(original_sql, str) or not original_sql.strip():
+        return None, {}, ["original_sql vide ou invalide."]
+    if len(original_sql) > MAX_DRAFT_SQL_CHARS:
+        return (
+            None,
+            {},
+            [f"SQL d'origine trop long ({len(original_sql)} > {MAX_DRAFT_SQL_CHARS} chars)."],
+        )
+
+    tables_map = _extract_tables_from_sql(original_sql)
+    table_names = list(dict.fromkeys(tables_map.values()))
+    if not table_names:
+        # Sans table détectable, impossible de construire un détail fiable :
+        # on laisse le caller basculer sur le fallback programmatique.
+        return None, {}, ["Aucune table détectée dans la requête d'origine."]
+
+    ddl_block, _missing = await _build_ddl_context(table_names, user_id=user_id)
+    if ddl_block is None:
+        return (
+            None,
+            {},
+            ["Schéma BDD inaccessible (training store). Sync via /admin/ai-config et réessaie."],
+        )
+
+    user_prompt = (
+        DRILLDOWN_USER_TEMPLATE.replace("__CURRENT_DATE__", _format_french_datetime())
+        .replace("__USER_ROLE__", user_role or "user")
+        .replace(
+            "__SQL_SERVER_VERSION__",
+            sql_server_version or _resolve_sql_server_version_label(),
+        )
+        .replace("__DDL_BLOCK__", ddl_block)
+        .replace("__ORIGINAL_SQL__", original_sql)
+        .replace("__RESULT_COLUMNS__", _render_result_columns(result_columns))
+        .replace("__COL_INDEX__", str(col_index))
+        .replace("__CLICKED_COLUMN__", clicked_column or "(inconnue)")
+        .replace("__CLICKED_METADATA__", _render_clicked_metadata(column_metadata, col_index))
+        .replace("__EXPECTED_DIMENSIONS__", _render_expected_dimensions(expected_dimensions))
+    )
+
+    from app.services.ai.llm_providers import LLMRequest
+    from app.services.ai.llm_runtime import (
+        CallProfile,
+        FallbackPolicy,
+        ModelKind,
+        call_llm,
+    )
+    from app.services.anonymization import anonymize_for_llm
+    from app.services.anonymization.proxy import get_confidentiality_prompt
+
+    # Proxy d'anonymisation : le ``user_prompt`` contient la requête d'origine
+    # (qui peut avoir des littéraux saisis par l'utilisateur) + DDL + NOMS de
+    # colonnes — JAMAIS de valeur de la ligne cliquée. Même posture que
+    # ``transform_sql_via_llm`` (fail-closed sur RuntimeError du proxy).
+    try:
+        anon_user_prompt, restore_fn = await anonymize_for_llm(user_id, user_prompt, "IRIS_CHAT")
+    except RuntimeError:
+        logger.error(
+            "iris_oneshot(drilldown): anonymisation user incomplète (fail-closed)",
+            exc_info=True,
+        )
+        return (
+            None,
+            {},
+            [
+                "Configuration anonymisation incomplète — vérifie tes termes "
+                "confidentiels (collision pseudonyme). Voir /data/privacy."
+            ],
+        )
+    except Exception:  # noqa: BLE001 — defense-in-depth proxy
+        logger.error("iris_oneshot(drilldown): anonymisation a levé (fail-closed)", exc_info=True)
+        return None, {}, ["Échec interne de l'anonymisation (voir logs serveur)."]
+
+    final_system_prompt = get_confidentiality_prompt("IRIS_CHAT") + "\n\n" + DRILLDOWN_SYSTEM_PROMPT
+
+    _user_for_gate = None
+    if user_id is not None:
+        from types import SimpleNamespace as _SimpleNamespace
+
+        _user_for_gate = _SimpleNamespace(id=user_id, role=None)
+
+    try:
+        response = await call_llm(
+            CallProfile(
+                caller="iris_oneshot_drilldown",
+                model_kind=ModelKind.PRIMARY,
+                max_tokens_soft=ONESHOT_MAX_TOKENS_SOFT,
+                # Génération SQL ad-hoc → chiffres sacrés, pas de fallback Ollama.
+                fallback_policy=FallbackPolicy.NONE,
+                # S2 — clic synchrone : on borne l'attente, puis fallback
+                # programmatique (call_llm lève sur timeout → except plus bas).
+                timeout_seconds=_DRILLDOWN_LLM_TIMEOUT_S,
+            ),
+            LLMRequest(prompt=anon_user_prompt, system=final_system_prompt),
+            user=_user_for_gate,
+        )
+    except Exception:
+        logger.warning("iris_oneshot(drilldown): LLM call failed", exc_info=True)
+        return None, {}, ["Échec de l'appel au LLM (voir logs serveur)."]
+
+    if _llm_response_truncated(response):
+        logger.warning("iris_oneshot(drilldown): réponse LLM tronquée (stop_reason=max_tokens)")
+        return (
+            None,
+            {},
+            [
+                "Le détail est trop volumineux pour être généré d'un seul tenant "
+                "(réponse IA tronquée). Réessaie sur une cellule plus ciblée."
+            ],
+        )
+
+    raw_content = response.content or ""
+    payload = _extract_json_payload(raw_content)
+    if payload is None:
+        logger.warning(
+            "iris_oneshot(drilldown): réponse non parseable. excerpt=%s",
+            raw_content[:200],
+        )
+        return (
+            None,
+            {},
+            ['Le LLM a renvoyé une réponse non parseable (attendu : JSON {"sql","dimensions"}).'],
+        )
+
+    sql_raw = payload.get("sql")
+    if not isinstance(sql_raw, str):
+        return None, {}, ["Réponse LLM sans champ 'sql' valide."]
+    sql_out = sql_raw.strip()
+
+    # "" = non drillable (règle 4 du system prompt) — succès « rien à détailler ».
+    if not sql_out:
+        return "", {}, []
+
+    # Restauration anonymisation (parse-then-restore, cf. transform_sql_via_llm).
+    try:
+        sql_out = restore_fn(sql_out)
+    except Exception:  # noqa: BLE001 — proxy restore peut lever
+        logger.error("iris_oneshot(drilldown): restore_fn a levé — fail-closed", exc_info=True)
+        return None, {}, ["Échec interne de l'anonymisation (restore)."]
+
+    if not _is_safe_select(sql_out):
+        logger.warning(
+            "iris_oneshot(drilldown): SQL non-SELECT ou mot-clé interdit. sql=%s",
+            sql_out[:200],
+        )
+        return None, {}, ["Le LLM a renvoyé une requête non-lecture (écriture/EXEC) — refusée."]
+
+    # ``dimensions`` : filtré aux colonnes de résultat RÉELLES (le système ne
+    # peut binder que celles dont il a la valeur), et nettoyé des expressions
+    # dangereuses (defense-in-depth : le SQL final est ré-exécuté read-only mais
+    # on bloque tôt).
+    raw_dims = payload.get("dimensions")
+    dimensions: Dict[str, str] = {}
+    if isinstance(raw_dims, dict):
+        allowed = {c for c in (result_columns or []) if isinstance(c, str)}
+        # Vérité-terrain des dimensions de regroupement (R1) : sert à distinguer
+        # une MESURE cliquée (à exclure des dimensions) d'une cellule qui EST
+        # elle-même une dimension de regroupement (à conserver).
+        expected_set = {d for d in (expected_dimensions or []) if isinstance(d, str)}
+        for k, v in raw_dims.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            expr = v.strip()
+            if not k or not expr:
+                continue
+            if allowed and k not in allowed:
+                continue
+            # F2 (corrigé R1) : la colonne de MESURE cliquée n'est jamais une
+            # dimension de filtre (on binderait <mesure> = <valeur agrégée> →
+            # détail faux). MAIS une cellule drillable peut ÊTRE une dimension de
+            # regroupement (clic sur la cellule `annee` : clicked_column ∈
+            # filter_dimensions). Il faut alors la GARDER — sinon le coverage
+            # guard la déclare manquante et bascule SYSTÉMATIQUEMENT en
+            # programmatique (LLM-path mort pour toute la classe « clic sur une
+            # colonne-dimension »). On ne droppe donc QUE si la colonne cliquée
+            # n'est PAS une dimension attendue (⇒ c'est bien une mesure).
+            if clicked_column and k == clicked_column and clicked_column not in expected_set:
+                continue
+            if _DRILL_FILTERS_SENTINEL in expr or _FORBIDDEN_KEYWORDS_RE.search(expr):
+                continue
+            # F4/F5 : l'EXPRESSION (membre gauche) vient du LLM et sera splicée
+            # verbatim. On exige une expression scalaire seule (pas de
+            # sous-requête, pas de booléen/tautologie). Sinon on droppe la dim →
+            # le garde de couverture côté caller bascule en programmatique.
+            if not _is_safe_dimension_expr(expr):
+                logger.warning(
+                    "iris_oneshot(drilldown): expression de dimension rejetée "
+                    "(non scalaire / sous-requête / booléen) — droppée. col=%s",
+                    k,
+                )
+                continue
+            dimensions[k] = expr
+
+    # Cohérence marqueur ↔ dimensions : des dimensions à binder SANS marqueur
+    # signifie qu'on ne peut PAS injecter les filtres → exécuter tel quel
+    # produirait un détail NON filtré (données fausses silencieuses, pire qu'un
+    # crash — cf. règle conséquences Q5). Fail-closed → fallback programmatique.
+    if dimensions and _DRILL_FILTERS_SENTINEL not in sql_out:
+        logger.warning(
+            "iris_oneshot(drilldown): dimensions présentes mais marqueur de "
+            "filtre absent du SQL — fail-closed"
+        )
+        return None, {}, ["Le LLM n'a pas placé le marqueur de filtre de détail."]
+
+    # Mode invisible (RLS) : refuse un SQL halluciné contenant un nom denied.
+    if user_id is not None:
+        from types import SimpleNamespace
+
+        from app.services.data_access.error_messages import (
+            DataAccessLeakDetectedError,
+            assert_safe_llm_response,
+        )
+
+        user_stub_for_check: Any = SimpleNamespace(id=user_id, role=None)
+        leak_msg = await assert_safe_llm_response(
+            sql_out,
+            user_stub_for_check,
+            context_label="iris_oneshot.build_drilldown_sql_via_llm",
+            strict_when_no_user=True,
+        )
+        if leak_msg is not None:
+            logger.critical(
+                "iris_oneshot(drilldown): SQL halluciné contient un nom denied "
+                "pour user_id=%s — fail-closed (mode invisible). sql_excerpt=%s",
+                user_id,
+                sql_out[:200],
+            )
+            raise DataAccessLeakDetectedError(leak_msg)
+
+    return sql_out, dimensions, []

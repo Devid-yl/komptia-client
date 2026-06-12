@@ -629,9 +629,19 @@ async def get_resolved_values(term: str, table_name: str, column_name: str) -> d
                     func.upper(ValueMapping.column_name) == column_name.upper(),
                 )
                 .order_by(ValueMapping.real_value_lower)
-                .limit(50)
+                # #18e (triage caps 2026-06-10) — limit(51) : la 51ᵉ ligne ne
+                # sert qu'à PROUVER qu'il en existe d'autres (truncated) sans
+                # payer un COUNT(*) sur value_mapping (29M lignes). Avant :
+                # limit(50) muet → le LLM recevait 50 valeurs présentées comme
+                # exhaustives et construisait des IN/NOT IN-listes partielles
+                # = résultats SQL faux silencieux au cœur d'Iris.
+                .limit(51)
             )
             rows = result.all()
+
+        values_truncated = len(rows) > 50
+        if values_truncated:
+            rows = rows[:50]
 
         matched = []
         for row in rows:
@@ -665,20 +675,44 @@ async def get_resolved_values(term: str, table_name: str, column_name: str) -> d
                 f"dans ta clause WHERE."
             )
         if contains_matches:
-            hint_parts.append(
-                f"{len(contains_matches)} valeur(s) CONTENANT '{term_clean}' trouvée(s). "
-                f"Les vraies valeurs sont retournées dans ``use_in_sql``. Pour un filtre "
-                f"NOT IN, chaque ``use_in_sql`` représente une vraie valeur à exclure."
-            )
+            if values_truncated:
+                # #18e (revue adv. 2026-06-10) — quand la liste est PARTIELLE,
+                # NE PAS inciter au NOT IN : la phrase « chaque use_in_sql
+                # représente une vraie valeur à exclure » contredirait le
+                # warning ci-dessous et pousserait le LLM vers une liste
+                # d'exclusion incomplète (lignes faussement gardées).
+                hint_parts.append(
+                    f"{len(contains_matches)} valeur(s) CONTENANT '{term_clean}' "
+                    "retournée(s) dans ``use_in_sql`` (liste partielle, voir "
+                    "ci-dessous)."
+                )
+            else:
+                hint_parts.append(
+                    f"{len(contains_matches)} valeur(s) CONTENANT '{term_clean}' trouvée(s). "
+                    f"Les vraies valeurs sont retournées dans ``use_in_sql``. Pour un filtre "
+                    f"NOT IN, chaque ``use_in_sql`` représente une vraie valeur à exclure."
+                )
         if not matched:
             hint_parts.append(
                 f"Aucune valeur contenant '{term_clean}' trouvée dans "
                 f"{table_name}.{column_name}."
             )
 
+        if values_truncated:
+            # #18e — la liste est PARTIELLE : interdire au LLM de la traiter
+            # comme exhaustive (IN/NOT IN-liste incomplète = résultat faux).
+            hint_parts.append(
+                "⚠ LISTE PARTIELLE : plus de 50 valeurs matchent — celles "
+                "ci-dessus ne sont PAS exhaustives. NE construis PAS de "
+                "IN/NOT IN-liste à partir d'elles ; utilise un filtre par "
+                f"motif (ex. LIKE '%{term_clean}%') ou demande à "
+                "l'utilisateur d'affiner le terme."
+            )
+
         response = {
             "matched_values": matched,
             "total_found": len(matched),
+            "values_truncated": values_truncated,
             "exact_count": len(exact_matches),
             "contains_count": len(contains_matches),
             "term": term_clean,
@@ -1829,6 +1863,47 @@ async def recommend_join(
     # Step 1: Find FK path
     path = find_fk_path(from_table, to_table, fk_graph)
     if path is None:
+        # #9a (2026-06-10) : une VUE n'a JAMAIS de FK déclarée → « aucun chemin
+        # FK » est NORMAL et ne doit PAS pousser vers un « LEFT JOIN sur clé
+        # métier » (cause racine du bug « entité » : le LLM abandonne la vue).
+        # Une vue se requête directement (elle pré-joint déjà ses tables).
+        # #20 (SSoT) : cache-first via ``store.is_cached_view`` (MÊME cache que
+        # #10 introspect → plus de conseils contradictoires si Sage est down),
+        # complété par ``_fetch_table_type`` (live, attrape une vue pas encore
+        # synchronisée). Fail-open : détection KO → message générique.
+        try:
+            from_is_view = (await store.is_cached_view(from_table)) or (
+                (await _fetch_table_type(from_table)) == "VIEW"
+            )
+            to_is_view = (await store.is_cached_view(to_table)) or (
+                (await _fetch_table_type(to_table)) == "VIEW"
+            )
+        except Exception:
+            from_is_view = to_is_view = False
+        if from_is_view or to_is_view:
+            _views = [n for n, v in ((from_table, from_is_view), (to_table, to_is_view)) if v]
+            return {
+                "found": False,
+                "is_view_involved": True,
+                "views": _views,
+                "from_table": from_table,
+                "to_table": to_table,
+                "recommendation": "USE_VIEW_DIRECTLY",
+                "reasoning": (
+                    f"{', '.join(_views)} est une VUE : l'absence de chemin FK est "
+                    "NORMALE (une vue n'a pas de FK déclarée). Ne force PAS un JOIN "
+                    "sur clé métier à l'aveugle — une vue pré-joint déjà ses tables "
+                    "sous-jacentes. Requête-la directement (FROM la vue), ou lis son "
+                    "DDL (`introspect_table`) pour voir ses colonnes et la clé "
+                    "exposée si tu dois vraiment la relier à une table."
+                ),
+                "warnings": [
+                    "Objet vue impliqué — pas de FK déclarée (attendu). Utiliser la "
+                    "vue comme source directe plutôt qu'un JOIN à l'aveugle."
+                ],
+                "sql_template": "",
+                "path_details": [],
+            }
         return {
             "found": False,
             "from_table": from_table,

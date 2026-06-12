@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -65,6 +66,40 @@ def _serialize_run(run: PipelineRun) -> dict:
 
 def _serialize_phase(phase: PipelinePhaseExecution) -> dict:
     return phase.to_dict()
+
+
+async def _sanitize_pipeline_dict_for_client(d: dict, user: Any) -> None:
+    """Sanitize EN PLACE un run/phase sérialisé AVANT envoi au client (status/history).
+
+    - **L6O2** : ``error_message`` brut (``str(exc)`` : path filesystem, stack
+      SQLAlchemy, fragment SQL) → message générique par catégorie via le helper
+      SSoT ``sanitize_pipeline_error_for_client`` (partagé avec le forward WS).
+    - **L6O1** : ``artifact_path`` (chemin disque ABSOLU serveur, ex.
+      ``/Users/.../data/pipeline_runs/42/phase_search.json``) → booléen
+      ``has_artifact``. Le client n'a JAMAIS besoin du chemin : il récupère
+      l'artefact via ``GET /api/iris/pipeline/{run_id}/artifacts/{phase_id}``
+      (clé = ``phase_id``, déjà exposé). Exposer le path absolu fuitait le layout
+      filesystem serveur.
+
+    No-op sur les champs absents (un run n'a pas d'``artifact_path``).
+    """
+    raw = d.get("error_message")
+    if raw:
+        from app.services.data_access.error_messages import (
+            sanitize_pipeline_error_for_client,
+        )
+
+        d["error_message"] = await sanitize_pipeline_error_for_client(raw, user)
+    if "artifact_path" in d:
+        d["has_artifact"] = bool(d.pop("artifact_path"))
+    # S8 (défense en profondeur) — ``metadata_summary`` est un champ texte libre
+    # forwardé brut au client ; son innocuité tient à une convention, pas à une
+    # barrière. On strip défensivement tout chemin filesystem absolu.
+    ms = d.get("metadata_summary")
+    if isinstance(ms, str) and ms:
+        from app.services.data_access.error_messages import redact_filesystem_paths
+
+        d["metadata_summary"] = redact_filesystem_paths(ms)
 
 
 class IrisPipelineRunCreateHandler(BaseHandler):
@@ -226,8 +261,14 @@ class IrisPipelineStatusHandler(BaseHandler):
                 return
 
             phases = [_serialize_phase(p) for p in run.phase_executions if not p.is_superseded]
+            run_dict = _serialize_run(run)
 
-        self.write({"success": True, "run": _serialize_run(run), "phases": phases})
+        # L6O2 (parité create P6) — sanitize les error_message AVANT envoi.
+        user = self.current_user
+        await _sanitize_pipeline_dict_for_client(run_dict, user)
+        for _pd in phases:
+            await _sanitize_pipeline_dict_for_client(_pd, user)
+        self.write({"success": True, "run": run_dict, "phases": phases})
 
 
 class IrisPipelineHistoryHandler(BaseHandler):
@@ -277,13 +318,13 @@ class IrisPipelineHistoryHandler(BaseHandler):
             stmt = stmt.order_by(PipelineRun.created_at.desc()).limit(limit)
             result = await session.execute(stmt)
             runs = result.scalars().all()
+            run_dicts = [_serialize_run(r) for r in runs]
 
-        self.write(
-            {
-                "success": True,
-                "runs": [_serialize_run(r) for r in runs],
-            }
-        )
+        # L6O2 (parité create P6) — sanitize les error_message AVANT envoi.
+        user = self.current_user
+        for _rd in run_dicts:
+            await _sanitize_pipeline_dict_for_client(_rd, user)
+        self.write({"success": True, "runs": run_dicts})
 
 
 class IrisPipelineArchiveHandler(BaseHandler):

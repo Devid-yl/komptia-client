@@ -36,12 +36,19 @@ import json
 import logging
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Mapping, Optional
 
 from app.core import clock
+
+# SSoT des noms de fichiers de log = le module qui les PRODUIT
+# (``app/utils/logger.py``). Importés (pas recopiés) pour qu'un rename du
+# handler se propage ici automatiquement — sinon lecture silencieusement vide.
+from app.utils.logger import ERROR_LOG_FILENAME as _ERROR_LOG_FILENAME
+from app.utils.logger import PRIMARY_LOG_FILENAME as _PRIMARY_LOG_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +92,24 @@ _LOCALSTORAGE_SENSITIVE_FRAGMENTS: Final[frozenset[str]] = frozenset(
     }
 )
 
-# Lecture logs serveur (corrélation par request_id) — caps stricts.
+# Lecture logs serveur — caps stricts PARTAGÉS par les deux lecteurs
+# (``_collect_server_logs`` filtré request_id + ``_collect_recent_log_tail`` brut).
 _SERVER_LOGS_MAX_LINES: Final[int] = 100
 _SERVER_LOGS_MAX_FILE_BYTES_TO_TAIL: Final[int] = 10 * 1024 * 1024  # 10 MB tail.
+#: Troncature par-ligne appliquée par TOUT lecteur de log (anti-ligne géante).
+#: Constante unique (avant : magic ``2000`` recopié dans chaque lecteur).
+_LOG_LINE_READ_MAX_CHARS: Final[int] = 2000
+
+# Pièce jointe « queue de logs serveur » (2026-06-06). Les N dernières lignes
+# BRUTES de komptia.log, jointes au mail support pour donner le contexte serveur
+# réel autour du bug. Nécessaire car ``_collect_server_logs`` ne garde que les
+# lignes corrélées au ``request_id`` — or ce request_id est celui de la requête
+# de SIGNALEMENT elle-même (cf. handlers/feedback.py), pas du bug rapporté, donc
+# il ne capture quasiment jamais le contexte utile. Joint comme FICHIER : 1000
+# lignes inlinées exploseraient le corps du mail (et certains SMTP le rejettent).
+_RECENT_LOG_TAIL_MAX_LINES: Final[int] = 1000
+_RECENT_LOG_TAIL_TIMEOUT_S: Final[float] = 3.0
+_RECENT_LOG_TAIL_ATTACHMENT_PREFIX: Final[str] = "komptia-logs-tail-"
 
 #: Préfixe du fichier audit-trail. Suffixe = date YYYY-MM-DD pour
 #: rotation quotidienne automatique. Au-delà de _AUDIT_FILE_MAX_BYTES
@@ -144,6 +166,13 @@ class FeedbackPayload:
     paresseuse côté service au moment de l'envoi, pas dans le payload
     initial). Peuplé par ``FeedbackService._collect_server_logs``."""
 
+    recent_log_tail_count: int = 0
+    """Nombre de lignes de la queue BRUTE de ``komptia.log`` jointes au mail
+    support (cf. ``FeedbackService._send_email``). Posé juste avant le rendu du
+    mail pour afficher la note « pièce jointe : N lignes ». 0 = aucune pièce
+    jointe (lecture impossible, log vide, ou envoi non effectué). L'audit des
+    pièces jointes est porté par ``EmailLog.attachment_names`` (pas ce champ)."""
+
     request_id: str = ""
     client_ip: str = ""
     user_id: Optional[int] = None
@@ -196,9 +225,7 @@ class FeedbackPayload:
             if entry is None:
                 continue
             clean_console.append(
-                _sanitize_text(
-                    _strip_url_queries_in_text(str(entry)), _MAX_CONSOLE_ENTRY_LENGTH
-                )
+                _sanitize_text(_strip_url_queries_in_text(str(entry)), _MAX_CONSOLE_ENTRY_LENGTH)
             )
 
         clean_extras: dict[str, Any] = {}
@@ -378,6 +405,11 @@ class FeedbackPayload:
             # inclut directement. L'audit JSONL ne tracke que le contexte
             # client + ID corrélation pour retrouver les logs source.
             "server_logs_lines_count": len(self.server_logs),
+            # NB : la queue brute komptia.log part en PIÈCE JOINTE du mail. Son
+            # suivi d'audit est porté par ``EmailLog.attachment_names`` (SSoT des
+            # pièces jointes, via ``audit_attachment_names``) — pas dupliqué ici :
+            # l'audit JSONL est écrit AVANT l'envoi (filet de sécurité), donc il
+            # ne peut de toute façon pas connaître la pièce jointe finale.
         }
 
 
@@ -450,6 +482,32 @@ def _strip_url_queries_in_text(value: Any) -> str:
     if not isinstance(value, str):
         value = str(value)
     return _URL_QUERY_IN_TEXT_REGEX.sub(lambda m: m.group("base") + "?[redacted]", value)
+
+
+def _read_tail_raw_lines(path: Path, byte_cap: int) -> list[str]:
+    """Lignes BRUTES (avec ``\\n``) du dernier ``byte_cap`` octets de ``path``.
+
+    Helper bas-niveau PARTAGÉ par ``_collect_server_logs`` et
+    ``_collect_recent_log_tail`` (single source of truth de la lecture tail —
+    avant : deux copies near-identiques qui pouvaient diverger). Jette la 1re
+    ligne (potentiellement coupée) quand on ne lit qu'un tail partiel. ``[]`` si
+    fichier absent / illisible (best-effort, ne lève jamais).
+    """
+    try:
+        if not path.exists():
+            return []
+        size = path.stat().st_size
+    except OSError:
+        return []
+    offset = max(0, size - byte_cap)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            if offset > 0:
+                f.seek(offset)
+                f.readline()  # jeter la 1re ligne potentiellement coupée
+            return f.readlines()
+    except OSError:
+        return []
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -600,38 +658,24 @@ class FeedbackService:
 
         # Construire la liste des fichiers à lire (dans l'ordre).
         candidates: list[Path] = [
-            self._fallback_dir / "komptia.log",
-            self._fallback_dir / "errors.log",
+            self._fallback_dir / _PRIMARY_LOG_FILENAME,
+            self._fallback_dir / _ERROR_LOG_FILENAME,
         ]
         # Fix #8 — Fichier rotaté du jour précédent si on est tôt après
         # minuit UTC (risque de bug signalé juste après rotation 00:00).
         yesterday = clock.now().date() - timedelta(days=1)
-        candidates.append(self._fallback_dir / f"komptia.log.{yesterday.isoformat()}")
+        candidates.append(self._fallback_dir / f"{_PRIMARY_LOG_FILENAME}.{yesterday.isoformat()}")
 
         def _read_tail_and_filter(log_path: Path) -> list[str]:
-            if not log_path.exists():
-                return []
-            try:
-                size = log_path.stat().st_size
-            except OSError:
-                return []
-            offset = max(0, size - _SERVER_LOGS_MAX_FILE_BYTES_TO_TAIL)
-            try:
-                with log_path.open("r", encoding="utf-8", errors="replace") as f:
-                    if offset > 0:
-                        f.seek(offset)
-                        f.readline()  # jeter la ligne potentiellement coupée
-                    raw_lines = f.readlines()
-            except OSError:
-                return []
             # C4-F2 (#70) — defense-in-depth : une ligne de log peut contenir
             # une URL avec query (un log applicatif ad-hoc « fetch failed
             # /api/x?token=… » ; Komptia logge le path seul mais rien ne
             # l'impose partout) et part au support externe (Gmail). On strippe
-            # la query comme pour stack_trace / console_entries.
+            # la query comme pour stack_trace / console_entries. Filtre AVANT
+            # strip/troncature (le marker request_id est en tête de ligne JSON).
             return [
-                _strip_url_queries_in_text(line.rstrip("\n")[:2000])
-                for line in raw_lines
+                _strip_url_queries_in_text(line.rstrip("\n")[:_LOG_LINE_READ_MAX_CHARS])
+                for line in _read_tail_raw_lines(log_path, _SERVER_LOGS_MAX_FILE_BYTES_TO_TAIL)
                 if exact_marker in line
             ]
 
@@ -660,6 +704,172 @@ class FeedbackService:
                 extra={"request_id": request_id},
             )
             return []
+
+    # ── Queue brute komptia.log (« les 1000 dernières lignes ») 2026-06-06 ─
+
+    async def _collect_recent_log_tail(
+        self, max_lines: int = _RECENT_LOG_TAIL_MAX_LINES
+    ) -> list[str]:
+        """Retourne les ``max_lines`` dernières lignes BRUTES de ``komptia.log``.
+
+        Contrairement à :meth:`_collect_server_logs` (qui filtre par
+        ``request_id`` — celui de la requête de signalement, donc hors-sujet
+        pour le bug réel), on remonte ici la queue brute du log applicatif :
+        c'est le contexte serveur réel autour du bug (« les 1000 dernières
+        lignes »). Le résultat part en PIÈCE JOINTE du mail support (cf.
+        :meth:`_send_email`).
+
+        Sources, fusionnées dans l'ordre chronologique (ancien → récent) :
+
+        1. ``komptia.log`` (logs courants).
+        2. Le fichier rotaté le plus RÉCENT (``komptia.log.*``, le plus récent
+           par mtime) — UNIQUEMENT en complément quand le fichier courant est
+           genuinement court (cas « juste après la rotation de minuit » où
+           komptia.log est quasi vide et ne donnerait que quelques lignes).
+
+        Robustesse rotation (corrige 2 bugs trouvés en revue) :
+
+        - On NE calcule PAS la date de la veille pour deviner le nom du rotaté :
+          ``clock.now()`` est en UTC alors que ``TimedRotatingFileHandler`` nomme
+          ses backups en heure LOCALE — le nom devinable divergerait sur un
+          serveur non-UTC, et un trou de plusieurs jours (app idle) raterait le
+          fichier. On prend donc le rotaté réellement présent le plus récent
+          (glob + mtime), zéro hypothèse de date/TZ.
+        - On ne complète depuis le rotaté QUE si le fichier courant est plus
+          petit que la fenêtre tail (donc lu EN ENTIER → peu de lignes = peu de
+          lignes au total). Si komptia.log dépasse la fenêtre mais que celle-ci
+          contient peu de lignes (lignes énormes), c'est une vraie tranche
+          récente : on la garde telle quelle, sans mélanger trompeusement la
+          veille (sous-livraison honnête plutôt que mix de 2 jours).
+
+        Autres garde-fous (mêmes que :meth:`_collect_server_logs`) :
+
+        - **Anti-OOM** : on ne lit que les ``_SERVER_LOGS_MAX_FILE_BYTES_TO_TAIL``
+          derniers octets de chaque fichier — jamais le fichier entier (Go).
+        - Chaque ligne tronquée à ``_LOG_LINE_READ_MAX_CHARS``.
+        - **Anti-leak** : la query-string des URLs est retirée
+          (``_strip_url_queries_in_text``) car le mail part vers un Gmail
+          externe. NB : les clés sensibles (password/token/api_key) sont déjà
+          rédigées À L'ÉCRITURE par le ``JSONFormatter`` (``app/utils/logger.py``).
+          ⚠️ Les VALEURS dans le corps des messages de log (ex SQL loggé) ne sont
+          PAS rédigées — cf. la note de confidentialité dans :meth:`_send_email`.
+        - **Best-effort** : fichier absent/illisible → on retourne ce qu'on a
+          (voire ``[]``), jamais d'exception remontée.
+        - **Timeout** : ``_RECENT_LOG_TAIL_TIMEOUT_S`` global via
+          ``asyncio.wait_for`` (protège d'un FS gelé / fichier pathologique).
+        """
+        if max_lines <= 0:
+            return []
+
+        primary = self._fallback_dir / _PRIMARY_LOG_FILENAME
+        byte_cap = _SERVER_LOGS_MAX_FILE_BYTES_TO_TAIL
+
+        def _clean(raw_lines: list[str], limit: int) -> list[str]:
+            return [
+                _strip_url_queries_in_text(line.rstrip("\n")[:_LOG_LINE_READ_MAX_CHARS])
+                for line in raw_lines[-limit:]
+            ]
+
+        def _newest_rotated() -> Optional[Path]:
+            """Le backup ``komptia.log.*`` le plus récent par mtime (None si
+            aucun). Évite tout calcul de date (robuste TZ + trous multi-jours)."""
+            try:
+                candidates = [
+                    p
+                    for p in self._fallback_dir.glob(f"{_PRIMARY_LOG_FILENAME}.*")
+                    if p.is_file() and not p.is_symlink()
+                ]
+            except OSError:
+                return None
+            newest: Optional[Path] = None
+            newest_mtime = -1.0
+            for p in candidates:
+                try:
+                    mtime = p.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest_mtime, newest = mtime, p
+            return newest
+
+        def _read_recent() -> list[str]:
+            current = _clean(_read_tail_raw_lines(primary, byte_cap), max_lines)
+            try:
+                primary_size = primary.stat().st_size if primary.exists() else 0
+            except OSError:
+                primary_size = 0
+            # Compléter depuis le rotaté UNIQUEMENT si le courant tient en entier
+            # dans la fenêtre (petit fichier post-rotation), pas si la fenêtre a
+            # juste capté peu de (grosses) lignes d'un gros fichier.
+            if len(current) >= max_lines or primary_size >= byte_cap:
+                return current[-max_lines:]
+            rotated = _newest_rotated()
+            if rotated is None:
+                return current
+            previous = _clean(_read_tail_raw_lines(rotated, byte_cap), max_lines - len(current))
+            return (previous + current)[-max_lines:]
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_read_recent),
+                timeout=_RECENT_LOG_TAIL_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "FeedbackService: lecture queue logs timeout (%ss) — komptia.log "
+                "probablement géant. Pièce jointe logs omise.",
+                _RECENT_LOG_TAIL_TIMEOUT_S,
+            )
+            return []
+
+    def _write_log_tail_tempfile(self, lines: list[str]) -> Optional[Path]:
+        """Écrit ``lines`` dans un fichier temporaire et retourne son ``Path``
+        (ou ``None`` si rien à écrire / échec IO).
+
+        Le fichier est créé dans ``tempfile.gettempdir()`` — la SEULE racine
+        (avec ``DATA_DIR``) autorisée par la sandbox pièces jointes du
+        ``SMTPClient`` (``_resolve_allowed_attachment_roots``). Le suffixe
+        aléatoire de ``mkstemp`` garantit l'absence de collision en
+        multi-utilisateurs (axe 18). Le caller (:meth:`_send_email`) DOIT
+        supprimer ce fichier après l'envoi (bloc ``finally``).
+        """
+        if not lines:
+            return None
+        try:
+            fd, raw_path = tempfile.mkstemp(
+                prefix=_RECENT_LOG_TAIL_ATTACHMENT_PREFIX, suffix=".log"
+            )
+        except OSError:
+            logger.warning("FeedbackService: création tempfile logs échouée", exc_info=True)
+            return None
+
+        def _cleanup_orphan() -> None:
+            try:
+                os.unlink(raw_path)
+            except OSError:
+                pass
+
+        # ``os.fdopen`` adopte le fd (le ``with`` le ferme, même sur erreur
+        # d'écriture). Mais si ``fdopen`` LUI-MÊME lève avant d'adopter le fd,
+        # ce dernier fuiterait — on le ferme explicitement dans ce cas.
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except OSError:
+            logger.warning("FeedbackService: ouverture tempfile logs échouée", exc_info=True)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _cleanup_orphan()
+            return None
+        try:
+            with handle as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            logger.warning("FeedbackService: écriture tempfile logs échouée", exc_info=True)
+            _cleanup_orphan()
+            return None
+        return Path(raw_path)
 
     # ── Audit-trail JSONL avec rotation quotidienne + cap 50 MB ─────────
 
@@ -751,14 +961,69 @@ class FeedbackService:
             return False
         from app.services.email.template_names import EmailTemplate
 
-        result = await client.send_email(
-            to_emails=recipient,
-            subject=subject,
-            body_html=self._render_html(payload),
-            body_text=self._render_text(payload),
-            sent_by_user_id=payload.user_id,
-            template_name=EmailTemplate.FEEDBACK_REPORT.value,
-        )
+        # 2026-06-06 — Joindre les N dernières lignes BRUTES de komptia.log
+        # (« les logs de komptia ») en PIÈCE JOINTE : contexte serveur réel
+        # autour du bug. Best-effort TOTAL — toute erreur de lecture/écriture
+        # NE DOIT PAS empêcher l'envoi du signalement (le support reçoit alors
+        # le mail sans la pièce jointe, comme avant cette feature).
+        #
+        # ⚠️ CONFIDENTIALITÉ (décision data-owner 2026-06-06, assumée) : la queue
+        # brute peut contenir des données cabinet en clair dans le CORPS des
+        # messages de log (ex SQL loggé avec valeurs). Seules les clés sensibles
+        # (password/token/api_key) sont rédigées à l'écriture (JSONFormatter) et
+        # les query-strings d'URL retirées ici. C'est un canal SUPPORT (inbox du
+        # propriétaire des données), pas un LLM cloud — hors périmètre de la
+        # doctrine d'anonymisation LLM. Pour durcir : passer à errors.log seul
+        # ou ajouter un scrubbing corps-de-message (cf. _collect_recent_log_tail).
+        attachments: Optional[list[dict[str, Any]]] = None
+        audit_names: Optional[list[str]] = None
+        tail_tempfile: Optional[Path] = None
+        try:
+            tail_lines = await self._collect_recent_log_tail()
+            tail_tempfile = self._write_log_tail_tempfile(tail_lines)
+            if tail_tempfile is not None:
+                payload.recent_log_tail_count = len(tail_lines)
+                display_name = (
+                    f"{_RECENT_LOG_TAIL_ATTACHMENT_PREFIX}"
+                    f"{payload.received_at.strftime('%Y%m%d-%H%M%S')}.log"
+                )
+                attachments = [
+                    {
+                        "path": str(tail_tempfile),
+                        "filename": display_name,
+                        "content_type": "text/plain",
+                    }
+                ]
+                audit_names = [display_name]
+        except Exception:  # noqa: BLE001 — best-effort, ne jamais bloquer l'envoi
+            logger.warning(
+                "FeedbackService: préparation pièce jointe logs échouée",
+                exc_info=True,
+                extra={"request_id": payload.request_id},
+            )
+
+        try:
+            result = await client.send_email(
+                to_emails=recipient,
+                subject=subject,
+                body_html=self._render_html(payload),
+                body_text=self._render_text(payload),
+                attachments=attachments,
+                sent_by_user_id=payload.user_id,
+                template_name=EmailTemplate.FEEDBACK_REPORT.value,
+                audit_attachment_names=audit_names,
+            )
+        finally:
+            # Nettoyage systématique du tempfile, succès OU échec d'envoi
+            # (le SMTPClient a déjà lu le fichier en mémoire au moment du build).
+            if tail_tempfile is not None:
+                try:
+                    tail_tempfile.unlink()
+                except OSError:
+                    logger.debug(
+                        "FeedbackService: suppression tempfile logs échouée (%s)",
+                        tail_tempfile,
+                    )
         return bool(result.get("success"))
 
     @staticmethod
@@ -834,6 +1099,12 @@ class FeedbackService:
                 "",
                 f"─── Logs serveur ({len(payload.server_logs)} ligne(s) filtrées par request_id) ──",
                 *payload.server_logs,
+            ]
+        if payload.recent_log_tail_count:
+            lines += [
+                "",
+                f"📎 Pièce jointe : queue komptia.log "
+                f"({payload.recent_log_tail_count} dernières lignes du log serveur).",
             ]
         lines += [
             "",
@@ -946,6 +1217,15 @@ class FeedbackService:
                 f"({len(payload.server_logs)} ligne(s) corrélées par request_id)</h3>"
                 f"<ol style='font-family:monospace;font-size:11px;background:#0f172a;color:#fafafa;padding:12px;border-radius:6px;overflow:auto;'>{log_lines}</ol>"
             )
+        log_tail_note_html = ""
+        if payload.recent_log_tail_count:
+            log_tail_note_html = (
+                "<p style='margin-top:24px;padding:10px 14px;background:#eff6ff;"
+                "border-left:3px solid #2563eb;color:#1e3a8a;font-size:13px;'>"
+                "📎 <strong>Pièce jointe</strong> : queue <code>komptia.log</code> "
+                f"({payload.recent_log_tail_count} dernières lignes du log serveur)."
+                "</p>"
+            )
 
         return (
             "<html><body style='font-family:-apple-system,Segoe UI,sans-serif;color:#111;"
@@ -960,7 +1240,7 @@ class FeedbackService:
             f"white-space:pre-wrap;'>{message_html}</div>"
             f"{stack_html}{console_html}{extras_html}"
             f"{network_html}{performance_html}{app_state_html}"
-            f"{localstorage_html}{server_logs_html}"
+            f"{localstorage_html}{server_logs_html}{log_tail_note_html}"
             "</body></html>"
         )
 

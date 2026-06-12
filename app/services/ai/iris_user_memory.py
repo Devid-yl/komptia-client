@@ -255,8 +255,12 @@ async def fuse_user_memory(
 
     Args:
         existing_memory: Contenu actuel de ``User.iris_memory``.
-        new_session_summary: Résumé fin-de-conv (déjà sanitizé en amont).
-            ``None`` / vide → on retourne ``None`` (rien à fusionner).
+        new_session_summary: Résumé fin-de-conv. **Sanitizé EN INTERNE** (BF8,
+            defense-in-depth) — les délimiteurs ``[BLOC]``/``<<<...>>>`` et directives
+            markdown sont retirés AVANT la fusion, sans dépendre d'une sanitization
+            amont (le chemin fallback ``terminal_summary`` brut du tool done/abandon
+            ne l'était pas → perte asymétrique : input non-strippé + output strippé).
+            ``None`` / vide (ou vide après sanitize) → on retourne ``None``.
         user_id: Identifiant utilisateur pour l'anonymisation user-scoped
             (pseudonymizer). ``None`` autorisé pour les appels système :
             la couche PII regex reste active sans pseudonymizer.
@@ -264,6 +268,14 @@ async def fuse_user_memory(
     Returns:
         Mémoire fusionnée sanitizée + cappée, ou ``None`` en cas d'échec.
     """
+    # FIX (hunt it.49, BF8, defense-in-depth) : sanitize l'INPUT avant la fusion.
+    # ``sanitize_iris_user_memory`` retire les délimiteurs/directives ET cape (idempotent
+    # si déjà propre). Sinon un ``new_session_summary`` non-sanitizé (ex: fallback
+    # ``terminal_summary`` brut quand ``generate_session_memory`` échoue) entrait dans le
+    # prompt avec ses délimiteurs ; comme la SORTIE est sanitizée, un echo LLM causait une
+    # perte ASYMÉTRIQUE dans ``User.iris_memory``. On ne dépend plus de la convention
+    # "déjà sanitizé en amont" (violée par le chemin fallback).
+    new_session_summary = sanitize_iris_user_memory(new_session_summary)
     if not new_session_summary or not new_session_summary.strip():
         return None
 

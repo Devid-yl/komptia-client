@@ -210,7 +210,10 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
         "description": (
             "See what the data looks like in a table (sample of rows). "
             "Useful to understand the format and type of values in each column. "
-            "Confidentiality is automatic: strings are anonymized, numbers and dates unchanged."
+            "Confidentiality is automatic: sensitive values appear as typed placeholders "
+            "like [NAME_1], [DATE_1] or [EMAIL_1] (date-like and id-like strings are "
+            "tokenized too). Treat any [TYPE_N] token as an anonymized value of that "
+            "type, never as a readable literal; values shown literally (most numbers) are real."
         ),
         "input_schema": {
             "type": "object",
@@ -1821,6 +1824,40 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
                         "concret à ajouter (pas d'invention)."
                     ),
                 },
+                "stop_after_phase": {
+                    "type": "string",
+                    # Enum aligné sur PHASES_ORDER (scripts/pipeline.py). Literal
+                    # gardé par un test anti-drift (test_pipeline_resume_tool.py)
+                    # — même pattern que ``from_phase`` (pipeline_resume) pour
+                    # éviter d'importer scripts.pipeline au chargement du schéma.
+                    "enum": [
+                        "1.1-1.2",
+                        "1.2.4",
+                        "1.2.5",
+                        "1.2.6",
+                        "1.3-1.4",
+                        "1.5",
+                        "2",
+                        "3",
+                        "4",
+                    ],
+                    "description": (
+                        "OPTIONAL early-stop. If set, the pipeline runs from the "
+                        "start UP TO AND INCLUDING this phase, then STOPS without "
+                        "composing the final SQL — it returns an INTERMEDIATE "
+                        "artifact, NOT an executable query. Use ONLY when the user "
+                        "wants to understand or validate the schema mapping BEFORE "
+                        "generating SQL. Most useful stops: '1.5' = blueprint "
+                        "(candidate tables + FK join graph, schema-level) ; '3' = "
+                        "concept fact sheets (resolved tables/columns with sampled "
+                        "real values). ALWAYS present the result as a HYPOTHESIS to "
+                        "confirm ('here are the tables I'd use — does that match?'), "
+                        "NEVER as a final answer. When the user validates, call "
+                        "``pipeline_resume`` (from_phase = the phase AFTER the stop) "
+                        "to continue to the SQL. Omit for a normal full run "
+                        "(default). '4' is a no-op (== full run)."
+                    ),
+                },
             },
             "required": ["query_nl"],
         },
@@ -2034,7 +2071,10 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
     },
     # -----------------------------------------------------------------------
     # Casquette Iris-agent-Komptia — lecture du code source pour Q&A.
-    # Tous rôles. Allowlist app/, static/, templates/, tests/, scripts/, docs/.
+    # Tous rôles. Modèle open-by-default + denylist (SSoT : codebase_reader) —
+    # PAS d'allowlist de dossiers (qui divergerait du contenu réel de l'image
+    # client : tests/, docs/, *.md sont exclus du build prod). Le contrat
+    # opérant est la DENYLIST (données/secrets), pas une liste de dossiers lisibles.
     # -----------------------------------------------------------------------
     {
         "name": "search_codebase",
@@ -2043,8 +2083,9 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
             "pour répondre aux questions sur l'app (architecture, "
             "fonctionnement, où vit telle feature). Utilise un pattern regex "
             "(re Python). Renvoie file:line + extrait. Hard caps : 200 "
-            "matches total, 25 par fichier. Restreint aux dossiers code "
-            "(app/, static/, templates/, tests/, scripts/, docs/). NE LIT "
+            "matches total, 25 par fichier. Grep le code source du projet "
+            "présent dans ce déploiement (certains dossiers de dev — tests/, "
+            "docs/ — peuvent être absents de l'image de production). NE LIT "
             "JAMAIS les données utilisateur (.afz.json, BDD, classeurs) ni "
             "les secrets (.env). Préférable au read_code_file quand tu ne "
             "connais pas encore la file path exacte."
@@ -2077,11 +2118,12 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
             "Komptia avec pagination. Hard caps : 200 KB par fichier max, "
             "2000 lignes par appel max. Si le fichier est plus grand, "
             "appelle plusieurs fois avec offset croissant. Lisible : le code "
-            "source du projet (app/, static/, templates/, tests/, scripts/, "
-            "docs/). REFUSE TOUJOURS : .env, data/, outputs/, backups/, logs, "
-            "BDD, classeurs (.afz.json), ET la doctrine/config interne Claude "
-            "Code (CLAUDE.md, .claude/) — protection isolation utilisateurs + "
-            "confidentialité."
+            "source du projet présent dans ce déploiement (certains dossiers de "
+            "dev — tests/, docs/ — peuvent être absents de l'image de "
+            "production). REFUSE TOUJOURS : .env, data/, outputs/, backups/, "
+            "logs, BDD, classeurs (.afz.json), ET la doctrine/config interne "
+            "Claude Code (CLAUDE.md, .claude/) — protection isolation "
+            "utilisateurs + confidentialité."
         ),
         "input_schema": {
             "type": "object",
@@ -2090,7 +2132,7 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Path relatif au projet (ex: 'app/handlers/iris.py', "
-                        "'tests/unit/test_agent_service.py')."
+                        "'app/services/ai/agent_service.py')."
                     ),
                 },
                 "offset": {
@@ -2124,8 +2166,8 @@ IRIS_TOOLS: List[Dict[str, Any]] = [
                 "directory": {
                     "type": "string",
                     "description": (
-                        "Path relatif d'un dossier autorisé (ex: "
-                        "'app/services/ai', 'tests/unit')."
+                        "Path relatif d'un dossier du projet (ex: "
+                        "'app/services/ai', 'app/handlers')."
                     ),
                 },
                 "glob_pattern": {
@@ -3541,6 +3583,7 @@ def extract_table_aliases(sql: str) -> Dict[str, List[str]]:
 async def _validate_sql_columns(
     sql: str,
     user: Any = None,
+    marker_out: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """**LEGACY WRAPPER (2026-05-26)** — délègue à ``sql_validator.validate_for_iris``.
 
@@ -3562,9 +3605,15 @@ async def _validate_sql_columns(
     enrichi de la clé ``"proof"`` (structure complète inspectable par Iris).
 
     Comportement :
-      - Si la BDD source est injoignable → retourne ``None`` (fail-open sur la
-        validation oracle ; ``execute_sql`` qui suit fera la vraie connexion et
-        reportera l'erreur réseau à l'utilisateur via son path d'erreur normal).
+      - Si la BDD source est injoignable → en fail-open (défaut) retourne
+        ``None`` MAIS pose ``marker_out["oracle_prevalidated"] = False`` si le
+        caller a fourni un dict ``marker_out`` (out-param : la signature legacy
+        ``Optional[Dict]`` ne peut pas porter le tri-state sans casser les
+        call-sites). Les callers user-facing (``create_report``) DOIVENT
+        fournir ``marker_out`` et propager le marqueur (contrat
+        ``validate_for_iris`` : pas de contournement muet) ; en fail-closed
+        (``ORACLE_FAIL_CLOSED=1``) le verdict revient ``passes=False``
+        (``ORACLE_UNAVAILABLE``) → dict bloquant.
       - Si la validation passe → retourne ``None``.
       - Si la validation échoue → retourne le dict legacy + ``proof`` structuré.
       - **Non-autoritatif** : ce wrapper est un PRÉ-CHECK best-effort (fail-open
@@ -3583,9 +3632,11 @@ async def _validate_sql_columns(
         connector = get_sage_connector()
         verdict = await validate_for_iris(sql, user, connector)
     except SageConnectionError as exc:
-        # Sage injoignable → fail-open sur la validation oracle. La vraie
-        # tentative se fait dans le path execute_sql qui reporte proprement.
+        # Defense-in-depth (dead code attendu depuis 2026-06-12 : la politique
+        # d'indisponibilité est centralisée DANS validate_for_iris).
         logger.warning("Sage unreachable during SQL validation (oracle skipped): %s", exc)
+        if isinstance(marker_out, dict):
+            marker_out["oracle_prevalidated"] = False
         return None
     except Exception as exc:  # noqa: BLE001
         # Defense-in-depth : si le validator unique lève une exception
@@ -3596,10 +3647,33 @@ async def _validate_sql_columns(
         return None
 
     if verdict.passes:
+        # Fail-open oracle injoignable : signaler au caller via l'out-param
+        # (la valeur de retour None signifie « pas de blocage », pas
+        # « pré-validé ») — cf. docstring « Comportement ».
+        if (
+            isinstance(marker_out, dict)
+            and getattr(verdict, "oracle_validated", None) is False
+        ):
+            marker_out["oracle_prevalidated"] = False
         return None
 
     assert verdict.proof is not None
     return verdict.proof.to_tool_result()
+
+
+def _compute_null_window(sql: str) -> int:
+    """Fenêtre TOP pour le diagnostic NULL fill-rate (#18f verdict #30).
+
+    Invariant CRITIQUE : ne RÉTRÉCIT JAMAIS la fenêtre originale.
+    ``max(N, 1000)`` — un ``TOP 50000`` réduit à 1000 fausserait davantage
+    les taux (échantillon plus petit = moins représentatif, et on
+    présenterait un taux calculé sur 1000 lignes comme s'il portait sur la
+    requête). Pas de ``TOP`` dans le SQL → 1000 par défaut.
+
+    Pure (testable en isolation — garde d'EFFET, pas de présence source).
+    """
+    m = re.search(r"\bTOP\s+(\d+)\b", sql, flags=re.IGNORECASE)
+    return max(int(m.group(1)) if m else 0, 1000)
 
 
 def _build_sample_warning(sql: str, rows_data: list[dict], columns: list[str]) -> str | None:
@@ -4206,6 +4280,18 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
                     existing = list(context.get("_sql_system_transformations") or [])
                     existing.extend(_flat_transforms)
                     context["_sql_system_transformations"] = existing
+
+    # ── Marqueur « non pré-validé par le SGBD » (politique oracle fail-open) ──
+    # ``validate_for_iris`` ne raise plus SageConnectionError : en fail-open
+    # (défaut) il retourne passes=True + oracle_validated=False. Ce flag est
+    # propagé (a) au tool result pour Iris, (b) au ``pending_results`` →
+    # event ``sql_results`` → bannière grille — pas de contournement muet.
+    # NB : ``_verdict is None`` ne peut venir QUE du except SageConnectionError
+    # legacy ci-dessus (defense-in-depth) → même traitement non-pré-validé.
+    # ``getattr`` : tolère les verdicts duck-typés (tests, wrappers legacy).
+    _oracle_unvalidated = _verdict is None or (
+        _verdict.passes and getattr(_verdict, "oracle_validated", None) is False
+    )
     # ──────────────────────────────────────────────────────────────────
 
     # ── Substitution des placeholders pseudonymizer → requête paramétrisée ──
@@ -4527,6 +4613,10 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
                 "row_count": result.row_count,
                 "execution_time_ms": elapsed_ms,
                 "truncated": result.truncated,
+                # Clé ADDITIVE, posée uniquement quand False : l'event
+                # ``sql_results`` la forwarde et la grille affiche la bannière
+                # « non pré-validé par le SGBD ». Absente = chemin normal.
+                **({"oracle_prevalidated": False} if _oracle_unvalidated else {}),
             }
         )
 
@@ -4614,7 +4704,8 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
                 "l'utilisateur dans un tableau interactif — TU ne les vois PAS. "
                 "L'échantillon ci-dessus contient des tokens `§…§` (termes user) "
                 "et `[TYPE_N]` (PII auto) qui REMPLACENT les valeurs réelles. "
-                "Les nombres et dates ne sont pas anonymisés (passés tels quels). "
+                + _PII_PLACEHOLDER_TRUTH
+                + " "
                 "UTILISE column_stats (distinct_count, min/max, etc.) pour "
                 "comprendre la forme des données. INTERDIT d'inventer de nouveaux "
                 "tokens (pas de `§CLIENT_X§` jamais vu, pas de `[EMAIL_99]` non "
@@ -4625,6 +4716,17 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
         # ── Add NULL context hints if any columns were flagged ────────────────
         if null_context_hints:
             response["_null_context_hints"] = null_context_hints
+
+        # ── Marqueur oracle fail-open → tool result (Iris doit le relayer) ──
+        if _oracle_unvalidated:
+            from app.services.ai.sql_validator import ORACLE_NOT_PREVALIDATED_WARNING
+
+            response["oracle_prevalidated"] = False
+            response["oracle_warning"] = (
+                "⚠️ " + ORACLE_NOT_PREVALIDATED_WARNING + " Mentionne-le à "
+                "l'utilisateur en présentant ce résultat (l'interface affiche "
+                "aussi un bandeau sur la grille)."
+            )
 
         # ── T22 — Détection cartésien masqué (JOIN sans ON/USING) ─────────
         # Catégorie "données fausses silencieuses" : un JOIN sans condition
@@ -4788,7 +4890,15 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
         # ── Auto-fill rate pour colonnes 100% NULL dans TOP queries ──────────
         # CODE > PROMPT : au lieu de dire "va vérifier", on VÉRIFIE et on injecte
         # le résultat. Le LLM ne peut plus ignorer.
-        if _sample_warn and "NULL DANS" in (_sample_warn or ""):
+        # FIX (hunt it.49, BF3) : match INSENSIBLE À LA CASSE. Le générateur
+        # ``_build_sample_warning`` (l.~3748) produit « ... sont NULL dans cet
+        # échantillon... » (minuscule « dans »), or ce gate testait « NULL DANS »
+        # (majuscule) → JAMAIS de match → tout ce bloc d'analyse fill-rate était
+        # MORT silencieusement (l'user ne recevait jamais le diagnostic). Le marqueur
+        # « null dans » implique ``null_cols`` non vide (donc ``rows_data`` non vide).
+        # ⚠️ Couplage de chaîne fragile générateur↔consommateur : si la formulation
+        # du warning change, garder le substring « null dans » (ou découpler).
+        if _sample_warn and "null dans" in _sample_warn.lower():
             try:
                 # Identifier les colonnes 100% NULL dans l'échantillon
                 all_null_cols = []
@@ -4800,10 +4910,17 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
                     # Utiliser la requête originale SANS le TOP comme sous-requête.
                     # Ça préserve tous les JOINs/WHERE → les colonnes de TOUTES
                     # les tables sont accessibles (pas juste la table principale).
-                    # On remplace TOP N par TOP 1000 pour avoir un échantillon
-                    # représentatif sans scanner toute la BDD.
+                    # On élargit TOP N à au moins 1000 pour un échantillon
+                    # plus large sans scanner toute la BDD. #18f (verdict #30) :
+                    # max(N, 1000) — ne JAMAIS rétrécir la fenêtre (un TOP
+                    # 50000 original réduit à 1000 faussait les taux davantage).
+                    _null_window = _compute_null_window(sql)
                     expanded_sql = re.sub(
-                        r"\bTOP\s+\d+\b", "TOP 1000", sql, count=1, flags=re.IGNORECASE
+                        r"\bTOP\s+\d+\b",
+                        f"TOP {_null_window}",
+                        sql,
+                        count=1,
+                        flags=re.IGNORECASE,
                     )
                     count_parts = ["COUNT(*) AS total_rows"]
                     for col in all_null_cols[:5]:  # Max 5 colonnes
@@ -4866,9 +4983,16 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
                                                         global_pct > 10
                                                         and fill_info[col]["fill_rate_pct"] < 5
                                                     ):
+                                                        # FIX (hunt it.49, BF4) : interpoler le VRAI
+                                                        # taux filtré (condition `< 5` → 0-4%, pas
+                                                        # forcément 0). Avant : « 0% » hardcodé →
+                                                        # message FAUX (« 0% » pour un vrai 2%) qui
+                                                        # trompait LLM + user sur la dispo réelle.
+                                                        _filtered_pct = fill_info[col]["fill_rate_pct"]
                                                         fill_info[col]["_warning"] = (
                                                             f"⚠️ La colonne '{col}' est {global_pct}% remplie "
-                                                            f"dans la table {tbl} mais 0% dans ta requête filtrée. "
+                                                            f"dans la table {tbl} mais {_filtered_pct}% dans "
+                                                            f"ta requête filtrée. "
                                                             f"Tes filtres WHERE excluent les lignes remplies. "
                                                             f"Vérifie tes filtres ou élargis la recherche."
                                                         )
@@ -4878,11 +5002,52 @@ async def _handle_execute_sql(tool_input: Dict[str, Any], user: Any, context: Di
                         except Exception as tbl_err:
                             logger.debug("Table-level fill rate failed: %s", tbl_err)
 
+                        # #18f (verdict #30) — fenêtre saturée = les taux
+                        # portent sur un ÉCHANTILLON (TOP sans ORDER BY),
+                        # pas sur la requête entière : le dire au LLM qui
+                        # relaie ces chiffres à l'utilisateur.
+                        _totals = [
+                            v.get("total_rows")
+                            for v in fill_info.values()
+                            if isinstance(v, dict) and isinstance(v.get("total_rows"), int)
+                        ]
+                        if _totals and max(_totals) >= _null_window:
+                            fill_info["_sample_note"] = (
+                                f"Taux calculés sur une fenêtre TOP {_null_window} "
+                                "sans ORDER BY (échantillon de préfixe) — "
+                                "total_rows N'EST PAS le total de la requête ; "
+                                "ne présente pas ces taux comme exhaustifs."
+                            )
+                        # #18f (verdict #30, partie 3) — au-delà de 5 colonnes
+                        # 100% NULL, seules les 5 premières sont diagnostiquées.
+                        # Sans ce marqueur, le LLM croit avoir le taux de TOUTES
+                        # les colonnes vides → il relaie un diagnostic partiel
+                        # comme complet (colonne vide non signalée = donnée
+                        # fausse silencieuse).
+                        if len(all_null_cols) > 5:
+                            fill_info["_omitted_columns"] = len(all_null_cols) - 5
+                            fill_info["_omitted_columns_note"] = (
+                                f"{len(all_null_cols) - 5} autre(s) colonne(s) "
+                                "100% NULL dans l'échantillon ne sont PAS "
+                                "diagnostiquées ici (cap à 5) — ne conclus pas "
+                                "qu'elles sont remplies."
+                            )
                         response["_auto_null_fill_rates"] = fill_info
+                        # Logger défensif : fill_info contient aussi des entrées
+                        # méta (_sample_note str, _omitted_columns int) — n'agréger
+                        # le % que sur les vraies entrées colonne (dict + clé).
                         logger.info(
                             "Auto NULL fill rate injected for %d columns: %s",
-                            len(fill_info),
-                            {k: f"{v['fill_rate_pct']}%" for k, v in fill_info.items()},
+                            sum(
+                                1
+                                for v in fill_info.values()
+                                if isinstance(v, dict) and "fill_rate_pct" in v
+                            ),
+                            {
+                                k: f"{v['fill_rate_pct']}%"
+                                for k, v in fill_info.items()
+                                if isinstance(v, dict) and "fill_rate_pct" in v
+                            },
                         )
             except Exception as fill_err:
                 logger.debug("Auto NULL fill rate failed: %s", fill_err)
@@ -5207,6 +5372,30 @@ def _validate_identifier(name: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_@#$]{0,127}$", name))
 
 
+# #132 — SSoT de la vérité sur ce que l'anonymisation fait aux nombres/dates,
+# partagée par TOUTES les notes LLM-facing des outils qui renvoient un échantillon
+# anonymisé (``peek_table_data`` ET ``execute_sql``). ``anonymize_for_llm`` (couche
+# PII ``apply_builtin_pii``) tokenise NON SEULEMENT les noms (``§…§`` user) mais AUSSI
+# toute chaîne ressemblant à une date / un email / un identifiant en ``[TYPE_N]``
+# (dont ``[DATE_N]``). Les anciennes notes affirmaient « dates inchangées / non
+# anonymisées » → mensonge : le LLM croyait lire ``2024-03-12`` alors qu'il reçoit
+# ``[DATE_1]`` (données fausses dans le prompt-outil). Une seule source = pas de drift.
+_PII_PLACEHOLDER_TRUTH = (
+    "Les nombres simples restent littéraux ; en revanche toute valeur qui ressemble "
+    "à une date, un email ou un identifiant est tokenisée (une date devient `[DATE_N]`). "
+    "Un token `[TYPE_N]` représente une vraie valeur masquée de ce type — raisonne "
+    "dessus comme tel, jamais comme un littéral lisible."
+)
+
+_PEEK_ANONYMIZATION_NOTICE = (
+    "⚠️ Les valeurs texte ci-dessous sont anonymisées par tokens. "
+    "Deux formats : `§…§` (termes utilisateur) et `[TYPE_N]` (PII auto). "
+    "L'utilisateur voit les valeurs réelles dans son interface — "
+    "tu reçois uniquement les tokens. INTERDIT d'inventer de nouveaux "
+    "tokens — utilise uniquement ceux présents dans la réponse. " + _PII_PLACEHOLDER_TRUTH
+)
+
+
 async def _handle_peek_table_data(tool_input: Dict[str, Any], user: Any, context: Dict) -> Dict:
     """Execute SELECT TOP N on a table and anonymise all string values via the proxy.
 
@@ -5247,8 +5436,10 @@ async def _handle_peek_table_data(tool_input: Dict[str, Any], user: Any, context
     # Confidentialité AUTOMATIQUE — pas de choix utilisateur.
     # Anonymisation via le proxy unifié (PII regex + Pseudonymizer user-scoped).
     # Strings → tokens `§…§` (termes user) et `[TYPE_N]` (PII auto).
-    # Nombres/dates : passés tels quels (non sensibles hors contexte, dates non
-    # tronquées — l'agent dispose des ranges pour reasoning sans valeur réelle).
+    # #132 — Les chaînes ressemblant à une date / un email / un identifiant SONT
+    # tokenisées par la couche PII (``_PII_PATTERNS["DATE"]`` → `[DATE_N]`). Seuls
+    # les nombres simples restent littéraux. (Les notes LLM-facing le disent via
+    # ``_PII_PLACEHOLDER_TRUTH`` — ne jamais réintroduire « dates inchangées ».)
 
     try:
         from app.services.data_access.enforcer import DataAccessDeniedError
@@ -5276,14 +5467,7 @@ async def _handle_peek_table_data(tool_input: Dict[str, Any], user: Any, context
             "columns": result.columns,
             "row_count": len(processed_rows),
             "rows": processed_rows,
-            "_anonymization_warning": (
-                "⚠️ Les valeurs texte ci-dessous sont anonymisées par tokens. "
-                "Deux formats : `§…§` (termes utilisateur) et `[TYPE_N]` (PII auto). "
-                "L'utilisateur voit les valeurs réelles dans son interface — "
-                "tu reçois uniquement les tokens. INTERDIT d'inventer de nouveaux "
-                "tokens — utilise uniquement ceux présents dans la réponse. "
-                "Nombres et dates sont inchangés (non sensibles hors contexte)."
-            ),
+            "_anonymization_warning": _PEEK_ANONYMIZATION_NOTICE,
         }
 
     except DataAccessDeniedError as exc:
@@ -5685,7 +5869,7 @@ async def _handle_save_to_datastore(tool_input: Dict[str, Any], user: Any, conte
         logger.info(
             "save_to_datastore: file queued for save",
             extra={
-                "filename": safe_name,
+                "saved_filename": safe_name,
                 "rows": len(data),
                 "user_id": getattr(user, "id", None),
             },
@@ -5750,24 +5934,37 @@ async def _handle_create_report(tool_input: Dict[str, Any], user: Any, context: 
     title = await _restore_for_user_safe(title)
 
     # ── Validate SQL columns before execution ──
+    # ``_oracle_marker`` : out-param posé par le wrapper quand l'oracle SGBD
+    # était injoignable (fail-open) — le rapport est un artefact user-facing,
+    # le marqueur « non pré-validé » DOIT le suivre (contrat validate_for_iris).
+    _oracle_marker: Dict[str, Any] = {}
     try:
-        validation_error = await _validate_sql_columns(sql, user=user)
+        validation_error = await _validate_sql_columns(sql, user=user, marker_out=_oracle_marker)
     except Exception as ve:
         logger.warning("Column validation error in create_report (query allowed): %s", ve)
         validation_error = None
 
     if validation_error:
-        hint = _classify_sql_error(validation_error)
-        return {
+        # ``validation_error`` est le dict Proof.to_tool_result() — extraire
+        # la STRING pour _classify_sql_error (qui fait .lower() ; lui passer
+        # le dict crashait en AttributeError → « Erreur interne » opaque au
+        # lieu du refus actionnable, p.ex. ORACLE_UNAVAILABLE en fail-closed).
+        err_msg = (
+            validation_error.get("error")
+            if isinstance(validation_error, dict)
+            else str(validation_error)
+        ) or "SQL rejeté par la validation."
+        response: Dict[str, Any] = {
             "success": False,
-            "error": validation_error,
-            "hint": hint,
-            "note": (
-                "Le SQL contient des colonnes invalides. "
-                "Utilise get_database_schema ou introspect_table pour vérifier "
-                "les noms de colonnes exacts avant de réessayer."
-            ),
+            "error": err_msg,
+            "hint": _classify_sql_error(err_msg),
         }
+        if isinstance(validation_error, dict):
+            if validation_error.get("blocked_by"):
+                response["blocked_by"] = validation_error["blocked_by"]
+            if validation_error.get("proof"):
+                response["proof"] = validation_error["proof"]
+        return response
 
     executor = get_query_executor()
 
@@ -5807,6 +6004,13 @@ async def _handle_create_report(tool_input: Dict[str, Any], user: Any, context: 
                 "format": fmt,
                 "row_count": len(data),
                 "user_id": getattr(user, "id", None),
+                # Clé ADDITIVE (posée uniquement quand False) : forwardée par
+                # l'event ``report_ready`` → avertissement sur la carte rapport.
+                **(
+                    {"oracle_prevalidated": False}
+                    if _oracle_marker.get("oracle_prevalidated") is False
+                    else {}
+                ),
             }
         )
 
@@ -5820,7 +6024,7 @@ async def _handle_create_report(tool_input: Dict[str, Any], user: Any, context: 
             },
         )
 
-        return {
+        response = {
             "success": True,
             "title": title,
             "filename": safe_name,
@@ -5828,6 +6032,15 @@ async def _handle_create_report(tool_input: Dict[str, Any], user: Any, context: 
             "row_count": len(data),
             "note": "Report generated and queued for download.",
         }
+        if _oracle_marker.get("oracle_prevalidated") is False:
+            from app.services.ai.sql_validator import ORACLE_NOT_PREVALIDATED_WARNING
+
+            response["oracle_prevalidated"] = False
+            response["oracle_warning"] = (
+                "⚠️ " + ORACLE_NOT_PREVALIDATED_WARNING + " Mentionne-le à "
+                "l'utilisateur en présentant ce rapport."
+            )
+        return response
 
     except Exception as exc:
         logger.warning("create_report failed: %s", exc, exc_info=True)
@@ -6338,7 +6551,11 @@ async def _handle_analyze_attachment(tool_input: Dict[str, Any], user: Any, cont
     file_info = uploads.get(file_id) or {}
     filename = file_info.get("filename", "unknown")
 
-    overview = _quick_overview_from_tabs(built["tabs_context"], filename=filename)
+    overview = _quick_overview_from_tabs(
+        built["tabs_context"],
+        filename=filename,
+        active_sheet_content=built.get("sheet_content"),
+    )
 
     if not overview["tabs"]:
         return {"success": False, "error": "Aucun onglet analysable dans le fichier."}
@@ -6347,11 +6564,14 @@ async def _handle_analyze_attachment(tool_input: Dict[str, Any], user: Any, cont
     # ``pd.read_excel`` sans ``sheet_name`` retournait sheet[0] uniquement).
     first_tab = overview["tabs"][0]
     if not first_tab.get("stats_available"):
+        # Avec active_sheet_content passé ci-dessus, on n'arrive ici que si
+        # le premier onglet est réellement sans cellules (classeur vide).
         return {
             "success": False,
             "error": (
-                "Le premier onglet n'est pas matérialisé en mémoire — utilise "
-                "list_workbook_tabs + quick_overview_workbook pour les détails."
+                "Le premier onglet ne contient aucune cellule exploitable "
+                "(classeur vide ?). Utilise list_workbook_tabs pour vérifier "
+                "la structure des onglets."
             ),
         }
 
@@ -6388,6 +6608,10 @@ async def _handle_analyze_attachment(tool_input: Dict[str, Any], user: Any, cont
     }
     if numeric_stats:
         result["numeric_stats"] = numeric_stats
+
+    trunc_note = _upload_truncation_note(built)
+    if trunc_note:
+        result["truncated_note"] = trunc_note
 
     # Multi-sheet hint
     if overview["tab_count"] > 1:
@@ -6622,6 +6846,13 @@ def _build_tabs_context_from_upload(file_info: Dict[str, Any]) -> Dict[str, Any]
             # le budget. -1 ligne pour le header déjà compté.
             n_cols = max(1, len(df.columns))
             budget_rows = max(1, (_UPLOAD_MAX_CELLS_FOR_COPILOT // n_cols) - 1)
+            # Total ORIGINAL conservé AVANT troncation — sans lui, impossible
+            # de signaler que stats/agrégats portent sur un sous-ensemble
+            # (doctrine Q5 : un total partiel présenté comme complet = pire
+            # mode de failure). Consommé par _upload_truncation_note +
+            # _quick_overview_from_tabs + le front (légende « sur N »).
+            tab_entry["row_count_original"] = len(df) + 1
+            tab_entry["truncated"] = True
             df = df.head(budget_rows)
             # On corrige row_count dans l'entry pour refléter la troncation
             tab_entry["row_count"] = len(df) + 1
@@ -6944,7 +7175,11 @@ async def _handle_transform_uploaded_file(
     # fois et réutilisée ici. Sinon construit fresh.
     try:
         if "_built_tabs" not in file_info:
-            file_info["_built_tabs"] = _build_tabs_context_from_upload(file_info)
+            # Off-loop obligatoire — cf. commentaire dans
+            # _resolve_workbook_for_read (parse pandas ~16s sur gros xlsx).
+            file_info["_built_tabs"] = await asyncio.to_thread(
+                _build_tabs_context_from_upload, file_info
+            )
         built = file_info["_built_tabs"]
     except ValueError as exc:
         # Erreur métier (format non supporté, fichier vide, encoding KO) —
@@ -7162,7 +7397,16 @@ async def _resolve_workbook_for_read(
     # invalidé en place).
     if "_built_tabs" not in file_info:
         try:
-            file_info["_built_tabs"] = _build_tabs_context_from_upload(file_info)
+            # Parse pandas/openpyxl = CPU/IO pur (~16s observés sur un xlsx
+            # de 2.8 Mo en prod) — JAMAIS sur l'event loop (gel total de
+            # l'app, cf. loop_lag_monitor). to_thread est race-benign ici :
+            # les workbook tools ne sont pas dans _PARALLEL_SAFE_TOOLS
+            # (exécution séquentielle par run) et file_info est per-run.
+            # Si un jour ils deviennent parallèles, ajouter un asyncio.Lock
+            # par file_info pour éviter N parses concurrents du même fichier.
+            file_info["_built_tabs"] = await asyncio.to_thread(
+                _build_tabs_context_from_upload, file_info
+            )
         except ValueError as exc:
             return None, f"Lecture du fichier impossible : {exc}"
         except Exception:
@@ -7170,6 +7414,104 @@ async def _resolve_workbook_for_read(
             return None, "Erreur interne lors de la lecture du fichier (voir logs serveur)."
 
     return file_info["_built_tabs"], None
+
+
+def _upload_truncation_note(built: Dict[str, Any]) -> Optional[str]:
+    """Note explicite quand l'onglet actif a été tronqué au parse.
+
+    Le builder cape l'onglet actif à ``_UPLOAD_MAX_CELLS_FOR_COPILOT``
+    cellules : tout count/aggregate/stat calculé dessus est PARTIEL. Sans
+    cette note, un « total montant » sommé sur les N premières lignes est
+    présenté comme un total fichier-entier — chiffre plausible et faux,
+    pire mode de failure pour un cabinet comptable (doctrine Q5). À injecter
+    dans le retour de TOUS les read-handlers quand ``built["truncated"]``.
+    """
+    if not built.get("truncated"):
+        return None
+    active = next(
+        (t for t in built.get("tabs_context") or [] if isinstance(t, dict) and t.get("is_active")),
+        None,
+    )
+    kept = max(0, (active.get("row_count") or 1) - 1) if active else 0
+    original = max(0, (active.get("row_count_original") or 1) - 1) if active else 0
+    if original > kept > 0:
+        detail = f"les {kept} premières lignes sur {original}"
+    else:
+        detail = f"les {kept} premières lignes" if kept else "un sous-ensemble du fichier"
+    return (
+        f"⚠️ Fichier tronqué au parse (cap {_UPLOAD_MAX_CELLS_FOR_COPILOT} "
+        f"cellules) : lectures, comptages, agrégats et statistiques portent "
+        f"sur {detail} UNIQUEMENT — totaux PARTIELS, ne les présente pas "
+        "comme des totaux fichier-entier. Pour des chiffres exacts, propose "
+        "à l'utilisateur de requêter la source SQL ou de réduire le fichier."
+    )
+
+
+def _workbook_tab_materialized_guard(built: Dict[str, Any], tab_idx: Any) -> Optional[str]:
+    """Erreur explicite si l'onglet ciblé n'a pas ses cellules en mémoire.
+
+    ``_build_tabs_context_from_upload`` ne matérialise QUE l'onglet actif
+    (premier) — les onglets suivants d'un Excel multi-feuilles n'ont que des
+    métadonnées. Sans ce garde, les cores copilot lisent ``[]`` et
+    retournent « 0 cellule / 0 ligne » avec ``success=True`` : le LLM
+    conclut à un onglet vide alors qu'il est plein — données fausses
+    silencieuses, le pire mode de failure (doctrine Q5 + bug prod
+    2026-06-11). Retourne ``None`` si la lecture peut procéder ; laisse le
+    core produire ses propres erreurs pour un ``tab_idx`` invalide.
+    """
+    tabs = built.get("tabs_context") or []
+    # bool est un int en Python — True ≡ tabs[1] silencieux : on laisse le
+    # core produire son erreur de type plutôt que de guard le mauvais onglet.
+    if isinstance(tab_idx, bool):
+        return None
+    if not isinstance(tab_idx, int) or tab_idx < 0 or tab_idx >= len(tabs):
+        return None
+    tab = tabs[tab_idx]
+    if not isinstance(tab, dict):
+        return None
+    if tab.get("sheet_content"):
+        return None
+    if tab.get("is_active") and built.get("sheet_content"):
+        return None
+    if tab.get("is_active"):
+        # Onglet ACTIF sans cellules top-level ni embedded alors que les
+        # métadonnées annoncent des données : parse incomplet/anormal — la
+        # recette « place l'onglet en premier » serait absurde (il l'est déjà).
+        row_count_active = tab.get("row_count") or 0
+        if row_count_active <= 1:
+            return None
+        return (
+            f"Onglet {tab_idx} (actif) annoncé non-vide "
+            f"(~{max(0, row_count_active - 1)} ligne(s) de données) mais aucune "
+            "cellule n'a été matérialisée au parse — lecture incomplète. "
+            "Demande à l'utilisateur de re-uploader le fichier ; si ça "
+            "persiste, signale le bug."
+        )
+    if "row_count" not in tab:
+        # Fail-closed : métadonnées incomplètes → impossible de garantir que
+        # « 0 cellule » serait honnête (doctrine Q5).
+        return (
+            f"Onglet {tab_idx} : métadonnées incomplètes (row_count absent), "
+            "contenu non vérifiable — lecture refusée pour ne pas retourner "
+            "un faux « onglet vide »."
+        )
+    row_count = tab.get("row_count") or 0
+    if row_count <= 1:
+        # Onglet réellement vide (ou header seul) — un résultat vide est honnête.
+        return None
+    # NB : PAS de label d'onglet dans ce message — les labels peuvent contenir
+    # des noms clients (CRIT-3, cf. list_workbook_tabs qui les anonymise) et
+    # ce retour d'erreur ne passe pas par le pseudonymizer. L'index suffit,
+    # le LLM a les labels anonymisés via list_workbook_tabs.
+    return (
+        f"Onglet {tab_idx} non matérialisé en mémoire : seul le premier "
+        f"onglet d'un classeur multi-feuilles est chargé au parse. Ses "
+        f"métadonnées annoncent ~{row_count - 1} ligne(s) de données — ce "
+        "n'est PAS un onglet vide, son contenu est juste illisible par les "
+        "outils de lecture. Demande à l'utilisateur d'exporter cet onglet "
+        "dans un fichier séparé (ou de le placer en premier) puis de "
+        "re-uploader."
+    )
 
 
 async def _handle_list_workbook_tabs(tool_input: Dict[str, Any], user: Any, context: Dict) -> Dict:
@@ -7197,12 +7539,20 @@ async def _handle_read_workbook_rows(tool_input: Dict[str, Any], user: Any, cont
         return {"success": False, "error": err}
     from app.services.ai.copilot_tools import _read_tab_rows_core
 
+    guard_err = _workbook_tab_materialized_guard(built, tool_input.get("tab_idx"))
+    if guard_err:
+        return {"success": False, "error": guard_err}
+
     # On NE passe PAS de tabs_touched — l'instrumentation copilot
     # (progress UI) n'a pas d'équivalent côté Iris (le LLM Iris voit
     # le résultat dans son tour, pas besoin de tracker l'avancement).
-    # On ne passe PAS top_level_sheet_content car les uploads ont leur
-    # sheet_content embedded dans chaque tab (pas le pattern copilot
-    # où l'actif est top-level).
+    # top_level_sheet_content=built["sheet_content"] : comme chez copilot,
+    # ``_build_tabs_context_from_upload`` matérialise les cellules de
+    # l'onglet ACTIF au top-level uniquement — les entrées de tabs_context
+    # ne portent QUE des métadonnées (label/row_count/columns/is_active).
+    # Passer None ici fait lire ``tab.get("sheet_content") or []`` → le
+    # core retourne « 0 cellule » silencieux sur un onglet plein (bug prod
+    # 2026-06-11, fichier TempsDuSite 714 lignes lu comme vide).
     # include_match=False : économie massive de tokens LLM. Les uploads
     # ont un ``match`` synthétique sur chaque cellule (cf. P2 task #13
     # + adversarial C3) qui contient TOUTES les colonnes de la row —
@@ -7212,13 +7562,16 @@ async def _handle_read_workbook_rows(tool_input: Dict[str, Any], user: Any, cont
     result = _read_tab_rows_core(
         tool_input,
         tabs_context=built["tabs_context"],
-        top_level_sheet_content=None,
+        top_level_sheet_content=built.get("sheet_content"),
         tabs_touched=None,
         include_match=False,
     )
     if "error" not in result:
         result["success"] = True
         result["file_id"] = file_id
+        trunc_note = _upload_truncation_note(built)
+        if trunc_note:
+            result["truncated_note"] = trunc_note
     else:
         result["success"] = False
     # CRIT-3 — anonymise les rows/cells brutes avant retour LLM
@@ -7234,15 +7587,24 @@ async def _handle_count_workbook_rows(tool_input: Dict[str, Any], user: Any, con
         return {"success": False, "error": err}
     from app.services.ai.copilot_tools import _count_rows_from_inputs
 
+    guard_err = _workbook_tab_materialized_guard(built, tool_input.get("tab_idx"))
+    if guard_err:
+        return {"success": False, "error": guard_err}
+
+    # top_level_sheet_content : cellules de l'onglet actif (cf. commentaire
+    # détaillé dans _handle_read_workbook_rows — None = count 0 silencieux).
     result = _count_rows_from_inputs(
         tool_input,
         tabs_context=built["tabs_context"],
-        top_level_sheet_content=None,
+        top_level_sheet_content=built.get("sheet_content"),
         tabs_touched=None,
     )
     if "error" not in result:
         result["success"] = True
         result["file_id"] = file_id
+        trunc_note = _upload_truncation_note(built)
+        if trunc_note:
+            result["truncated_note"] = trunc_note
     else:
         result["success"] = False
     # CRIT-3 — anonymise les filter values référencées dans le retour
@@ -7266,16 +7628,25 @@ async def _handle_aggregate_workbook(tool_input: Dict[str, Any], user: Any, cont
         return {"success": False, "error": err}
     from app.services.ai.copilot_tools import _aggregate_from_inputs
 
+    guard_err = _workbook_tab_materialized_guard(built, tool_input.get("source_tab_idx"))
+    if guard_err:
+        return {"success": False, "error": guard_err}
+
+    # top_level_sheet_content : cellules de l'onglet actif (cf. commentaire
+    # détaillé dans _handle_read_workbook_rows — None = agrégat 0 silencieux).
     result = _aggregate_from_inputs(
         tool_input,
         tabs_context=built["tabs_context"],
-        top_level_sheet_content=None,
+        top_level_sheet_content=built.get("sheet_content"),
         tabs_touched=None,
         pseudonymizer=None,
     )
     if "error" not in result:
         result["success"] = True
         result["file_id"] = file_id
+        trunc_note = _upload_truncation_note(built)
+        if trunc_note:
+            result["truncated_note"] = trunc_note
     else:
         result["success"] = False
     # CRIT-3 — anonymise les bucket keys (valeurs string en GROUP BY)
@@ -7304,9 +7675,16 @@ _QUICK_OVERVIEW_UNIQUE_CAP: int = 20
 def _quick_overview_from_tabs(
     tabs_context: List[Dict[str, Any]],
     filename: Optional[str] = None,
+    active_sheet_content: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Calcule un overview structurel d'un workbook depuis le tabs_context
     déjà construit (zéro pandas, zéro re-parse).
+
+    ``active_sheet_content`` : cellules de l'onglet actif quand elles vivent
+    au top-level du ``built`` (pattern ``_build_tabs_context_from_upload`` —
+    identique au pattern copilot ``ctx.sheet_content``). Sans ce paramètre,
+    l'onglet actif d'un upload était traité « non matérialisé » et l'overview
+    retombait en métadonnées-seules (bug prod 2026-06-11).
 
     Pour chaque onglet matérialisé (avec sheet_content non vide), calcule :
     - row_count, column_count
@@ -7327,9 +7705,14 @@ def _quick_overview_from_tabs(
         tab_columns = list(tab.get("columns", []))
         tab_row_count = tab.get("row_count", 0)
         cells = tab.get("sheet_content") or []
+        if not cells and tab.get("is_active") and active_sheet_content:
+            cells = active_sheet_content
 
         if not cells:
-            # Onglet non matérialisé — overview minimal sans stats
+            # Onglet non matérialisé — overview minimal sans stats.
+            # NB : ne PAS recommander read_workbook_rows ici — il échouerait
+            # aussi (mêmes cellules absentes) : guidance circulaire qui a
+            # fait tourner Iris en rond en prod (2026-06-11).
             overview_tabs.append(
                 {
                     "label": tab_label,
@@ -7340,8 +7723,12 @@ def _quick_overview_from_tabs(
                     "is_active": bool(tab.get("is_active")),
                     "stats_available": False,
                     "stats_note": (
-                        "Onglet non matérialisé en mémoire. Utilise "
-                        "`read_workbook_rows(tab_idx=...)` pour le contenu détaillé."
+                        "Onglet non matérialisé en mémoire (seul le premier "
+                        "onglet d'un classeur multi-feuilles est chargé au "
+                        "parse) — contenu illisible par les outils de "
+                        "lecture, mais PAS vide d'après les métadonnées. "
+                        "Demande à l'utilisateur d'exporter cet onglet "
+                        "séparément ou de le placer en premier."
                     ),
                 }
             )
@@ -7458,18 +7845,25 @@ def _quick_overview_from_tabs(
                 {tab_columns[i]: dense_row[i] for i in range(min(len(tab_columns), len(dense_row)))}
             )
 
-        overview_tabs.append(
-            {
-                "label": tab_label,
-                "index": tab_idx,
-                "row_count": data_rows_observed,
-                "column_count": len(tab_columns),
-                "columns_summary": columns_summary,
-                "sample_rows": sample_rows,
-                "is_active": bool(tab.get("is_active")),
-                "stats_available": True,
-            }
-        )
+        overview_entry: Dict[str, Any] = {
+            "label": tab_label,
+            "index": tab_idx,
+            "row_count": data_rows_observed,
+            "column_count": len(tab_columns),
+            "columns_summary": columns_summary,
+            "sample_rows": sample_rows,
+            "is_active": bool(tab.get("is_active")),
+            "stats_available": True,
+        }
+        # Onglet tronqué au parse (cap cellules du builder) : exposer le
+        # total ORIGINAL pour que LLM et frontend ne présentent jamais le
+        # sous-ensemble comme le fichier entier (doctrine Q5).
+        if tab.get("truncated"):
+            overview_entry["truncated"] = True
+            orig = tab.get("row_count_original")
+            if isinstance(orig, int) and orig > 1:
+                overview_entry["row_count_original"] = orig - 1  # data rows
+        overview_tabs.append(overview_entry)
 
     return {"tabs": overview_tabs, "filename": filename, "tab_count": len(tabs_context)}
 
@@ -7492,9 +7886,16 @@ async def _handle_quick_overview_workbook(
     uploads = context.get("uploads", {}) or {}
     file_info = uploads.get(file_id) or {}
     filename = file_info.get("filename")
-    result = _quick_overview_from_tabs(built["tabs_context"], filename=filename)
+    result = _quick_overview_from_tabs(
+        built["tabs_context"],
+        filename=filename,
+        active_sheet_content=built.get("sheet_content"),
+    )
     result["success"] = True
     result["file_id"] = file_id
+    trunc_note = _upload_truncation_note(built)
+    if trunc_note:
+        result["truncated_note"] = trunc_note
     # CRIT-3 — anonymise sample_rows + columns_summary + numeric_stats
     return await _anonymize_workbook_tool_result(result, user)
 
@@ -7909,8 +8310,32 @@ async def _handle_introspect_table(tool_input: Dict[str, Any], user: Any, contex
                         f"les JOINs manuellement — les vues contiennent souvent des "
                         f"colonnes calculées absentes des tables de base."
                     )
+
         except Exception as view_exc:
             logger.debug("introspect_table: view suggestion search failed: %s", view_exc)
+
+        # ── Cet objet EST-il LUI-MÊME une vue ? ──────────────────────────────
+        # #20 (SSoT) : détection via le helper canonique
+        # ``TrainingStore.is_cached_view`` (MÊME logique que #9a recommend_join →
+        # plus de divergence cache/live). Si oui : signaler au LLM que l'absence
+        # de FK est NORMALE pour une vue → la requêter directement comme FROM,
+        # NE PAS l'abandonner pour les tables brutes (cause racine du bug
+        # « entité » : viewGroupes01 ignorée car FK=[]). Hors de la session
+        # ci-dessus (le helper ouvre la sienne) pour éviter tout nesting.
+        try:
+            if await get_training_store().is_cached_view(table_name):
+                result["is_view"] = True
+                result["object_type"] = "VIEW"
+                result["view_self_hint"] = (
+                    f"ℹ️ {table_name} est une VUE SQL (pas une table de base). "
+                    "L'absence de clés étrangères est NORMALE pour une vue : "
+                    f"requête-la directement comme source (FROM {table_name}). "
+                    "Elle pré-joint déjà ses tables sous-jacentes — ne conclus "
+                    "PAS « pas de chemin de jointure » et ne te rabats pas sur "
+                    "les tables brutes."
+                )
+        except Exception as _isv_exc:
+            logger.debug("introspect_table: is_view check failed: %s", _isv_exc)
 
         # Auto-learn: persist key discoveries so future conversations benefit
         try:
@@ -8319,6 +8744,9 @@ async def _handle_analyze_null_data(tool_input: Dict[str, Any], user: Any, conte
     rows: List[Dict[str, Any]] = []
     columns: Optional[List[str]] = None
     source_label: str = "query"
+    # #18e — divulgation d'échantillonnage (posés par la branche table_name).
+    _sampled_from_table: bool = False
+    _table_total_rows: Optional[int] = None
 
     if table_name:
         # Validate identifiers against SQL injection
@@ -8346,6 +8774,27 @@ async def _handle_analyze_null_data(tool_input: Dict[str, Any], user: Any, conte
             )
             rows = result.to_dicts()
             columns = result.columns
+            # #18e (triage caps 2026-06-10) — l'analyse porte sur un
+            # ÉCHANTILLON TOP-sans-ORDER-BY (préfixe physique) : faux dès que
+            # la distribution des NULL corrèle avec l'ordre d'insertion (ex.
+            # colonne ajoutée en 2020 → 100% NULL sur les vieilles lignes).
+            # Avant : présenté comme exhaustif. On récupère le vrai total
+            # (fail-soft) et on DIVULGUE l'échantillonnage dans la réponse.
+            _sampled_from_table = True
+            _table_total_rows = None
+            try:
+                _count_res = await executor.execute(
+                    f"SELECT COUNT_BIG(*) AS n FROM [{table_name}]",
+                    max_rows=1,
+                    add_limit=False,
+                    user=user,
+                    rls_source="analyze_null_data",
+                )
+                _count_rows = _count_res.to_dicts()
+                if _count_rows:
+                    _table_total_rows = next(iter(_count_rows[0].values()), None)
+            except Exception:  # noqa: BLE001 — divulgation best-effort
+                logger.debug("analyze_null_data: COUNT total échoué", exc_info=True)
         except DataAccessDeniedError as exc:
             return {
                 "success": False,
@@ -8395,11 +8844,33 @@ async def _handle_analyze_null_data(tool_input: Dict[str, Any], user: Any, conte
     analysis = analyzer.analyze(rows, columns, source_label=source_label)
     report = generate_null_report(analysis)
 
+    # #18e — divulgation d'échantillonnage (branche table_name uniquement ;
+    # la branche pending_results analyse le résultat COMPLET déjà chargé).
+    if _sampled_from_table:
+        _total_note = (
+            f" sur {_table_total_rows} dans la table"
+            if isinstance(_table_total_rows, int)
+            else ""
+        )
+        report = (
+            f"⚠ ANALYSE SUR ÉCHANTILLON : {len(rows)} ligne(s){_total_note}, "
+            "prélevées en TOP sans ORDER BY (préfixe physique, NON "
+            "représentatif de la distribution). Les ratios ci-dessous valent "
+            "pour cet échantillon uniquement.\n\n" + report
+        )
+
     response: Dict[str, Any] = {
         "success": True,
         "report": report,
         "analysis": analysis.to_dict(),
     }
+    if _sampled_from_table:
+        response["sampling"] = {
+            "is_sample": True,
+            "sample_size": len(rows),
+            "table_total_rows": _table_total_rows,
+            "note": "TOP sans ORDER BY — échantillon non représentatif",
+        }
 
     if include_suggestions:
         actions = suggest_completion_actions(analysis)
@@ -8574,6 +9045,11 @@ async def _handle_test_sql(tool_input: Dict[str, Any], user: Any, context: Dict)
             if _verdict.sql_used:
                 sql = _verdict.sql_used
 
+        # Marqueur oracle fail-open (cf. _handle_execute_sql, même politique).
+        _oracle_unvalidated = _verdict is None or (
+            _verdict.passes and getattr(_verdict, "oracle_validated", None) is False
+        )
+
         result = await execute_count(sql, connector, user=user)
 
         # RLS-blocked → propager le message d'erreur explicitement
@@ -8600,6 +9076,13 @@ async def _handle_test_sql(tool_input: Dict[str, Any], user: Any, context: Dict)
                 "count": result,
                 "sql_tested": sql[:200],
             }
+            if _oracle_unvalidated:
+                from app.services.ai.sql_validator import (
+                    ORACLE_NOT_PREVALIDATED_WARNING,
+                )
+
+                response["oracle_prevalidated"] = False
+                response["oracle_warning"] = "⚠️ " + ORACLE_NOT_PREVALIDATED_WARNING
             if is_sqlite:
                 response["_sqlite_warning"] = (
                     "⚠️ COUNT exécuté sur la copie SQLite locale (pas SQL Server). "
@@ -8772,35 +9255,99 @@ async def _handle_compare_query_variants(
 
     try:
         from app.services.ai.orchestrator_tools import execute_count
-        from app.services.database.sage_connector import get_sage_connector
+        from app.services.ai.sql_validator import validate_for_iris
+        from app.services.database.sage_connector import (
+            SageConnectionError,
+            get_sage_connector,
+        )
 
         connector = get_sage_connector()
     except Exception as exc:
         return {"success": False, "error": f"Connecteur indisponible : {exc}"}
 
     async def _count_one(variant: dict) -> dict:
+        # ── Oracle unique AVANT exécution (parité execute_sql/test_sql, doctrine
+        # 2026-05-26) ──────────────────────────────────────────────────────────
+        # Sans ça, `compare_query_variants` était le SEUL chemin d'exécution SQL
+        # d'Iris qui ne passait PAS par `validate_for_iris` (PARSEONLY/FMTONLY +
+        # RLS) : asymétrie observable (compare comptait du SQL que execute_sql /
+        # test_sql auraient bloqué) = motif légitime pour Iris de blâmer le système.
+        # On valide chaque variante indépendamment ; une variante rejetée n'empêche
+        # PAS les autres (garde-fou existant). RLS reste appliquée en plus par
+        # execute_count (defense-in-depth ; row_filter idempotent au count).
+        v_sql = variant["sql"]
         try:
-            result = await execute_count(variant["sql"], connector, user=user)
+            _verdict = await validate_for_iris(v_sql, user, connector)
+        except SageConnectionError as _sage_exc:
+            logger.warning(
+                "Sage unreachable during compare_query_variants validation (deferring): %s",
+                _sage_exc,
+            )
+            _verdict = None
+        except Exception as _val_exc:  # noqa: BLE001
+            logger.error(
+                "validate_for_iris crashed in compare_query_variants (fail-closed): %s",
+                _val_exc,
+                exc_info=True,
+            )
+            return {
+                "label": variant["label"],
+                "sql": v_sql[:500],
+                "count": -1,
+                "error": "Validation indisponible — variante bloquée par sécurité.",
+                "blocked_by": "validation_error",
+            }
+        if _verdict is not None:
+            if not _verdict.passes:
+                assert _verdict.proof is not None
+                _proof = _verdict.proof.to_tool_result()
+                _msg = _proof.get("error") if isinstance(_proof, dict) else None
+                return {
+                    "label": variant["label"],
+                    "sql": v_sql[:500],
+                    "count": -1,
+                    "error": _msg or "SQL rejeté par la validation.",
+                    "blocked_by": "validation_failed",
+                }
+            # SQL post-RLS pour le COUNT (row_filter éventuellement appliqué),
+            # à l'identique de test_sql.
+            if _verdict.sql_used:
+                v_sql = _verdict.sql_used
+        try:
+            result = await execute_count(v_sql, connector, user=user)
             if isinstance(result, dict) and result.get("blocked_by") == "data_access_rule":
                 return {
                     "label": variant["label"],
-                    "sql": variant["sql"][:500],
+                    "sql": v_sql[:500],
                     "count": -1,
                     "error": result.get("error") or "Accès refusé",
                     "blocked_by": "data_access_rule",
                 }
             if isinstance(result, int):
-                return {
+                # Marqueur oracle fail-open (même politique qu'execute_sql).
+                _oracle_unvalidated = _verdict is None or (
+                    _verdict.passes
+                    and getattr(_verdict, "oracle_validated", None) is False
+                )
+                _out: dict = {
                     "label": variant["label"],
-                    "sql": variant["sql"][:500],
+                    "sql": v_sql[:500],
                     "count": result,
                     "error": None,
                 }
+                if _oracle_unvalidated:
+                    from app.services.ai.sql_validator import (
+                        ORACLE_NOT_PREVALIDATED_WARNING,
+                    )
+
+                    _out["oracle_prevalidated"] = False
+                    _out["oracle_warning"] = "⚠️ " + ORACLE_NOT_PREVALIDATED_WARNING
+                return _out
             if isinstance(result, str):
                 # Trivial query / info message
                 return {
                     "label": variant["label"],
-                    "sql": variant["sql"][:500],
+                    "sql": v_sql[:500],
                     "count": None,
                     "info": result,
                     "error": None,
@@ -8808,20 +9355,20 @@ async def _handle_compare_query_variants(
             if isinstance(result, dict):
                 return {
                     "label": variant["label"],
-                    "sql": variant["sql"][:500],
+                    "sql": v_sql[:500],
                     "count": None,
                     "error": result.get("error") or str(result),
                 }
             return {
                 "label": variant["label"],
-                "sql": variant["sql"][:500],
+                "sql": v_sql[:500],
                 "count": None,
                 "error": f"Résultat inattendu : {type(result).__name__}",
             }
         except Exception as e:
             return {
                 "label": variant["label"],
-                "sql": variant["sql"][:500],
+                "sql": v_sql[:500],
                 "count": None,
                 "error": str(e)[:300],
             }
@@ -8831,9 +9378,19 @@ async def _handle_compare_query_variants(
         return_exceptions=False,  # chaque _count_one capture déjà ses erreurs
     )
 
-    # Calculer les deltas entre variantes (seuls les counts numériques)
+    # Calculer les deltas entre variantes (seuls les counts numériques RÉELS).
+    # Un variant bloqué (RLS / validation) renvoie count=-1 + blocked_by : il NE
+    # DOIT PAS entrer dans le calcul de delta, sinon le DBA verrait des deltas
+    # fantaisistes (« 100 → -1 (-101 lignes) ») = donnée fausse silencieuse
+    # (consequences.md Q5). On exige un count entier >= 0 ET l'absence de blocked_by.
     deltas: list[str] = []
-    counts = [(r["label"], r.get("count")) for r in results if isinstance(r.get("count"), int)]
+    counts = [
+        (r["label"], r.get("count"))
+        for r in results
+        if isinstance(r.get("count"), int)
+        and r.get("count") >= 0
+        and not r.get("blocked_by")
+    ]
     if len(counts) >= 2:
         for i in range(len(counts)):
             for j in range(i + 1, len(counts)):
@@ -9198,6 +9755,34 @@ async def _handle_get_resolved_values(
         return {"success": False, "error": f"Erreur résolution valeurs: {e}"}
 
 
+# #A5 (revue adversariale) : UNKNOWN RETIRÉ. Le fallback word-split (JSON KO,
+# ligne ~9545) ET le défaut role-less (``concept.get("role", "UNKNOWN")``)
+# produisent UNKNOWN → flagger l'ambiguïté dessus sur-sollicitait l'utilisateur
+# (ce que David déteste) sur le chemin dégradé. Seuls les rôles de filtre/axe
+# EXPLICITEMENT extraits par le LLM déclenchent désormais la désambiguïsation.
+_AMBIGUITY_SENSITIVE_ROLES = frozenset({"WHERE_IN", "WHERE_NOT", "GROUP_BY"})
+
+
+def _is_cross_table_ambiguous(candidate_cols: set, role: str) -> bool:
+    """True si un concept de filtre/axe matche N≥2 colonnes sur ≥2 tables.
+
+    Heuristique anti-faux-silencieux (bug « entité » SOFIGEC) : un concept
+    de FILTRE/AXE (WHERE/GROUP BY) qui correspond à plusieurs colonnes
+    DISTINCTES réparties sur des tables différentes est une ambiguïté
+    d'INTENTION métier — le choix change le résultat et doit être tranché
+    par l'utilisateur, pas deviné. On NE lève PAS l'ambiguïté pour un simple
+    SELECT (mauvais choix visible/corrigeable) ni pour une seule colonne.
+    100% générique : ``candidate_cols`` est un set de ``(table, column)``
+    issu du schéma réel, aucun nom hardcodé.
+    """
+    if role not in _AMBIGUITY_SENSITIVE_ROLES:
+        return False
+    if len(candidate_cols) < 2:
+        return False
+    distinct_tables = {t for (t, _c) in candidate_cols}
+    return len(distinct_tables) >= 2
+
+
 async def _handle_align_request(
     tool_input: Dict[str, Any], user: Any, context: Dict
 ) -> Dict[str, Any]:
@@ -9339,6 +9924,28 @@ async def _handle_align_request(
         # UNE seule recherche massive (le moteur gère le batching)
         all_results = await search_all_terms(unique_terms, indexes)
 
+        # ── Lecteur ConceptGlossary (#13) : rejoue les désambiguïsations DÉJÀ
+        # validées par feedback ✅ pour ne PAS redemander (boucle « apprendre →
+        # rejouer »). Fail-open : si la lecture échoue, on continue sans (le pire
+        # cas = on redemande, jamais un faux). ──
+        try:
+            from app.services.ai.agent_knowledge import get_concept_glossary_mappings
+
+            # #A1 (revue adversariale) : la clé glossaire ÉCRITE vient de
+            # l'extraction concept du PIPELINE ; la clé LUE ici vient de
+            # l'extraction d'align_request (prompts différents → libellés
+            # divergents, « CA » vs « chiffre d'affaires »). On élargit la
+            # recherche aux SYNONYMES (qu'align_request extrait déjà) pour que la
+            # clé pipeline matche au moins un synonyme → le rejeu #13 se déclenche.
+            _glossary_terms: list[str] = []
+            for _c in concepts:
+                _glossary_terms.append(_c.get("term", ""))
+                _glossary_terms.extend(_c.get("synonyms", []) or [])
+            glossary = await get_concept_glossary_mappings(_glossary_terms)
+        except Exception as _gloss_exc:
+            logger.debug("align_request: lecture glossaire ignorée: %s", _gloss_exc)
+            glossary = {}
+
         # Construire le plan par concept
         alignment_plan: list[dict] = []
 
@@ -9386,7 +9993,55 @@ async def _handle_align_request(
             )
             has_values = len(unique_vl) > 0
 
-            if has_columns and (not values or has_values):
+            # ── Ambiguïté STRUCTURELLE (anti-faux-silencieux, bug « entité ») ──
+            # Si un concept de FILTRE/AXE matche N≥2 colonnes DISTINCTES sur ≥2
+            # TABLES différentes, le choix de colonne change le résultat et n'est
+            # PAS tranchable par les outils seuls = question d'INTENTION métier.
+            # Détection 100% programmatique et générique (aucun nom hardcodé),
+            # depuis les candidats 5D DÉJÀ montrés au LLM (cohérence plan↔question).
+            # Restreinte aux rôles où un mauvais choix = chiffre faux SILENCIEUX
+            # (filtre/group) — on ne sur-sollicite pas sur un simple SELECT.
+            # Candidats = colonnes de TABLES DE BASE uniquement (dimension
+            # "column", PAS "view_column") : une vue dérive de ses tables, donc
+            # « Factures.facMontant vs viewX.montant » n'est pas une vraie
+            # ambiguïté de sens (même donnée) — l'inclure sur-solliciterait
+            # l'utilisateur. Le bug ciblé (« entité ») est inter-tables-de-base.
+            candidate_cols = {
+                (m.table_name, m.column_name)
+                for r in concept_results.values()
+                for m in r.matches
+                if m.dimension == "column"
+                and m.match_type in ("exact", "contains")
+                and m.table_name
+                and m.column_name
+            }
+            is_cross_table_ambiguous = _is_cross_table_ambiguous(candidate_cols, role)
+            # #A1 : on cherche le mapping appris par le terme PUIS ses synonymes
+            # (priorité au terme) — la clé pipeline peut correspondre à l'un d'eux.
+            learned: list = []
+            for _lk in [term] + (synonyms or []):
+                _lk_norm = (_lk or "").strip().lower()
+                if _lk_norm and _lk_norm in glossary:
+                    learned = glossary[_lk_norm]
+                    break
+
+            if len(learned) == 1:
+                # Concept DÉJÀ désambiguïsé par un feedback ✅ antérieur (UN SEUL
+                # mapping appris) → on applique sans redemander. Boucle « demander
+                # une fois, apprendre, rejouer » : surclasse la détection #11.
+                # #A4 (revue adversariale) : si ≥2 mappings concurrents (concept
+                # multi-contexte), on NE surclasse PAS — imposer le mapping d'un
+                # autre contexte en silence rouvrirait le faux-silencieux. Le
+                # glossaire reste affiché comme HINT (learned_mapping/alternatives)
+                # mais l'ambiguïté est maintenue → l'utilisateur tranche pour CE
+                # contexte.
+                status = "found"
+                is_cross_table_ambiguous = False
+            elif is_cross_table_ambiguous:
+                # Prime sur "found" : colonnes concurrentes inter-tables → lever
+                # l'ambiguïté AVANT le SQL (sinon faux silencieux type SOFIGEC).
+                status = "ambiguous"
+            elif has_columns and (not values or has_values):
                 status = "found"
             elif has_columns and values and not has_values:
                 status = "calculated"
@@ -9405,6 +10060,9 @@ async def _handle_align_request(
                     "search_results": formatted,
                     "values_found": unique_vl[:10],
                     "values_requested": values,
+                    "candidate_columns": sorted(f"{t}.{c}" for (t, c) in candidate_cols),
+                    "learned_mapping": learned[0] if learned else None,
+                    "learned_alternatives": learned[1:5] if len(learned) > 1 else [],
                 }
             )
 
@@ -9417,6 +10075,16 @@ async def _handle_align_request(
             f"Vérifie chaque concept avant de construire le SQL.\n"
         )
 
+        _ambiguous_plan = [c for c in alignment_plan if c["status"] == "ambiguous"]
+        if _ambiguous_plan:
+            plan_lines.append(
+                f"\n> 🛑 **STOP — {len(_ambiguous_plan)} concept(s) AMBIGU(S).** "
+                "Avant d'écrire le moindre SQL, lève l'ambiguïté avec "
+                "`ask_user_clarification` : présente les options en langage MÉTIER "
+                "(pas en schéma) avec un échantillon de ce que chacune donnerait. "
+                "Choisir au hasard = risque de chiffre FAUX silencieux.\n"
+            )
+
         for c in alignment_plan:
             icon = {
                 "found": "✅",
@@ -9427,6 +10095,20 @@ async def _handle_align_request(
             }.get(c["status"], "❓")
 
             plan_lines.append(f"\n## {icon} {c['concept']} ({c['role']})")
+
+            if c.get("learned_mapping"):
+                _lm = c["learned_mapping"]
+                plan_lines.append(
+                    f"  → ✅ APPRIS (feedback validé {_lm.get('usage_count', 1)}×) : "
+                    f"pour ce concept, utilise `{_lm['table']}.{_lm['column']}`. "
+                    "Ne redemande pas — désambiguïsation déjà confirmée."
+                )
+                _alts = c.get("learned_alternatives") or []
+                if _alts:
+                    plan_lines.append(
+                        "    Alternatives apprises (moins fréquentes) : "
+                        + ", ".join(f"{a['table']}.{a['column']}" for a in _alts)
+                    )
 
             if c["status"] == "calculated":
                 plan_lines.append(
@@ -9443,6 +10125,16 @@ async def _handle_align_request(
                     "  → Valeur trouvée mais pas de colonne directe. "
                     "La valeur est peut-être dans une colonne au nom différent."
                 )
+            elif c["status"] == "ambiguous":
+                plan_lines.append(
+                    "  → ⚠️ AMBIGU : ce concept correspond à PLUSIEURS colonnes sur "
+                    "des tables différentes — le choix change le résultat. DEMANDE à "
+                    "l'utilisateur laquelle via `ask_user_clarification` (langage "
+                    "métier, AVANT tout SQL). Ne devine pas."
+                )
+                _cand = c.get("candidate_columns") or []
+                if _cand:
+                    plan_lines.append(f"    Candidats : {', '.join(_cand[:8])}")
 
             # Valeurs trouvées
             if c["values_found"]:
@@ -9506,6 +10198,13 @@ async def _handle_align_request(
         except Exception as _pattern_exc:
             logger.debug("Pattern matching in align_request skipped: %s", _pattern_exc)
 
+        # Note : le flag ``context["_pending_ambiguity"]`` (qui armait le guard
+        # DUR #15 bloquant ``execute_sql``) a été RETIRÉ 2026-06-11 sur demande
+        # utilisateur. Le signal d'ambiguïté reste SOFT : ``requires_user_clarification``
+        # + ``ambiguous_concepts`` dans le résultat ci-dessous + bannière 🛑 dans
+        # le plan + prompt #12 → l'agent est DIRIGÉ vers ``ask_user_clarification``,
+        # il n'est plus FORCÉ.
+
         return {
             "success": True,
             "alignment_plan": "\n".join(plan_lines) + pattern_section,
@@ -9515,6 +10214,21 @@ async def _handle_align_request(
             "not_found": sum(1 for c in alignment_plan if c["status"] == "not_found"),
             "calculated": sum(1 for c in alignment_plan if c["status"] == "calculated"),
             "pattern_hint_count": pattern_section.count("**") // 2 if pattern_section else 0,
+            # Anti-faux-silencieux : signal machine-lisible (consommable par un
+            # guard amont agent_service [tâche #11b] ET par le LLM) — il DOIT
+            # clarifier les concepts ambigus avant de générer du SQL.
+            "requires_user_clarification": any(
+                c["status"] == "ambiguous" for c in alignment_plan
+            ),
+            "ambiguous_concepts": [
+                {
+                    "concept": c["concept"],
+                    "role": c["role"],
+                    "candidates": c.get("candidate_columns", []),
+                }
+                for c in alignment_plan
+                if c["status"] == "ambiguous"
+            ],
         }
     except Exception as e:
         logger.error("align_request error: %s", e, exc_info=True)
@@ -9532,6 +10246,15 @@ async def _handle_check_join_compatibility(
 
     if not all([table_a, column_a, table_b, column_b]):
         return {"success": False, "error": "Tous les paramètres sont requis."}
+
+    # ── Validation d'identifiants (anti-injection) ──
+    # table_*/column_* sont interpolés en f-string `[{...}]` dans la requête
+    # INTERSECT ci-dessous. Sans validation, un nom contenant `]` casse le
+    # bracket-quoting (injection SQL). Même garde que peek_table_data /
+    # execute_sql (SSoT _validate_identifier).
+    for _ident in (table_a, column_a, table_b, column_b):
+        if not _validate_identifier(_ident):
+            return {"success": False, "error": "Nom de table ou de colonne invalide."}
 
     # ── RLS check (defense-in-depth) ──
     # check_join_compatibility est un canal latéral majeur (count des
@@ -9568,6 +10291,28 @@ async def _handle_check_join_compatibility(
             f"SELECT DISTINCT [{column_b}] FROM [{table_b}]"
             f") x) AS overlap"
         )
+
+        # ── RLS row-level (en plus du check table/colonne ci-dessus) ──
+        # Injecte les filtres de LIGNES de l'user dans la requête de comptage —
+        # sinon distinct/overlap portent sur TOUTES les lignes (canal latéral de
+        # cardinalité sur des lignes non visibles). SSoT = enforce_for_executor
+        # (idem execute_count / query_executor). Fail-closed : enforce_sql renvoie
+        # denied si un row_filter ne peut pas être appliqué proprement — JAMAIS
+        # de SQL non filtrée (donc pas de count faux silencieux).
+        from app.services.data_access.enforcer import (
+            DataAccessDeniedError,
+            enforce_for_executor,
+        )
+
+        try:
+            sql = await enforce_for_executor(sql, user, source="check_join_compatibility")
+        except DataAccessDeniedError as exc:
+            return {
+                "success": False,
+                "error": exc.user_message,
+                "blocked_by": "data_access_rule",
+            }
+
         result = await connector.execute(sql, max_rows=1)
         if not result.rows:
             return {"success": False, "error": "Pas de résultat."}
@@ -9791,8 +10536,14 @@ async def _handle_run_pipeline(
                 "en langage naturel)."
             ),
         }
+    # #18f (triage caps 2026-06-10) — aligné sur le pattern honnête du site
+    # exploration_mode (l.~10830, ``was_truncated``) : couper la question NL
+    # en silence avant run_pipeline = pipeline qui répond à une question
+    # AMPUTÉE → SQL faux sans signal. L'agent doit le dire à l'utilisateur.
+    query_nl_truncated = False
     if len(query_nl) > 5000:
         query_nl = query_nl[:5000].rstrip()
+        query_nl_truncated = True
 
     user_id = getattr(user, "id", None)
     if user_id is None:
@@ -9828,6 +10579,13 @@ async def _handle_run_pipeline(
     # task #82 — défaut False : vues incluses dans le shortlist Phase 1.5.
     block_all_views = bool(tool_input.get("block_all_views", False))
     use_sage = bool(tool_input.get("use_sage", True))
+
+    # Feature « preview » (docs/design/iris_stop_at_phase.md) : Iris peut
+    # demander d'arrêter la pipeline à une phase intermédiaire (blueprint 1.5
+    # / factsheets 3) au lieu d'aller jusqu'au SQL. Normalisation empty→None ;
+    # la VALIDATION de la phase (fail-closed sur valeur inconnue) est faite en
+    # aval par ``_build_phases_to_run`` (SSoT). None = run complet.
+    stop_after_phase = (tool_input.get("stop_after_phase") or "").strip() or None
 
     # Task #93 PR3 (2026-05-21) — ADD-only : Iris peut enrichir la query NL
     # avec un contexte complémentaire (informations vues via ses tools), sans
@@ -9924,6 +10682,7 @@ async def _handle_run_pipeline(
             triggered_via=TriggeredVia.IRIS_CHAT,
             request_id=context.get("_request_id") if isinstance(context, dict) else None,
             additional_context=additional_context or None,
+            stop_after_phase=stop_after_phase,
         )
     except QuotaExceededError as exc:
         return {
@@ -9967,11 +10726,22 @@ async def _handle_run_pipeline(
     # Donc le LLM Iris ne voit JAMAIS les clés ci-dessous — il voit le
     # résumé final. Les ``instructions_for_assistant`` sont posées par
     # le synthétique final (cf. _stream_pipeline_run_to_chat).
-    return {
+    result_payload: Dict[str, Any] = {
         "success": True,
         "run_id": run.id,
         "status": (run.status.value if hasattr(run.status, "value") else str(run.status)),
     }
+    if query_nl_truncated:
+        # #18f — le pipeline a travaillé sur une question AMPUTÉE à 5000
+        # chars : l'agent doit le signaler (le SQL peut ignorer la fin de
+        # la demande).
+        result_payload["query_nl_truncated"] = True
+        result_payload["warning"] = (
+            "La question a été tronquée à 5000 caractères avant le pipeline "
+            "— le SQL peut ignorer la fin de la demande. Signale-le à "
+            "l'utilisateur et propose de reformuler plus court."
+        )
+    return result_payload
 
 
 async def _handle_inspect_pipeline_artifact(
@@ -10980,6 +11750,27 @@ async def execute_tool(
                 tool_name,
             )
             return {"success": False, "error": "Permission refusée. Réservé aux administrateurs."}
+
+    # S5 (L3O4) — Defense-in-depth: en mode automation, ré-appliquer la whitelist
+    # ``AUTOMATION_TOOL_CLASSIFICATION`` à l'EXÉCUTION (pas seulement à l'exposition
+    # via ``filter_tools_for_context``). Sans ça, blocage par MASQUAGE SEUL : un
+    # tool_use forgé / halluciné / rejoué (ex. send_email, manage_users,
+    # propose_sql_write) contournerait le filtre et s'exécuterait en background.
+    # Fail-closed strict (doctrine 2026-05-27) : tout tool != "allowed" (donc
+    # "blocked" OU absent de la classification) est refusé. ``isinstance(context, dict)``
+    # garde contre un context non-dict inattendu (refus = sûr).
+    if isinstance(context, dict) and context.get("_exec_source") == "automation":
+        if AUTOMATION_TOOL_CLASSIFICATION.get(tool_name) != "allowed":
+            logger.warning(
+                "execute_tool: tool '%s' bloqué en mode automation "
+                "(classification=%r, défense-en-profondeur)",
+                tool_name,
+                AUTOMATION_TOOL_CLASSIFICATION.get(tool_name),
+            )
+            return {
+                "success": False,
+                "error": "Outil non autorisé en mode automation (exécution en arrière-plan).",
+            }
 
     logger.info(
         "execute_tool: dispatching '%s'",

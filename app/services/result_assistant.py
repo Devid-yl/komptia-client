@@ -101,7 +101,24 @@ async def _call_llm_anon(
     import dataclasses
 
     try:
-        prompt_anon, restore_fn = await anonymize_for_llm(user_id, request.prompt, "COPILOT")
+        # #19a (triage anonymisation 2026-06-10, 3 FUITES confirmées) — le
+        # ``prompt_cache_prefix`` partait EN CLAIR : seul request.prompt
+        # était anonymisé, or les « parties stables » des sites modify_result
+        # (SQL des onglets, valeurs réelles col_distinct/sample_rows,
+        # feuilles sœurs JSON) vivent justement dans le prefix. UN SEUL
+        # appel anonymize_for_llm sur {prefix, prompt} : compteurs PII
+        # partagés (même entité = même token dans les 2 blocs) + restore_fn
+        # commun. ``prefix`` EN PREMIER : ses compteurs PII restent stables
+        # quel que soit le prompt dynamique → tokens identiques d'un appel
+        # à l'autre → cacheabilité Anthropic préservée (pseudonymizer
+        # déterministe par construction).
+        _anon_payload, restore_fn = await anonymize_for_llm(
+            user_id,
+            {"prefix": request.prompt_cache_prefix or "", "prompt": request.prompt},
+            "COPILOT",
+        )
+        prompt_anon = _anon_payload["prompt"]
+        prefix_anon = _anon_payload["prefix"] if request.prompt_cache_prefix else None
     except RuntimeError as exc:
         # Le proxy fail-closed quand le pseudonymizer est incohérent.
         # On wrappe pour distinguer du cas "LLM cloud down" et donner
@@ -139,6 +156,12 @@ async def _call_llm_anon(
         request,
         prompt=prompt_anon,
         system=new_system,
+        # #19a — le prefix anonymisé remplace le clair (None reste None) ;
+        # user_id posé = defense-in-depth : la couche 2 provider re-vérifie
+        # même si un futur caller oublie l'anonymisation amont (le
+        # pseudonymizer est idempotent sur du texte déjà tokenisé).
+        prompt_cache_prefix=prefix_anon,
+        user_id=user_id,
     )
 
     # **Phase 3.4/3.5 (#65/#66) defense-in-depth** : on passe ``user=`` au
@@ -1116,14 +1139,16 @@ async def _get_schema_context(
         user_id: optionnel — Phase α.4 (#22/#52). Si fourni, on construit
             un stub user pour activer le filtrage mode invisible côté
             training_store. ``user_id=None`` = comportement legacy.
-            ATTENTION : le cache DDL est partagé entre tous les users
-            (cache_key par tables, pas par user). C'est intentionnel pour
-            ne pas multiplier les entrées — mais ça signifie que le filtre
-            mode invisible se fait au FETCH initial, pas au lookup cache.
-            Si un user restreint fetche en premier, son DDL filtré sera
-            servi à tous → BUG. Pour corriger en V2 : inclure user_id
-            dans cache_key. Pour V1 : fail-safe = bypass cache si user_id
-            fourni.
+            INVARIANT cache (post-fix audit C-1) : le cache ne contient QUE du
+            DDL NON filtré — read ET write sont gardés par ``user_id is None``.
+            Tout appel avec un ``user_id`` (= prod) bypasse ENTIÈREMENT le cache
+            (ni read ni write) : son DDL est filtré (mode invisible/RLS) et le
+            partager sous une clé par-tables le fuiterait à tous les users.
+            Conséquence assumée : en prod le DDL est re-fetché à chaque appel
+            (lookup SQLite local, peu coûteux) — le cache ne sert que les
+            callers legacy ``user_id=None``. ⚠️ NE JAMAIS ajouter ``user_id``
+            au cache_key pour « cacher en prod » : ça ré-introduirait la
+            croissance par-user que cette V1 évite (cf. commentaire au write).
     """
     if not table_names:
         return ""
@@ -1133,6 +1158,11 @@ async def _get_schema_context(
     cache_key = "|".join(n.upper() for n in sorted(table_names))
     now = time.time()
     if user_id is None:
+        # Éviction des entrées expirées (même pattern que _recent_requests) —
+        # sinon croissance non bornée dans le process Tornado (axe 21, audit C-1).
+        expired = [k for k, (_, ts) in _ddl_cache.items() if now - ts >= _DDL_CACHE_TTL]
+        for k in expired:
+            _ddl_cache.pop(k, None)
         cached = _ddl_cache.get(cache_key)
         if cached and (now - cached[1]) < _DDL_CACHE_TTL:
             logger.debug("DDL cache hit for %d tables", len(table_names))
@@ -1184,7 +1214,13 @@ async def _get_schema_context(
                 parts.append(content)
 
     result = "\n\n".join(parts)
-    _ddl_cache[cache_key] = (result, now)
+    # N'écrire QUE sur le path NON filtré (user_id is None). Avec un user_id, le
+    # DDL est filtré (mode invisible / RLS) : le partager sous une clé
+    # user-agnostique fuiterait un DDL restreint à tous les users (cf. docstring),
+    # ET ferait croître le cache sans borne (user_id TOUJOURS fourni en prod →
+    # write-only dead weight jamais relu). Audit C-1 / axe 21 + isolation users.
+    if user_id is None:
+        _ddl_cache[cache_key] = (result, now)
     return result
 
 
@@ -1266,6 +1302,62 @@ def _truncate_sheet_content_for_llm(
         }
     )
     return sampled
+
+
+#: #90 — cap COLONNES de l'aperçu sample_rows (drop de colonne = leak-safe, on
+#: signale « (+N colonnes) »).
+_SAMPLE_PREVIEW_MAX_COLS: int = 8
+#: #73-bis — seuil de PLACEHOLDER de cellule. On NE TRONQUE PLUS une valeur
+#: brute (le bug d'origine #90 coupait à 20 chars + « … ») : un pseudonyme
+#: configuré coupé en plein milieu (ex. 'SOFIGEC PARTICIPATION SA' → 'SOFIGEC
+#: PARTICIPATIO') ne matche plus l'anonymiseur aval — qui substitue le terme
+#: COMPLET — et son préfixe RÉEL part EN CLAIR au LLM (fuite niveau 2). On laisse
+#: donc la valeur ENTIÈRE (anonymisée en aval → token court ; PII regex matche
+#: aussi le terme complet), et SEULE une valeur pathologiquement longue (> ce
+#: seuil) est remplacée par un placeholder de LONGUEUR — AUCUN contenu exposé,
+#: donc aucune fuite, et le budget prompt reste borné. Seuil large pour couvrir
+#: les raisons sociales / adresses réelles (qui doivent passer entières pour
+#: être anonymisées correctement).
+_SAMPLE_PREVIEW_CELL_PLACEHOLDER_CHARS: int = 200
+
+
+def _build_sample_rows_preview(sample: list) -> str:
+    """Construit l'aperçu markdown des ``sample_rows`` pour le prompt copilot.
+
+    SSoT des 2 builders fallback (chemins onglet SQL et non-SQL).
+    Retourne "" si l'échantillon est inexploitable (no-op à concaténer).
+
+    #73-bis — ne tronque JAMAIS une valeur de cellule brute (fuite de pseudonyme
+    par coupe avant anonymisation) : valeur entière, ou placeholder de longueur
+    si pathologiquement longue.
+    """
+    if not sample or not isinstance(sample, list):
+        return ""
+    first = sample[0]
+    if not isinstance(first, dict):
+        return ""
+    all_keys = list(first.keys())
+    keys = all_keys[:_SAMPLE_PREVIEW_MAX_COLS]
+    hdr = " | ".join(keys)
+    if len(all_keys) > _SAMPLE_PREVIEW_MAX_COLS:
+        hdr += f" (+{len(all_keys) - _SAMPLE_PREVIEW_MAX_COLS} colonnes)"
+    rows_lines: list[str] = []
+    for row in sample:
+        cells: list[str] = []
+        for k in keys:
+            v = row.get(k)
+            if v is None:
+                cells.append("")
+                continue
+            s = str(v)
+            # #73-bis — valeur entière (anonymisée en aval) ; placeholder de
+            # LONGUEUR (sans contenu → sans fuite) si pathologiquement longue.
+            if len(s) > _SAMPLE_PREVIEW_CELL_PLACEHOLDER_CHARS:
+                cells.append(f"[valeur longue: {len(s)} car.]")
+            else:
+                cells.append(s)
+        rows_lines.append(" | ".join(cells))
+    return f"\n**Aperçu** :\n{hdr}\n" + "\n".join(rows_lines)
 
 
 def _build_structured_sheet_json(sheet_content: list[dict]) -> str | None:
@@ -2580,7 +2672,12 @@ def _validate_emit_tab(
                 # Check 2 : value_column dans tab.columns (requiert value_column)
                 src_tab = tabs_context[stix]
                 src_cols = src_tab.get("columns") if isinstance(src_tab, dict) else None
-                if vcol is not None and isinstance(src_cols, list) and src_cols and vcol not in src_cols:
+                if (
+                    vcol is not None
+                    and isinstance(src_cols, list)
+                    and src_cols
+                    and vcol not in src_cols
+                ):
                     preview = list(src_cols)[:15]
                     suffix = "…" if len(src_cols) > 15 else ""
                     src_label = (
@@ -3176,7 +3273,15 @@ def _is_match_op_dict(val: Any) -> bool:
 
 def _coerce_numeric_or_none(x: Any) -> Optional[float]:
     """``x`` → float si parsable, sinon None. ``bool`` ≠ numérique (anti
-    coercion Python ``True == 1``). Strings : on strip() avant parse."""
+    coercion Python ``True == 1``). Strings : on strip() avant parse.
+
+    ``decimal.Decimal`` DOIT être géré : pyodbc renvoie les colonnes
+    MONEY/NUMERIC/DECIMAL de SQL Server en ``Decimal`` (objets, PAS strings) et
+    ``QueryResult.to_dicts`` préserve les types natifs. Sans ce cast, un Decimal
+    retombait sur la comparaison **lexicographique** de :func:`_emit_tab_cmp_op`
+    (« 90.00 » >= « 100 » → ``True``, FAUX ; « 1500.00 » >= « 200 » → ``False``,
+    FAUX) → filtres ``$gt``/``$gte``/``$lt``/``$lte`` sur des montants
+    silencieusement faux (même classe que #139/#147)."""
     if isinstance(x, bool):
         return None
     if isinstance(x, (int, float)):
@@ -3186,7 +3291,17 @@ def _coerce_numeric_or_none(x: Any) -> Optional[float]:
             return float(x.strip())
         except (TypeError, ValueError):
             return None
-    return None
+    # Tout le reste (decimal.Decimal, numpy number…) — tenter le cast.
+    # date/datetime → TypeError → None : gérés par la branche date ISO du caller.
+    # NB : on NE filtre PAS NaN/inf ici (à dessein). Renvoyer ``nan`` donne la
+    # bonne sémantique IEEE dans _emit_tab_cmp_op (``nan >= x`` → False, comme
+    # NULL). Le filtrer → None ferait retomber sur le fallback lexicographique
+    # (« NaN » >= « 100 » → True) = exactement le bug qu'on corrige. SQL Server
+    # ne stocke d'ailleurs pas de NaN sur DECIMAL/MONEY.
+    try:
+        return float(x)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _coerce_iso_date_or_none(x: Any) -> Optional[Any]:
@@ -3407,6 +3522,41 @@ def _emit_tab_in_excluded(val: Any, excluded: Any) -> bool:
                 return True
         return False
     return False
+
+
+def deanon_source_match(
+    sc_match: Dict[str, Any],
+    pseudonymizer: Optional[Any],
+    needed_keys: Optional[set] = None,
+) -> Dict[str, Any]:
+    """#120 — SSoT : vue CLEARTEXT des valeurs d'un ``match`` SOURCE (anonymisé)
+    pour la comparaison avec un ``match`` LLM cleartext.
+
+    Dans le run copilot, les ``sheet_content`` du contexte sont anonymisés (le LLM
+    les lit tokenisés ``§…§``), mais le ``match`` émis par le LLM est déanonymisé
+    par ``_full_restore`` AVANT le dispatch → cleartext. Comparer les deux sans
+    réconcilier donne 0 hit SILENCIEUX (agrégat/somme/count faux). Ce helper est
+    partagé par ``_recompute_emit_tab`` ET les outils de pré-vol du LLM
+    (``_aggregate_core`` / ``_count_rows_core`` dans ``copilot_tools``) — single
+    source pour qu'un 4e site ne ré-introduise pas la classe de bug.
+
+    - ``deanonymize_text`` est idempotent sur du clair → sûr quand ``pseudonymizer``
+      est ``None`` (call-sites legacy) ou que la source est déjà en clair.
+    - ``needed_keys`` (clés effectivement présentes dans ``match``/``match_exclude``)
+      limite la déanonymisation aux 1-3 clés utiles dans le hot-loop (perf).
+    - **INVARIANT anti-fuite** : la valeur retournée sert UNIQUEMENT aux
+      comparaisons booléennes — on ne la renvoie JAMAIS au LLM (les samples /
+      diagnostics gardent la version anonymisée d'origine).
+    """
+    if pseudonymizer is None or not isinstance(sc_match, dict):
+        return sc_match
+    out: Dict[str, Any] = {}
+    for k, v in sc_match.items():
+        if isinstance(v, str) and (needed_keys is None or k in needed_keys):
+            out[k] = pseudonymizer.deanonymize_text(v)
+        else:
+            out[k] = v
+    return out
 
 
 def _evaluate_derived_formulas(
@@ -3744,23 +3894,31 @@ def _recompute_emit_tab(
         list_key_count = sum(1 for mv in match.values() if isinstance(mv, list) and len(mv) > 0)
         collect_samples = list_key_count >= 2
         samples: List[Dict[str, Any]] = []  # liste des sc_match matchés
+        # #120 — réconciliation cleartext (cf. ``deanon_source_match``) : le ``match``
+        # LLM est cleartext (post-_full_restore) mais ``sheet_content`` est anonymisé.
+        # On limite la déanonymisation aux clés effectivement comparées (perf hot-loop).
+        _needed_keys = set(match.keys()) | set(match_exclude.keys())
         for sc_cell in sheet_content:
             if not isinstance(sc_cell, dict):
                 continue
             sc_match = sc_cell.get("match")
             if not isinstance(sc_match, dict):
                 continue
+            # INVARIANT anti-fuite : ``sc_match`` (anonymisé) reste la source des
+            # ``samples``/diagnostics renvoyés au LLM — ``sc_match_cmp`` (cleartext)
+            # ne sert QU'aux comparaisons booléennes ci-dessous.
+            sc_match_cmp = deanon_source_match(sc_match, pseudonymizer, _needed_keys)
             all_match = True
             for mk, mv in match.items():
                 # mv peut être scalaire (égalité) ou liste (IN)
-                if not _emit_tab_match_value(sc_match.get(mk), mv):
+                if not _emit_tab_match_value(sc_match_cmp.get(mk), mv):
                     all_match = False
                     break
             if not all_match:
                 continue
             excluded = False
             for ek, evs in match_exclude.items():
-                if _emit_tab_in_excluded(sc_match.get(ek), evs):
+                if _emit_tab_in_excluded(sc_match_cmp.get(ek), evs):
                     excluded = True
                     break
             if excluded:
@@ -3791,7 +3949,12 @@ def _recompute_emit_tab(
             # "contaminantes" arrivent plus tard dans sheet_content.
             if collect_samples and len(samples) < 10:
                 projected = {mk: sc_match.get(mk) for mk in match.keys()}
-                projected["_value"] = val
+                # #135 (résidu adversarial) — ÉCHO la valeur SOURCE BRUTE (token
+                # ``§…§`` si l'utilisateur a anonymisé ce nombre via add_mapping),
+                # PAS ``val`` qui est le float déanonymisé par ``coerce_to_numeric``.
+                # Le float ne sert qu'à ``total`` ; l'échantillon part au LLM et ne
+                # doit jamais exposer un nombre que l'utilisateur a masqué.
+                projected["_value"] = sc_cell.get("value")
                 samples.append(projected)
 
         # [DEBUG TEMPORAIRE 2026-04-27] Trace par cellule des paramètres
@@ -3890,8 +4053,28 @@ def _recompute_emit_tab(
             else:
                 bucket["cell_keys"].append(cell_key)
         for bucket in groups.values():
+            # #135 — le ``match`` du LLM est cleartext (post-_full_restore). Avant de
+            # le diagnostiquer ET de le ré-écho au LLM, on le RE-TOKENISE :
+            #  (1) le diagnostic compare alors token↔token contre la source anonymisée
+            #      (sinon "DUPONT" vs "§TXT§" → diagnostics « valeur absente » FAUX) ;
+            #  (2) on n'expose JAMAIS de cleartext au LLM (le tool_result n'est pas
+            #      ré-anonymisé en aval — cf. copilot_agent : pas de re-anon des
+            #      résultats mid-loop). ``anonymize`` est déterministe → re-tokenise
+            #      ``DUPONT`` vers SON token d'origine ``§TXT§``.
+            try:
+                m_anon = (
+                    pseudonymizer.anonymize(bucket["match"])
+                    if pseudonymizer is not None
+                    else bucket["match"]
+                )
+            except RuntimeError:
+                # #135 (résidu adversarial) — fail-closed : ``anonymize`` peut lever
+                # (cas Unicode non normalisable) avec le cleartext dans le message.
+                # Un hint est non-essentiel → on DROP ce groupe plutôt que de laisser
+                # l'exception (et son cleartext) remonter au tool_result du LLM.
+                continue
             errs = _diagnose_no_source(
-                bucket["match"],
+                m_anon,
                 tabs_context,
                 bucket["source_tab_index_hint"],
             )
@@ -3900,7 +4083,7 @@ def _recompute_emit_tab(
                 # incompatible / col_distinct absent) — pas de faux positif
             cell_keys = bucket["cell_keys"]
             hint: Dict[str, Any] = {
-                "match": bucket["match"],
+                "match": m_anon,
                 "affected_cells_count": len(cell_keys),
                 "affected_cell_keys": cell_keys[:5],
                 "errors": errs,
@@ -3938,9 +4121,23 @@ def _recompute_emit_tab(
             else:
                 bucket["cell_keys"].append(cell_key)
         for bucket in cp_groups.values():
+            # #135 — re-tokenise le ``match`` LLM (cleartext post-_full_restore) avant
+            # de le renvoyer au LLM : anti-fuite (le tool_result n'est pas ré-anonymisé
+            # en aval). ``sample_matched_rows`` reste tel quel (déjà anonymisé, source).
+            try:
+                m_anon = (
+                    pseudonymizer.anonymize(bucket["match"])
+                    if pseudonymizer is not None
+                    else bucket["match"]
+                )
+            except RuntimeError:
+                # fail-closed : ``anonymize`` peut lever avec le cleartext en message
+                # (cas Unicode non normalisable) → on DROP le sample plutôt que de
+                # risquer une fuite via une exception remontée au tool_result du LLM.
+                continue
             cross_product_samples.append(
                 {
-                    "match": bucket["match"],
+                    "match": m_anon,
                     "hit_count": bucket["hit_count"],
                     "affected_cells_count": len(bucket["cell_keys"]),
                     "affected_cell_keys": bucket["cell_keys"][:5],
@@ -4130,7 +4327,11 @@ def _user_wants_reuse(instruction: str) -> bool:
 _MAX_SUBSTITUTIONS = 100
 _MAX_VALUE_SOURCE_TABS = 20
 _MAX_EXCLUDES = 50
-_MAX_EXCLUDE_VALUES = 100
+# #60 review (Faible) — relevé 100 → 500 : une liste d'exclusion métier légitime
+# (ex. « exclure ces 200 dossiers ») dépassait routinièrement 100. Les valeurs
+# servent d'ensemble d'appartenance (lookup O(1), cf. l.470 « exclusion sets »),
+# donc linéaire en mémoire, pas combinatoire — 500 reste largement borné.
+_MAX_EXCLUDE_VALUES = 500
 
 
 def _clean_clone_sheet_fields(
@@ -4153,10 +4354,21 @@ def _clean_clone_sheet_fields(
     """
     max_tab_idx = (len(tabs_context) - 1) if tabs_context else -1
 
+    # #60 — les 4 caps ci-dessous tronquaient EN SILENCE : une feuille clonée
+    # partait avec des substitutions/exclusions amputées sans aucun message.
+    # On collecte des notes alimentant le canal ``warnings`` (consommé par le
+    # front en bout de chaîne).
+    _trunc_notes: List[str] = []
+
     # substitutions — liste de {old, new}, tronquée à _MAX_SUBSTITUTIONS
     subs_raw = raw_plan.get("substitutions", [])
     if not isinstance(subs_raw, list):
         subs_raw = []
+    if len(subs_raw) > _MAX_SUBSTITUTIONS:
+        _trunc_notes.append(
+            f"{len(subs_raw) - _MAX_SUBSTITUTIONS} substitution(s) au-delà de "
+            f"{_MAX_SUBSTITUTIONS} ignorée(s) — clone partiel."
+        )
     clean_subs: List[Dict[str, str]] = []
     for s in subs_raw[:_MAX_SUBSTITUTIONS]:
         if not isinstance(s, dict):
@@ -4173,6 +4385,11 @@ def _clean_clone_sheet_fields(
     vst_raw = raw_plan.get("value_source_tabs") or []
     if not isinstance(vst_raw, list):
         vst_raw = []
+    if len(vst_raw) > _MAX_VALUE_SOURCE_TABS:
+        _trunc_notes.append(
+            f"{len(vst_raw) - _MAX_VALUE_SOURCE_TABS} onglet(s) source de valeurs "
+            f"au-delà de {_MAX_VALUE_SOURCE_TABS} ignoré(s)."
+        )
     value_src_tabs = [
         i
         for i in vst_raw[:_MAX_VALUE_SOURCE_TABS]
@@ -4186,6 +4403,15 @@ def _clean_clone_sheet_fields(
     excludes_raw = raw_plan.get("excludes") or []
     clean_excludes: List[Dict[str, Any]] = []
     if isinstance(excludes_raw, list):
+        if len(excludes_raw) > _MAX_EXCLUDES:
+            _trunc_notes.append(
+                f"{len(excludes_raw) - _MAX_EXCLUDES} règle(s) d'exclusion "
+                f"au-delà de {_MAX_EXCLUDES} ignorée(s) — clone partiel."
+            )
+        # #60 review (Moyen) — on AGRÈGE les colonnes dont les valeurs débordent
+        # en UNE note bornée (sinon jusqu'à 50 notes, dont une seule est rendue
+        # par le front warnings[0]).
+        _value_overflow_cols: List[str] = []
         for ex in excludes_raw[:_MAX_EXCLUDES]:
             if not isinstance(ex, dict):
                 continue
@@ -4195,12 +4421,23 @@ def _clean_clone_sheet_fields(
                 continue
             if not isinstance(vals, list) or not vals:
                 continue
+            if len(vals) > _MAX_EXCLUDE_VALUES:
+                _value_overflow_cols.append(col.strip())
             clean_vals = [
                 str(v) for v in vals[:_MAX_EXCLUDE_VALUES] if v is not None and str(v).strip()
             ]
             if not clean_vals:
                 continue
             clean_excludes.append({"column": col.strip(), "values": clean_vals})
+        if _value_overflow_cols:
+            _shown = ", ".join(_value_overflow_cols[:5]) + (
+                "…" if len(_value_overflow_cols) > 5 else ""
+            )
+            _trunc_notes.append(
+                f"{len(_value_overflow_cols)} colonne(s) d'exclusion limitée(s) à "
+                f"{_MAX_EXCLUDE_VALUES} valeurs ({_shown}) — des lignes censées être "
+                "exclues pourraient rester."
+            )
 
     # target_labels — facultatif, mais propagé si présent (pour le lookup)
     tl_raw = raw_plan.get("target_labels")
@@ -4216,6 +4453,8 @@ def _clean_clone_sheet_fields(
         "new_tab": new_tab,
         "excludes": clean_excludes,
         "target_labels": target_labels,
+        # #60 — notes de troncature à déverser dans ``warnings`` par les callers.
+        "_truncation_notes": _trunc_notes,
     }
 
 
@@ -4660,7 +4899,6 @@ def _extract_json_blocks(text: str) -> list[dict]:
     return blocks
 
 
-
 def _validate_plan(
     plan: Optional[Dict[str, Any]], tabs_context: Optional[List]
 ) -> Optional[Dict[str, Any]]:
@@ -4755,10 +4993,17 @@ def _build_planning_context(
             if cols_str:
                 line += f"\n  Colonnes : {cols_str}"
             if tab_sql:
-                snippet = tab_sql[:200].replace("\n", " ")
-                if len(tab_sql) > 200:
-                    snippet += "..."
-                line += f"\n  SQL : `{snippet}`"
+                # #73-bis (confidentialité) — on NE met PLUS l'aperçu `tab_sql[:200]`
+                # du SQL BRUT dans ce contexte « léger ». Cet aperçu partait au LLM
+                # PUIS était anonymisé (via _call_llm_anon au call-site) : une coupe
+                # scindant un literal de chaîne ('...') faisait fuiter le préfixe
+                # RÉEL d'un pseudonyme configuré (le Pseudonymizer matche le terme
+                # COMPLET). Une coupe « à la frontière de literal » par comptage de
+                # « ' » est INFIABLE — les apostrophes de commentaires/identifiants
+                # T-SQL faussent la parité (review adversariale → fuite démontrée).
+                # Le label + les colonnes suffisent au plan ; on signale seulement
+                # que l'onglet est adossé à une requête (aucun contenu SQL exposé).
+                line += "\n  (onglet adossé à une requête SQL)"
             # Sibling sheet content (JSON summary)
             sibling = tab.get("sheet_content")
             if not is_active and not tab_sql and sibling:
@@ -4882,21 +5127,11 @@ def _build_execution_context(
                             lines.append(f"{col_name}: {vals_str}{suffix}")
                     if lines:
                         entry += "\n**Aperçu** :\n" + "\n".join(lines)
-                # Fallback: sample_rows if col_distinct absent
+                # Fallback: sample_rows if col_distinct absent. #90 — marqueurs
+                # de coupe colonnes/cellules via le helper SSoT.
                 sample = tab.get("sample_rows")
                 if not col_distinct and sample and isinstance(sample, list) and len(sample) > 0:
-                    first = sample[0]
-                    if isinstance(first, dict):
-                        keys = list(first.keys())[:8]
-                        hdr = " | ".join(keys)
-                        rows_lines = [
-                            " | ".join(
-                                str(row.get(k, ""))[:20] if row.get(k) is not None else ""
-                                for k in keys
-                            )
-                            for row in sample
-                        ]
-                        entry += f"\n**Aperçu** :\n{hdr}\n" + "\n".join(rows_lines)
+                    entry += _build_sample_rows_preview(sample)
                 # Sibling sheet content — inclut aussi les onglets SQL (rows
                 # aplaties avec match dans _getTabsContext côté frontend), pour que
                 # Call 2 puisse générer emit_tab.cellDetails[R,C].match correctement.
@@ -4914,6 +5149,15 @@ def _build_execution_context(
                 dv_lines = []
                 for col_name, values in distinct_values.items():
                     vals_str = ", ".join(f"'{v}'" for v in values[:15])
+                    # #18f (verdict #59) — sans marqueur, le LLM prend la
+                    # liste pour exhaustive (IN-lists/CASE qui omettent des
+                    # valeurs → agrégats partiels écrits dans la grille).
+                    # ``values`` est déjà pré-cappé à 30 par le producteur :
+                    # à >=30, la vraie cardinalité est inconnue → le dire.
+                    if len(values) >= 30:
+                        vals_str += ", … (liste NON exhaustive)"
+                    elif len(values) > 15:
+                        vals_str += f", … (+{len(values) - 15} autres)"
                     dv_lines.append(f"- **{col_name}** : [{vals_str}]")
                 tab_parts.append(
                     "### Valeurs distinctes des colonnes de dimension\n" + "\n".join(dv_lines)
@@ -5116,20 +5360,11 @@ async def modify_result(
                         lines.append(f"{col_name}: {vals_str}{suffix}")
                 if lines:
                     entry += "\n**Aperçu** :\n" + "\n".join(lines)
-            # Fallback: ancien format sample_rows si col_distinct absent
+            # Fallback: ancien format sample_rows si col_distinct absent. #90 —
+            # marqueurs de coupe colonnes/cellules via le helper SSoT.
             sample = tab.get("sample_rows")
             if not col_distinct and sample and isinstance(sample, list) and len(sample) > 0:
-                first = sample[0]
-                if isinstance(first, dict):
-                    keys = list(first.keys())[:8]
-                    hdr = " | ".join(keys)
-                    rows_lines = [
-                        " | ".join(
-                            str(row.get(k, ""))[:20] if row.get(k) is not None else "" for k in keys
-                        )
-                        for row in sample
-                    ]
-                    entry += f"\n**Aperçu** :\n{hdr}\n" + "\n".join(rows_lines)
+                entry += _build_sample_rows_preview(sample)
             # Feuilles sœurs : même format JSON que la feuille active
             sibling = tab.get("sheet_content")
             if not is_active and not tab_sql and sibling:
@@ -5143,6 +5378,11 @@ async def modify_result(
             dv_lines = []
             for col_name, values in distinct_values.items():
                 vals_str = ", ".join(f"'{v}'" for v in values[:15])
+                # #18f (verdict #59) — même marqueur que le site jumeau.
+                if len(values) >= 30:
+                    vals_str += ", … (liste NON exhaustive)"
+                elif len(values) > 15:
+                    vals_str += f", … (+{len(values) - 15} autres)"
                 dv_lines.append(f"- **{col_name}** : [{vals_str}]")
             tab_parts.append(
                 "### Valeurs distinctes des colonnes de dimension\n" + "\n".join(dv_lines)
@@ -6288,17 +6528,43 @@ async def modify_result(
                 async def _fetch_detail(rc, det_sql, lbl):
                     try:
                         async with sem:
-                            det_result = await connector.execute(det_sql, max_rows=_DETAIL_MAX_ROWS)
+                            # #58 — BUG : ``max_rows=_DETAIL_MAX_ROWS`` (=0) faisait
+                            # lever ``ValueError`` au connecteur (max_rows < 1) →
+                            # CHAQUE detail échouait en silence (drill-down mort).
+                            # ``None`` = « pas de cap caller » → le connecteur
+                            # applique self.max_rows (cap admin /admin/database,
+                            # SSoT). ``_DETAIL_MAX_ROWS=0`` reste correct UNIQUEMENT
+                            # pour _make_detail_sql (0 = pas de clause TOP).
+                            det_result = await connector.execute(det_sql, max_rows=None)
                         local_detail_ms_parts.append(det_result.execution_time_ms or 0)
+                        _det_truncated = bool(getattr(det_result, "truncated", False))
+                        # #58 — si le détail est plafonné au cap admin, le signaler
+                        # DANS la description (champ déjà rendu par la grille au
+                        # niveau 9139) — sinon un détail partiel paraît complet
+                        # (donnée fausse silencieuse). On passe par le canal
+                        # consommé existant plutôt qu'un flag inerte côté front.
+                        _det_desc = lbl
+                        if _det_truncated:
+                            _det_desc = (
+                                f"{lbl} — ⚠ détail LIMITÉ au cap admin "
+                                f"({det_result.row_count} lignes) : partiel, pas exhaustif"
+                            )
                         rc["detail"] = {
                             "sql": det_sql,
                             "columns": det_result.columns,
                             "rows": [list(r) for r in det_result.rows],
                             "row_count": det_result.row_count,
-                            "description": lbl,
+                            "description": _det_desc,
+                            "truncated": _det_truncated,
                         }
                     except Exception as det_exc:
-                        logger.debug("fill_sql detail failed: %s", det_exc)
+                        # #58 — observabilité ADMIN (warning loggé) : le drill-down
+                        # qui échoue n'est plus invisible côté serveur. ``detail_error``
+                        # est sérialisé dans la cellule comme métadonnée honnête ;
+                        # son rendu USER (tooltip/affordance dans la grille) est un
+                        # follow-up front (iris-grid.js, hors scope ici).
+                        logger.warning("fill_sql detail failed: %s", det_exc)
+                        rc["detail_error"] = str(det_exc).split("\n")[0]
 
                 await asyncio.gather(
                     *[_fetch_detail(rc, ds, lb) for rc, ds, lb in detail_tasks],
@@ -6533,13 +6799,28 @@ async def modify_result(
         if not all_cells:
             return {"error": "fill_plan: aucune cellule générée."}
 
-        # Cap at 500 cells
+        # #18d (triage caps 2026-06-10) — le cap est un garde-fou de taille,
+        # mais un plan de REMPLISSAGE tronqué écrit un classeur PARTIEL :
+        # avant, 800 cellules → 500 écrites sans aucun signal (donnée fausse
+        # silencieuse dans le classeur de l'utilisateur). On borne toujours,
+        # mais en le DISANT dans le plan ET sa description (affichée par le
+        # front qui applique les cells).
+        total_cells = len(all_cells)
+        truncated = total_cells > 500
         all_cells = all_cells[:500]
+        if truncated:
+            description = (
+                f"{description} — ⚠ PLAN TRONQUÉ : {len(all_cells)} cellules "
+                f"écrites sur {total_cells} générées. Le remplissage est "
+                "PARTIEL ; affinez la sélection ou procédez par zones."
+            )
 
         return {
             "type": "fill",
             "description": description,
             "cells": all_cells,
+            "truncated": truncated,
+            "total_cells": total_cells,
         }
 
     elif result_type == "display":
@@ -6580,6 +6861,17 @@ async def modify_result(
         # alors que source_tabs liste des onglets → on interprète source_tabs
         # comme une intention de lookup et on s'en sert.
         warnings: list[str] = []
+        # #60 — surfacer les troncatures silencieuses (substitutions/exclusions
+        # amputées) dans le canal warnings consommé. IMPORTANT (review) : sur le
+        # chemin 2-call, `parsed` est le plan DÉJÀ validé/tronqué (Call 1), donc
+        # le re-clean ci-dessus ne re-détecte AUCUN dépassement (listes ≤ cap) →
+        # les notes correctes vivent dans `parsed["_truncation_notes"]` (posées
+        # au Call 1 via validated.update). Sur le chemin single-call fallback,
+        # `parsed` est la réponse LLM brute (pas de clé) → on retombe sur le
+        # re-clean `cleaned` qui les calcule à partir du brut. `or` couvre les 2.
+        warnings.extend(
+            parsed.get("_truncation_notes") or cleaned.get("_truncation_notes", [])
+        )
         if not value_src_tabs:
             raw_source_tabs = parsed.get("source_tabs") or []
             fallback_src = [
@@ -6706,8 +6998,33 @@ async def modify_result(
         err = _validate_emit_tab(parsed, tabs_context)
         if err:
             return err
+        # BF2b (defense-in-depth, hunt it.49) : passer un pseudonymizer user-scoped au
+        # recompute pour que les ``no_source_hints`` (cf. BF2 it.50) soient anonymisés MÊME
+        # si le gate handler ``ANON_BLOCKS_AUTOFILL`` (409) venait à être retiré un jour.
+        # Aujourd'hui ce chemin single-shot est gardé par le 409 (0 terme actif) →
+        # ``_load_user_pseudonymizer`` renvoie un pseudonymizer VIDE → ``anonymize`` /
+        # ``deanonymize`` sont des NO-OPS → 0 changement de comportement (hints identiques).
+        # Fail-safe : ``None`` si le chargement échoue → dégrade au comportement actuel (le
+        # gate protège). Aligné CLAUDE.md anti-bâclage #4 (defense-in-depth à chaque couche)
+        # + parité ``copilot_tools.py`` qui passe déjà ``pseudonymizer=ctx._pseudonymizer``.
+        # Chargé AVANT le timer pour ne pas gonfler ``recompute_ms`` (mesure le recompute).
+        _recompute_pseudo = None
+        if user_id is not None:
+            try:
+                from app.services.anonymization.proxy import _load_user_pseudonymizer
+
+                _recompute_pseudo = await _load_user_pseudonymizer(user_id)
+            except Exception as exc:  # noqa: BLE001 — fail-safe : dégrade au comportement actuel
+                # Observabilité (review BF2b) : un échec PERSISTANT de chargement rabaisserait
+                # silencieusement la defense-in-depth au gate-only — on le trace en debug.
+                logger.debug(
+                    "BF2b: _load_user_pseudonymizer échec user=%s, dégrade gate-only (%s)",
+                    user_id,
+                    exc,
+                )
+                _recompute_pseudo = None
         recompute_start = time.monotonic()
-        parsed = _recompute_emit_tab(parsed, tabs_context)
+        parsed = _recompute_emit_tab(parsed, tabs_context, pseudonymizer=_recompute_pseudo)
         recompute_ms = round((time.monotonic() - recompute_start) * 1000)
 
         new_tab_flag = parsed.get("new_tab")
@@ -6717,7 +7034,7 @@ async def modify_result(
 
         total_ms = round((time.monotonic() - t_start) * 1000)
         recompute_metrics = parsed.get("_recompute_metrics") or {}
-        return {
+        _emit_result: Dict[str, Any] = {
             "type": "emit_tab",
             "description": description,
             "tab": parsed["tab"],
@@ -6731,6 +7048,29 @@ async def modify_result(
                 "no_source": recompute_metrics.get("no_source", 0),
             },
         }
+        # FIX (hunt it.49, BF2 HIGH) : exposer au LLM les DIAGNOSTICS des cellules
+        # ``no_source`` (`no_source_hints`). Sans eux, le tool_result donnait
+        # « no_source: N » SANS le POURQUOI (clé absente de tous les onglets, valeur
+        # hors col_distinct, type incompatible…) → le LLM ne pouvait NI se corriger NI
+        # appeler ask_iris() → cellules silencieusement vides.
+        # CONFIDENTIALITÉ (vérifié review it.50, exposition nette = ZÉRO) : les hints
+        # dérivent UNIQUEMENT du ``tabs_context`` (col_distinct + noms de colonnes) DÉJÀ
+        # présent dans le prompt envoyé au LLM — aucune lecture de rows bruts. Deux chemins :
+        #   • copilot tool-loop → tabs_context ANONYMISÉ (handle_emit_tab/copilot_tools,
+        #     ``_recompute_emit_tab(..., pseudonymizer=...)``) → hints anonymisés ;
+        #   • auto-fill single-shot (CE chemin) : DOUBLE protection — (1) le handler
+        #     fail-close 409 ``ANON_BLOCKS_AUTOFILL`` REFUSE l'auto-fill dès qu'un terme
+        #     /data-privacy est actif (1ʳᵉ ligne, le prompt sortant porte déjà ces
+        #     col_distinct en clair → parité prompt↔hint) ; (2) BF2b (it.57) : ``_recompute``
+        #     reçoit désormais un pseudonymizer user-scoped (``_load_user_pseudonymizer``) →
+        #     si le gate 409 disparaissait un jour ET qu'un terme était actif, les hints
+        #     seraient ANONYMISÉS au lieu de fuiter (defense-in-depth, no-op aujourd'hui car
+        #     0 terme actif sous le gate). Cappé à 20.
+        # On ne les inclut que s'il y en a (résultat propre = pas de bruit).
+        _ns_hints = recompute_metrics.get("no_source_hints") or []
+        if _ns_hints:
+            _emit_result["no_source_hints"] = _ns_hints
+        return _emit_result
 
     return {"error": f"Type de modification inconnu : {result_type}"}
 

@@ -83,13 +83,129 @@ var SqlResultGrid = (function() {
         return String(a).localeCompare(String(b), 'fr', { sensitivity: 'base' });
     }
 
+    // Embellisseur SQL pour l'AFFICHAGE (panneau « Requête SQL exécutée »,
+    // éditeur, etc.). CRITICAL : la sortie doit rester du SQL SÉMANTIQUEMENT
+    // IDENTIQUE à l'entrée — l'utilisateur copie ce texte pour le ré-exécuter
+    // (datastore / "Modifier & réexécuter" / "Enregistrer cette requête").
+    //
+    // On ne reflow QUE le « code ». Le contenu des string literals ('...'),
+    // des identifiants quotés ("..." / [...]) et des commentaires (-- / /* */)
+    // est émis VERBATIM. Sans cette protection, l'ancienne version (regex
+    // globale `\s+`→' ' puis `\n` devant chaque mot-clé) cassait deux choses :
+    //   1) un mot-clé DANS un commentaire `--` (ex: le `ORDER BY` de
+    //      « STRING_AGG(...) WITHIN GROUP (ORDER BY ...) ») recevait un `\n`
+    //      devant → le reste du commentaire passait à la ligne SANS `--` →
+    //      devenait du SQL vivant → « Incorrect syntax near 'ORDER' » à la
+    //      copie (incident dashboard 2026-06-09).
+    //   2) un mot-clé DANS un string literal (`WHERE x = 'ORDER 2024'`) était
+    //      coupé par un `\n`, et les espaces multiples d'un littéral écrasés
+    //      → valeur de la chaîne MODIFIÉE silencieusement → résultats faux.
+    //
+    // Règle de jointure : un commentaire de ligne `--` DOIT être suivi d'un
+    // `\n`, sinon le token suivant se retrouverait commenté.
     function formatSql(sql) {
         if (!sql) return sql;
-        var s = sql.replace(/\s+/g, ' ').trim();
-        s = s.replace(/\b(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|EXCEPT|INTERSECT|WITH)\b/gi, '\n$1');
-        s = s.replace(/\b(LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|OUTER\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|JOIN)\b/gi, '\n    $1');
-        s = s.replace(/\b(AND|OR)\b/gi, '\n        $1');
-        return s.trim();
+
+        // ── 1) Tokenisation : code | protected (string/ident/bloc) | linecomment ──
+        var tokens = [];
+        var i = 0, n = sql.length, buf = '';
+        function flush() { if (buf) { tokens.push({ kind: 'code', text: buf }); buf = ''; } }
+        while (i < n) {
+            var ch = sql.charAt(i);
+            var two = sql.substr(i, 2);
+            if (ch === "'") {
+                // String literal, échappement SQL standard '' (apostrophe doublée).
+                flush();
+                var js = i + 1;
+                while (js < n) {
+                    if (sql.charAt(js) === "'") {
+                        if (sql.charAt(js + 1) === "'") { js += 2; continue; }
+                        js++; break;
+                    }
+                    js++;
+                }
+                tokens.push({ kind: 'protected', text: sql.slice(i, js) });
+                i = js;
+            } else if (ch === '"' || ch === '[') {
+                // Identifiant quoté SQL Server : "..." ou [...].
+                // Escape T-SQL : le caractère de fermeture DOUBLÉ est littéral
+                // (`]]` dans [...], `""` dans "...") → on saute la paire et on
+                // continue, sinon `[col]]with]]bracket]` serait tronqué au 1er ].
+                flush();
+                var close = (ch === '"') ? '"' : ']';
+                var ji = i + 1;
+                while (ji < n) {
+                    if (sql.charAt(ji) === close) {
+                        if (sql.charAt(ji + 1) === close) { ji += 2; continue; }
+                        ji++; break;
+                    }
+                    ji++;
+                }
+                tokens.push({ kind: 'protected', text: sql.slice(i, ji) });
+                i = ji;
+            } else if (two === '--') {
+                // Commentaire de ligne — jusqu'au \n (exclu, normalisé ensuite).
+                flush();
+                var jc = i + 2;
+                while (jc < n && sql.charAt(jc) !== '\n') jc++;
+                tokens.push({ kind: 'linecomment', text: sql.slice(i, jc) });
+                i = jc;
+            } else if (two === '/*') {
+                // Commentaire bloc — T-SQL autorise l'IMBRICATION (`/* /* */ */`) :
+                // chaque `/*` incrémente, chaque `*/` décrémente. Un indexOf('*/')
+                // simple fermerait au 1er `*/` → laisserait du « code » mort en
+                // SQL vivant. On compte donc la profondeur.
+                flush();
+                var depth = 1, jb = i + 2;
+                while (jb < n && depth > 0) {
+                    var p = sql.substr(jb, 2);
+                    if (p === '/*') { depth++; jb += 2; }
+                    else if (p === '*/') { depth--; jb += 2; }
+                    else jb++;
+                }
+                // jb pointe après le `*/` correspondant (ou n si non fermé).
+                tokens.push({ kind: 'protected', text: sql.slice(i, jb) });
+                i = jb;
+            } else {
+                buf += ch; i++;
+            }
+        }
+        flush();
+
+        // ── 2) Reflow du CODE uniquement (mêmes règles qu'avant) ──
+        // Le nettoyage cosmétique (espaces avant un \n) est fait ICI, sur le
+        // code SEUL — JAMAIS sur l'output réassemblé : sinon il rognerait les
+        // espaces/sauts de ligne À L'INTÉRIEUR d'un string literal ou d'un
+        // commentaire (ex: 'a\n\n\nb' ou 'fin  \nsuite') = donnée fausse
+        // silencieuse (bug trouvé en revue adversariale 2026-06-09).
+        function beautify(s) {
+            s = s.replace(/\s+/g, ' ');
+            s = s.replace(/\b(SELECT|FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|UNION|EXCEPT|INTERSECT|WITH)\b/gi, '\n$1');
+            s = s.replace(/\b(LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|OUTER\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|JOIN)\b/gi, '\n    $1');
+            s = s.replace(/\b(AND|OR)\b/gi, '\n        $1');
+            s = s.replace(/[ \t]+\n/g, '\n');
+            return s;
+        }
+
+        // ── 3) Réassemblage : protected/linecomment verbatim ──
+        var out = '';
+        for (var k = 0; k < tokens.length; k++) {
+            var t = tokens[k];
+            if (t.kind === 'code') {
+                out += beautify(t.text);
+            } else if (t.kind === 'linecomment') {
+                if (out.length && !/\s$/.test(out)) out += ' ';
+                out += t.text;
+                if (k < tokens.length - 1) out += '\n'; // un `--` DOIT être suivi d'un \n
+            } else {
+                out += t.text; // string / identifiant / commentaire bloc : intacts
+            }
+        }
+        // PAS de post-traitement regex sur `out` ici : il toucherait le contenu
+        // des tokens protégés. `trim()` ne rogne que les bords (whitespace de
+        // formatage hors token, ou espaces d'un commentaire de fin — sans effet
+        // sur l'exécution).
+        return out.trim();
     }
 
     function csvEscape(val) {
@@ -221,6 +337,81 @@ var SqlResultGrid = (function() {
             if (c.indexOf(name) === 0) return c.substring(name.length);
         }
         return '';
+    }
+
+    /**
+     * Compresse une string JSON en Blob gzip via ``CompressionStream`` pour
+     * réduire ~20× le payload sur le réseau. Les ``.afz.json`` sont DÉJÀ
+     * stockés gzippés côté serveur (``datastore.py`` gzip niveau 6) — le
+     * handler d'upload détecte les magic bytes ``0x1f 0x8b`` et décompresse de
+     * façon transparente à la réception, donc l'envoi compressé est lossless
+     * et passe sous le cap nginx ``client_max_body_size`` sans rien gonfler.
+     *
+     * Retourne une ``Promise<Blob|null>`` — ``null`` si ``CompressionStream``
+     * (ou ``Blob.prototype.stream``) est indisponible (vieux navigateur) ou en
+     * cas d'échec : le caller retombe alors sur l'upload BRUT (aucune
+     * régression, le serveur accepte les deux formats). Ne throw jamais.
+     */
+    function _gzipStringToBlob(jsonString) {
+        try {
+            if (typeof CompressionStream === 'undefined'
+                || typeof Response === 'undefined'
+                || typeof Blob === 'undefined') {
+                return Promise.resolve(null);
+            }
+            var inputBlob = new Blob([jsonString], { type: 'application/json' });
+            if (typeof inputBlob.stream !== 'function') {
+                return Promise.resolve(null);
+            }
+            var stream = inputBlob.stream().pipeThrough(new CompressionStream('gzip'));
+            return new Response(stream).blob().then(
+                function (gz) { return (gz && gz.size > 0) ? gz : null; },
+                function () { return null; }
+            );
+        } catch (e) {
+            return Promise.resolve(null);
+        }
+    }
+
+    /**
+     * Lecture SÛRE d'une réponse fetch JSON. Délègue au helper global
+     * ``window.komptiaReadJson`` (static/js/read-json.js, chargé en <head>).
+     * **Filet (fix L1)** : si ce helper n'a pas chargé (CSP, réseau, ad-blocker,
+     * ou un futur template qui n'étend pas base.html), on retombe sur une
+     * implémentation locale équivalente — sinon CHAQUE save planterait en
+     * ``komptiaReadJson is not a function`` (pire que le bug d'origine). Ne
+     * throw jamais ; même contrat de retour que le helper global.
+     */
+    function _readJsonSafe(resp) {
+        if (typeof window !== 'undefined' && typeof window.komptiaReadJson === 'function') {
+            return window.komptiaReadJson(resp);
+        }
+        if (!resp || typeof resp.text !== 'function') {
+            return Promise.resolve({
+                ok: false, status: (resp && resp.status) || 0, data: null,
+                error: 'Réponse réseau invalide.', errorCode: null,
+                isHtmlError: false, tooLarge: false, rawText: ''
+            });
+        }
+        return resp.text().then(function (t) {
+            var d = null;
+            try { d = t ? JSON.parse(t) : null; } catch (e) { d = null; }
+            var hasFields = d && typeof d === 'object';
+            return {
+                ok: !!resp.ok, status: resp.status || 0, data: d,
+                error: resp.ok ? null : ((hasFields && d.error) || 'Erreur (' + (resp.status || 0) + ').'),
+                errorCode: (hasFields && d.error_code) || null,
+                isHtmlError: false,
+                tooLarge: resp.status === 413,
+                rawText: t || ''
+            };
+        }, function () {
+            return {
+                ok: false, status: resp.status || 0, data: null,
+                error: 'Lecture de la réponse impossible.', errorCode: null,
+                isHtmlError: false, tooLarge: resp.status === 413, rawText: ''
+            };
+        });
     }
 
     // ── Modal custom pour saisir le nom du fichier SQL ───────────────
@@ -489,18 +680,22 @@ var SqlResultGrid = (function() {
             'padding:1.25rem;box-sizing:border-box;';
 
         var title = document.createElement('h2');
-        title.textContent = filename
-            ? 'Modifier la requête SQL : ' + filename
-            : 'Modifier la requête SQL';
+        title.textContent = opts.title
+            ? String(opts.title)
+            : (filename
+                ? 'Modifier la requête SQL : ' + filename
+                : 'Modifier la requête SQL');
         title.title = title.textContent;
         title.style.cssText =
             'font-size:0.95rem;font-weight:600;color:var(--text-primary, #111827);' +
             'margin:0 0 0.25rem 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
 
         var sub = document.createElement('p');
-        sub.textContent = allowSave
-            ? 'Modifie la requête puis exécute-la, ou enregistre la version modifiée dans le datastore.'
-            : 'Modifie la requête puis exécute-la. La modification n\'est pas enregistrée.';
+        sub.textContent = opts.hint
+            ? String(opts.hint)
+            : (allowSave
+                ? 'Modifie la requête puis exécute-la, ou enregistre la version modifiée dans le datastore.'
+                : 'Modifie la requête puis exécute-la. La modification n\'est pas enregistrée.');
         sub.style.cssText =
             'font-size:0.75rem;color:var(--text-muted, #6b7280);margin:0 0 0.75rem 0;';
 
@@ -752,8 +947,8 @@ var SqlResultGrid = (function() {
                     try { console.error('[sql-editor] onSuccess threw:', e); } catch (_) {}
                     if (typeof window.showToast === 'function') {
                         window.showToast(
-                            'warning',
-                            'Requête exécutée, mais l\'affichage du résultat a échoué. Voir la console.'
+                            'Requête exécutée, mais l\'affichage du résultat a échoué. Voir la console.',
+                            'warning'
                         );
                     }
                 }
@@ -912,6 +1107,11 @@ var SqlResultGrid = (function() {
         this.isArrayFormat = this.allRows.length > 0 && Array.isArray(this.allRows[0]);
         this.columnMetadata = columnMetadata || null; // from /api/drilldown/analyze
         this._options = options || {}; // { onDrillResult, anonymizationState, onAnonymizationStateChange, ... }
+        // Provenance de la feuille (externalSource du tab, posée par addTab).
+        // Sert à distinguer une feuille SQL VIVANTE d'un SNAPSHOT importé
+        // (« Ajouter feuilles externes… ») qui transporte son SQL d'origine
+        // à titre de provenance — cf. _isImportedSnapshot.
+        this._externalSource = this._options.externalSource || null;
 
         // ── État d'anonymisation piloté par l'utilisateur (v2) ──
         // Source de vérité = BDD serveur (table ``anonymization_terms`` du
@@ -930,6 +1130,14 @@ var SqlResultGrid = (function() {
             : { version: 1, terms: {} };
         this._anonymizationFetchPromise = null;
         this._anonymizationFetched = !!this._options.anonymizationState;
+        // Timestamp du dernier échec réseau du fetch state (0 = aucun).
+        // Porte le backoff anti-tempête de _fetchAnonymizationState.
+        this._anonymizationFetchFailedAt = 0;
+        // Jeton de révision du verrou optimiste PUT (fix lost update
+        // 2026-06-10). null = pas encore connu → le premier PUT part en
+        // legacy last-writer-wins (fail-open assumé : sans GET préalable,
+        // il n'y a pas de base à protéger).
+        this._anonRevision = null;
         // Tokens nouveaux depuis le dernier "vu" = dernière ouverture du
         // panneau. Utilisé uniquement pour afficher le badge NOUVEAU et
         // trier le rendu — vidé à l'ouverture du panneau (l'user les voit).
@@ -1047,8 +1255,13 @@ var SqlResultGrid = (function() {
 
         this._build();
 
-        // Auto-analyze columns for drill-down if we have SQL with GROUP BY
-        if (this.sql && !this.columnMetadata && /GROUP\s+BY/i.test(this.sql)) {
+        // Auto-analyze columns for drill-down if we have SQL with GROUP BY.
+        // PAS pour une feuille importée (snapshot) : son SQL est une provenance,
+        // pas une requête vivante — l'analyse déclencherait un appel réseau
+        // inutile + ouvrirait le drill LIVE sur la BDD courante alors que les
+        // lignes affichées sont un instantané (données ≠ silencieusement).
+        if (this.sql && !this.columnMetadata && /GROUP\s+BY/i.test(this.sql)
+            && !this._isImportedSnapshot()) {
             this._fetchColumnMetadata();
         }
     }
@@ -1186,9 +1399,24 @@ var SqlResultGrid = (function() {
     //    sensé. Blank = pas de data → non sensé. Merges = casse le layout.
     //  - ``drill_down`` : uniquement si des cellDetails réels existent.
     //  - ``edit``, ``anon_menu``, ``copy``, ``export`` : OK partout.
+    // Feuille importée d'une source externe (« Ajouter feuilles externes… ») :
+    // les rows sont un SNAPSHOT du classeur/fichier source ; le sql transporté
+    // (préservé depuis 2026-06-11) n'est qu'une PROVENANCE, pas une requête
+    // vivante de cette feuille. NB : type 'sql_query' (onglet Requête SQL
+    // dashboard) = feuille vivante, PAS un snapshot.
+    SqlResultGrid.prototype._isImportedSnapshot = function() {
+        var src = this._externalSource;
+        return !!(src && (src.type === 'workbook'
+            || src.type === 'excel' || src.type === 'csv'));
+    };
+
     SqlResultGrid.prototype._sheetType = function() {
         if (this._isBlankSheet) return 'blank';
         if (this._isDashboardSheet) return 'dashboard';
+        // Snapshot importé : reste 'imported' même s'il transporte un SQL de
+        // provenance — sinon il serait classé feuille SQL vivante (drill live,
+        // réexécution) alors que ses lignes sont figées.
+        if (this._isImportedSnapshot()) return 'imported';
         if (this.sql) return 'sql';
         return 'imported';
     };
@@ -1376,8 +1604,25 @@ var SqlResultGrid = (function() {
             html = '<strong>' + total + '</strong> ligne(s)';
         }
         if (this._truncated) {
-            html += ' <span class="grid-truncated-badge" title="La requête a retourné plus de '
-                + total + ' lignes. Le résultat est limité.">⚠ limité</span>';
+            // Wording générique : ce badge sert aux résultats SQL ET aux
+            // aperçus de fichiers uploadés — « la requête » serait mensonger
+            // pour un fichier, et la source complète reste intacte dans les
+            // deux cas (cohérent avec le badge colonnes ci-dessous).
+            html += ' <span class="grid-truncated-badge" title="Plus de ' + total
+                + ' lignes au total — seul un aperçu est affiché ici, la source '
+                + 'complète reste intacte.">⚠ limité</span>';
+        }
+        // Troncation COLONNES (aperçu pièce jointe : cap serveur, ex. 50 cols).
+        // Sans ce badge, un fichier de 80 colonnes s'affiche avec 50 sans
+        // AUCUNE indication — données fausses silencieuses (doctrine Q5).
+        if (this._truncatedCols) {
+            var colShown = this.columns.length;
+            var colTitle = 'Aperçu limité aux ' + colShown + ' premières colonnes'
+                + (typeof this._truncatedColsTotal === 'number'
+                    ? ' sur ' + this._truncatedColsTotal : '')
+                + '. Le fichier complet reste intact.';
+            html += ' <span class="grid-truncated-badge" title="' + colTitle
+                + '">⚠ colonnes limitées</span>';
         }
         if (this._merges && this._merges.length > 0) {
             html += ' <span class="grid-merges-badge" title="Tri, filtre et réorganisation des colonnes désactivés tant que des cellules sont fusionnées.">'
@@ -1566,21 +1811,60 @@ var SqlResultGrid = (function() {
         this.container.appendChild(wrapper);
         this.wrapperEl = wrapper;
 
-        // Scroll activé uniquement au clic (évite de capturer le scroll du chat)
+        // Scroll activé uniquement au clic (évite de capturer le scroll du chat).
+        // Affordance : sans indication, l'utilisateur croit que les lignes
+        // sous le pli n'existent pas (bug vécu 2026-06-11 : « il manque des
+        // lignes de mon fichier » sur un aperçu 714 lignes coupé à ~18).
+        // Tooltip natif au survol prolongé (doctrine axe 4) + aria-label
+        // (title n'est ni focusable ni tactile) + fade bas via .has-overflow.
+        // Wording NEUTRE : pas de promesse « toutes les lignes sont chargées »
+        // (faux pour les aperçus tronqués au cap serveur — la complétude est
+        // l'affaire du header info + badges ⚠, single source of truth).
+        var SCROLL_HINT = 'Cliquer dans le tableau pour activer le défilement';
+        wrapper.title = SCROLL_HINT;
+        wrapper.setAttribute('aria-label', SCROLL_HINT);
         wrapper.addEventListener('click', function() {
             if (!wrapper.classList.contains('scroll-active')) {
                 wrapper.classList.add('scroll-active');
+                wrapper.title = '';
             }
         });
-        // Désactiver quand on clique en dehors
-        document.addEventListener('click', function(e) {
+        // Désactiver quand on clique en dehors. Handler STOCKÉ sur l'instance
+        // (T12c) : avant, ce listener ``document`` anonyme était ré-ajouté à
+        // CHAQUE ``_buildTable`` (switch d'onglet, rebuild) sans retirer le
+        // précédent → accumulation intra-grille. On retire l'ancien avant de
+        // ré-attacher, et ``destroy()`` le retire en fin de vie.
+        if (this._scrollDeactivateHandler) {
+            document.removeEventListener('click', this._scrollDeactivateHandler);
+        }
+        this._scrollDeactivateHandler = function(e) {
             if (!wrapper.contains(e.target) && wrapper.classList.contains('scroll-active')) {
                 wrapper.classList.remove('scroll-active');
+                wrapper.title = SCROLL_HINT;
             }
-        });
+        };
+        document.addEventListener('click', this._scrollDeactivateHandler);
 
         this._rebuildBody();
         this._initContextMenu();
+    };
+
+    /**
+     * T12c — teardown d'une grille : retire les listeners ``document``
+     * PERSISTANTS de cette instance pour éviter leur accumulation cross-instance
+     * (fuite mémoire sous re-render répété, ex. auto-refresh dashboard).
+     * Le handler ``mouseup`` ferme sur ``self`` (toute la grille + allRows) :
+     * le retirer libère la plus grosse référence. Idempotent (re-appelable).
+     */
+    SqlResultGrid.prototype.destroy = function() {
+        if (this._onMouseUp) {
+            document.removeEventListener('mouseup', this._onMouseUp);
+            this._onMouseUp = null;
+        }
+        if (this._scrollDeactivateHandler) {
+            document.removeEventListener('click', this._scrollDeactivateHandler);
+            this._scrollDeactivateHandler = null;
+        }
     };
 
     SqlResultGrid.prototype._buildThead = function(table) {
@@ -1843,7 +2127,54 @@ var SqlResultGrid = (function() {
                 + '<td colspan="' + visibleColCount + '"></td></tr>';
         }
 
+        // GRID-3 — corps vide muet : quand un filtre réduit la vue à 0 ligne
+        // alors qu'il existe des données sous-jacentes, le <tbody> serait
+        // totalement vide. L'utilisateur ne voit qu'un compteur d'en-tête
+        // « Filtrées : 0 / N » facile à manquer et croit à un bug. On injecte
+        // une ligne placeholder explicite + un lien de réinitialisation. On NE
+        // touche PAS au cas « 0 résultat réel » (allRows vide) : il est déjà géré
+        // par le message wrapper « Aucun résultat retourné. » à la construction.
+        var _emptyFiltered = rows.length === 0 && this.allRows.length > 0;
+        if (_emptyFiltered) {
+            var _hasActiveFilters = this.filters && Object.keys(this.filters).length > 0;
+            html += '<tr class="grid-empty-row"><td class="grid-empty-cell" colspan="'
+                + visibleColCount + '" '
+                + 'style="text-align:center;padding:1.25rem 0.75rem;'
+                + 'color:var(--text-secondary, #6b7280);font-style:italic;">'
+                + (_hasActiveFilters
+                    ? 'Aucune ligne ne correspond au filtre actif — '
+                      + '<a href="#" class="grid-empty-reset" '
+                      + 'style="font-style:normal;color:var(--accent-primary, #2563eb);">'
+                      + 'réinitialiser les filtres</a>'
+                    : 'Aucune ligne à afficher.')
+                + '</td></tr>';
+        }
+
         this.tbodyEl.innerHTML = html;
+
+        // GRID-3 — câbler le lien « réinitialiser les filtres » (CSP : jamais
+        // d'onclick inline, addEventListener uniquement).
+        if (_emptyFiltered) {
+            var _resetLink = this.tbodyEl.querySelector('.grid-empty-reset');
+            if (_resetLink) {
+                _resetLink.addEventListener('click', function(ev) {
+                    ev.preventDefault();
+                    self._clearAllFilters();
+                });
+            }
+        }
+
+        // Affordance défilement : tant que le scroll n'est pas activé (clic),
+        // un fade en bas (.has-overflow, CSS) signale qu'il reste des lignes
+        // sous le pli. Sans ça, l'utilisateur croit le tableau complet.
+        // Gaté hors rebuilds de pur scroll (rAF, >500 lignes) : lire
+        // scrollHeight juste après innerHTML force un layout synchrone par
+        // frame, et l'état d'overflow ne change pas pendant un scroll (les
+        // spacers virtuels maintiennent la hauteur totale).
+        if (this.wrapperEl && !this._isScrollRebuild) {
+            var _hasOverflow = this.wrapperEl.scrollHeight > this.wrapperEl.clientHeight + 1;
+            this.wrapperEl.classList.toggle('has-overflow', _hasOverflow);
+        }
 
         // Mesurer la hauteur RÉELLE des rows au 1er render pour calibrer.
         // On prend la MÉDIANE de 5 premières rows (au lieu de juste la 1ère)
@@ -1875,7 +2206,17 @@ var SqlResultGrid = (function() {
                 if (rafId !== null) return;
                 rafId = requestAnimationFrame(function() {
                     rafId = null;
-                    self._rebuildBody();
+                    // Rebuild PUREMENT visuel (scroll/resize) : ni la sélection ni
+                    // les données ne changent → ``_rebuildBody`` saute le recalcul
+                    // O(N) du résumé de sélection (le re-surlignage O(rendus) reste
+                    // fait). Sinon, une colonne entière sélectionnée (N keys, jusqu'au
+                    // cap admin) re-sommerait N lignes à CHAQUE frame de scroll = jank.
+                    self._isScrollRebuild = true;
+                    try {
+                        self._rebuildBody();
+                    } finally {
+                        self._isScrollRebuild = false;
+                    }
                 });
             };
             this.wrapperEl.addEventListener('scroll', triggerRebuild);
@@ -1910,6 +2251,14 @@ var SqlResultGrid = (function() {
         // reçoit une classe CSS. Visual : underscore dotted pour actif,
         // fond rouge léger pour pending. Classes appliquées post-render
         // pour préserver le path chaud du renderBody.
+        //
+        // Le rebuild vient de réécrire innerHTML : toutes les classes posées
+        // par un apply précédent ont disparu, mais le fingerprint (state +
+        // rowCount) peut être identique — typiquement en virtual scrolling
+        // où la fenêtre garde la même taille à chaque scroll. Sans
+        // invalidation, le skip-cache laisserait les nouvelles cellules SANS
+        // marquage (faux visuel silencieux — fix 2026-06-11, tâche #24).
+        this._anonMarkerFingerprint = null;
         try { this._applyAnonymizationCellMarkers(); } catch (e) { /* defensive */ }
 
         // Bouton legacy "Afficher 200 de plus" supprimé — remplacé par
@@ -1935,7 +2284,12 @@ var SqlResultGrid = (function() {
             // reste tracée → réapparaissent sélectionnées au prochain scroll
             // vers leur position. Fix régression Q2 adversarial review.
             this._reapplySelectionToDom();
-            if (typeof this._refreshSelectionSummary === 'function') {
+            // Le résumé (Σ/moyenne) est invariant au scroll : on ne le recalcule
+            // PAS sur un rebuild purement visuel (``_isScrollRebuild``) — il est
+            // déjà à jour dans le DOM. On le recalcule sur les rebuilds de DONNÉES
+            // (édition/tri/filtre/fusion : flag non posé) et à chaque mutation de
+            // sélection (les setters l'appellent directement). Évite O(N)/frame.
+            if (!this._isScrollRebuild && typeof this._refreshSelectionSummary === 'function') {
                 this._refreshSelectionSummary();
             }
         }
@@ -2067,8 +2421,16 @@ var SqlResultGrid = (function() {
 
         this._selectedCells = [];
         this._selectionAnchor = null;
-        // Cache l'info sélection : au rebuild, les cells sont neuves donc
-        // la sélection est vide → pas de résumé à afficher.
+        // Reset de TOUTE la sélection à chaque (re)build de données — point
+        // unique appelé par _buildTable (nouveau tbody) : load initial, undo/redo
+        // (_restoreFromState), remplacement de contenu (applyResultModification /
+        // replaceTabContentProgrammatic). Sans vider la sélection LOGIQUE
+        // (_selectedKeys), une colonne entière sélectionnée AVANT un reload
+        // laissait des keys positionnelles périmées → Σ recalculée sur les
+        // NOUVELLES données (review adversariale, CRITIQUE Q5). On vide donc AUSSI
+        // les keys + le flag colonne-entière ici.
+        if (this._selectedKeys) this._selectedKeys.clear();
+        this._entireColumnSelected = null;
         this._refreshSelectionSummary();
 
         // Guard: attach mousedown only once per tbodyEl
@@ -2346,6 +2708,12 @@ var SqlResultGrid = (function() {
     // absentes du DOM mais leur key reste tracée → réapparaissent
     // sélectionnées au scroll vers elles.
     SqlResultGrid.prototype._selectCell = function(td) {
+        // Toute sélection cellule-par-cellule (clic/drag/range) est PARTIELLE →
+        // annule le mode « colonne entière » (sinon _refreshView re-dériverait
+        // toute la colonne au tri/filtre au lieu de respecter la sélection
+        // manuelle). _selectEntireColumn n'appelle PAS _selectCell (il peuple les
+        // keys en direct), donc ce reset ne concerne que les gestes manuels.
+        this._entireColumnSelected = null;
         if (td.classList.contains('grid-cell-selected')) return;  // dedup
         td.classList.add('grid-cell-selected');
         this._selectedCells.push(td);
@@ -2360,6 +2728,11 @@ var SqlResultGrid = (function() {
     };
 
     SqlResultGrid.prototype._deselectCell = function(td) {
+        // Désélectionner UNE cellule (Ctrl/Cmd+Click) rend la sélection PARTIELLE
+        // → sortir du mode « colonne entière » (symétrique de _selectCell), sinon
+        // _refreshView re-dériverait toute la colonne au tri/filtre et ré-
+        // intégrerait silencieusement la cellule retirée (review adversariale Q5).
+        this._entireColumnSelected = null;
         td.classList.remove('grid-cell-selected');
         this._selectedCells = this._selectedCells.filter(function(c) { return c !== td; });
         if (this._selectedKeys) {
@@ -2376,6 +2749,7 @@ var SqlResultGrid = (function() {
         }
         this._selectedCells = [];
         if (this._selectedKeys) this._selectedKeys.clear();
+        this._entireColumnSelected = null;
         this._refreshSelectionSummary();
     };
 
@@ -2385,22 +2759,27 @@ var SqlResultGrid = (function() {
     // sélection disparaît visuellement dès qu'on scrolle hors viewport
     // alors qu'elle est encore tracée logiquement.
     SqlResultGrid.prototype._reapplySelectionToDom = function() {
-        if (!this._selectedKeys || this._selectedKeys.size === 0) {
+        // PERF : on itère les ``<td>`` effectivement RENDUS (≈ fenêtre visible du
+        // virtual scrolling, ~30-60) et on teste l'appartenance au Set (O(1)),
+        // PLUTÔT que de faire un ``querySelector`` par key. Sans ça, une sélection
+        // de colonne entière (``_selectEntireColumn`` peuple 1 key/ligne →
+        // potentiellement des centaines de milliers) déclencherait autant de
+        // requêtes DOM à CHAQUE rebuild (scroll) = gel. Coût désormais O(rendus),
+        // indépendant de la taille de la sélection.
+        if (!this._selectedKeys || this._selectedKeys.size === 0 || !this.tbodyEl) {
             this._selectedCells = [];
             return;
         }
         var cells = [];
-        var self = this;
-        this._selectedKeys.forEach(function(key) {
-            var parts = key.split(',');
-            var td = self.tbodyEl.querySelector(
-                'td[data-row="' + parts[0] + '"][data-col="' + parts[1] + '"]'
-            );
-            if (td) {
+        var tds = this.tbodyEl.querySelectorAll('td[data-row]');
+        for (var i = 0; i < tds.length; i++) {
+            var td = tds[i];
+            var key = td.getAttribute('data-row') + ',' + td.getAttribute('data-col');
+            if (this._selectedKeys.has(key)) {
                 td.classList.add('grid-cell-selected');
                 cells.push(td);
             }
-        });
+        }
         this._selectedCells = cells;
     };
 
@@ -2431,16 +2810,41 @@ var SqlResultGrid = (function() {
     // des classeurs > 1000 lignes).
     SqlResultGrid.prototype._selectEntireColumn = function(colIndex) {
         if (!this.tbodyEl) return;
+        // Sélection LOGIQUE de TOUTE la colonne sur ``displayRows`` (vue
+        // triée/filtrée, intégralement en mémoire) — PAS via le DOM. En virtual
+        // scrolling, ``tbodyEl`` ne contient que ~30-60 ``<td>`` visibles :
+        // l'ancien ``querySelectorAll('td[data-col=N]')`` ne sélectionnait donc
+        // que le visible → la somme ne portait que sur les cellules CHARGÉES et
+        // changeait même au scroll (bug rapporté 2026-06-03). On peuple
+        // ``_selectedKeys`` (indices LOGIQUES "r,c") pour TOUTES les lignes ;
+        // ``_reapplySelectionToDom`` surligne les td visibles (et re-surligne au
+        // scroll) ; ``_refreshSelectionSummary`` calcule sur les keys.
         this._suppressSelectionRefresh = true;
         try {
             this._clearSelection();
-            var cells = this.tbodyEl.querySelectorAll(
-                'td[data-col="' + colIndex + '"]'
-            );
-            for (var i = 0; i < cells.length; i++) this._selectCell(cells[i]);
+            if (!this._selectedKeys) this._selectedKeys = new Set();
+            var n = this.displayRows ? this.displayRows.length : 0;
+            for (var r = 0; r < n; r++) {
+                this._selectedKeys.add(r + ',' + colIndex);
+            }
+            // Surligne les cellules actuellement dans le DOM + reconstruit
+            // ``_selectedCells`` (les lignes hors viewport seront surlignées au
+            // scroll, leur key restant tracée).
+            this._reapplySelectionToDom();
+            if (n > 0 && this.container) {
+                // Focusable pour la copie clavier (cohérent avec ``_selectCell``).
+                this.container.tabIndex = -1;
+                this.container.focus();
+            }
         } finally {
             this._suppressSelectionRefresh = false;
         }
+        // Marque la sélection comme « colonne entière » : permet à _refreshView
+        // (tri/filtre) de la RE-DÉRIVER sur la nouvelle vue (toujours toute la
+        // colonne → Σ correcte) au lieu de la clearer comme une sélection
+        // partielle (cf. _refreshView). Réinitialisé par toute sélection
+        // partielle (_selectCell) et par _clearSelection.
+        this._entireColumnSelected = colIndex;
         this._refreshSelectionSummary();
     };
 
@@ -2451,8 +2855,14 @@ var SqlResultGrid = (function() {
         if (this._suppressSelectionRefresh) return;
         var el = this._selectionInfoEl;
         if (!el) return;
-        var cells = this._selectedCells || [];
-        if (cells.length < 2) {
+        // Calcul sur la sélection LOGIQUE (``_selectedKeys`` = indices "r,c" dans
+        // ``displayRows``), JAMAIS sur les refs DOM (``_selectedCells``) qui, en
+        // virtual scrolling, ne couvrent que les lignes VISIBLES → la
+        // somme/moyenne ne portait que sur les cellules chargées et changeait au
+        // scroll (bug "somme de colonne" 2026-06-03). ``displayRows`` est la vue
+        // triée/filtrée intégralement en mémoire → on agrège TOUTE la colonne.
+        var keys = this._selectedKeys ? Array.from(this._selectedKeys) : [];
+        if (keys.length < 2) {
             // Moins de 2 cellules → somme pas pertinente. Cache.
             el.style.display = 'none';
             el.textContent = '';
@@ -2460,44 +2870,41 @@ var SqlResultGrid = (function() {
         }
         var sum = 0;
         var count = 0;
+        var considered = 0; // cellules réellement DANS la vue courante (in-bounds)
         var allNumeric = true;
-        for (var i = 0; i < cells.length; i++) {
-            var td = cells[i];
-            // Valeur source : ``data-row``/``data-col`` pointent la cellule
-            // dans ``displayRows`` (vue triée/filtrée), PAS dans ``allRows``.
-            // Cf. garde ligne ~2020 qui documente cette invariante. Indexer
-            // ``allRows`` directement quand un filtre/tri est actif somme les
-            // mauvaises lignes silencieusement (bug confirmé : Σ d'une colonne
-            // filtrée sur didier renvoyait les valeurs d'anne car les 8
-            // premières lignes brutes de allRows étaient lues à la place
-            // des 8 lignes affichées de displayRows). Lecture directe depuis
-            // le modèle évite les soucis de formatage d'affichage (ex:
-            // "1 234,56" devenu "1234.56" à l'origine).
-            var rAttr = td.getAttribute('data-row');
-            var cAttr = td.getAttribute('data-col');
-            var raw = null;
-            if (rAttr !== null && cAttr !== null) {
-                var r = parseInt(rAttr, 10);
-                var c = parseInt(cAttr, 10);
-                if (!isNaN(r) && !isNaN(c) && this.displayRows[r]) {
-                    raw = this.isArrayFormat
-                        ? this.displayRows[r][c]
-                        : this.displayRows[r][this.columns[c]];
-                }
-            }
-            if (raw === null || raw === undefined || raw === '') {
-                // Cellule vide → on passe, mais elle ne disqualifie pas.
+        for (var i = 0; i < keys.length; i++) {
+            // Valeur source : indices LOGIQUES dans ``displayRows`` (vue
+            // triée/filtrée), PAS ``allRows`` (bug confirmé : Σ d'une colonne
+            // filtrée lisait les mauvaises lignes brutes). Lecture directe depuis
+            // le modèle (pas le texte DOM) → pas de souci de formatage ("1 234,56").
+            var parts = keys[i].split(',');
+            var r = parseInt(parts[0], 10);
+            var c = parseInt(parts[1], 10);
+            // Key hors borne (cas : sélection plein-colonne PUIS filtre réduisant
+            // ``displayRows``) → la ligne n'existe plus dans la vue → ignorée ET
+            // NON comptée (sinon le dénominateur « vides ignorées » imputerait à
+            // tort les lignes filtrées à des cellules vides — review adversariale).
+            if (isNaN(r) || isNaN(c) || !this.displayRows[r]) {
                 continue;
             }
-            var n = this._parseCellNumber(raw);
-            if (n === null) {
+            considered += 1;
+            var raw = this.isArrayFormat
+                ? this.displayRows[r][c]
+                : this.displayRows[r][this.columns[c]];
+            if (raw === null || raw === undefined || raw === '') {
+                // Cellule in-bounds mais vide → ignorée du calcul, comptée au
+                // dénominateur (« vides ignorées »).
+                continue;
+            }
+            var num = this._parseCellNumber(raw);
+            if (num === null) {
                 allNumeric = false;
                 break;
             }
-            sum += n;
+            sum += num;
             count += 1;
         }
-        if (!allNumeric || count === 0) {
+        if (!allNumeric || count === 0 || considered < 2) {
             el.style.display = 'none';
             el.textContent = '';
             return;
@@ -2512,11 +2919,21 @@ var SqlResultGrid = (function() {
                 maximumFractionDigits: maxFrac,
             });
         }
+        // Honnêteté (conséquences Q5) : si le résultat SQL a été TRONQUÉ côté
+        // serveur (cap admin ``max_rows``), même toute la colonne chargée reste
+        // PARTIELLE vs la requête réelle → on le signale plutôt que d'afficher un
+        // total faussement complet. Sinon, on indique les cellules vides ignorées.
+        var suffix = '';
+        if (this._truncated) {
+            suffix = '    ·    ⚠ ' + considered + ' lignes chargées (résultat tronqué)';
+        } else if (count < considered) {
+            suffix = ' / ' + considered + ' (vides ignorées)';
+        }
         el.textContent =
             'Σ ' + fmt(sum) +
             '    ·    Moyenne ' + fmt(avg) +
             '    ·    Nombre ' + count +
-            (count < cells.length ? ' / ' + cells.length + ' (vides ignorées)' : '');
+            suffix;
         el.style.display = 'block';
     };
 
@@ -3100,8 +3517,13 @@ var SqlResultGrid = (function() {
         };
 
         var tsv = SqlResultGrid._clipboard.tsv;
-        navigator.clipboard.writeText(tsv).then(function() {
-            // Green flash then marching ants
+
+        var toast = (typeof showToast === 'function')
+            ? showToast
+            : function(m) { console.warn('[copy]', m); };
+
+        // Succès : flash vert puis marching ants (comportement d'origine).
+        function _flashCopied() {
             var cells = self._selectedCells.slice();
             for (var m = 0; m < cells.length; m++) cells[m].classList.add('grid-cell-copied');
             setTimeout(function() {
@@ -3111,7 +3533,38 @@ var SqlResultGrid = (function() {
                 }
                 SqlResultGrid._clipboardAnts = cells;
             }, 400);
-        });
+        }
+
+        // GRID-4 — l'écriture presse-papier peut échouer SILENCIEUSEMENT : contexte
+        // non sécurisé (HTTP par IP au 1er déploiement), document non focalisé,
+        // refus transitoire de permission, ou API clipboard absente. On (1) tente
+        // l'API moderne, (2) retombe sur execCommand('copy') via un textarea
+        // temporaire, (3) avertit l'utilisateur si tout échoue — jamais de faux
+        // silence où l'user croit avoir copié alors que rien n'est dans le presse-papier.
+        function _legacyCopy() {
+            try {
+                var ta = document.createElement('textarea');
+                ta.value = tsv;
+                ta.setAttribute('readonly', '');
+                ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+                document.body.appendChild(ta);
+                ta.select();
+                var ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (ok) { _flashCopied(); return true; }
+            } catch (e) { /* géré par le toast ci-dessous */ }
+            return false;
+        }
+
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(tsv).then(_flashCopied).catch(function() {
+                if (!_legacyCopy()) {
+                    toast('Copie impossible — vérifiez les permissions du presse-papier (une connexion HTTPS peut être requise).', 'error');
+                }
+            });
+        } else if (!_legacyCopy()) {
+            toast('Copie impossible — le presse-papier n\'est pas accessible dans ce contexte.', 'error');
+        }
     };
 
     // Clear marching ants from all grids
@@ -3126,6 +3579,18 @@ var SqlResultGrid = (function() {
 
     SqlResultGrid.prototype._pasteFromClipboard = function() {
         var self = this;
+        var toast = (typeof showToast === 'function')
+            ? showToast
+            : function(m) { console.warn('[paste]', m); };
+        // GRID-4 (jumeau lecture) — readText() peut être indisponible (contexte
+        // non sécurisé) ou rejeter (permission refusée). Sans garde, le collage
+        // échoue en silence : l'utilisateur fait Ctrl+V et rien ne se passe, sans
+        // savoir pourquoi. Pas de fallback execCommand fiable en lecture → on
+        // informe et on oriente vers le Ctrl+V natif dans une cellule.
+        if (!navigator.clipboard || typeof navigator.clipboard.readText !== 'function') {
+            toast('Collage impossible — le presse-papier n\'est pas accessible dans ce contexte (HTTPS requis).', 'error');
+            return;
+        }
         navigator.clipboard.readText().then(function(text) {
             if (!text) return;
             self._pushHistory();
@@ -3189,6 +3654,8 @@ var SqlResultGrid = (function() {
                     self._triggerAutoFill();
                 }, 3000);
             }
+        }).catch(function() {
+            toast('Collage impossible — autorisez l\'accès au presse-papier, ou collez directement dans une cellule avec Ctrl+V.', 'error');
         });
     };
 
@@ -3289,6 +3756,10 @@ var SqlResultGrid = (function() {
         this.allRows.push(row);
         this.displayRows = this.allRows.slice();
         this.totalRowCount = this.allRows.length;
+        // Structure changée (lignes) → la sélection positionnelle (_selectedKeys
+        // + flag colonne-entière) est périmée → on la vide (fail-closed) sinon Σ
+        // fausse silencieuse sur des keys hors borne (review convergence Q5).
+        this._clearSelection();
         this._rebuildBody();
         this._updateHeaderInfo();
         this._updateResizeButtons();
@@ -3303,6 +3774,7 @@ var SqlResultGrid = (function() {
         this.allRows.pop();
         this.displayRows = this.allRows.slice();
         this.totalRowCount = this.allRows.length;
+        this._clearSelection(); // structure changée → sélection périmée (cf. _addRow)
         this._rebuildBody();
         this._updateHeaderInfo();
         this._updateResizeButtons();
@@ -3324,6 +3796,7 @@ var SqlResultGrid = (function() {
             }
         }
         this.displayRows = this.allRows.slice();
+        this._clearSelection(); // structure changée (colonnes) → sélection périmée
         this._rebuildThead();
         this._rebuildBody();
         this._updateResizeButtons();
@@ -3349,6 +3822,7 @@ var SqlResultGrid = (function() {
             }
         }
         this.displayRows = this.allRows.slice();
+        this._clearSelection(); // structure changée (colonnes) → sélection périmée
         this._rebuildThead();
         this._rebuildBody();
         this._updateResizeButtons();
@@ -3634,6 +4108,18 @@ var SqlResultGrid = (function() {
                 if (!hadDetail && self._options && typeof self._options.onStateChange === 'function') {
                     self._options.onStateChange();
                 }
+                // Une édition inline change la valeur affichée → recalcule le résumé
+                // de sélection si la cellule éditée fait partie d'une sélection
+                // active (sinon Σ figée sur l'ancienne valeur — review adversariale
+                // Q5). Idempotent si aucune sélection.
+                self._refreshSelectionSummary();
+                // L'édition mute td.textContent SANS passer par _rebuildBody :
+                // si la nouvelle valeur contient (ou ne contient plus) un terme
+                // d'anonymisation, le marquage serait stale. On invalide le
+                // skip-cache et on re-applique (coalescé par rAF) —
+                // review adversariale tâche #24.
+                self._anonMarkerFingerprint = null;
+                self._applyAnonymizationCellMarkers();
             }
             td.classList.add('grid-cell-editable');
             // Auto-fill ghost :
@@ -3987,6 +4473,16 @@ var SqlResultGrid = (function() {
                 if (self.isArrayFormat) self.allRows[rowIdx][colIdx] = value;
                 else self.allRows[rowIdx][self.columns[colIdx]] = value;
                 self.displayRows = self.allRows.slice();
+                // Écriture asynchrone (la réponse IA arrive après coup) : si une
+                // sélection est active (ex. colonne entière sélectionnée pendant
+                // l'attente réseau), recalculer le résumé pour intégrer la nouvelle
+                // valeur (idempotent si aucune sélection — review adversariale).
+                self._refreshSelectionSummary();
+                // Contenu injecté par l'IA hors _rebuildBody : il peut contenir
+                // un terme d'anonymisation → re-marquage (rAF-coalescé) sinon
+                // marquage stale (review adversariale tâche #24).
+                self._anonMarkerFingerprint = null;
+                self._applyAnonymizationCellMarkers();
             }
 
             // Store detail data for this cell (for copy/paste preservation)
@@ -4084,7 +4580,11 @@ var SqlResultGrid = (function() {
                 'gap:0.5rem;margin:0.5rem 0;flex-wrap:wrap;';
 
             var hint = document.createElement('span');
-            hint.textContent = 'Requête SQL exécutée :';
+            // Snapshot importé : le SQL affiché est celui de la feuille SOURCE
+            // (provenance), pas une requête que CETTE feuille a exécutée.
+            hint.textContent = this._isImportedSnapshot()
+                ? 'Requête SQL d\'origine (feuille importée) :'
+                : 'Requête SQL exécutée :';
             hint.style.cssText = 'font-size:0.7rem;text-transform:uppercase;letter-spacing:0.02em;color:var(--text-muted,#6b7280);font-weight:500;';
 
             // Wrapper droite pour deux boutons (Modifier, Enregistrer) alignés.
@@ -4102,7 +4602,7 @@ var SqlResultGrid = (function() {
                 e.stopPropagation();
                 if (typeof window.openSqlEditorModal !== 'function') {
                     if (typeof window.showToast === 'function') {
-                        window.showToast('error', 'Éditeur SQL indisponible.');
+                        window.showToast('Éditeur SQL indisponible.', 'error');
                     }
                     return;
                 }
@@ -4143,11 +4643,19 @@ var SqlResultGrid = (function() {
                                     summary.appendChild(badge);
                                 }
                             }
+                            // Feature « feuilles SQL » (widget dashboard) :
+                            // persiste le nouveau SQL de CETTE feuille.
+                            // payload.sql = requête D'ORIGINE saisie (jamais
+                            // filtre-wrappée). No-op hors dashboard / feuille
+                            // non-SQL (callback absent).
+                            if (typeof self._options.onSqlAuthored === 'function') {
+                                self._options.onSqlAuthored(payload.sql);
+                            }
                         } catch (err) {
                             // Le grid lui-même a probablement été remplacé entre temps.
                             // Fallback : afficher un toast pour signaler le succès.
                             if (typeof window.showToast === 'function') {
-                                window.showToast('success', 'Requête exécutée.');
+                                window.showToast('Requête exécutée.', 'success');
                             }
                         }
                     },
@@ -4165,7 +4673,16 @@ var SqlResultGrid = (function() {
                 _saveSqlToDatastore(self.sql, saveBtn, IDLE_LABEL);
             });
 
-            actionBtns.appendChild(editBtn);
+            // Snapshot importé : SQL en LECTURE SEULE — « Modifier &
+            // réexécuter » exécuterait la requête de PROVENANCE sur la BDD
+            // courante et REMPLACERAIT les lignes importées (+ éditions
+            // manuelles) par un jeu de données potentiellement différent,
+            // sans avertissement (revue adversariale F1, données fausses
+            // silencieuses). « Enregistrer cette requête » reste : il ne
+            // touche pas aux données, il copie juste le SQL au datastore.
+            if (!this._isImportedSnapshot()) {
+                actionBtns.appendChild(editBtn);
+            }
             actionBtns.appendChild(saveBtn);
             actionRow.appendChild(hint);
             actionRow.appendChild(actionBtns);
@@ -4654,6 +5171,9 @@ var SqlResultGrid = (function() {
             isBlankSheet: this._isBlankSheet,
             isDashboardSheet: this._isDashboardSheet,
             truncated: this._truncated,
+            truncatedCols: this._truncatedCols || false,
+            truncatedColsTotal:
+                typeof this._truncatedColsTotal === 'number' ? this._truncatedColsTotal : null,
             filters: JSON.parse(JSON.stringify(this.filters, function(k, v) {
                 return v instanceof Set ? Array.from(v) : v;
             })),
@@ -4665,10 +5185,22 @@ var SqlResultGrid = (function() {
         if (!state || !state.columns) return; // Defensive guard
         this.sql = state.sql || '';
         this.columns = (state.columns || []).slice();
-        // Deep clone : sinon une édition post-undo muterait le snapshot
-        // redo-cible (rows partagées par référence). Coût : équivalent au
-        // captureState — acceptable car appelé seulement sur Ctrl+Z/Y.
-        this.allRows = this._deepCloneSafe(state.allRows || []);
+        // Split light/heavy (grid-store, cf. docs/design/grid_storage_tiered_indexeddb.md) :
+        //  - ``state.allRows`` DÉFINI (undo/redo, legacy monolithique, état déjà
+        //    hydraté depuis IndexedDB) — y compris ``[]`` pour un résultat
+        //    légitimement vide → on l'applique tel quel. Deep clone : sinon une
+        //    édition post-undo muterait le snapshot redo-cible (rows partagées
+        //    par référence).
+        //  - ``state.allRows`` ABSENT (``undefined``) = tier "intention" seul
+        //    (les données vivent en IndexedDB, pas encore hydratées OU
+        //    indisponibles) → on PRÉSERVE les rows déjà en place (fournies par
+        //    le backend au rendu). Sans ça, restaurer l'intention VIDERAIT la
+        //    grille (régression données — invariant #1/#2 du design).
+        if (state.allRows !== undefined) {
+            this.allRows = this._deepCloneSafe(Array.isArray(state.allRows) ? state.allRows : []);
+        } else if (!Array.isArray(this.allRows)) {
+            this.allRows = [];
+        }
         this.totalRowCount = state.totalRowCount || 0;
         this.isArrayFormat = typeof state.isArrayFormat === 'boolean'
             ? state.isArrayFormat
@@ -4699,6 +5231,9 @@ var SqlResultGrid = (function() {
         this._isBlankSheet = !!state.isBlankSheet;
         this._isDashboardSheet = !!state.isDashboardSheet || !!state.isBlankSheet;
         this._truncated = !!state.truncated;
+        this._truncatedCols = !!state.truncatedCols;
+        this._truncatedColsTotal =
+            typeof state.truncatedColsTotal === 'number' ? state.truncatedColsTotal : null;
         this.displayRows = this.allRows.slice();
         this._detectTypes();
         this._build();
@@ -4706,6 +5241,14 @@ var SqlResultGrid = (function() {
     };
 
     SqlResultGrid.prototype._pushHistory = function() {
+        // Marqueur « l'utilisateur a muté la grille depuis le rendu ». Posé AVANT
+        // le guard _history (une mutation a lieu même si l'undo n'est pas câblé).
+        // _pushHistory est le point de passage OBLIGÉ de toute mutation user
+        // (édition cellule, add/remove ligne/colonne, tri, filtre, fusion, paste,
+        // copilot) et n'est JAMAIS appelé à l'init/build/restore. Sert à
+        // _loadPersistedState pour ne pas écraser une édition faite pendant
+        // l'hydratation async des données (course ~ms) — sinon perte silencieuse.
+        this._userDirtied = true;
         if (!this._history) return;
         // Try/catch défensif : si _captureState throw (structuredClone
         // sur un type non-cloneable, cycle inattendu, mémoire saturée),
@@ -5527,6 +6070,17 @@ var SqlResultGrid = (function() {
         return this._anonStateSeq;
     };
 
+    // SSoT d'invalidation du cache de state anonymisation (fix 2026-06-11,
+    // tâche #13). Les sites qui forcent un resync (409, conflation refusée,
+    // DELETE backend, refresh inter-grilles) doivent passer par ICI : reset
+    // des 3 champs ensemble, y compris le backoff post-échec réseau — une
+    // invalidation EXPLICITE doit toujours autoriser un fetch immédiat.
+    SqlResultGrid.prototype._invalidateAnonymizationCache = function() {
+        this._anonymizationFetched = false;
+        this._anonymizationFetchPromise = null;
+        this._anonymizationFetchFailedAt = 0;
+    };
+
     SqlResultGrid.prototype._fetchAnonymizationState = function() {
         // Charge le state d'anonymisation du user courant depuis le
         // serveur. Promise cachée : fetch 1× par cycle de vie de la grille
@@ -5545,6 +6099,15 @@ var SqlResultGrid = (function() {
         if (this._anonymizationFetchPromise) {
             return this._anonymizationFetchPromise;
         }
+        // Backoff post-échec réseau (fix 2026-06-11, tâche #13) : les
+        // renders/markers peuvent appeler en rafale — sans backoff, un
+        // serveur down déclencherait une tempête de retries. Une
+        // invalidation EXPLICITE (cf. _invalidateAnonymizationCache)
+        // remet ce timestamp à 0 et bypass le backoff.
+        if (this._anonymizationFetchFailedAt
+            && (Date.now() - this._anonymizationFetchFailedAt) < ANON_FETCH_RETRY_BACKOFF_MS) {
+            return Promise.resolve(this._anonymizationState);
+        }
         var capturedSeq = this._anonStateSeq || 0;
         this._anonymizationFetchPromise = fetch('/api/anonymization/terms', {
             method: 'GET',
@@ -5559,9 +6122,19 @@ var SqlResultGrid = (function() {
             return resp.json();
         }).then(function(data) {
             self._anonymizationFetched = true;
+            self._anonymizationFetchFailedAt = 0;
             self._anonymizationLastFetchTs = Date.now();
-            // Adopter UNIQUEMENT si aucune mutation locale n'est intervenue
-            // depuis le début du fetch.
+            // Révision adoptée SANS garde seq (eXamine 2026-06-10) : c'est
+            // le jeton serveur le plus frais connu — même si le STATE local
+            // est plus récent (toggle pendant le fetch), le prochain PUT
+            // doit présenter CE jeton. Le garder sous le seq guard créait
+            // une boucle 409 sous toggles continus (révision périmée rejouée
+            // à chaque save). Cohérent avec l'adoption post-PUT (sans seq).
+            if (data && typeof data.revision === 'string') {
+                self._anonRevision = data.revision;
+            }
+            // Adopter le STATE uniquement si aucune mutation locale n'est
+            // intervenue depuis le début du fetch.
             if ((self._anonStateSeq || 0) !== capturedSeq) {
                 return self._anonymizationState;
             }
@@ -5570,10 +6143,16 @@ var SqlResultGrid = (function() {
             }
             return self._anonymizationState;
         }).catch(function() {
-            // Échec réseau : on garde le state vide. Le gate backend
-            // ré-aplatira via 409 si nécessaire au premier send.
-            self._anonymizationFetched = true;
-            self._anonymizationLastFetchTs = Date.now();
+            // Échec réseau (fix 2026-06-11, tâche #13) : ne PAS latcher le
+            // cache « fetched » sur un état vide — le panneau resterait
+            // vide (0 terme affiché alors que la BDD en a des milliers)
+            // jusqu'au reload de la page, et c'est exactement le scénario
+            // qui produisait les 409 MASS_DELETE vécus. On libère le cache
+            // pour retry au prochain appelant, borné par le backoff
+            // ci-dessus (anti-tempête).
+            self._anonymizationFetched = false;
+            self._anonymizationFetchPromise = null;
+            self._anonymizationFetchFailedAt = Date.now();
             return self._anonymizationState;
         });
         return this._anonymizationFetchPromise;
@@ -5589,6 +6168,13 @@ var SqlResultGrid = (function() {
         // l'impression de lag inexpliqué.
         var self = this;
         var payload = { anonymization_state: state };
+        // Verrou optimiste (fix lost update 2026-06-10) : renvoie la révision
+        // connue du GET — un autre onglet//data-privacy/scan qui a écrit
+        // entre-temps fait refuser ce PUT (409 STATE_REVISION_MISMATCH) au
+        // lieu d'écraser silencieusement ses modifications.
+        if (typeof this._anonRevision === 'string' && this._anonRevision) {
+            payload.expected_revision = this._anonRevision;
+        }
         var syncToken = this._beginSync('Synchronisation anonymisation…');
         // Capture le seq AU MOMENT de l'envoi. Si une mutation locale
         // arrive pendant le PUT, la réponse serveur (qui ne reflète que
@@ -5604,10 +6190,23 @@ var SqlResultGrid = (function() {
             credentials: 'same-origin',
             body: JSON.stringify(payload)
         }).then(function(resp) {
-            return resp.json().then(function(data) { return { status: resp.status, data: data }; });
+            // Lecture SÛRE : ne plante pas sur le HTML d'une erreur passerelle
+            // (413 mapping volumineux, 429, 502/504). ``ctx.data`` reste le
+            // JSON parsé quand il y en a, ``ctx.status`` est toujours fiable.
+            return _readJsonSafe(resp).then(function(r) {
+                return { status: r.status, data: r.data || {} };
+            });
         }).then(function(ctx) {
             var data = ctx.data || {};
             if (ctx.status === 200 && data.success) {
+                // Adopter la révision post-write SANS condition de seq : elle
+                // reflète l'état serveur après NOTRE écriture — le prochain
+                // PUT (même conflaté avec des mutations locales plus
+                // récentes) doit la présenter, sinon il 409-erait sur sa
+                // propre écriture.
+                if (typeof data.revision === 'string') {
+                    self._anonRevision = data.revision;
+                }
                 // N'écrase le cache local QUE si aucune mutation locale
                 // n'est intervenue depuis l'envoi — sinon la réponse est
                 // stale par rapport à l'intention la plus récente de l'user.
@@ -5674,9 +6273,21 @@ var SqlResultGrid = (function() {
                     // toast. Les conflations multiples rendaient un revert
                     // local ambigu (on reverte à quoi exactement ?) — refetch
                     // est déterministe.
-                    self._anonymizationFetched = false;
-                    self._anonymizationFetchPromise = null;
-                    self._fetchAnonymizationState();
+                    //
+                    // Pour les 409 MASS_DELETE_REFUSED / REVISION_MISMATCH,
+                    // _showAnonymizationError fait DÉJÀ invalidate+refetch :
+                    // doubler ici relançait un 2e GET concurrent pendant que
+                    // le 1er était en vol (review globale 2026-06-11, FAIBLE).
+                    // Tout autre statut (incl. 409 d'un autre error_code)
+                    // garde le refetch amont.
+                    var ec = (res.data || {}).error_code;
+                    var handledBy409 = res.status === 409
+                        && (ec === 'MASS_DELETE_REFUSED'
+                            || ec === 'STATE_REVISION_MISMATCH');
+                    if (!handledBy409) {
+                        self._invalidateAnonymizationCache();
+                        self._fetchAnonymizationState();
+                    }
                     self._showAnonymizationError(res);
                 }
                 pending.resolve(res);
@@ -5767,11 +6378,42 @@ var SqlResultGrid = (function() {
             return;
         }
 
+        // 409 MASS_DELETE_REFUSED (save auto/debounced hors panneau) : liste
+        // locale désynchronisée — message humain (pas le texte API backend) +
+        // resync automatique du state pour que le prochain save reparte d'une
+        // base fraîche. Jamais de confirm_mass_delete automatique.
+        if (status === 409
+            && (data.error_code === 'MASS_DELETE_REFUSED'
+                || data.error_code === 'STATE_REVISION_MISMATCH')) {
+            var resyncMsg = data.error_code === 'STATE_REVISION_MISMATCH'
+                ? ('Enregistrement refusé : tes termes ont été modifiés '
+                   + 'entre-temps (autre onglet ou scan). Rien n\'a été écrasé '
+                   + '— état rechargé, réessaie.')
+                : ('Enregistrement refusé : ta liste de termes était '
+                   + 'désynchronisée du serveur. Rien n\'a été supprimé — état '
+                   + 'rechargé, réessaie.');
+            this._invalidateAnonymizationCache();
+            this._fetchAnonymizationState();
+            if (typeof showToast === 'function') {
+                showToast(resyncMsg, 'error', 12000);
+                return;
+            }
+            errorMessage = resyncMsg; // fallback : statut discret ci-dessous
+        }
+
         if (this._copilotStatus) {
             this._copilotStatus.textContent = errorMessage;
             this._copilotStatus.className = 'grid-copilot-status error';
             var self = this;
-            setTimeout(function() {
+            // clearTimeout AVANT de ré-armer (fix 2026-06-11, tâche #13) :
+            // sans handle, le timer d'une erreur A (t0) effaçait l'erreur B
+            // affichée à t0+3s après seulement 1s de visibilité (le guard
+            // « className contient error » est vrai pour B aussi).
+            if (this._anonStatusErrTimer) {
+                clearTimeout(this._anonStatusErrTimer);
+            }
+            this._anonStatusErrTimer = setTimeout(function() {
+                self._anonStatusErrTimer = null;
                 if (self._copilotStatus && self._copilotStatus.className.indexOf('error') !== -1) {
                     self._copilotStatus.textContent = '';
                     self._copilotStatus.className = 'grid-copilot-status';
@@ -5786,6 +6428,21 @@ var SqlResultGrid = (function() {
     // son texte et on vérifie la présence de termes ``enabled=True`` ou
     // ``confirmed=False`` dans le state. Classe CSS ajoutée → styling via
     // les règles inline ci-dessous (pas besoin de fichier CSS séparé).
+
+    // FNV-1a 32 bits (Math.imul = multiplication exacte mod 2^32, supporté
+    // par les 2 dernières versions de Chrome/Firefox/Safari/Edge). Hash PAR
+    // TERME, combiné par ADDITION dans le caller : commutatif, donc
+    // insensible à l'ordre d'énumération de ``state.terms`` (non garanti
+    // identique entre navigateurs). Pas un hash crypto — juste un signal
+    // « le contenu du dictionnaire a bougé » (fix 2026-06-11, tâche #24).
+    function _anonFnv1a(str) {
+        var h = 0x811c9dc5;
+        for (var i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h = Math.imul(h, 0x01000193) >>> 0;
+        }
+        return h;
+    }
 
     SqlResultGrid.prototype._applyAnonymizationCellMarkers = function() {
         if (!this.tbodyEl) return;
@@ -5814,17 +6471,28 @@ var SqlResultGrid = (function() {
         var activeTokens = Object.create(null);
         var pendingTokens = Object.create(null);
         var activeCount = 0, pendingCount = 0;
+        var termsHash = 0;
         for (var t in state.terms) {
             if (!Object.prototype.hasOwnProperty.call(state.terms, t)) continue;
             var e = state.terms[t] || {};
-            if (!e.confirmed) { pendingTokens[t] = 1; pendingCount++; }
-            else if (e.enabled) { activeTokens[t] = 1; activeCount++; }
+            // Le préfixe ('p:'/'a:') entre dans le hash : un même terme qui
+            // passe de pending → actif change le fingerprint même à counts
+            // égaux par ailleurs.
+            if (!e.confirmed) {
+                pendingTokens[t] = 1; pendingCount++;
+                termsHash = (termsHash + _anonFnv1a('p:' + t)) >>> 0;
+            } else if (e.enabled) {
+                activeTokens[t] = 1; activeCount++;
+                termsHash = (termsHash + _anonFnv1a('a:' + t)) >>> 0;
+            }
         }
 
-        // Fingerprint léger : compte actifs+pending + premier et dernier
-        // token sorted pour invalider sur mutations. Pas un hash crypto —
-        // juste un signal "ça a bougé".
-        var fp = activeCount + '|' + pendingCount + '|' + this.tbodyEl.childElementCount;
+        // Fingerprint : counts + hash additif du CONTENU des termes + nb de
+        // rows. L'ancien fingerprint (counts seuls) ne bougeait pas quand un
+        // terme était REMPLACÉ par un autre à count égal → marquage visuel
+        // figé/FAUX après édition du dictionnaire (fix 2026-06-11, #24).
+        var fp = activeCount + '|' + pendingCount + '|' + termsHash.toString(36) +
+            '|' + this.tbodyEl.childElementCount;
         if (this._anonMarkerFingerprint === fp && this._anonMarkerTbody === this.tbodyEl) {
             return; // rien à faire, même state + même tbody
         }
@@ -6202,11 +6870,16 @@ var SqlResultGrid = (function() {
             'display:flex;align-items:center;justify-content:center;';
 
         var card = document.createElement('div');
+        // overflow:hidden (fix 2026-06-10, bug vécu « boutons dans la zone
+        // d'erreur ») : sans clip, quand le contenu dépasse max-height:86vh
+        // (petit écran + message d'erreur long + progressBox visible), le
+        // footer (Annuler/Enregistrer/Voir tous) était RENDU HORS du
+        // rectangle de la card, superposé visuellement au contenu derrière.
         card.style.cssText =
             'background:var(--bg-surface, #fff);color:var(--text-primary, #111827);' +
             'border-radius:0.75rem;box-shadow:var(--shadow-lg, 0 10px 40px rgba(0,0,0,0.2));' +
             'border:1px solid var(--border, transparent);' +
-            'width:min(720px, 94vw);max-height:86vh;' +
+            'width:min(720px, 94vw);max-height:86vh;overflow:hidden;' +
             'display:flex;flex-direction:column;padding:1.25rem;gap:0.75rem;';
 
         var title = document.createElement('h2');
@@ -6721,20 +7394,18 @@ var SqlResultGrid = (function() {
                 return inScope[t];
             });
             if (allTokens.length === 0) {
-                err.style.color = 'var(--text-muted, #6b7280)';
                 var scopeLabel = ({
                     active: 'l\'onglet actif',
                     workbook: 'le classeur actif'
                 })[scope] || 'ce périmètre';
-                err.textContent = 'Aucun terme dans ' + scopeLabel + ' à analyser.';
+                setErr('Aucun terme dans ' + scopeLabel + ' à analyser.', 'muted');
                 return;
             }
 
             var prevText = btnAuto.textContent;
             btnAuto.disabled = true;
             btnAuto.innerHTML = '<i class="bi bi-hourglass-split"></i> Calibrage…';
-            err.textContent = '';
-            err.style.color = 'var(--text-muted, #6b7280)';
+            setErr('', 'muted');
             cancelRequested = false;
             btnCancel2.disabled = false;
             btnCancel2.textContent = 'Annuler';
@@ -6747,12 +7418,18 @@ var SqlResultGrid = (function() {
             var avgMs = null;
             classifyUrl = '/api/anonymization/auto-classify';
             try {
+                // signal abortable (fix 2026-06-11, tâche #13) : la
+                // calibration appelle le LLM local — si celui-ci est wedgé,
+                // le probe peut pendre longtemps. Sans signal, « Annuler »
+                // restait bloqué sur « Annulation… » toute la durée du probe.
+                currentAbortCtrl = new AbortController();
                 var probeRes = await fetch('/api/anonymization/auto-classify/probe', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-Xsrftoken': _getXsrfCookie()
-                    }
+                    },
+                    signal: currentAbortCtrl.signal
                 });
                 if (probeRes.status === 503) {
                     // LLM local indisponible (non configuré ou down). Fallback
@@ -6760,16 +7437,19 @@ var SqlResultGrid = (function() {
                     // est instantané), juste un message informatif puis run.
                     classifyUrl = '/api/anonymization/auto-classify/regex';
                     avgMs = null; // pas de calibration en regex (rapide)
-                    err.style.color = 'var(--text-muted, #6b7280)';
-                    err.textContent = 'LLM local indisponible — détection via patterns regex (PII built-in).';
+                    setErr('LLM local indisponible — détection via patterns regex (PII built-in).', 'muted');
                 } else if (probeRes.ok) {
                     var probeData = await probeRes.json();
                     if (probeData.duration_ms) avgMs = probeData.duration_ms;
                     if (probeData.batch_size) batchSize = probeData.batch_size;
                 }
             } catch (e) {
-                err.style.color = 'var(--status-error,#dc2626)';
-                err.textContent = 'Erreur calibration : ' + (e && e.message ? e.message : 'inconnue');
+                if (e && e.name === 'AbortError') {
+                    // Annulation user pendant la calibration — pas une erreur.
+                    setErr('Annulé.', 'muted');
+                } else {
+                    setErr('Erreur calibration : ' + (e && e.message ? e.message : 'inconnue'));
+                }
                 btnAuto.disabled = false;
                 btnAuto.textContent = prevText;
                 return;
@@ -6801,20 +7481,17 @@ var SqlResultGrid = (function() {
                         // Bascule transparente sur regex : retry du même chunk
                         // pour ne pas perdre les classifications déjà faites.
                         classifyUrl = '/api/anonymization/auto-classify/regex';
-                        err.style.color = 'var(--text-muted, #6b7280)';
-                        err.textContent = 'LLM local indisponible — bascule sur regex.';
+                        setErr('LLM local indisponible — bascule sur regex.', 'muted');
                         i--; // retry ce chunk avec la nouvelle URL
                         continue;
                     }
                     if (res.status === 503) {
                         // Déjà en mode regex et 503 — vrai problème serveur.
-                        err.style.color = 'var(--status-error,#dc2626)';
-                        err.textContent = 'Service de détection indisponible (lot ' + (i + 1) + '/' + totalChunks + ').';
+                        setErr('Service de détection indisponible (lot ' + (i + 1) + '/' + totalChunks + ').');
                         break;
                     }
                     if (!res.ok) {
-                        err.style.color = 'var(--status-error,#dc2626)';
-                        err.textContent = 'Erreur ' + res.status + ' au lot ' + (i + 1) + '/' + totalChunks + '.';
+                        setErr('Erreur ' + res.status + ' au lot ' + (i + 1) + '/' + totalChunks + '.');
                         break;
                     }
                     var data = await res.json();
@@ -6843,9 +7520,8 @@ var SqlResultGrid = (function() {
                         cancelRequested = true;
                         break;
                     }
-                    err.style.color = 'var(--status-error,#dc2626)';
-                    err.textContent = 'Erreur réseau au lot ' + (i + 1) + ' : ' +
-                        (e && e.message ? e.message : 'inconnue');
+                    setErr('Erreur réseau au lot ' + (i + 1) + ' : ' +
+                        (e && e.message ? e.message : 'inconnue'));
                     break;
                 }
 
@@ -6895,49 +7571,74 @@ var SqlResultGrid = (function() {
 
             var totalProcessed = totalApplied + totalNotSensitive;
             if (cancelRequested) {
-                err.style.color = 'var(--text-muted, #6b7280)';
-                err.textContent = 'Annulé. ' + totalApplied + ' terme(s) anonymisé(s) avant arrêt.';
+                setErr('Annulé. ' + totalApplied + ' terme(s) anonymisé(s) avant arrêt.', 'muted');
                 if (totalProcessed > 0) mergeAndPersistAutoFlags();
                 return;
             }
             if (totalProcessed === 0) {
-                err.style.color = 'var(--text-muted, #6b7280)';
-                err.textContent = 'Analyse non aboutie en ' + fmtDuration(totalTime) +
-                    '. Sélection manuelle possible si nécessaire.';
+                setErr('Analyse non aboutie en ' + fmtDuration(totalTime) +
+                    '. Sélection manuelle possible si nécessaire.', 'muted');
                 return;
             }
-            err.style.color = 'var(--status-success, #059669)';
-            err.textContent = totalApplied + ' terme(s) anonymisé(s), ' +
+            setErr(totalApplied + ' terme(s) anonymisé(s), ' +
                 totalNotSensitive + ' laissé(s) en clair (analyse en ' +
-                fmtDuration(totalTime) + '). Modifiable dans la liste si besoin.';
+                fmtDuration(totalTime) + '). Modifiable dans la liste si besoin.', 'success');
             try {
                 await mergeAndPersistAutoFlags();
                 self._updateAnonymizationBadge && self._updateAnonymizationBadge();
                 self._applyAnonymizationCellMarkers && self._applyAnonymizationCellMarkers();
             } catch (e) {
-                err.style.color = 'var(--status-error,#dc2626)';
-                err.textContent = 'Détection OK mais persist échouée : ' +
+                setErr('Détection OK mais persist échouée : ' +
                     (e && e.message ? e.message : 'inconnue') +
-                    '. Cliquer « Enregistrer » pour réessayer.';
+                    '. Cliquer « Enregistrer » pour réessayer.');
             }
-            setTimeout(function() {
-                err.style.color = 'var(--status-error,#dc2626)';
-            }, 6000);
+            // NB : l'ancien ``setTimeout`` qui re-forçait err en ROUGE après
+            // 6s a été SUPPRIMÉ (fix 2026-06-11, tâche #13) — il recolorait
+            // en rouge le message de succès encore affiché (bug vécu).
+            // setErr pose désormais la couleur atomiquement à chaque message,
+            // le « reset au rouge par défaut » n'a plus de raison d'être.
         }
 
-        // Container scrollable de la liste
+        // Container scrollable de la liste. min-height:0 (fix 2026-06-10) :
+        // l'idiome flex pour qu'un enfant flex:1 scrollable puisse SE
+        // COMPRESSER sous la contrainte du parent — l'ancien plancher rigide
+        // 200px forçait le débordement de la card sur petit écran.
         var listWrap = document.createElement('div');
         listWrap.style.cssText =
-            'flex:1;min-height:200px;overflow-y:auto;border:1px solid var(--border, #e5e7eb);' +
+            'flex:1;min-height:0;overflow-y:auto;border:1px solid var(--border, #e5e7eb);' +
             'border-radius:0.5rem;padding:0.25rem;background:var(--bg-surface-2, #f9fafb);';
 
+        // Zone d'erreur : flex-shrink:0 (jamais compressée par le layout) +
+        // max-height + scroll interne pour les messages longs (ex: 409
+        // verbeux) — au lieu de pousser le footer hors de la card.
         var err = document.createElement('div');
-        err.style.cssText = 'font-size:0.8125rem;color:var(--status-error,#dc2626);min-height:1rem;';
+        err.style.cssText =
+            'font-size:0.8125rem;color:var(--status-error,#dc2626);min-height:1rem;' +
+            'flex-shrink:0;max-height:6em;overflow-y:auto;overflow-wrap:anywhere;';
 
-        // Footer
+        // SSoT d'affichage du statut du panneau (fix 2026-06-11, tâche #13) :
+        // TOUT message passe par setErr — texte + couleur posés ATOMIQUEMENT.
+        // Supprime deux classes de bugs vécus : « succès recoloré en rouge »
+        // (l'ancien timer 6s re-forçait le rouge sur un message encore
+        // affiché) et « message héritant de la couleur du précédent » (writer
+        // qui posait le texte sans la couleur). kind: 'error' (défaut, rouge)
+        // | 'muted' (info discrète) | 'success' (vert).
+        var _ERR_KIND_COLORS = {
+            error: 'var(--status-error,#dc2626)',
+            muted: 'var(--text-muted, #6b7280)',
+            success: 'var(--status-success, #059669)'
+        };
+        function setErr(text, kind) {
+            err.textContent = text;
+            err.style.color = _ERR_KIND_COLORS[kind] || _ERR_KIND_COLORS.error;
+        }
+
+        // Footer : flex-shrink:0 — les boutons d'action gardent toujours
+        // leur taille et leur place EN BAS DE LA CARD (pattern modal
+        // standard : tout est shrink:0 sauf la zone scrollable listWrap).
         var footer = document.createElement('div');
         footer.style.cssText =
-            'display:flex;justify-content:flex-end;gap:0.5rem;align-items:center;';
+            'display:flex;justify-content:flex-end;gap:0.5rem;align-items:center;flex-shrink:0;';
 
         // Lien vers la page de gestion globale ``/data/privacy``. La page
         // est la single source of truth pour la liste complète des termes
@@ -7501,8 +8202,7 @@ var SqlResultGrid = (function() {
                 if (!_hasBackendId(entry)) return;
                 if (!window.PrivacyDetailPanel
                     || typeof window.PrivacyDetailPanel.loadCoverage !== 'function') {
-                    err.style.color = 'var(--status-error,#dc2626)';
-                    err.textContent = 'Module détail indisponible (rechargez la page).';
+                    setErr('Module détail indisponible (rechargez la page).');
                     return;
                 }
                 window.PrivacyDetailPanel.loadCoverage(entry.id, {
@@ -7584,13 +8284,17 @@ var SqlResultGrid = (function() {
                     btnSave.title =
                         'Refermez et rouvrez le panneau pour appliquer d\'autres modifications ' +
                         '(état rafraîchi depuis le serveur).';
-                    err.style.color = 'var(--text-muted, #6b7280)';
-                    err.textContent =
-                        'Terme supprimé. Refermez le panneau pour appliquer d\'autres modifications.';
+                    setErr('Terme supprimé. Refermez le panneau pour appliquer '
+                        + 'd\'autres modifications.', 'muted');
                     // Refresh asynchrone du state autoritatif — pas bloquant
                     // pour la UI courante, mais aligne les autres composants
-                    // (badge, cell markers) avec la BDD.
+                    // (badge, cell markers) avec la BDD. Invalidation du
+                    // cache OBLIGATOIRE avant (fix 2026-06-11, tâche #13) :
+                    // sans elle, _anonymizationFetched=true court-circuitait
+                    // le fetch → le « refresh » était un no-op et la révision
+                    // optimiste restait périmée (409 au PUT suivant).
                     if (typeof self._fetchAnonymizationState === 'function') {
+                        self._invalidateAnonymizationCache();
                         self._fetchAnonymizationState();
                     }
                     renderList();
@@ -7598,9 +8302,8 @@ var SqlResultGrid = (function() {
                     self._updateAnonymizationBadge && self._updateAnonymizationBadge();
                     self._applyAnonymizationCellMarkers && self._applyAnonymizationCellMarkers();
                 }).catch(function(e) {
-                    err.style.color = 'var(--status-error,#dc2626)';
-                    err.textContent = 'Suppression échouée : ' +
-                        ((e && e.message) || 'inconnue');
+                    setErr('Suppression échouée : ' +
+                        ((e && e.message) || 'inconnue'));
                     btnDelete.disabled = false;
                     btnDelete.textContent = '';
                     btnDelete.innerHTML = _DELETE_ICON_SVG;
@@ -7784,7 +8487,7 @@ var SqlResultGrid = (function() {
         overlay.addEventListener('click', function(e) { if (e.target === overlay) close(); });
 
         btnSave.addEventListener('click', function() {
-            err.textContent = '';
+            setErr('');
             // Validation côté client : collisions pseudo + sentinelles +
             // cross-term + trim. Source de vérité unique dans
             // ``window.AnonymizationSaveHelpers`` (cf.
@@ -7799,10 +8502,9 @@ var SqlResultGrid = (function() {
             // visible plutôt que silent divergence.
             if (!window.AnonymizationSaveHelpers
                 || typeof window.AnonymizationSaveHelpers.validatePseudoMap !== 'function') {
-                err.textContent =
-                    'Erreur interne : module de validation indisponible. '
+                setErr('Erreur interne : module de validation indisponible. '
                     + 'Rechargez la page (Ctrl+F5). Si le problème persiste, '
-                    + 'utilisez « Signaler un problème ».';
+                    + 'utilisez « Signaler un problème ».');
                 if (window.console && console.error) {
                     console.error(
                         '[iris-grid] AnonymizationSaveHelpers manquant — '
@@ -7813,8 +8515,8 @@ var SqlResultGrid = (function() {
             }
             var validation = window.AnonymizationSaveHelpers.validatePseudoMap(draft);
             if (validation.errors.length) {
-                err.textContent = validation.errors[0]
-                    + (validation.errors.length > 1 ? ' (+' + (validation.errors.length - 1) + ' autre(s))' : '');
+                setErr(validation.errors[0]
+                    + (validation.errors.length > 1 ? ' (+' + (validation.errors.length - 1) + ' autre(s))' : ''));
                 return;
             }
             // Commit du draft — persist vers la BDD serveur. Tant que le
@@ -7911,9 +8613,8 @@ var SqlResultGrid = (function() {
                                     'error'
                                 );
                             }
-                            err.textContent =
-                                'Confirmation requise pour continuer — '
-                                + 'autorisez les dialogs et réessayez.';
+                            setErr('Confirmation requise pour continuer — '
+                                + 'autorisez les dialogs et réessayez.');
                             // Restore le bouton (modal reste ouvert).
                             btnSave.disabled = false;
                             btnSave.textContent = 'Enregistrer';
@@ -7927,9 +8628,8 @@ var SqlResultGrid = (function() {
                             // Enregistrer. Backend a partiellement sauvé —
                             // l'user verra au prochain save les corrections
                             // (idempotent replace-state).
-                            err.textContent =
-                                (warnDetailConsent || ('Erreurs : ' + warningErrors.length))
-                                + ' — corrige avant de continuer.';
+                            setErr((warnDetailConsent || ('Erreurs : ' + warningErrors.length))
+                                + ' — corrige avant de continuer.');
                             btnSave.disabled = false;
                             btnSave.textContent = 'Enregistrer';
                             return;
@@ -7973,12 +8673,83 @@ var SqlResultGrid = (function() {
                 btnSave.disabled = false;
                 btnSave.textContent = 'Enregistrer';
                 var data = (res && res.data) || {};
+                // 409 MASS_DELETE_REFUSED : la liste locale est désynchronisée
+                // du serveur (cas résiduel post-fix delete_scope 2026-06-10 :
+                // dico ACTIF réellement tronqué côté client, ex. fetch initial
+                // échoué → state vide). JAMAIS de confirm_mass_delete
+                // automatique (= purge aveugle). Recovery in-place : re-fetch
+                // l'état serveur, reconstruit draft + liste — le panneau et le
+                // flow consent restent ouverts, l'user refait ses modifs sur
+                // une base fraîche. Message HUMAIN (pas le texte API backend
+                // qui mentionne confirm_mass_delete, inactionnable depuis l'UI).
+                if (data.error_code === 'MASS_DELETE_REFUSED'
+                    || data.error_code === 'STATE_REVISION_MISMATCH') {
+                    setErr(data.error_code === 'STATE_REVISION_MISMATCH'
+                        ? ('Tes termes ont été modifiés entre-temps (autre onglet, '
+                           + 'page Confidentialité ou scan). Rien n\'a été écrasé. '
+                           + 'Rechargement en cours…')
+                        : ('Ta liste affichée était désynchronisée du serveur ('
+                           + (data.count_delete != null ? data.count_delete : '?')
+                           + ' termes manquants sur '
+                           + (data.count_before != null ? data.count_before : '?')
+                           + '). Rien n\'a été supprimé. Rechargement en cours…'));
+                    // Bouton verrouillé jusqu'à la fin du re-fetch (eXamine
+                    // 2026-06-10 finding c) : sinon un re-clic re-PUT le draft
+                    // périmé → re-409 + entrelacement de renders.
+                    btnSave.disabled = true;
+                    // Compte des termes actifs AVANT resync — pour détecter en
+                    // flow consent un dico qui a RÉTRÉCI côté serveur (finding
+                    // e : ne jamais relancer Iris avec moins d'anonymisation
+                    // que ce que l'user croyait avoir, sans le prévenir).
+                    var enabledBefore409 = 0;
+                    for (var k409 in draft) {
+                        if (Object.prototype.hasOwnProperty.call(draft, k409)
+                            && draft[k409] && draft[k409].enabled) { enabledBefore409++; }
+                    }
+                    self._invalidateAnonymizationCache();
+                    // NB (finding d, rare) : si un toggle local bump le seq
+                    // pendant ce fetch, le guard seq de _fetchAnonymizationState
+                    // ignore la réponse serveur et ``fresh`` peut être périmé.
+                    // Convergence garantie sans perte : le prochain save
+                    // re-prend un 409 (le backend refuse, ne supprime jamais)
+                    // et re-déclenche cette recovery.
+                    self._fetchAnonymizationState().then(function(st) {
+                        var fresh = (st && st.terms) || {};
+                        // Invariant : toute réassignation de ``draft`` DOIT être
+                        // suivie de renderList() — les rows existantes capturent
+                        // les anciens objets entry et doivent être reconstruites.
+                        draft = JSON.parse(JSON.stringify(fresh));
+                        renderList();
+                        updateSubtitle();
+                        var enabledAfter409 = 0;
+                        for (var k2 in draft) {
+                            if (Object.prototype.hasOwnProperty.call(draft, k2)
+                                && draft[k2] && draft[k2].enabled) { enabledAfter409++; }
+                        }
+                        if (_consentCallbacks && enabledAfter409 < enabledBefore409) {
+                            setErr('Liste rechargée — attention : le serveur a MOINS '
+                                + 'de termes actifs (' + enabledAfter409 + ' vs '
+                                + enabledBefore409 + ' affichés avant). Vérifie '
+                                + 'ton anonymisation avant d\'enregistrer (Iris '
+                                + 'reprendra avec ce dictionnaire).');
+                        } else {
+                            setErr('Liste rechargée — vérifie puis refais tes '
+                                + 'modifications.', 'muted');
+                        }
+                        btnSave.disabled = false;
+                    }).catch(function() {
+                        // Réseau down : draft inchangé, on rend la main.
+                        setErr('Rechargement impossible (réseau). Réessaie plus tard.');
+                        btnSave.disabled = false;
+                    });
+                    return;
+                }
                 var stErrs = Array.isArray(data.state_errors) ? data.state_errors : [];
                 var msg = window.AnonymizationSaveHelpers.formatStateErrors(stErrs);
                 if (msg) {
-                    err.textContent = msg;
+                    setErr(msg);
                 } else {
-                    err.textContent = data.error || 'Échec de l\'enregistrement.';
+                    setErr(data.error || 'Échec de l\'enregistrement.');
                 }
             });
         });
@@ -8432,7 +9203,25 @@ var SqlResultGrid = (function() {
         }
 
         fetchPromise
-        .then(function(resp) { return resp.json().then(function(data) { return {status: resp.status, data: data}; }); })
+        .then(function(resp) {
+            // Lecture SÛRE (fix 2026-06-10) : resp.json() brut rejette en
+            // SyntaxError sur un body non-JSON (page HTML d'un proxy 502/504,
+            // crash avant handler) → l'user voyait « Erreur réseau :
+            // Unexpected token… ». _readJsonSafe (SSoT komptiaReadJson) ne
+            // throw jamais et normalise en message lisible.
+            return _readJsonSafe(resp).then(function(res) {
+                var d = res.data;
+                if (!d || typeof d !== 'object') {
+                    // Préserver error_code si le helper l'a extrait (eXamine
+                    // 2026-06-10) : un 409/400 renvoyé en HTML par un proxy
+                    // garde ainsi ses branches error_code fonctionnelles.
+                    d = res.error
+                        ? { error: res.error, error_code: res.errorCode || undefined }
+                        : {};
+                }
+                return {status: res.status, data: d};
+            });
+        })
         .then(function(ctx) {
             // Ignore stale response if a newer request has been fired
             if (self._copilotAbort !== thisAbort) return;
@@ -8538,6 +9327,39 @@ var SqlResultGrid = (function() {
             if (data.error) {
                 self._copilotStatus.textContent = data.error;
                 self._copilotStatus.className = 'grid-copilot-status error';
+                // Axe 5 du contrat (fix 2026-06-11, tâche #19) : bouton
+                // « Signaler » UNIQUEMENT sur les erreurs 5xx (bug serveur,
+                // LLM down, budget run épuisé). Doctrine partagée avec
+                // iris-widget : pas de bouton sur les erreurs métier/4xx —
+                // une session expirée ou un rate-limit noierait le canal
+                // bug-report. SSoT du signalement = feedback-reporter.js
+                // (window.komptiaReportFeedback, capture console+réseau).
+                if (ctx.status >= 500
+                    && typeof window.komptiaReportFeedback === 'function') {
+                    var reportBtn = document.createElement('button');
+                    reportBtn.type = 'button';
+                    reportBtn.className = 'copilot-report-btn';
+                    reportBtn.textContent = 'Signaler';
+                    reportBtn.setAttribute(
+                        'aria-label', 'Signaler cette erreur au support');
+                    // Snapshot du contexte AU MOMENT de l'erreur (le run_id
+                    // courant peut changer si l'user relance avant de
+                    // cliquer Signaler).
+                    var reportPayload = {
+                        context: 'copilot_grid',
+                        message: String(data.error),
+                        error_kind: data.error_kind || null,
+                        http_status: ctx.status,
+                        run_id: self._copilotRunId || null,
+                        timestamp: new Date().toISOString(),
+                        page: window.location.pathname,
+                    };
+                    reportBtn.addEventListener('click', function() {
+                        try { window.komptiaReportFeedback(reportPayload); }
+                        catch (e) { /* defensive — reporter optionnel */ }
+                    });
+                    self._copilotStatus.appendChild(reportBtn);
+                }
                 return;
             }
             if (data.skipped) {
@@ -8569,17 +9391,36 @@ var SqlResultGrid = (function() {
                 }
             }
 
-            self._applyCopilotResult(data);
+            var outcome = self._applyCopilotResult(data);
             self._copilotInput.value = '';
             self._copilotInput.style.height = 'auto';
             self._copilotSendBtn.disabled = true;
-            self._copilotStatus.textContent = data.description || 'Modification appliquée';
-            self._copilotStatus.className = 'grid-copilot-status success';
-            setTimeout(function() {
-                if (self._copilotStatus.className.indexOf('success') !== -1) {
-                    self._copilotStatus.textContent = '';
-                }
-            }, 4000);
+            // Fix faux succès (2026-06-10, bug vécu) : ne plus écraser
+            // inconditionnellement le statut par « Succès : Modification
+            // appliquée » —
+            //  * max_turns_reached : _handleMultiActionResult vient de poser
+            //    le message info/warning (invitation à reprendre ou 0-action),
+            //    l'ancien code le détruisait à l'instant où il apparaissait ;
+            //  * applied === 0 (ex: fill_sql dont toutes les cellules étaient
+            //    null/hors-grille) : avertissement honnête au lieu d'un
+            //    succès sur un classeur inchangé.
+            if (outcome && outcome.statusHandled) {
+                // Statut déjà posé par le handler — rien à faire.
+            } else if (outcome && outcome.applied === 0) {
+                self._copilotStatus.textContent =
+                    (outcome.errorsTotal > 0
+                        ? outcome.errorsTotal + ' erreur(s) — ' : '')
+                    + 'aucune cellule modifiée. Reformule ou précise ta demande.';
+                self._copilotStatus.className = 'grid-copilot-status warning';
+            } else {
+                self._copilotStatus.textContent = data.description || 'Modification appliquée';
+                self._copilotStatus.className = 'grid-copilot-status success';
+                setTimeout(function() {
+                    if (self._copilotStatus.className.indexOf('success') !== -1) {
+                        self._copilotStatus.textContent = '';
+                    }
+                }, 4000);
+            }
         })
         .catch(function(err) {
             if (err && err.name === 'AbortError') {
@@ -8603,7 +9444,11 @@ var SqlResultGrid = (function() {
                 return;
             }
             self._setCopilotProcessing(false);
-            self._copilotStatus.textContent = 'Erreur réseau : ' + err.message;
+            // err.message peut être undefined (coupure réseau brutale) —
+            // fallback lisible plutôt que « Erreur réseau : undefined ».
+            self._copilotStatus.textContent = 'Erreur réseau : '
+                + ((err && err.message) || 'connexion interrompue')
+                + '. Vérifie ta connexion puis réessaie.';
             self._copilotStatus.className = 'grid-copilot-status error';
         });
     };
@@ -8618,6 +9463,11 @@ var SqlResultGrid = (function() {
     };
 
     SqlResultGrid.prototype._applyCopilotResult = function(result) {
+        // Outcome optionnel remonté au caller (fix faux succès 2026-06-10) :
+        // {applied: n, errorsTotal: n, statusHandled: bool}. undefined pour
+        // les branches qui n'ont pas (encore) de comptage — le caller garde
+        // alors le statut succès historique.
+        var outcome;
         if (result.type === 'sql' && result.columns && result.rows) {
             // Force new tab on blank sheets (never destroy user content)
             var forceNewTab = result.new_tab || this._isBlankSheet;
@@ -8739,12 +9589,19 @@ var SqlResultGrid = (function() {
             this._detectTypes();
             this._rebuildBody();
             this._updateHeaderInfo();
+            // Outcome remonté au caller (fix faux succès 2026-06-10) : avec
+            // filledCount=0 (toutes cellules null/hors-grille), la barre de
+            // statut affichait quand même « Succès : Modification appliquée ».
+            outcome = {
+                applied: filledCount,
+                errorsTotal: result.errors_count || 0,
+            };
             // Show feedback toast
             if (typeof this._showSaveToast === 'function') {
                 var msg = filledCount + ' cellule' + (filledCount > 1 ? 's' : '') + ' remplie' + (filledCount > 1 ? 's' : '');
                 if (detailCount > 0) msg += ' (' + detailCount + ' avec détails)';
                 if (result.errors_count > 0) msg += ' — ' + result.errors_count + ' erreur' + (result.errors_count > 1 ? 's' : '');
-                this._showSaveToast(msg, result.errors_count > 0 ? 'warning' : 'success');
+                this._showSaveToast(msg, (result.errors_count > 0 || filledCount === 0) ? 'warning' : 'success');
             }
         } else if (result.type === 'display' && result.actions) {
             // Display-only modifications — save state for undo
@@ -8770,10 +9627,10 @@ var SqlResultGrid = (function() {
             // des actions individuelles. ``max_turns_reached`` partage le même
             // shape (emits + modifications) mais signale en plus le message
             // d'invitation à reprendre via le chat.
-            this._handleMultiActionResult(result);
+            outcome = this._handleMultiActionResult(result);
         } else if (result.type === 'multi_action') {
             // Alias historique potentiel (au cas où un retour custom le pose).
-            this._handleMultiActionResult(result);
+            outcome = this._handleMultiActionResult(result);
         }
 
         this._updateUndoRedoButtons();
@@ -8811,6 +9668,7 @@ var SqlResultGrid = (function() {
                 try { console.error('[copilot] onSnapshot threw :', _e); } catch (__e) { /* noop */ }
             }
         }
+        return outcome;
     };
 
     // Format ``{type: "done"|"max_turns_reached", emits: [...],
@@ -8822,12 +9680,21 @@ var SqlResultGrid = (function() {
     SqlResultGrid.prototype._handleMultiActionResult = function(result) {
         var emits = Array.isArray(result.emits) ? result.emits : [];
         var modifications = Array.isArray(result.modifications) ? result.modifications : [];
+        var appliedCount = 0;
+        var errorsTotal = 0;
 
         for (var i = 0; i < emits.length; i++) {
             var emit = emits[i];
-            if (!emit || typeof emit !== 'object') continue;
-            // ``emit`` a déjà le shape attendu par _handleEmitTab (type/tab/...)
-            this._handleEmitTab(emit);
+            if (!emit || typeof emit !== 'object') { errorsTotal++; continue; }
+            // ``emit`` a déjà le shape attendu par _handleEmitTab (type/tab/...).
+            // _handleEmitTab retourne false sur structure invalide (eXamine
+            // 2026-06-10) — ne pas compter un emit raté comme « appliqué »,
+            // sinon le caller affiche un succès sur un classeur inchangé.
+            if (this._handleEmitTab(emit) !== false) {
+                appliedCount++;
+            } else {
+                errorsTotal++;
+            }
         }
         for (var j = 0; j < modifications.length; j++) {
             var mod = modifications[j];
@@ -8835,15 +9702,19 @@ var SqlResultGrid = (function() {
             switch (mod.type) {
                 case 'patch_tab':
                     this._handlePatchTab(mod);
+                    appliedCount++;
                     break;
                 case 'rename_tab':
                     this._handleRenameTab(mod);
+                    appliedCount++;
                     break;
                 case 'delete_tab':
                     this._handleDeleteTab(mod);
+                    appliedCount++;
                     break;
                 case 'modify_tab_sql':
                     this._handleModifyTabSql(mod);
+                    appliedCount++;
                     break;
                 default:
                     // Type inconnu — on l'ignore plutôt que de planter
@@ -8853,23 +9724,48 @@ var SqlResultGrid = (function() {
         }
 
         // Pour ``max_turns_reached`` : afficher le message d'invitation à
-        // reprendre dans le chat. Le copilotStatus est l'emplacement neutre
-        // que le grid expose pour les messages courts ; si un onClause
-        // ``onCopilotMessage`` est branché côté manager, on le préfère.
-        if (result.type === 'max_turns_reached' && typeof result.message === 'string') {
+        // reprendre. NB (eXamine 2026-06-10) : le hook ``onCopilotMessage``
+        // n'a AUCUNE implémentation dans la codebase à ce jour — l'appel
+        // ci-dessous est un point d'extension pour un futur manager qui
+        // voudrait pousser le message dans un chat persistant ; aujourd'hui
+        // le fallback _copilotStatus est TOUJOURS le chemin effectif.
+        // Fix faux succès 2026-06-10 : si AUCUNE action n'a été appliquée
+        // (le LLM a bouclé sur des done rejetés jusqu'au budget), le dire
+        // en avertissement — l'ancien code laissait le caller afficher
+        // « Succès : Modification appliquée » sur un classeur inchangé.
+        if (result.type === 'max_turns_reached') {
+            var mtMsg = (typeof result.message === 'string' && result.message)
+                ? result.message
+                : 'Budget de l\'agent épuisé.';
+            var mtSeverity = 'info';
+            if (appliedCount === 0) {
+                mtMsg = 'Budget de l\'agent épuisé — AUCUNE modification n\'a été '
+                    + 'appliquée au classeur. Reformule ta demande ou relance avec '
+                    + '« continue ».';
+                mtSeverity = 'warning';
+            }
             if (typeof this._options.onCopilotMessage === 'function') {
                 try {
-                    this._options.onCopilotMessage(result.message, 'info');
+                    this._options.onCopilotMessage(mtMsg, mtSeverity);
                 } catch (e) {
                     // Hook utilisateur cassé : on retombe sur _copilotStatus
                     // sans casser l'application des actions ci-dessus.
                 }
             }
             if (this._copilotStatus) {
-                this._copilotStatus.textContent = result.message;
-                this._copilotStatus.className = 'grid-copilot-status info';
+                this._copilotStatus.textContent = mtMsg;
+                this._copilotStatus.className = 'grid-copilot-status ' + mtSeverity;
             }
         }
+
+        // statusHandled : pour max_turns_reached, le statut vient d'être posé
+        // ici (info reprise ou warning 0-action) — le caller ne doit PAS
+        // l'écraser avec le succès générique (fix faux succès 2026-06-10).
+        return {
+            applied: appliedCount,
+            errorsTotal: errorsTotal,
+            statusHandled: result.type === 'max_turns_reached',
+        };
     };
 
     // ── emit_tab: the LLM returns a complete new tab (label, columns, rows,
@@ -8883,7 +9779,9 @@ var SqlResultGrid = (function() {
                 this._copilotStatus.textContent = 'emit_tab: structure invalide';
                 this._copilotStatus.className = 'grid-copilot-status error';
             }
-            return;
+            // false = échec signalé au caller (_handleMultiActionResult ne
+            // compte pas cet emit comme appliqué — fix faux succès 2026-06-10).
+            return false;
         }
         var label = tab.label || result.description || 'Onglet émis';
         var columns = tab.columns;
@@ -10164,6 +11062,37 @@ var SqlResultGrid = (function() {
         return { values: sorted, counts: vals, hasNull: hasNull };
     };
 
+    // #46 (suite GRID-2) — collecteur de valeurs distinctes FILTRÉ par une
+    // sous-chaîne (insensible à la casse). Sert au popup de filtre sur colonne à
+    // forte cardinalité : la liste statique est cappée aux 500 premières valeurs,
+    // donc la recherche doit pouvoir RETROUVER une valeur au-delà en re-scannant
+    // tout. Même balayage O(N) que _collectDistinct, mais ne retient que les
+    // valeurs contenant `query`. `limit` borne le nombre de correspondances
+    // distinctes (perf : on n'affiche pas 10 000 cases). `truncated` signale au
+    // popup que la recherche elle-même a atteint le cap → « affinez ».
+    SqlResultGrid.prototype._collectDistinctMatching = function(colIndex, query, limit) {
+        limit = limit || 500;
+        var q = String(query == null ? '' : query).toLowerCase();
+        var vals = new Map();
+        var hasNull = false;
+        var truncated = false;
+        for (var i = 0; i < this.allRows.length; i++) {
+            var v = this._getVal(this.allRows[i], colIndex);
+            if (v == null) { hasNull = true; continue; }
+            var s = String(v);
+            if (q !== '' && s.toLowerCase().indexOf(q) === -1) continue;
+            if (!vals.has(s)) {
+                if (vals.size >= limit) { truncated = true; continue; }
+                vals.set(s, 0);
+            }
+            vals.set(s, vals.get(s) + 1);
+        }
+        var sorted = Array.from(vals.keys()).sort(function(a, b) {
+            return a.localeCompare(b, 'fr', { sensitivity: 'base' });
+        });
+        return { values: sorted, counts: vals, hasNull: hasNull, truncated: truncated };
+    };
+
     SqlResultGrid.prototype._applyFilters = function() {
         var self = this;
         var filterKeys = Object.keys(this.filters);
@@ -10189,6 +11118,25 @@ var SqlResultGrid = (function() {
     SqlResultGrid.prototype._refreshView = function() {
         this._applyFilters();
         this._applySort();
+        // La sélection est indexée par POSITION dans displayRows. Réordonner
+        // (tri) ou réduire (filtre) displayRows invalide les keys d'une sélection
+        // PARTIELLE (elles pointeraient d'autres lignes → Σ FAUSSE silencieuse,
+        // Q5 — review adversariale). Donc :
+        //   - colonne ENTIÈRE (_entireColumnSelected) : on RE-DÉRIVE les keys sur
+        //     la nouvelle vue → toujours toute la colonne → Σ correcte ;
+        //   - sélection partielle : on CLEAR (fail-closed) — jamais de Σ sur des
+        //     lignes que l'utilisateur n'a pas choisies.
+        if (this._entireColumnSelected !== null && this._entireColumnSelected !== undefined) {
+            var ec = this._entireColumnSelected;
+            this._selectedKeys = new Set();
+            var nn = this.displayRows ? this.displayRows.length : 0;
+            for (var rr = 0; rr < nn; rr++) {
+                this._selectedKeys.add(rr + ',' + ec);
+            }
+            // (le rebuild ci-dessous re-surligne + recalcule le résumé)
+        } else if (this._selectedKeys && this._selectedKeys.size > 0) {
+            this._clearSelection();
+        }
         this._rebuildBody();
         this._updateHeaderInfo();
         this._updateFilterIndicators();
@@ -10226,8 +11174,11 @@ var SqlResultGrid = (function() {
             if (exclude) {
                 f.excludeNull = true;
             } else {
-                // Keep only nulls: exclude everything else
-                var d = this._collectDistinct(colIndex);
+                // Keep only nulls: exclude everything else. GRID-1 — distinct
+                // COMPLET (pas le cap 500 réservé au popup) : sinon des valeurs
+                // non-null au-delà du cap ne seraient pas exclues → elles
+                // passeraient le filtre à tort (donnée silencieusement fausse).
+                var d = this._collectDistinct(colIndex, Number.MAX_SAFE_INTEGER);
                 f.excluded = new Set(d.values);
                 f.excludeNull = false;
             }
@@ -10236,8 +11187,11 @@ var SqlResultGrid = (function() {
             if (exclude) {
                 f.excluded.add(strVal);
             } else {
-                // Keep only this value: exclude everything else
-                var d2 = this._collectDistinct(colIndex);
+                // Keep only this value: exclude everything else. GRID-1 — on
+                // collecte TOUTES les valeurs distinctes (pas le cap 500 réservé
+                // au popup) : sinon les valeurs au-delà du cap ne sont pas
+                // exclues → des lignes ≠ X passent le filtre silencieusement.
+                var d2 = this._collectDistinct(colIndex, Number.MAX_SAFE_INTEGER);
                 f.excluded = new Set(d2.values);
                 f.excluded.delete(strVal);
                 f.excludeNull = true;
@@ -10265,7 +11219,19 @@ var SqlResultGrid = (function() {
         var self = this;
         var colName = this.columns[colIndex];
         var currentFilter = this.filters[colIndex];
-        var distinct = this._collectDistinct(colIndex);
+        // GRID-2 — on probe 501 valeurs distinctes pour DÉTECTER une troncature
+        // sans la confondre avec « exactement 500 ». Si >500, on n'affiche que
+        // les 500 premières + on AVERTIT (sinon cases manquantes / recherche
+        // aveugle, et l'user croit filtrer sur toute la colonne).
+        var _distinctProbe = this._collectDistinct(colIndex, 501);
+        var _distinctTruncated = _distinctProbe.values.length > 500;
+        var distinct = _distinctTruncated
+            ? {
+                values: _distinctProbe.values.slice(0, 500),
+                counts: _distinctProbe.counts,
+                hasNull: _distinctProbe.hasNull,
+            }
+            : _distinctProbe;
 
         var popup = document.createElement('div');
         popup.className = 'grid-filter-popup';
@@ -10298,7 +11264,12 @@ var SqlResultGrid = (function() {
         sortAsc.addEventListener('click', function() {
             if (!canMutate) return;
             self.sortColIndex = colIndex; self.sortDirection = 'asc';
-            self._applySort(); self._updateSortIndicators(); self._rebuildBody();
+            // Passe par _refreshView (SSoT du tri, comme _onHeaderClick) : applique
+            // la logique de sélection (re-dérive colonne entière / clear partielle)
+            // sinon une sélection partielle sommerait de mauvaises lignes après tri
+            // (review adversariale Q5). _applySort+_rebuildBody en direct la
+            // contournait.
+            self._refreshView(); self._updateSortIndicators();
             self._closeFilterPopup();
         });
         popup.appendChild(sortAsc);
@@ -10310,7 +11281,8 @@ var SqlResultGrid = (function() {
         sortDesc.addEventListener('click', function() {
             if (!canMutate) return;
             self.sortColIndex = colIndex; self.sortDirection = 'desc';
-            self._applySort(); self._updateSortIndicators(); self._rebuildBody();
+            // SSoT du tri (cf. lien « Trier A → Z » ci-dessus + _onHeaderClick).
+            self._refreshView(); self._updateSortIndicators();
             self._closeFilterPopup();
         });
         popup.appendChild(sortDesc);
@@ -10339,6 +11311,25 @@ var SqlResultGrid = (function() {
         search.className = 'grid-fp-search';
         search.placeholder = 'Rechercher...';
         popup.appendChild(search);
+
+        if (_distinctTruncated) {
+            // GRID-2 — colonne à forte cardinalité : la liste de cases (et la
+            // recherche) ne couvre que les 500 premières valeurs. Avertir
+            // honnêtement + orienter vers le clic-droit « Filtrer par » sur une
+            // cellule (exact et non cappé — cf. GRID-1).
+            var truncWarn = document.createElement('div');
+            truncWarn.className = 'grid-fp-trunc-warn';
+            truncWarn.style.cssText =
+                'padding:0.4rem 0.6rem;margin:0.25rem 0;' +
+                'background:rgba(251, 191, 36, 0.12);' +
+                'border-left:3px solid rgb(217, 119, 6);' +
+                'color:var(--text-primary, #111827);font-size:0.72rem;line-height:1.35;';
+            truncWarn.textContent =
+                'Colonne à forte cardinalité : seules les 500 premières valeurs ' +
+                'sont listées. Utilisez la recherche ci-dessous pour retrouver et ' +
+                'cocher une valeur au-delà, ou clic-droit sur une cellule → « Filtrer par ».';
+            popup.appendChild(truncWarn);
+        }
 
         // Checkbox list
         var listWrap = document.createElement('div');
@@ -10410,12 +11401,112 @@ var SqlResultGrid = (function() {
             }
         });
 
+        // #46 (fix revue adversariale) — mémoire vivante de l'état coché des cases
+        // DYNAMIQUES (injectées par la recherche). Ces cases sont détruites/recréées
+        // à chaque ré-injection (frappe suivante) ; sans mémoire, une valeur que
+        // l'utilisateur vient de décocher reviendrait cochée (dérivée du seul
+        // currentFilter) → réincluse en silence dans le filtre = donnée FAUSSE.
+        // Clé = valeur ; valeur = état coché voulu par l'utilisateur. Vidée quand
+        // la recherche est effacée (q==='').
+        var dynChecked = new Map();
+
+        // Note de troncature des correspondances de recherche (#46) — créée à la
+        // demande quand une recherche ramène plus de valeurs que le cap.
+        var searchTruncNote = null;
+        function _setSearchTruncNote(show) {
+            // Défense : si le popup a été fermé entre-temps (listWrap détaché),
+            // ne rien faire — insertBefore sur un parentNode null crasherait.
+            if (!listWrap.parentNode) return;
+            if (show && !searchTruncNote) {
+                searchTruncNote = document.createElement('div');
+                searchTruncNote.className = 'grid-fp-search-trunc';
+                searchTruncNote.style.cssText =
+                    'padding:0.3rem 0.6rem;font-size:0.7rem;line-height:1.3;'
+                    + 'color:var(--text-secondary, #6b7280);font-style:italic;';
+                searchTruncNote.textContent =
+                    'Beaucoup de correspondances — seules les premières sont affichées. Affinez la recherche.';
+                listWrap.parentNode.insertBefore(searchTruncNote, listWrap);
+            } else if (!show && searchTruncNote) {
+                searchTruncNote.parentNode.removeChild(searchTruncNote);
+                searchTruncNote = null;
+            }
+        }
+
+        // Retire les cases injectées dynamiquement par la recherche (#46) → liste
+        // canonique (500 premières). À appeler quand la recherche est vidée.
+        function _clearDynamicMatches() {
+            for (var j = allItems.length - 1; j >= 0; j--) {
+                var el = allItems[j].el;
+                if (el && el.classList && el.classList.contains('grid-fp-dynamic')) {
+                    if (el.parentNode) el.parentNode.removeChild(el);
+                    allItems.splice(j, 1);
+                }
+            }
+        }
+
+        // #46 — sur colonne tronquée, injecte les valeurs distinctes (au-delà des
+        // 500 listées) qui correspondent à `q`, en cases cochables, pour que la
+        // recherche les TROUVE réellement. Dédup vs items déjà présents.
+        function _injectMatches(q) {
+            _clearDynamicMatches();
+            var already = Object.create(null);
+            for (var j = 0; j < allItems.length; j++) {
+                if (allItems[j].value != null) already[allItems[j].value] = true;
+            }
+            var matched = self._collectDistinctMatching(colIndex, q, 500);
+            for (var i = 0; i < matched.values.length; i++) {
+                (function(val) {
+                    if (already[val]) return;
+                    var lbl = document.createElement('label');
+                    lbl.className = 'grid-fp-item grid-fp-dynamic';
+                    var cb = document.createElement('input');
+                    cb.type = 'checkbox';
+                    // État coché : priorité à la mémoire vivante (toggle utilisateur
+                    // qui doit survivre aux ré-injections), sinon dérivé du filtre
+                    // courant. Sans ça, décocher puis affiner la recherche réincluait
+                    // silencieusement la valeur.
+                    cb.checked = dynChecked.has(val)
+                        ? dynChecked.get(val)
+                        : !(currentFilter && currentFilter.excluded && currentFilter.excluded.has(val));
+                    cb.addEventListener('change', function() { dynChecked.set(val, cb.checked); });
+                    lbl.appendChild(cb);
+                    var displayVal = val === '' ? '(texte vide)' : val;
+                    if (displayVal.length > 40) displayVal = displayVal.substring(0, 40) + '…';
+                    lbl.appendChild(document.createTextNode(' ' + displayVal));
+                    listWrap.appendChild(lbl);
+                    allItems.push({ el: lbl, cb: cb, value: val, label: displayVal });
+                })(matched.values[i]);
+            }
+            _setSearchTruncNote(matched.truncated);
+        }
+
         // Search filtering
         search.addEventListener('input', function() {
             var q = search.value.trim().toLowerCase();
+            // 1) Filtre rapide des items déjà rendus. On matche sur la valeur
+            //    COMPLÈTE (pas le label tronqué à 40 car) pour ne pas masquer à
+            //    tort une valeur dont le fragment recherché est au-delà du 40e car.
             for (var j = 0; j < allItems.length; j++) {
-                var show = q === '' || allItems[j].label.toLowerCase().indexOf(q) !== -1;
+                var hay = (allItems[j].value != null ? String(allItems[j].value) : allItems[j].label).toLowerCase();
+                var show = q === '' || hay.indexOf(q) !== -1;
                 allItems[j].el.style.display = show ? '' : 'none';
+            }
+            // 2) Colonne tronquée : la liste statique n'a que 500 valeurs. On
+            //    re-scanne tout (débounce) pour faire apparaître les correspondances
+            //    au-delà — sinon la recherche est aveugle au reste de la colonne.
+            if (_distinctTruncated) {
+                clearTimeout(self._fpSearchTimer);
+                if (q === '') {
+                    _clearDynamicMatches();
+                    dynChecked.clear(); // nouvelle recherche → on repart propre
+                    _setSearchTruncNote(false);
+                    updateCheckAll();
+                } else {
+                    self._fpSearchTimer = setTimeout(function() {
+                        _injectMatches(q);
+                        updateCheckAll();
+                    }, 160);
+                }
             }
             updateCheckAll();
         });
@@ -10435,15 +11526,38 @@ var SqlResultGrid = (function() {
         }
         btnOk.addEventListener('click', function() {
             if (!canMutate) return;
+            // #46 (fix race débounce↔OK) : une injection de correspondances peut
+            // être EN ATTENTE (l'utilisateur a tapé puis cliqué OK avant les 160ms).
+            // Si on calcule le filtre maintenant, les valeurs au-delà du cap ne sont
+            // pas encore dans allItems → sur colonne tronquée elles seraient TOUTES
+            // exclues (0 ligne) ou le mauvais sous-ensemble gardé. On matérialise donc
+            // l'injection SYNCHRONEMENT avant tout calcul.
+            if (_distinctTruncated && search.value.trim() !== '') {
+                clearTimeout(self._fpSearchTimer);
+                _injectMatches(search.value.trim().toLowerCase());
+            }
             var searchActive = search.value.trim() !== '';
             var excluded = new Set();
             var excludeNull = false;
 
             if (searchActive) {
-                // Search active: EXCLUDE everything, then UN-exclude only visible+checked
-                for (var j = 0; j < allItems.length; j++) {
-                    if (allItems[j].value == null) excludeNull = true;
-                    else excluded.add(allItems[j].value);
+                // Recherche active = « ne garder QUE les valeurs cochées visibles » :
+                // on EXCLUT tout le reste, puis on ré-inclut les cochées visibles.
+                if (_distinctTruncated) {
+                    // Colonne tronquée : la liste (même augmentée par la recherche
+                    // #46) ne contient PAS toutes les valeurs distinctes. N'exclure
+                    // que `allItems` laisserait passer les valeurs non listées → le
+                    // filtre « ne garder que X » serait silencieusement FAUX (trappe
+                    // GRID-1). On matérialise donc le distinct COMPLET (uncapped),
+                    // exactement comme le clic-droit « Filtrer par «X» ».
+                    var full = self._collectDistinct(colIndex, Number.MAX_SAFE_INTEGER);
+                    for (var fi = 0; fi < full.values.length; fi++) excluded.add(full.values[fi]);
+                    if (full.hasNull) excludeNull = true;
+                } else {
+                    for (var j = 0; j < allItems.length; j++) {
+                        if (allItems[j].value == null) excludeNull = true;
+                        else excluded.add(allItems[j].value);
+                    }
                 }
                 for (var j = 0; j < allItems.length; j++) {
                     if (allItems[j].el.style.display !== 'none' && allItems[j].cb.checked) {
@@ -10504,6 +11618,9 @@ var SqlResultGrid = (function() {
     };
 
     SqlResultGrid.prototype._closeFilterPopup = function() {
+        // #46 — annuler le débounce de recherche en vol : sinon il s'exécuterait
+        // sur un popup détaché du DOM (insertBefore sur parentNode null → crash).
+        clearTimeout(this._fpSearchTimer);
         if (this._activePopup) {
             this._activePopup.remove();
             this._activePopup = null;
@@ -10966,6 +12083,11 @@ var SqlResultGrid = (function() {
             var nv = Number(value);
             td.textContent = (value && !isNaN(nv) && isFinite(nv)) ? formatNumber(nv) : (value || '');
             td.classList.add('grid-cell-editable');
+            // Le paste mute td.textContent hors _rebuildBody : la valeur collée
+            // peut contenir (ou retirer) un terme d'anonymisation → re-marquage
+            // (rAF-coalescé) sinon marquage stale (review adversariale tâche #24).
+            this._anonMarkerFingerprint = null;
+            this._applyAnonymizationCellMarkers();
             // Green flash feedback
             td.classList.add('grid-cell-copied');
             setTimeout(function() { td.classList.remove('grid-cell-copied'); }, 400);
@@ -11070,6 +12192,12 @@ var SqlResultGrid = (function() {
         if (this._options && typeof this._options.onStateChange === 'function') {
             this._options.onStateChange();
         }
+        // Une cellule vidée change la valeur affichée → le résumé de sélection
+        // (Σ/moyenne) doit se recalculer, sinon il resterait FIGÉ non nul sur des
+        // cellules désormais vides (review adversariale, Q5). Respecte
+        // _suppressSelectionRefresh → en batch (_clearSelectedCells), on ne
+        // recalcule qu'une fois après la boucle.
+        this._refreshSelectionSummary();
     };
 
     SqlResultGrid.prototype._clearSelectedCells = function() {
@@ -11077,12 +12205,20 @@ var SqlResultGrid = (function() {
         // Snapshot UNIQUE pour la batch (vs un par cellule sinon spam).
         // `_clearCellAt` n'a pas son propre push pour éviter le N-push.
         this._pushHistory();
-        for (var i = 0; i < this._selectedCells.length; i++) {
-            var td = this._selectedCells[i];
-            var r = parseInt(td.getAttribute('data-row'), 10);
-            var c = parseInt(td.getAttribute('data-col'), 10);
-            this._clearCellAt(r, c);
+        this._suppressSelectionRefresh = true;
+        try {
+            for (var i = 0; i < this._selectedCells.length; i++) {
+                var td = this._selectedCells[i];
+                var r = parseInt(td.getAttribute('data-row'), 10);
+                var c = parseInt(td.getAttribute('data-col'), 10);
+                this._clearCellAt(r, c);
+            }
+        } finally {
+            this._suppressSelectionRefresh = false;
         }
+        // Recalcule une SEULE fois après la batch (les cellules vidées doivent se
+        // refléter dans la Σ — sinon total figé non nul sur cellules vidées, Q5).
+        this._refreshSelectionSummary();
     };
 
     // ── Paste clipboard (multi-cell) at target position ──
@@ -11601,7 +12737,15 @@ var SqlResultGrid = (function() {
         .then(function(data) {
             self._loadingAllCols = false;
             if (data.error) {
-                alert('Erreur : ' + data.error);
+                // Toast stylé (cohérent Komptia) plutôt que l'alert() natif moche.
+                // Le message vient du backend déjà CLAIR + adapté à l'audience
+                // (admin vs user) ; pas de SQL brut ici (bruit pour l'utilisateur,
+                // dispo en logs serveur). Fallback alert() si toast.js absent.
+                if (typeof window.showToast === 'function') {
+                    window.showToast(data.error, 'error');
+                } else {
+                    alert('Erreur : ' + data.error);
+                }
                 self._updateHeaderInfo();
                 return;
             }
@@ -11751,7 +12895,14 @@ var SqlResultGrid = (function() {
             self._endSync(drillMainToken, !!(data && data.error));
             self._drillInProgress = false;
             if (data.error) {
-                alert('Erreur drill-down :\n' + data.error + (data.sql ? '\n\nSQL:\n' + data.sql : ''));
+                // Toast stylé (cohérent Komptia) plutôt que l'alert() natif moche.
+                // Message backend déjà CLAIR + adapté à l'audience ; SQL brut
+                // retiré du toast (bruit user, dispo en logs). Fallback alert().
+                if (typeof window.showToast === 'function') {
+                    window.showToast(data.error, 'error');
+                } else {
+                    alert('Erreur drill-down :\n' + data.error);
+                }
                 if (!hasCallback) { self._navStack.pop(); }
                 self._updateHeaderInfo();
                 return;
@@ -12079,8 +13230,21 @@ var SqlResultGrid = (function() {
     var _focusListenerInstalled = false;
     // Constantes de timing — centralisées pour éviter les magic numbers.
     var ANON_REFETCH_MIN_INTERVAL_MS = 30000; // 30s : ne refetch pas à chaque micro-focus
+    // Backoff entre deux tentatives de fetch du state anonymisation après
+    // un échec réseau (tâche #13). Assez court pour auto-guérir vite,
+    // assez long pour ne pas marteler un serveur down depuis les renders.
+    var ANON_FETCH_RETRY_BACKOFF_MS = 15000;
     var ANON_PERSIST_DEBOUNCE_MS = 300;       // conflation des toggles rapides
     var PERSIST_STATE_DEBOUNCE_MS = 500;      // localStorage write coalescing
+    // Feature menu [+] « Requête SQL » : cap d'onglets SQL additionnels par
+    // widget grille. MIROIR de app/models/dashboard.py:MAX_GRID_EXTRA_TABS —
+    // la BDD reste l'autorité (validate() rejette au-delà) ; ce miroir ne sert
+    // qu'à désactiver l'item de menu côté UX avant l'aller-retour réseau.
+    var GRID_MAX_EXTRA_SQL_TABS = 10;
+    // MIROIR de app/models/dashboard.py:MAX_GRID_TAB_LABEL_LEN — cap appliqué
+    // au libellé d'un onglet SQL AVANT persistance pour que le backend ne
+    // rejette jamais (400) un titre trop long saisi/collé localement.
+    var GRID_MAX_EXTRA_TAB_LABEL_LEN = 100;
     var SYNC_OP_TTL_MS = 10000;               // safety : op abandonnée = dot auto-retiré
     var SYNC_FADE_DELAY_MS = 300;             // évite flicker si new sync arrive dans la foulée
     var SYNC_ERROR_FLASH_MS = 2000;           // durée du dot rouge avant reset
@@ -12230,8 +13394,9 @@ var SqlResultGrid = (function() {
                             if (now - lastTs < ANON_REFETCH_MIN_INTERVAL_MS) continue;
                             // Force un nouveau fetch. L'ancien (si encore en vol)
                             // sera ignoré via _anonFetchSeq dans _fetchAnonymizationState.
-                            g._anonymizationFetched = false;
-                            g._anonymizationFetchPromise = null;
+                            if (typeof g._invalidateAnonymizationCache === 'function') {
+                                g._invalidateAnonymizationCache();
+                            }
                             g._fetchAnonymizationState();
                         }
                     } catch (e) { /* defensive */ }
@@ -12326,6 +13491,35 @@ var SqlResultGrid = (function() {
     }
 
     /**
+     * T12c — teardown UNIQUE d'un manager (appelé avant remplacement sur le
+     * dashboard ou fin de vie). Ferme : (1) les timers persistState/autosave/
+     * scan, (2) les listeners ``document`` des grilles enfants (cf.
+     * SqlResultGrid.destroy — le mouseup ferme sur toute la grille → fuite
+     * cross-instance sous re-render répété), (3) la référence dans le registre
+     * ``_activeManagers`` (sinon le manager mort y reste jusqu'au prochain
+     * passage de ``_isManagerAlive``). Best-effort + idempotent.
+     */
+    GridTabManager.prototype.destroy = function() {
+        try {
+            if (this._persistStateTimer) { clearTimeout(this._persistStateTimer); this._persistStateTimer = null; }
+            if (this._autosavePeriodicTimer) { clearInterval(this._autosavePeriodicTimer); this._autosavePeriodicTimer = null; }
+            if (this._anonScanTimer) { clearTimeout(this._anonScanTimer); this._anonScanTimer = null; }
+        } catch (e) { /* defensive */ }
+        if (this._searchOutsideHandler) {
+            document.removeEventListener('mousedown', this._searchOutsideHandler);
+            this._searchOutsideHandler = null;
+        }
+        try {
+            for (var i = 0; i < this.tabs.length; i++) {
+                var g = this.tabs[i] && this.tabs[i].grid;
+                if (g && typeof g.destroy === 'function') g.destroy();
+            }
+        } catch (e2) { /* best-effort cleanup */ }
+        var idx = _activeManagers.indexOf(this);
+        if (idx !== -1) _activeManagers.splice(idx, 1);
+    };
+
+    /**
      * Capture un snapshot du classeur pour l'historique undo/redo.
      * Debounced à 500ms pour éviter les rafales.
      */
@@ -12380,6 +13574,13 @@ var SqlResultGrid = (function() {
         this._restoringState = true;
         this.loadWorkbook(state);
         this._restoringState = false;
+        // Feature « feuilles SQL » : un undo/redo peut RESTAURER l'externalSource.query
+        // d'une feuille (annuler une édition SQL). Sans re-sync, le serveur garderait
+        // le SQL POST-édition → après edit→undo→refresh le backend ré-exécuterait
+        // l'ancien SQL (donnée fausse silencieuse, contredit ce que l'user voit).
+        // _notifySqlTabsChanged est no-op hors dashboard (_sqlTabContext absent) et
+        // dédupé par signature (no-op si la liste {label,query} n'a pas changé).
+        this._notifySqlTabsChanged();
     };
 
     GridTabManager.prototype._updateAllUndoRedoButtons = function() {
@@ -12439,10 +13640,13 @@ var SqlResultGrid = (function() {
             if (e.key === 'Escape') { input.value = ''; self._closeSearchResults(); }
         });
 
-        // Close dropdown on outside click
-        document.addEventListener('mousedown', function(e) {
+        // Close dropdown on outside click. Handler STOCKÉ (T12c) sur le manager
+        // → retiré dans destroy() (sinon ce listener ``document`` garde le manager
+        // + la search bar vivants après remplacement du widget dashboard).
+        this._searchOutsideHandler = function(e) {
             if (!bar.contains(e.target)) self._closeSearchResults();
-        });
+        };
+        document.addEventListener('mousedown', this._searchOutsideHandler);
 
         return bar;
     };
@@ -12553,6 +13757,51 @@ var SqlResultGrid = (function() {
         setTimeout(function() { tr.classList.remove('grid-row-highlight'); }, 2000);
     };
 
+    // Prépare les cellDetails d'une feuille IMPORTÉE depuis un autre classeur
+    // (« Ajouter feuilles externes… »). Copie superficielle entrée par entrée
+    // avec ``source_tab_index`` neutralisé : cet index référence l'ordre des
+    // onglets du classeur SOURCE — dans le classeur de destination il pointerait
+    // un onglet arbitraire (reconstruction de détail plausible-mais-fausse à
+    // l'export). À null, ``_reconstructDetailRowsFromMatch`` retombe sur son
+    // auto-détection par couverture de colonnes, valide quel que soit l'hôte.
+    // ``rowCount`` = nb de lignes réellement importées : les clés "row,col"
+    // au-delà (source tronquée par tab-data max_rows) sont des détails
+    // orphelins jamais atteignables → drop pour rester cohérent.
+    // Fail-soft : input non-dict → null (l'import continue sans cellDetails).
+    // NB cohérence : les shapes « slim » de _captureState (~5100) et
+    // serialize() (~16230) allowlistent les champs ; ici on copie tout-venant
+    // car la source est le format .afz déjà slim — ``source_tab_index`` est à
+    // ce jour le SEUL champ relatif au classeur source à neutraliser. Si un
+    // futur champ devient source-relatif, le traiter aux TROIS endroits.
+    function _sanitizeImportedCellDetails(cd, rowCount) {
+        if (!cd || typeof cd !== 'object' || Array.isArray(cd)) return null;
+        var maxRow = (typeof rowCount === 'number' && rowCount >= 0) ? rowCount : null;
+        var out = {};
+        var has = false;
+        for (var k in cd) {
+            if (!cd.hasOwnProperty(k)) continue;
+            // Clés magiques JS : jamais des coordonnées "row,col" légitimes,
+            // et assigner out['__proto__'] remplacerait le prototype de out.
+            if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+            var d = cd[k];
+            if (!d || typeof d !== 'object' || Array.isArray(d)) continue;
+            if (maxRow !== null) {
+                var rowIdx = parseInt(String(k).split(',')[0], 10);
+                if (!isNaN(rowIdx) && rowIdx >= maxRow) continue;
+            }
+            var copy = {};
+            for (var f in d) {
+                if (!d.hasOwnProperty(f)) continue;
+                if (f === '__proto__' || f === 'constructor' || f === 'prototype') continue;
+                copy[f] = d[f];
+            }
+            copy.source_tab_index = null;
+            out[k] = copy;
+            has = true;
+        }
+        return has ? out : null;
+    }
+
     GridTabManager.prototype.addTab = function(label, columns, rows, sql, rowCount, metadata, closable) {
         var self = this;
         var id = this._nextId++;
@@ -12561,11 +13810,16 @@ var SqlResultGrid = (function() {
         containerEl.style.display = 'none';
         this.contentEl.appendChild(containerEl);
 
-        // Extended metadata: callers can pass {columnMetadata, merges, externalSource}
-        // or just the raw columnMetadata dict (legacy).
+        // Extended metadata: callers can pass {columnMetadata, merges, externalSource,
+        // cellDetails} or just the raw columnMetadata dict (legacy). NB : la
+        // détection du format étendu reste volontairement sur les 3 clés
+        // historiques — ``cellDetails`` n'est lu QUE dans la branche détectée
+        // (pas de nouveau mot-clé qui pourrait collisionner avec un nom de
+        // colonne d'un dict columnMetadata legacy).
         var gridColumnMetadata = metadata;
         var gridMerges = null;
         var externalSource = null;
+        var initialCellDetails = null;
         if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)
             && (metadata.hasOwnProperty('merges')
                 || metadata.hasOwnProperty('externalSource')
@@ -12573,6 +13827,10 @@ var SqlResultGrid = (function() {
             gridColumnMetadata = metadata.columnMetadata || null;
             gridMerges = Array.isArray(metadata.merges) ? metadata.merges : null;
             externalSource = metadata.externalSource || null;
+            initialCellDetails = (metadata.cellDetails
+                && typeof metadata.cellDetails === 'object'
+                && !Array.isArray(metadata.cellDetails))
+                ? metadata.cellDetails : null;
         }
 
         var grid = null;
@@ -12617,6 +13875,14 @@ var SqlResultGrid = (function() {
                 onReplaceTabContent: function(idx, payload) {
                     return self.replaceTabContentProgrammatic(idx, payload);
                 },
+                // Feature « feuilles SQL » : quand l'user édite le SQL de CETTE
+                // feuille via le bouton "Modifier & réexécuter" de la grille, on
+                // remonte la requête D'ORIGINE saisie pour mettre à jour la
+                // feuille + persister (dédup). ``id`` identifie la feuille (≠ idx
+                // qui bouge au réordonnancement).
+                onSqlAuthored: function(newSql) {
+                    self._handleTabSqlAuthored(id, newSql);
+                },
                 tabLabel: label,
                 fullscreenTarget: self.parentContainer,
                 onStateChange: function() { self.persistState(); },
@@ -12646,7 +13912,11 @@ var SqlResultGrid = (function() {
                 onSyncEnd: function(token, opts) {
                     self._syncIndicator.end(token, opts);
                 },
-                merges: gridMerges
+                merges: gridMerges,
+                // Provenance de la feuille — la grille en a besoin DÈS la
+                // construction (gate de l'auto-analyze GROUP BY) pour
+                // distinguer feuille SQL vivante / snapshot importé.
+                externalSource: externalSource
             });
             if (grid && gridMerges && gridMerges.length > 0) {
                 grid.setMerges(gridMerges);
@@ -12656,6 +13926,15 @@ var SqlResultGrid = (function() {
         } catch (err) {
             console.error('[TabManager] Grid creation error:', err);
             containerEl.innerHTML = '<div class="iris-no-results">Erreur d\'affichage</div>';
+        }
+
+        // cellDetails initiaux (import « Ajouter feuilles externes… » : SQL par
+        // cellule du classeur source). Posés AVANT le snapshotWorkbook plus bas
+        // pour que le premier snapshot undo de l'onglet les contienne — une
+        // assignation après le retour d'addTab laisserait un snapshot amputé
+        // (un undo+redo perdrait les SQL de cellules silencieusement).
+        if (grid && initialCellDetails) {
+            grid._cellDetails = initialCellDetails;
         }
 
         var tabInfo = {
@@ -12709,6 +13988,172 @@ var SqlResultGrid = (function() {
         var info = this.addTab(label, columns, rows, sql, rowCount, metadata, true);
         this._switchTab(previousIdx);
         return info;
+    };
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Feature menu [+] « Requête SQL » (widgets grille de dashboard)
+    //
+    // Un onglet « Requête SQL » est un onglet normal portant son SQL +
+    // externalSource:{type:'sql_query', query}. Côté dashboard il est PERSISTÉ
+    // dans la config du widget et RÉ-EXÉCUTÉ par le backend à CHAQUE affichage
+    // (toujours frais, survit au refresh sans snapshot ni localStorage). Le
+    // contexte d'autorisation + la persistance sont injectés par renderIrisGrid
+    // (builder_view.html) via ``this._sqlTabContext = {canAuthor, persist}``.
+    // Hors dashboard (/iris, /datastore), _sqlTabContext est absent → l'item de
+    // menu n'apparaît pas (feature dashboard-only, menu partagé non régressé).
+    // ──────────────────────────────────────────────────────────────────────
+
+    // Liste {label, query} des onglets « Requête SQL » courants, dans l'ordre.
+    // Source de vérité de ce qui est persisté côté serveur.
+    GridTabManager.prototype._collectSqlQueryTabs = function() {
+        var out = [];
+        for (var i = 0; i < this.tabs.length; i++) {
+            var t = this.tabs[i];
+            var src = t && t.externalSource;
+            if (src && src.type === 'sql_query' && typeof src.query === 'string') {
+                // Cap du libellé au point UNIQUE où il devient le payload de
+                // persistance → le backend (validate, max 100) ne rejette jamais
+                // un titre trop long quelle que soit la voie (rename interactif,
+                // copilot, collage). Évite la divergence local↔serveur (400).
+                var lbl = String(t.label == null ? '' : t.label);
+                if (lbl.length > GRID_MAX_EXTRA_TAB_LABEL_LEN) {
+                    lbl = lbl.slice(0, GRID_MAX_EXTRA_TAB_LABEL_LEN);
+                }
+                out.push({ label: lbl, query: src.query });
+            }
+        }
+        return out;
+    };
+
+    // Re-persiste la liste courante d'onglets SQL via le contexte dashboard.
+    // No-op hors dashboard. **Idempotente / dédupliquée par signature** : ne
+    // déclenche un PUT QUE si la liste {label, query} des onglets SQL a
+    // réellement changé. On peut donc l'appeler après N'IMPORTE quelle mutation
+    // d'onglet (close, rename, bulk-close, delete programmatique) sans PUT
+    // parasite pour les onglets non-SQL (drill-down, feuilles externes).
+    // Optimiste : la mutation locale a déjà eu lieu ; en cas d'échec serveur on
+    // restaure la signature précédente pour ré-essayer au prochain changement
+    // (le builder remonte déjà un toast d'erreur). La baseline initiale est
+    // posée par renderIrisGrid après chargement des onglets du backend.
+    GridTabManager.prototype._notifySqlTabsChanged = function() {
+        var ctx = this._sqlTabContext;
+        if (!ctx || !ctx.canAuthor || typeof ctx.persist !== 'function') return;
+        var self = this;
+        var list = this._collectSqlQueryTabs();
+        var sig = JSON.stringify(list);
+        if (sig === this._lastPersistedSqlTabsSig) return;
+        var prevSig = this._lastPersistedSqlTabsSig;
+        this._lastPersistedSqlTabsSig = sig;  // optimiste
+        this._enqueueSqlTabsPut(list).then(function(ok) {
+            // Échec → restaure la signature pour ré-essayer au prochain changement.
+            if (!ok) self._lastPersistedSqlTabsSig = prevSig;
+        });
+    };
+
+    // Enfile un PUT de ``list`` sur une CHAÎNE de promesses sérialisée. Garantit
+    // que deux mutations rapprochées (rename + close, drag, ajout) émettent
+    // leurs PUT DANS L'ORDRE — le dernier état gagne côté serveur. Sans ça, deux
+    // fetch PUT concurrents non ordonnés pouvaient committer dans le désordre,
+    // le PÉRIMÉ en dernier (race « out-of-order PUT », ``set_widget_extra_tabs``
+    // fait un remplacement complet sans contrôle de version). La chaîne avance
+    // même sur échec (un PUT raté ne bloque pas les suivants). Retourne une
+    // Promise<bool> (ok) résolue quand CE maillon a été traité, dans l'ordre.
+    GridTabManager.prototype._enqueueSqlTabsPut = function(list) {
+        var ctx = this._sqlTabContext;
+        if (!ctx || !ctx.canAuthor || typeof ctx.persist !== 'function') {
+            return Promise.resolve(false);
+        }
+        var prev = this._sqlTabsPutChain || Promise.resolve();
+        var result = prev.then(function() { return ctx.persist(list); });
+        this._sqlTabsPutChain = result.then(function() {}, function() {});
+        return result.then(
+            function(ok) { return ok !== false; },
+            function() { return false; }
+        );
+    };
+
+    // Feature « feuilles SQL » : l'édition du SQL d'une feuille (bouton
+    // "Modifier & réexécuter" de la grille) met à jour la requête PERSISTÉE de
+    // cette feuille + déclenche la sauvegarde (dédupée par signature). On
+    // identifie la feuille par son ``id`` stable (≠ index, qui bouge au
+    // réordonnancement). ``newSql`` = requête D'ORIGINE saisie par l'user
+    // (jamais filtre-wrappée). No-op pour une feuille non-SQL (drill-down,
+    // feuille externe sans externalSource) ou hors dashboard.
+    GridTabManager.prototype._handleTabSqlAuthored = function(id, newSql) {
+        if (typeof newSql !== 'string') return;
+        for (var i = 0; i < this.tabs.length; i++) {
+            var t = this.tabs[i];
+            if (t && t.id === id) {
+                var src = t.externalSource;
+                if (src && src.type === 'sql_query') {
+                    src.query = newSql;
+                    this._notifySqlTabsChanged();
+                }
+                return;
+            }
+        }
+    };
+
+    // Ouvre l'éditeur SQL pour créer un nouvel onglet « Requête SQL ».
+    // Flux PERSIST-FIRST : on exécute (preview via l'éditeur), on persiste la
+    // nouvelle liste côté serveur, et SEULEMENT si la persistance réussit on
+    // ajoute l'onglet localement — la BDD reste la source de vérité (pas
+    // d'onglet fantôme non sauvegardé qui disparaîtrait au refresh suivant).
+    GridTabManager.prototype._openSqlQueryTab = function() {
+        var self = this;
+        var ctx = self._sqlTabContext;
+        if (!ctx || !ctx.canAuthor || typeof ctx.persist !== 'function') return;
+        if (typeof window.openSqlEditorModal !== 'function') {
+            if (typeof window.showToast === 'function') {
+                window.showToast("Éditeur SQL non chargé.", 'error');
+            }
+            return;
+        }
+        window.openSqlEditorModal({
+            sql: '',
+            filename: null,
+            allowSave: false,
+            title: 'Nouvel onglet : Requête SQL',
+            hint: 'Cette requête sera ré-exécutée à chaque affichage du widget '
+                + '(données toujours fraîches). Lecture seule — SELECT/WITH.',
+            onSuccess: function(result) {
+                if (!result || typeof result.sql !== 'string' || !result.sql.trim()) return;
+                // Numérote d'après les feuilles ADDITIONNELLES (exclut la
+                // principale de confiance, collectée) → la 1ère feuille créée par
+                // l'user = « Requête 1 », pas « Requête 2 ».
+                var label = 'Requête '
+                    + (self._collectSqlQueryTabs().length
+                        - (self._primarySheetTrusted ? 1 : 0) + 1);
+                var candidate = self._collectSqlQueryTabs().concat([
+                    { label: label, query: result.sql }
+                ]);
+                // PERSIST-FIRST via la CHAÎNE sérialisée (ordonnée vis-à-vis
+                // d'un éventuel rename/close en vol) : on n'ajoute l'onglet
+                // localement qu'après confirmation serveur.
+                self._enqueueSqlTabsPut(candidate).then(function(ok) {
+                    if (!ok) {
+                        if (typeof window.showToast === 'function') {
+                            window.showToast("Onglet non sauvegardé (erreur serveur).", 'error');
+                        }
+                        return;
+                    }
+                    self.addTab(
+                        label,
+                        result.columns || [],
+                        result.rows || [],
+                        result.sql,
+                        (typeof result.row_count === 'number'
+                            ? result.row_count
+                            : (result.rows ? result.rows.length : 0)),
+                        { externalSource: { type: 'sql_query', query: result.sql } },
+                        true
+                    );
+                    // Baseline = état persisté (la liste vient d'être PUT avec
+                    // succès) → un rename/close ultérieur sera détecté correctement.
+                    self._lastPersistedSqlTabsSig = JSON.stringify(self._collectSqlQueryTabs());
+                });
+            }
+        });
     };
 
     GridTabManager.prototype._renderTabBar = function() {
@@ -12809,6 +14254,19 @@ var SqlResultGrid = (function() {
                 });
                 btn.addEventListener('drop', function(e) {
                     e.preventDefault();
+                    // Feuille PRINCIPALE (index 0) figée en 1ère position pour un
+                    // widget dashboard : interdit de la déplacer OU d'insérer une
+                    // autre feuille avant elle (le backend mappe la feuille 0 →
+                    // data_source_config["query"]). Hors dashboard
+                    // (_sqlTabContext absent) : réordonnancement libre.
+                    if (self._sqlTabContext && (dragSrcIdx === 0 || idx === 0)) {
+                        dragSrcIdx = null;
+                        var dragOvers = self.tabBarEl.querySelectorAll('.grid-tab-drag-over');
+                        for (var d = 0; d < dragOvers.length; d++) {
+                            dragOvers[d].classList.remove('grid-tab-drag-over');
+                        }
+                        return;
+                    }
                     if (dragSrcIdx !== null && dragSrcIdx !== idx) {
                         // Move tab in array
                         var moved = self.tabs.splice(dragSrcIdx, 1)[0];
@@ -12825,6 +14283,12 @@ var SqlResultGrid = (function() {
                         }
                         self._renderTabBar();
                         self._switchTab(self.activeTabIndex);
+                        // Feature « Requête SQL » : persiste le nouvel ORDRE des
+                        // onglets (le drag réordonne this.tabs). Sans ça, l'ordre
+                        // était perdu au refresh — les onglets revenaient dans
+                        // l'ordre stocké. Dédup par signature → no-op si le drag
+                        // ne touche que des onglets non-SQL. (Fix revue adv.)
+                        self._notifySqlTabsChanged();
                     }
                     dragSrcIdx = null;
                 });
@@ -12890,20 +14354,73 @@ var SqlResultGrid = (function() {
                             sheet.label || 'Feuille externe',
                             sheet.columns || [],
                             sheet.rows || [],
-                            '',
+                            // SQL de la feuille source (classeur .afz) : le
+                            // transporter pour qu'il survive au save/reload —
+                            // avant, '' hardcodé = perte silencieuse du SQL
+                            // de chaque feuille importée. Excel/CSV n'en ont
+                            // pas → ''.
+                            (typeof sheet.sql === 'string') ? sheet.sql : '',
                             sheet.row_count || 0,
                             {
                                 columnMetadata: null,
                                 merges: sheet.merges || [],
-                                externalSource: sheet.source || { type: sheet.type }
+                                externalSource: sheet.source || { type: sheet.type },
+                                cellDetails: _sanitizeImportedCellDetails(
+                                    sheet.cellDetails, (sheet.rows || []).length)
                             },
                             true
                         );
                     });
+                    // T11 — sur un widget dashboard, une feuille externe importée
+                    // ne survit au refresh QUE si le widget est enregistré comme
+                    // classeur (l'import seul ne persiste pas). On le rappelle.
+                    if (self._dashboardWidget && typeof window.showToast === 'function') {
+                        window.showToast(
+                            'Feuille importée — cliquez « Enregistrer » pour la conserver.',
+                            'info'
+                        );
+                    }
                 }
             });
         });
         addMenu.appendChild(itemExt);
+
+        // Item « Requête SQL » — feature dashboard-only (menu [+]). N'apparaît
+        // QUE si renderIrisGrid a injecté un contexte d'autorisation
+        // (this._sqlTabContext.canAuthor) → owner d'un widget grille de
+        // dashboard. Crée un onglet adossé à une requête SQL ré-exécutée à
+        // chaque affichage (persistée dans la config du widget).
+        if (self._sqlTabContext && self._sqlTabContext.canAuthor) {
+            var itemSql = document.createElement('button');
+            itemSql.type = 'button';
+            itemSql.className = 'grid-save-menu-item';
+            itemSql.textContent = 'Requête SQL';
+            // Cap sur les onglets SQL ADDITIONNELS (miroir backend
+            // MAX_GRID_EXTRA_TABS qui ne compte QUE extra_tabs). En mode « feuille
+            // principale de confiance » (source_sql fourni), la principale porte
+            // elle-même externalSource sql → elle est collectée → on la retire du
+            // compte des additionnels (sinon cap à 9 au lieu de 10). En legacy
+            // (principale non collectée) on ne retire rien.
+            var _extraSqlCount = self._collectSqlQueryTabs().length
+                - (self._primarySheetTrusted ? 1 : 0);
+            var atCap = _extraSqlCount >= GRID_MAX_EXTRA_SQL_TABS;
+            if (atCap) {
+                itemSql.disabled = true;
+                itemSql.title = 'Maximum ' + GRID_MAX_EXTRA_SQL_TABS
+                    + ' onglets SQL par widget.';
+                itemSql.style.opacity = '0.5';
+                itemSql.style.cursor = 'not-allowed';
+            }
+            itemSql.addEventListener('click', function() {
+                addMenu.style.display = 'none';
+                if (window.OverlayManager) {
+                    try { window.OverlayManager.close(addMenu); } catch (_) {}
+                }
+                if (atCap) return;
+                self._openSqlQueryTab();
+            });
+            addMenu.appendChild(itemSql);
+        }
 
         // Portal vers <body> : sort le menu du stacking context du parent
         // (sinon il est masqué par .grid-fullscreen, dorénavant à
@@ -13463,6 +14980,11 @@ var SqlResultGrid = (function() {
 
         // Snapshot workbook state after closing a tab
         if (!this._restoringState) this.snapshotWorkbook();
+
+        // Re-persiste la config widget si la liste d'onglets SQL a changé
+        // (no-op hors dashboard ; dédupliqué par signature → pas de PUT pour
+        // la fermeture d'un onglet non-SQL comme un drill-down).
+        this._notifySqlTabsChanged();
     };
 
     // ── Mutations programmatiques (utilisées par copilot_agent) ──
@@ -13485,6 +15007,9 @@ var SqlResultGrid = (function() {
         this.tabs[index].label = trimmed;
         this._renderTabBar();
         if (!this._restoringState) this.snapshotWorkbook();
+        // Feature « Requête SQL » : persiste si le renommage touche un onglet
+        // SQL (dédup par signature → no-op sinon).
+        this._notifySqlTabsChanged();
         return true;
     };
 
@@ -13551,6 +15076,19 @@ var SqlResultGrid = (function() {
             this._renderTabBar();
         }
 
+        // Feuille SQL : aligner le contrat de persistance ``externalSource``
+        // sur le SQL muté. Sans ça, un ``modify_tab_sql`` du copilot mutait
+        // ``grid.sql`` (affichage) mais PAS la requête PERSISTÉE → au refresh
+        // le serveur ré-exécutait l'ANCIEN SQL (bug constaté en prod
+        // 2026-06-10 : « le copilot a modifié le SQL, le refresh a remis
+        // l'ancien résultat »). _notifySqlTabsChanged est dédupé par
+        // signature → no-op hors dashboard / si rien n'a changé.
+        if (tab.externalSource && tab.externalSource.type === 'sql_query'
+            && typeof newSql === 'string' && newSql) {
+            tab.externalSource.query = newSql;
+            this._notifySqlTabsChanged();
+        }
+
         if (!this._restoringState) this.snapshotWorkbook();
         return true;
     };
@@ -13577,6 +15115,7 @@ var SqlResultGrid = (function() {
         this._renderTabBar();
         this._switchTab(this.activeTabIndex);
         if (!this._restoringState) this.snapshotWorkbook();
+        this._notifySqlTabsChanged();  // feature « Requête SQL » (dédup par signature)
         return true;
     };
 
@@ -13599,10 +15138,21 @@ var SqlResultGrid = (function() {
     GridTabManager.prototype._startTabRename = function(tabIdx, labelSpan) {
         var self = this;
         var tab = this.tabs[tabIdx];
+        // Feuille PRINCIPALE d'un widget dashboard (index 0) : NON renommable —
+        // son titre = celui du widget (pas de champ label en base ; le backend
+        // ignore le label de la feuille 0). Un renommage serait éphémère (perdu
+        // au reload). Hors dashboard (_sqlTabContext absent) : inchangé.
+        if (self._sqlTabContext && tabIdx === 0) return;
         var oldName = tab.label;
 
         var input = document.createElement('input');
         input.type = 'text';
+        // Onglet « Requête SQL » : cap la saisie au max backend (le titre est
+        // persisté → un titre >100 serait rejeté 400). Les autres onglets
+        // (/iris, feuilles externes) gardent leur comportement (pas de cap).
+        if (tab.externalSource && tab.externalSource.type === 'sql_query') {
+            input.maxLength = GRID_MAX_EXTRA_TAB_LABEL_LEN;
+        }
         input.value = oldName;
         input.style.cssText = 'font:inherit;border:1px solid var(--brand-light);border-radius:3px;'
             + 'padding:0 4px;outline:none;width:' + Math.max(80, labelSpan.offsetWidth + 20) + 'px;'
@@ -13648,6 +15198,10 @@ var SqlResultGrid = (function() {
             btn.removeEventListener('keyup', blockBtnDefault, true);
             btn.removeEventListener('click', blockBtnDefault, true);
             if (!self._restoringState) self.snapshotWorkbook();
+            // Feature « Requête SQL » : persiste le nouveau titre si l'onglet
+            // renommé est un onglet SQL (dédup par signature → no-op si rien
+            // n'a changé ou si l'onglet n'est pas un onglet SQL).
+            self._notifySqlTabsChanged();
         };
 
         input.addEventListener('blur', commit);
@@ -13692,7 +15246,7 @@ var SqlResultGrid = (function() {
         var selLabel = keepSet.size > 1 ? ' (' + keepSet.size + ' gardés)' : '';
 
         var items = [
-            { label: 'Renommer', enabled: true, action: function() {
+            { label: 'Renommer', enabled: !(self._sqlTabContext && tabIdx === 0), action: function() {
                 var btn = self.tabBarEl.querySelector('[data-tab-idx="' + tabIdx + '"] > span:first-child');
                 if (btn) self._startTabRename(tabIdx, btn);
             }},
@@ -13780,6 +15334,7 @@ var SqlResultGrid = (function() {
         this._renderTabBar();
         this._switchTab(this.activeTabIndex);
         if (!this._restoringState) this.snapshotWorkbook();
+        this._notifySqlTabsChanged();  // feature « Requête SQL » (dédup par signature)
     };
 
     GridTabManager.prototype._closeTabsIn = function(closeSet) {
@@ -13795,6 +15350,7 @@ var SqlResultGrid = (function() {
         this._renderTabBar();
         this._switchTab(this.activeTabIndex);
         if (!this._restoringState) this.snapshotWorkbook();
+        this._notifySqlTabsChanged();  // feature « Requête SQL » (dédup par signature)
     };
 
     GridTabManager.prototype._closeTabsRight = function(fromIdx) {
@@ -13812,6 +15368,7 @@ var SqlResultGrid = (function() {
         this._renderTabBar();
         this._switchTab(this.activeTabIndex);
         if (!this._restoringState) this.snapshotWorkbook();
+        this._notifySqlTabsChanged();  // feature « Requête SQL » (dédup par signature)
     };
 
     GridTabManager.prototype._closeTabsLeft = function(fromIdx) {
@@ -13829,6 +15386,7 @@ var SqlResultGrid = (function() {
         this._renderTabBar();
         this._switchTab(this.activeTabIndex);
         if (!this._restoringState) this.snapshotWorkbook();
+        this._notifySqlTabsChanged();  // feature « Requête SQL » (dédup par signature)
     };
 
     GridTabManager.prototype._handleDrillResult = function(data) {
@@ -13939,6 +15497,16 @@ var SqlResultGrid = (function() {
                     }
                 }
                 entry.col_distinct = colDistinct;
+                // #18f (triage caps 2026-06-10) — au-delà de MAX_SCAN_ROWS,
+                // min/max/comptes distincts sont calculés sur un PRÉFIXE :
+                // sans ce flag, le LLM lit « min=X, max=Y, N distinct »
+                // comme des faits de table entière (filtres/analyses faux).
+                if (grid.allRows.length > scanLimit) {
+                    entry.col_distinct_scan = {
+                        scanned: scanLimit,
+                        total: grid.allRows.length
+                    };
+                }
             }
             // sheet_content — pour TOUS les onglets sœurs avec lignes (SQL ou non).
             // - Non-SQL (dashboard / xlsx) : émet chaque cellule non vide + cellDetails existants
@@ -14230,6 +15798,15 @@ var SqlResultGrid = (function() {
     GridTabManager.prototype._setDirty = function(dirty) {
         var was = this._dirty;
         this._dirty = !!dirty;
+        // **Compteur de mutations monotone** : bumpé à CHAQUE appel dirty=true,
+        // même quand le workbook était DÉJÀ dirty (``_setDirty(true)`` est
+        // idempotent sur le booléen). Sert à détecter une édition PENDANT un
+        // save in-flight dans le cas autosave (où ``_dirty`` est déjà true au
+        // départ) — un snapshot booléen ne verrait jamais le changement et
+        // resetterait "clean" à tort (perte silencieuse, cf. fix H1).
+        if (this._dirty) {
+            this._dirtySeq = (this._dirtySeq || 0) + 1;
+        }
         // Scan auto anonymization à chaque mutation workbook (debounce 2.5s
         // côté _scheduleAnonymizationScan). Couvre edit cellule, paste, add
         // tab, import xlsx/csv en preview, etc. — alimente
@@ -14487,6 +16064,7 @@ var SqlResultGrid = (function() {
     GridTabManager.prototype._flushAutosaveOnUnload = function() {
         if (!this._dirty || !this._currentFilePath || this._autosaveDisabled) return;
         if (this._autosaveSaving) return;
+        var self = this;
         try {
             var data = this.serialize();
             var json = JSON.stringify(data);
@@ -14511,22 +16089,81 @@ var SqlResultGrid = (function() {
             if (this._currentFileHash) {
                 headers['If-Match'] = this._currentFileHash;
             }
-            // **Marqueur "unload-flush in flight"** : si l'utilisateur
-            // annule l'unload (clique "Rester"), la fetch keepalive
-            // continue mais la response sera ignorée. On marque l'état
-            // pour qu'au prochain focus on re-sync l'ETag (le serveur
-            // a peut-être un nouveau hash dont on n'a pas connaissance).
-            this._unloadFlushInFlight = true;
-            // ``keepalive: true`` permet à la requête de survivre à la
-            // fermeture de la page (pendant ~30s côté navigateur).
-            fetch('/api/datastore/upload', {
-                method: 'POST',
-                headers: headers,
-                body: formData,
-                keepalive: true,
-            }).catch(function() { /* best-effort, ignore */ });
-            // Fallback localStorage en parallèle.
+            // Sérialise avec l'autosave normal : on pose ``_autosaveSaving``
+            // pour la durée du keepalive afin qu'un ``_maybeAutosave`` concurrent
+            // ENQUEUE au lieu de courir avec un ``If-Match`` périmé pendant que le
+            // keepalive est en vol (sinon le 412 fantôme se relocalise sur le
+            // chemin autosave). L'entrée de ce flush a déjà vérifié
+            // ``!_autosaveSaving`` plus haut → on ne piétine aucun save en cours.
+            // Fallback localStorage écrit EN PREMIER : indépendant du fetch, il
+            // doit s'exécuter même si ``fetch(keepalive)`` lève une exception
+            // SYNCHRONE (ex. body multipart > limite keepalive sur certains
+            // navigateurs). Posé AVANT le verrou pour ne pas geler l'autosave
+            // s'il throwait lui-même.
             this._writeAutoRecover();
+            this._autosaveSaving = true;
+            var seqAtFlush = this._dirtySeq || 0;
+            try {
+                // ``keepalive: true`` permet à la requête de survivre à la
+                // fermeture de la page (pendant ~30s côté navigateur).
+                fetch('/api/datastore/upload', {
+                    method: 'POST',
+                    headers: headers,
+                    body: formData,
+                    keepalive: true,
+                }).then(function(res) {
+                    // Page SURVÉCUE (l'utilisateur a cliqué « Rester » dans le
+                    // prompt beforeunload) → la réponse est lisible : on
+                    // re-synchronise l'ETag, sinon le prochain save enverrait un
+                    // ``If-Match`` périmé = 412 FANTÔME (le flush keepalive a
+                    // changé le hash serveur). Page réellement fermée → ce
+                    // ``then`` ne tourne jamais (best-effort inchangé, la requête
+                    // keepalive part quand même).
+                    if (!res.ok) return; // 412/échec RÉEL → ne pas toucher au hash
+                    // Lecture SÛRE via le SSoT ``_readJsonSafe`` (ne throw jamais,
+                    // même sur une page d'erreur HTML de proxy → pas de skip
+                    // silencieux de la re-sync). Retourne ``{status, data}``.
+                    return _readJsonSafe(res).then(function(parsed) {
+                        var result = (parsed && parsed.data && typeof parsed.data === 'object')
+                            ? parsed.data : {};
+                        var up = result.uploaded && result.uploaded[0];
+                        if (up && typeof up.file_hash === 'string') {
+                            self._currentFileHash = up.file_hash;
+                            // Reset dirty + purge AutoRecover UNIQUEMENT si aucune
+                            // mutation depuis le flush (même garde anti-perte que
+                            // ``_saveToPathAsync`` : un edit fait APRÈS « Rester »
+                            // ne doit pas être masqué « clean »). ``_setDirty(false)``
+                            // (≠ ``_dirty = false`` brut) rafraîchit aussi
+                            // l'astérisque du titre/onglet.
+                            if ((self._dirtySeq || 0) === seqAtFlush) {
+                                self._setDirty(false);
+                                self._clearAutoRecover();
+                            }
+                        }
+                    });
+                }).catch(function() {
+                    /* best-effort : réponse illisible / réseau / page fermée */
+                }).then(function() {
+                    // Libère le verrou single-flight et relance un autosave mis
+                    // en file pendant le vol du keepalive (même logique de queue
+                    // que ``_maybeAutosave``). Ce ``then`` final tourne après
+                    // succès ET après erreur → le verrou n'est jamais bloqué
+                    // (sauf page fermée, où plus aucun autosave ne tournera).
+                    self._autosaveSaving = false;
+                    if (self._autosaveQueued && self._dirty) {
+                        self._autosaveQueued = false;
+                        self._scheduleIdleAutosave();
+                    } else {
+                        self._autosaveQueued = false;
+                    }
+                });
+            } catch (eFetch) {
+                // ``fetch`` a throw SYNCHRONEMENT (rare) → relâcher le verrou,
+                // sinon l'autosave reste gelé toute la session sur une page
+                // survivante. L'AutoRecover ci-dessus a déjà sauvé l'état RAM.
+                self._autosaveSaving = false;
+                self._autosaveQueued = false;
+            }
         } catch (e) { /* best-effort */ }
     };
 
@@ -14565,6 +16202,12 @@ var SqlResultGrid = (function() {
                 self._autosaveQueued = false;
                 self._autosaveFailureCount += 1;
                 console.warn('[Autosave] failed (' + trigger + '):', err && err.message);
+                // **Filet anti-perte de données** : tout échec serveur (412,
+                // quota, oversize, panne réseau, 5xx) écrit un AutoRecover
+                // localStorage. La version RAM n'est donc jamais silencieusement
+                // perdue, même si le serveur refuse durablement (le chemin
+                // unload a déjà ce filet ; l'autosave périodique ne l'avait pas).
+                try { self._writeAutoRecover(); } catch (e) { /* best-effort */ }
                 // 412 conflict — on doit notifier le user qui résoudra
                 // (reload ou force overwrite). Bloque les autosaves
                 // futurs jusqu'à résolution pour ne pas spammer.
@@ -14581,6 +16224,20 @@ var SqlResultGrid = (function() {
                     self._autosaveDisabled = true;
                     self._showSaveToast(
                         'Quota atteint — auto-sauvegarde désactivée.',
+                        true
+                    );
+                    return;
+                }
+                // Oversize passerelle (nginx 413) : un RETRY ne réussira
+                // JAMAIS tant que le classeur reste trop gros. On désactive
+                // l'autosave avec un message ACTIONNABLE (≠ "réessayez", qui
+                // serait un mensonge) et on s'appuie sur l'AutoRecover ci-dessus.
+                if (err && err._tooLarge) {
+                    self._autosaveDisabled = true;
+                    self._showSaveToast(
+                        'Classeur trop volumineux pour être sauvegardé sur le '
+                        + 'serveur. Réduisez les lignes/colonnes ou supprimez '
+                        + 'des onglets, puis réenregistrez.',
                         true
                     );
                     return;
@@ -14632,6 +16289,9 @@ var SqlResultGrid = (function() {
                 isBlankSheet: grid._isBlankSheet || false,
                 isDashboardSheet: mergesSnapshot.length > 0,
                 truncated: grid._truncated || false,
+                truncatedCols: grid._truncatedCols || false,
+                truncatedColsTotal:
+                    typeof grid._truncatedColsTotal === 'number' ? grid._truncatedColsTotal : null,
                 merges: mergesSnapshot,
                 externalSource: tab.externalSource || null,
                 cellDetails: (function() {
@@ -14682,11 +16342,41 @@ var SqlResultGrid = (function() {
      * Enregistrer — écrase le fichier courant. Si aucun fichier courant, fait "Enregistrer sous".
      */
     GridTabManager.prototype.saveWorkbook = function() {
+        // Délégué de sauvegarde custom (widget grille de dashboard : le
+        // classeur est persisté SUR LE WIDGET via PUT .../workbook, pas en
+        // fichier datastore libre). Posé par le contexte hôte
+        // (builder_view.html). Intercepte TOUS les chemins « Enregistrer » :
+        // menu de la barre d'onglets, Ctrl+S (onSave), appels programmatiques.
+        // « Enregistrer sous » n'est PAS intercepté (export de copie datastore).
+        if (typeof this._saveDelegate === 'function') {
+            this._saveDelegate();
+            return;
+        }
         if (this._currentFilePath) {
             this._saveToPath(this._currentFilePath, true);
         } else {
             this.saveWorkbookAs();
         }
+    };
+
+    /**
+     * Sérialise le classeur complet et le compresse en Blob gzip (même
+     * pipeline que la sauvegarde datastore : ``serialize()`` +
+     * ``_gzipStringToBlob``). Retourne une Promise<{blob, isGzip}> —
+     * ``isGzip=false`` (Blob JSON brut) si CompressionStream indisponible
+     * (vieux navigateur) ; le backend accepte les deux (magic bytes).
+     * Utilisé par la sauvegarde du widget grille (builder_view.html) —
+     * single source of truth de la sérialisation, pas de duplication.
+     */
+    GridTabManager.prototype.serializeToGzipBlob = function() {
+        var json = JSON.stringify(this.serialize());
+        return _gzipStringToBlob(json).then(function(gz) {
+            if (gz) return { blob: gz, isGzip: true };
+            return {
+                blob: new Blob([json], { type: 'application/json;charset=utf-8' }),
+                isGzip: false
+            };
+        });
     };
 
     /**
@@ -14773,18 +16463,30 @@ var SqlResultGrid = (function() {
         if (!key) return;
         try {
             var data = this.serialize();
-            var payload = {
-                version: 1,
-                ts: Date.now(),
-                file_hash_at_load: this._currentFileHash || null,
-                data: data,
-            };
-            var json = JSON.stringify(payload);
-            // Cap 4 Mo : au-delà, skip (l'autosave backend prend le
-            // relais). 4 Mo = 4_000_000 chars UTF-16 ≈ 8 Mo bytes côté
-            // localStorage qui stocke en UTF-16 → on est dans la limite.
-            if (json.length > 4_000_000) return;
-            localStorage.setItem(key, json);
+            var ts = Date.now();
+            var hash = this._currentFileHash || null;
+            // Stockage à étages (cf. design) : le gros blob (workbook entier)
+            // va en IndexedDB via GridStore (plus de cap 4 Mo — IDB gère le
+            // volume), et un MARQUEUR léger reste en localStorage (sync) pour
+            // que ``_checkAutoRecover`` décide "récup plus récente que le
+            // serveur ?" SANS charger le blob.
+            if (typeof window !== 'undefined' && window.GridStore) {
+                try {
+                    localStorage.setItem(key, JSON.stringify({
+                        version: 1, ts: ts, file_hash_at_load: hash, hasHeavy: true,
+                    }));
+                } catch (e) { /* marqueur best-effort */ }
+                this._autoRecoverPromise = window.GridStore.put('autorec:' + key, {
+                    version: 1, ts: ts, _savedAt: ts, file_hash_at_load: hash, data: data,
+                }).catch(function () {});
+            } else {
+                // Très vieux navigateur sans GridStore : repli localStorage
+                // direct (avec cap, comme avant) pour ne pas perdre la feature.
+                var json = JSON.stringify({
+                    version: 1, ts: ts, file_hash_at_load: hash, data: data,
+                });
+                if (json.length <= 4000000) localStorage.setItem(key, json);
+            }
         } catch (e) {
             // Quota exceeded ou storage indisponible — best-effort, on
             // ignore. L'autosave backend reste actif.
@@ -14796,6 +16498,12 @@ var SqlResultGrid = (function() {
         var key = this._autoRecoverKey(filePath);
         if (!key) return;
         try { localStorage.removeItem(key); } catch (e) { /* noop */ }
+        // Supprime aussi le blob lourd en IndexedDB (sinon orphelin).
+        try {
+            if (typeof window !== 'undefined' && window.GridStore) {
+                window.GridStore.del('autorec:' + key);
+            }
+        } catch (e) { /* noop */ }
     };
 
     /**
@@ -14819,56 +16527,89 @@ var SqlResultGrid = (function() {
             raw = localStorage.getItem(key);
         } catch (e) { return false; }
         if (!raw) return false;
-        var payload;
+        var meta;
         try {
-            payload = JSON.parse(raw);
+            meta = JSON.parse(raw);
         } catch (e) {
-            // Corrompu, on nettoie.
             try { localStorage.removeItem(key); } catch (_) {}
             return false;
         }
-        if (!payload || payload.version !== 1 || !payload.data) {
+        // ``meta`` est soit un MARQUEUR léger (``hasHeavy:true``, données en
+        // IndexedDB), soit un full payload legacy (``data`` inline, navigateur
+        // sans GridStore). Les deux portent ``version`` + ``ts``.
+        var isMarker = meta && meta.hasHeavy === true;
+        if (!meta || meta.version !== 1 || (!meta.data && !isMarker)) {
             try { localStorage.removeItem(key); } catch (_) {}
             return false;
         }
-        // Compare timestamp du snapshot local vs ``Last-Modified``
-        // serveur. Si le local est strictement plus récent (5s de
-        // marge pour les rebonds), on propose. Fail-safe : si pas de
-        // timestamp serveur (0), on ne propose pas — mieux vaut louper
-        // une restauration légitime que présenter une version obsolète
-        // par erreur de comparaison.
-        var localTs = payload.ts || 0;
+        // Compare le timestamp local vs ``Last-Modified`` serveur. Si le local
+        // est strictement plus récent (5s de marge), on propose. Fail-safe : si
+        // pas de timestamp serveur (0), on ne propose pas (mieux vaut louper une
+        // restauration que présenter une version obsolète par erreur de compare).
+        var localTs = meta.ts || 0;
         var loadedTs = serverLastModifiedTs || 0;
         if (loadedTs === 0 || localTs <= loadedTs + 5000) {
-            // Snapshot pas plus récent — on le retire (déjà couvert
-            // par le serveur).
             try { localStorage.removeItem(key); } catch (_) {}
+            // Marqueur pas plus récent → le blob IndexedDB associé est inutile.
+            try { if (typeof window !== 'undefined' && window.GridStore) window.GridStore.del('autorec:' + key); } catch (_) {}
             return false;
         }
-        // Propose la restauration via modale simple.
+
         var self = this;
-        this._openAutoRecoverModal(payload, function(restore) {
-            if (restore) {
-                try {
-                    self.loadWorkbook(payload.data);
-                    // **Restaure le hash AU MOMENT du write AutoRecover**
-                    // (pas le hash serveur courant). Si entre-temps un
-                    // autre tab a écrit une version concurrente, le
-                    // backend détectera 412 au prochain save et l'user
-                    // pourra trancher (au lieu d'un overwrite silencieux).
-                    if (typeof payload.file_hash_at_load === 'string') {
-                        self._currentFileHash = payload.file_hash_at_load;
-                    }
-                    self._setDirty(true); // état restauré = à re-sauver
-                    self._showSaveToast('Version récupérée — pensez à enregistrer');
-                } catch (e) {
-                    self._showSaveToast('Impossible de restaurer la version locale', true);
-                }
+        // Propose la restauration via modale (factorisée : appelée depuis le
+        // chemin sync legacy OU le chemin async IndexedDB).
+        var proposeRestore = function (payload) {
+            if (!payload || !payload.data) {
+                // Marqueur orphelin (blob évincé/absent) : nettoyer, ne rien proposer.
+                self._clearAutoRecover();
+                return;
             }
-            // Dans tous les cas on nettoie la clef pour ne pas
-            // re-proposer à chaque load.
-            self._clearAutoRecover();
-        });
+            // Anti-desync marqueur↔blob (multi-onglets sur le même fichier) : le
+            // marqueur localStorage peut venir d'un onglet et le blob IndexedDB d'un
+            // autre. On RE-vérifie la fraîcheur avec le ts du BLOB (autorité des
+            // données), pas seulement celui du marqueur — sinon on restaurerait une
+            // version plus ancienne que le serveur sur la foi d'un marqueur trompeur.
+            var blobTs = payload.ts || payload._savedAt || 0;
+            if (loadedTs === 0 || blobTs <= loadedTs + 5000) {
+                self._clearAutoRecover();
+                return;
+            }
+            self._openAutoRecoverModal(payload, function (restore) {
+                if (restore) {
+                    try {
+                        self.loadWorkbook(payload.data);
+                        // **Restaure le hash AU MOMENT du write AutoRecover**
+                        // (pas le hash serveur courant). Si entre-temps un autre
+                        // tab a écrit une version concurrente, le backend
+                        // détectera 412 au prochain save et l'user pourra
+                        // trancher (au lieu d'un overwrite silencieux).
+                        if (typeof payload.file_hash_at_load === 'string') {
+                            self._currentFileHash = payload.file_hash_at_load;
+                        }
+                        self._setDirty(true); // état restauré = à re-sauver
+                        self._showSaveToast('Version récupérée — pensez à enregistrer');
+                    } catch (e) {
+                        self._showSaveToast('Impossible de restaurer la version locale', true);
+                    }
+                }
+                // Dans tous les cas on nettoie la clef pour ne pas re-proposer.
+                self._clearAutoRecover();
+            });
+        };
+
+        if (isMarker) {
+            // Données en IndexedDB → fetch async puis propose.
+            if (typeof window !== 'undefined' && window.GridStore) {
+                window.GridStore.get('autorec:' + key)
+                    .then(function (payload) { proposeRestore(payload); })
+                    .catch(function () { self._clearAutoRecover(); });
+            } else {
+                self._clearAutoRecover();
+            }
+        } else {
+            // Full payload legacy (inline) → propose synchrone.
+            proposeRestore(meta);
+        }
         return true;
     };
 
@@ -15087,6 +16828,17 @@ var SqlResultGrid = (function() {
                     self._syncIndicator.end(syncToken, { error: true });
                 }
                 console.error('[Workbook] Save failed:', err);
+                // Oversize passerelle : message dédié actionnable (≠ jeter
+                // une "SyntaxError" brute à l'utilisateur, ce que faisait
+                // l'ancien chemin quand nginx renvoyait du HTML).
+                if (err && err._tooLarge) {
+                    self._showSaveToast(
+                        'Classeur trop volumineux pour le serveur. Réduisez '
+                        + 'les lignes/colonnes ou supprimez des onglets.',
+                        true
+                    );
+                    return;
+                }
                 self._showSaveToast('Erreur : ' + (err && err.message ? err.message : 'Échec'), true);
             });
     };
@@ -15098,8 +16850,9 @@ var SqlResultGrid = (function() {
      *
      * Retourne une ``Promise<string>`` résolue avec le ``filePath`` sauvé,
      * ou rejetée avec une ``Error`` en cas d'échec. L'erreur peut porter
-     * un flag ``_etagMismatch`` (conflit cross-tab, 412) ou
-     * ``_quotaExceeded`` (507) que le caller exploite.
+     * un flag ``_etagMismatch`` (conflit cross-tab, 412), ``_quotaExceeded``
+     * (413 + ``error_code: 'QUOTA_EXCEEDED'`` côté serveur) ou ``_tooLarge``
+     * (413 oversize passerelle nginx, sans ``error_code``) que le caller exploite.
      *
      * Optional ``options.silent`` : si true, ne marque pas dirty=true
      * en cas d'échec (utile pour autosave qui ne veut pas spammer
@@ -15129,17 +16882,15 @@ var SqlResultGrid = (function() {
             self._autosaveSaving = true;
             // Snapshot du dirty state AVANT le serialize : si une
             // mutation a lieu pendant l'inflight, on ne reset PAS dirty
-            // (la version envoyée est obsolète). Sinon on reset.
-            var dirtyAtStart = self._dirty;
+            // (la version envoyée est obsolète). Sinon on reset. On capture le
+            // COMPTEUR de mutations (pas le booléen ``_dirty`` : dans le cas
+            // autosave il est déjà true au départ, un snapshot booléen ne
+            // verrait pas une édition concurrente — cf. fix H1).
+            var seqAtStart = self._dirtySeq || 0;
 
             var data = self.serialize();
             var json = JSON.stringify(data);
-            var blob = new Blob([json], { type: 'application/json;charset=utf-8' });
             var filename = filePath.split('/').pop();
-            var formData = new FormData();
-            formData.append('files', blob, filename);
-            formData.append('path', '');
-            if (overwrite) formData.append('overwrite', 'true');
             var xsrf = _getXsrfCookie();
             var headers = { 'X-Xsrftoken': xsrf };
             // If-Match : envoie le hash courant pour détection conflit
@@ -15149,17 +16900,34 @@ var SqlResultGrid = (function() {
             if (overwrite && self._currentFileHash) {
                 headers['If-Match'] = self._currentFileHash;
             }
-            return fetch('/api/datastore/upload', {
-                method: 'POST',
-                headers: headers,
-                body: formData,
+            // Compression gzip côté client (le serveur décompresse via les
+            // magic bytes — cf. ``_gzipStringToBlob``). Fait passer un classeur
+            // volumineux (SELECT * large) sous le cap nginx sans rien gonfler.
+            // ``null`` → fallback upload BRUT (vieux navigateur), pas de
+            // régression : le serveur accepte les deux.
+            return _gzipStringToBlob(json).then(function(gzBlob) {
+                var blob = gzBlob
+                    || new Blob([json], { type: 'application/json;charset=utf-8' });
+                var formData = new FormData();
+                formData.append('files', blob, filename);
+                formData.append('path', '');
+                if (overwrite) formData.append('overwrite', 'true');
+                return fetch('/api/datastore/upload', {
+                    method: 'POST',
+                    headers: headers,
+                    body: formData,
+                });
             })
                 .then(function(r) {
-                    return r.json().then(function(result) { return { status: r.status, result: result }; });
+                    // Lecture SÛRE : ne throw jamais, même sur la page HTML
+                    // d'erreur de nginx (413/429/502/504) qui faisait planter
+                    // ``r.json()`` en "SyntaxError: <". ``_readJsonSafe`` garde
+                    // la sûreté même si le helper global n'a pas chargé (L1).
+                    return _readJsonSafe(r);
                 })
-                .then(function(ctx) {
-                    var status = ctx.status;
-                    var result = ctx.result || {};
+                .then(function(res) {
+                    var status = res.status;
+                    var result = (res.data && typeof res.data === 'object') ? res.data : {};
                     if (status === 412) {
                         var err412 = new Error(
                             'Conflit : ce classeur a été modifié ailleurs.'
@@ -15168,12 +16936,38 @@ var SqlResultGrid = (function() {
                         err412._currentHash = result.current_hash || null;
                         throw err412;
                     }
-                    if (status === 507) {
-                        var err507 = new Error('Quota dépassé.');
-                        err507._quotaExceeded = true;
-                        throw err507;
+                    // 413 : DEUX causes distinctes, désambiguïsées par le body.
+                    //  (a) Quota app dépassé → Tornado renvoie un JSON avec
+                    //      ``error_code === 'QUOTA_EXCEEDED'`` → ``_quotaExceeded``.
+                    //  (b) Oversize passerelle (nginx ``client_max_body_size``)
+                    //      → body HTML, aucun ``error_code`` → ``_tooLarge``.
+                    // (L'ancien chemin testait ``status === 507`` que le serveur
+                    //  n'émet JAMAIS — code mort supprimé. Le serveur émet 413
+                    //  pour le quota, cf. datastore.py.)
+                    if (status === 413) {
+                        if (result.error_code === 'QUOTA_EXCEEDED') {
+                            var errQuota = new Error(
+                                result.error || 'Quota de stockage dépassé.'
+                            );
+                            errQuota._quotaExceeded = true;
+                            throw errQuota;
+                        }
+                        var errTooLarge = new Error(
+                            res.error || 'Classeur trop volumineux pour le serveur.'
+                        );
+                        errTooLarge._tooLarge = true;
+                        throw errTooLarge;
                     }
-                    if (result.success) {
+                    // **Anti-perte silencieuse (C1)** : quand le SEUL fichier
+                    // du batch échoue côté serveur (gunzip illisible, cap de
+                    // décompression, validation contenu/extension/taille), le
+                    // backend renvoie HTTP 200 ``{success:true, uploaded:[]}``.
+                    // Si on ne vérifiait QUE ``res.ok && result.success``, on
+                    // marquerait le classeur "sauvé" (reset dirty + clear
+                    // AutoRecover) alors que le serveur n'a RIEN écrit → perte
+                    // silencieuse. On EXIGE donc une entrée ``uploaded`` réelle.
+                    var uploaded = (result.uploaded && result.uploaded[0]) || null;
+                    if (res.ok && result.success && uploaded) {
                         // **Path tracking** : on utilise le path
                         // RETOURNÉ par le backend, qui peut différer
                         // du demandé si auto-rename a eu lieu (ex:
@@ -15183,8 +16977,7 @@ var SqlResultGrid = (function() {
                         // path demandé alors que le serveur a un autre
                         // fichier → tous les saves futurs en 412 ou
                         // écrasent un autre fichier.
-                        var uploaded = (result.uploaded && result.uploaded[0]) || null;
-                        var actualPath = (uploaded && (uploaded.rel_path || uploaded.path))
+                        var actualPath = (uploaded.rel_path || uploaded.path)
                             || filePath;
                         // ``_clearAutoRecover`` AVANT la maj du path
                         // pour bien nettoyer la clef ANCIENNE (ex: cas
@@ -15199,14 +16992,14 @@ var SqlResultGrid = (function() {
                         if (uploaded && typeof uploaded.file_hash === 'string') {
                             self._currentFileHash = uploaded.file_hash;
                         }
-                        // **Reset dirty conditionnel** : si une mutation
-                        // a eu lieu pendant l'inflight (``_dirty``
-                        // redevenu true alors qu'on l'avait snapshotté
-                        // false), on NE reset PAS — la version
-                        // sauvegardée ne reflète pas l'état RAM
-                        // actuel, marquer "clean" serait mensonger
-                        // ("données fausses silencieusement").
-                        if (self._dirty === dirtyAtStart) {
+                        // **Reset dirty conditionnel** : si une mutation a eu
+                        // lieu pendant l'inflight (compteur ``_dirtySeq``
+                        // avancé depuis le snapshot), on NE reset PAS — la
+                        // version sauvegardée ne reflète pas l'état RAM actuel,
+                        // marquer "clean" serait mensonger ("données fausses
+                        // silencieusement"). Le prochain autosave/idle sauvera
+                        // la nouvelle version.
+                        if ((self._dirtySeq || 0) === seqAtStart) {
                             self._setDirty(false);
                             // Cleanup AutoRecover seulement si on est
                             // vraiment clean (sinon on en aura besoin
@@ -15221,7 +17014,16 @@ var SqlResultGrid = (function() {
                         self._startAutosave();
                         return actualPath;
                     }
-                    throw new Error(result.error || 'Échec sauvegarde');
+                    // Échec non typé (4xx/5xx, HTML passerelle, JSON
+                    // success:false, OU success:true mais uploaded:[] = tous
+                    // les fichiers rejetés serveur) : message actionnable issu
+                    // du 1er ``errors[]`` serveur, sinon ``error``, sinon
+                    // dérivé du status — jamais une "SyntaxError" brute, et le
+                    // ``.catch`` préserve l'AutoRecover (pas de perte).
+                    throw new Error(
+                        (result.errors && result.errors[0])
+                        || result.error || res.error || 'Échec sauvegarde'
+                    );
                 });
         };
 
@@ -15488,6 +17290,9 @@ var SqlResultGrid = (function() {
                 // spreadsheet vide), comme avant.
                 grid._isDashboardSheet = (Array.isArray(t.merges) && t.merges.length > 0) || !!t.isBlankSheet;
                 grid._truncated = !!t.truncated;
+                grid._truncatedCols = !!t.truncatedCols;
+                grid._truncatedColsTotal =
+                    typeof t.truncatedColsTotal === 'number' ? t.truncatedColsTotal : null;
                 grid.isArrayFormat = t.isArrayFormat !== undefined ? t.isArrayFormat : grid.isArrayFormat;
 
                 // Restore filters
@@ -16648,65 +18453,141 @@ var SqlResultGrid = (function() {
         this._doPersistState();
     };
 
+    // ── Stockage à étages (grid-store) ───────────────────────────────────
+    // Sépare un état de grille sérialisé en INTENTION (light, sans ``allRows``)
+    // et DONNÉES (heavy, juste ``allRows``). L'intention va en localStorage
+    // synchrone (minuscule, survit toujours au F5) ; les données vont en
+    // IndexedDB via ``window.GridStore`` (capacité Go, async, structured clone).
+    // Cf. docs/design/grid_storage_tiered_indexeddb.md.
+    function _splitGridState(state) {
+        var heavy = { allRows: (state && state.allRows) || [] };
+        var light = {};
+        if (state) {
+            for (var k in state) {
+                // On STRIPPE ``allRows`` du light : son absence (undefined) est
+                // le signal pour ``_restoreFromState`` de préserver les rows
+                // backend (≠ ``[]`` qui voudrait dire "vider").
+                if (state.hasOwnProperty(k) && k !== 'allRows') light[k] = state[k];
+            }
+        }
+        return { light: light, heavy: heavy };
+    }
+
+    // Recompose un état complet (light + rows) pour ``_restoreFromState``.
+    function _withAllRows(lightState, allRows) {
+        var out = {};
+        for (var k in lightState) {
+            if (lightState.hasOwnProperty(k)) out[k] = lightState[k];
+        }
+        out.allRows = allRows;
+        return out;
+    }
+
+    // Reconnaît une clé "intention" de grille en localStorage (pour le sweep) :
+    // chat ``grid-{user}-conv{id}-{n}`` OU dashboard ``u{id}-dash{id}-w{id}``.
+    function _isGridLightKey(key) {
+        return key.indexOf('grid-') === 0 || /^u\d+-dash\d+-w/.test(key);
+    }
+
+    // Dédup du toast de saturation au niveau SESSION (pas par grille) : c'est une
+    // condition globale au navigateur (pool plein) — inutile de la répéter par
+    // grille. Conforme au design §5 (« 1×/session »).
+    var _quotaToastShownSession = false;
+
     GridTabManager.prototype._doPersistState = function() {
         if (!this._persistId) return;
         // Guard re-entrance : le timer + flushPersistState peuvent tous
         // deux lancer _doPersistState en concurrence (pagehide + beforeunload
         // qui firent l'un après l'autre). Le 2e appel doit no-op pour éviter
-        // le double JSON.stringify du classeur entier (50-150ms × 2).
+        // le double travail de capture/sérialisation du classeur entier.
         if (this._persistStateRunning) return;
         this._persistStateRunning = true;
         try {
-            var snapshot = [];
+            var lightTabs = [];
+            var heavyTabs = [];
             for (var i = 0; i < this.tabs.length; i++) {
                 var tab = this.tabs[i];
-                var gridState = null;
+                var lightState = null;
+                var heavyState = { allRows: [] };
                 if (tab.grid && typeof tab.grid._captureState === 'function') {
                     var raw = tab.grid._captureState();
-                    // Sérialiser les Sets en Arrays pour JSON
-                    gridState = JSON.parse(JSON.stringify(raw, function(k, v) {
+                    // Sérialiser les Sets en Arrays pour JSON/structured-clone.
+                    var serialized = JSON.parse(JSON.stringify(raw, function(k, v) {
                         return v instanceof Set ? Array.from(v) : v;
                     }));
+                    var split = _splitGridState(serialized);
+                    lightState = split.light;
+                    heavyState = split.heavy;
                 }
-                snapshot.push({
-                    label: tab.label,
-                    closable: tab.closable,
-                    state: gridState,
-                });
+                lightTabs.push({ label: tab.label, closable: tab.closable, state: lightState });
+                heavyTabs.push(heavyState);
             }
-            var data = {
+            var savedAt = Date.now();
+            // ``_schema: 2`` = format à étages (allRows hors localStorage).
+            // Son absence sur une vieille clé = legacy monolithique (lu une fois,
+            // puis réécrit au nouveau format → pool localStorage libéré).
+            var lightData = {
                 activeTabIndex: this.activeTabIndex,
-                tabs: snapshot,
-                // Mo3 — Horodatage pour TTL implicite (purge auto > 30j au load).
-                // Sans ça, les clés d'anciennes conv (supprimées hors flow Effacer)
-                // s'accumulaient indéfiniment jusqu'au quota 5-10 MB Chrome.
-                _savedAt: Date.now(),
+                tabs: lightTabs,
+                _savedAt: savedAt,
+                _schema: 2,
             };
+            var heavyData = { tabs: heavyTabs, _savedAt: savedAt };
+
+            // 1) INTENTION → localStorage SYNCHRONE (doit tenir : ~Ko).
             try {
-                localStorage.setItem(this._persistId, JSON.stringify(data));
+                localStorage.setItem(this._persistId, JSON.stringify(lightData));
             } catch (quotaErr) {
-                // Mo3 — Avant : catch silencieux → user perdait tri/filtres
-                // sans signal et blâmait "le bug". Maintenant : toast + log
-                // explicite pour qu'il sache que le navigateur est plein.
-                if (quotaErr && (quotaErr.name === 'QuotaExceededError'
-                                 || quotaErr.code === 22 || quotaErr.code === 1014)) {
-                    console.warn('[Iris] localStorage plein, état grille non sauvé:', this._persistId);
-                    if (typeof window !== 'undefined' && typeof window.showToast === 'function') {
-                        window.showToast(
-                            "Stockage local du navigateur plein. Les filtres/tris " +
-                            "de cette grille ne seront pas conservés au refresh. " +
-                            "Effacez des conversations anciennes pour libérer.",
-                            'warning'
-                        );
-                    }
-                } else {
-                    // localStorage indisponible (mode privé Safari, etc.) — silencieux
-                }
+                this._handlePersistQuota(quotaErr, null);
+            }
+
+            // 2) DONNÉES → GridStore (IndexedDB ; repli localStorage ``gs1:``).
+            //    Async mais SÉRIALISÉ par persistId : on chaîne sur la promesse
+            //    précédente pour éviter deux ``put`` concurrents sur la même clé.
+            //    Le garde de ré-entrance ``_persistStateRunning`` est SYNCHRONE et
+            //    ne couvre pas l'async → sans chaînage, un put N-1 résolu APRÈS un
+            //    put N laisserait un heavy périmé face à un light frais (désync
+            //    silencieuse). Le dernier état gagne. La ref tient aussi la
+            //    promesse (anti-GC). Pas de stringify géant (structured clone IDB).
+            if (typeof window !== 'undefined' && window.GridStore) {
+                var self = this;
+                var prev = this._persistHeavyPromise || Promise.resolve();
+                this._persistHeavyPromise = prev.then(function () {
+                    return window.GridStore.put(self._persistId, heavyData);
+                }).then(function (res) {
+                    if (res && res.ok === false) self._handlePersistQuota(null, res.reason);
+                }).catch(function () { /* best-effort */ });
             }
         } catch (e) {
-            // Erreur dans la sérialisation snapshot (rare) — pas critique
+            // Erreur dans la capture/sérialisation (rare) — pas critique.
+        } finally {
+            // ``finally`` (pas après le catch) : si un futur edit ajoute un
+            // ``return`` dans le ``try``, le flag de ré-entrance resterait
+            // ``true`` et figerait TOUT persist ultérieur. Robustesse.
+            this._persistStateRunning = false;
         }
-        this._persistStateRunning = false;
+    };
+
+    // Toast dégradation, DÉDUPÉ (1×/session). N'apparaît plus en
+    // régime normal (IndexedDB absorbe le volume) — uniquement dans le repli
+    // extrême (IDB indispo + localStorage plein). Message corrigé : honnête
+    // (l'intention EST conservée) + actionnable (relancer la requête).
+    GridTabManager.prototype._handlePersistQuota = function(err, reason) {
+        var isQuota = reason === 'quota' || reason === 'too_large'
+            || (err && (err.name === 'QuotaExceededError'
+                || err.code === 22 || err.code === 1014));
+        if (!isQuota) return; // localStorage indisponible (privé Safari) → silencieux
+        if (_quotaToastShownSession) return;
+        _quotaToastShownSession = true;
+        try { console.warn('[Iris] cache plein, données grille non mises en cache:', this._persistId); } catch (e) { /* noop */ }
+        if (typeof window !== 'undefined' && typeof window.showToast === 'function') {
+            window.showToast(
+                "Cache du navigateur saturé : le tri et les filtres restent conservés, "
+                + "mais les données complètes ne seront pas remises en cache au "
+                + "rafraîchissement. Relancez la requête pour tout réafficher.",
+                'warning'
+            );
+        }
     };
 
     /**
@@ -16719,54 +18600,139 @@ var SqlResultGrid = (function() {
 
     GridTabManager.prototype._loadPersistedState = function() {
         if (!this._persistId) return;
+        var light;
         try {
             var raw = localStorage.getItem(this._persistId);
             if (!raw) return;
-            var data = JSON.parse(raw);
-            if (!data || !Array.isArray(data.tabs) || data.tabs.length === 0) return;
+            light = JSON.parse(raw);
+        } catch (e) { return; }
+        if (!light || !Array.isArray(light.tabs) || light.tabs.length === 0) return;
 
-            // Mo3 — Check TTL : si _savedAt absent (legacy, pré-Mo3) ou plus
-            // vieux que 30j, on drop la clé au lieu de la restaurer. La grille
-            // démarre dans son état par défaut, plus propre que de restaurer
-            // un état stale qui peut référencer un schéma SQL changé.
-            if (!data._savedAt || (Date.now() - data._savedAt) > GRID_STATE_TTL_MS) {
-                try { localStorage.removeItem(this._persistId); } catch (e) { /* noop */ }
-                return;
-            }
+        // TTL : intention absente/trop vieille → drop les DEUX stores et stop.
+        // (Avant : seul localStorage était purgé → la donnée lourde restait
+        // orpheline. Désormais on nettoie aussi IndexedDB.)
+        if (!light._savedAt || (Date.now() - light._savedAt) > GRID_STATE_TTL_MS) {
+            try { localStorage.removeItem(this._persistId); } catch (e) { /* noop */ }
+            try { if (typeof window !== 'undefined' && window.GridStore) window.GridStore.del(this._persistId); } catch (e) { /* noop */ }
+            return;
+        }
 
-            // Ne restaurer que si le premier onglet a le même SQL (même grille)
-            var firstSaved = data.tabs[0];
-            if (!firstSaved || !firstSaved.state) return;
-            var firstCurrent = this.tabs[0];
-            if (!firstCurrent || !firstCurrent.grid) return;
-            if (firstSaved.state.sql !== firstCurrent.grid.sql) return;
+        // Gate : ne restaurer que si l'onglet 0 a le même SQL (même grille).
+        var firstSaved = light.tabs[0];
+        if (!firstSaved || !firstSaved.state) return;
+        var firstCurrent = this.tabs[0];
+        if (!firstCurrent || !firstCurrent.grid) return;
+        if (firstSaved.state.sql !== firstCurrent.grid.sql) return;
 
-            // Restaurer l'état du premier onglet (déjà créé par addTab)
-            firstCurrent.grid._restoreFromState(firstSaved.state);
+        // Legacy = schéma monolithique pré-étages : ``allRows`` est DANS le
+        // light (localStorage). On restaure synchrone, sans lire IndexedDB ;
+        // au prochain persist, la clé est réécrite au format à étages (le gros
+        // volume migre vers IndexedDB → pool localStorage libéré).
+        var isLegacy = (light._schema !== 2);
+        var self = this;
 
-            // Recréer les onglets supplémentaires (drill-downs, etc.)
-            for (var i = 1; i < data.tabs.length; i++) {
-                var tabData = data.tabs[i];
-                if (!tabData.state || !tabData.state.columns) continue;
-                var s = tabData.state;
-                var tabInfo = this.addTab(
-                    tabData.label || 'Onglet',
-                    s.columns, s.allRows, s.sql,
-                    s.totalRowCount, null,
-                    tabData.closable !== false
-                );
-                if (tabInfo && tabInfo.grid) {
-                    tabInfo.grid._restoreFromState(s);
+        var applyRestore = function (heavy) {
+            try {
+                var g = firstCurrent.grid;
+                // Anti-mispairing : light (localStorage) et heavy (IndexedDB) sont
+                // appariés par INDEX d'onglet. Un heavy périmé d'une session/écriture
+                // antérieure (même clé, _savedAt différent) apparié au light frais
+                // donnerait des rows au MAUVAIS onglet (données fausses silencieuses).
+                // On exige le MÊME _savedAt (les deux sont écrits ensemble dans
+                // _doPersistState). Sinon on jette le heavy → fallback sûr.
+                if (heavy && light._savedAt && heavy._savedAt !== light._savedAt) {
+                    heavy = null;
                 }
-            }
+                // L'utilisateur a-t-il muté la grille depuis le rendu ? (édition
+                // cellule, add/remove, fusion, paste…, via _pushHistory). Si oui,
+                // NE PAS écraser son travail avec la donnée persistée (course async).
+                var dirtied = !!g._userDirtied;
 
-            // Restaurer l'onglet actif
-            var activeIdx = data.activeTabIndex || 0;
-            if (activeIdx >= 0 && activeIdx < this.tabs.length) {
-                this._switchTab(activeIdx);
+                // ── Onglet 0 (déjà créé par addTab, peuplé par le backend) ──
+                var s0 = firstSaved.state;
+                var rows0 = (heavy && heavy.tabs && heavy.tabs[0] && heavy.tabs[0].allRows)
+                    ? heavy.tabs[0].allRows
+                    : (isLegacy ? s0.allRows : null);
+                // Pristine = aucune interaction depuis le rendu (ni tri/filtre, ni
+                // édition). Sinon on ne CLOBBERE rien : la grille garde l'état user.
+                var pristine = !dirtied && !g._restorePersistApplied
+                    && (g.sortColIndex == null || g.sortColIndex < 0)
+                    && (!g.filters || Object.keys(g.filters).length === 0);
+                if (pristine) {
+                    var merged0 = (rows0 && rows0.length) ? _withAllRows(s0, rows0) : s0;
+                    g._restoreFromState(merged0);
+                    g._restorePersistApplied = true;
+                    // Applique RÉELLEMENT le tri/filtre restauré à la vue. Avant
+                    // ce fix, _restoreFromState posait l'état en mémoire mais
+                    // _build() rendait allRows.slice() non filtré/trié → le
+                    // tri/filtre persisté était INERTE au reload (bug latent).
+                    if (typeof g._refreshView === 'function') g._refreshView();
+                    if (typeof g._updateSortIndicators === 'function') g._updateSortIndicators();
+                } else if (!dirtied && rows0 && rows0.length) {
+                    // L'user a trié/filtré (mais pas édité les données) → on hydrate
+                    // juste les rows sous SA vue courante via _refreshView, sans
+                    // toucher son intention. Si dirtied : on ne touche RIEN.
+                    g.allRows = g._deepCloneSafe(rows0);
+                    g.isArrayFormat = rows0.length > 0 && Array.isArray(rows0[0]);
+                    if (typeof g._refreshView === 'function') g._refreshView();
+                }
+
+                // ── Onglets supplémentaires (drill-downs) ──
+                // Reconstruire UNIQUEMENT si seul l'onglet 0 existe (sinon l'user a
+                // créé ses propres onglets pendant l'hydratation → ne pas dupliquer)
+                // ET s'il n'a pas muté la grille.
+                var canRestoreDrillTabs = !dirtied && self.tabs.length === 1;
+                var droppedDrill = false;
+                if (canRestoreDrillTabs) {
+                    for (var i = 1; i < light.tabs.length; i++) {
+                        var td = light.tabs[i];
+                        if (!td.state || !td.state.columns) continue;
+                        var si = td.state;
+                        var rowsi = (heavy && heavy.tabs && heavy.tabs[i] && heavy.tabs[i].allRows)
+                            ? heavy.tabs[i].allRows
+                            : (isLegacy ? si.allRows : null);
+                        // Sans rows (IDB indispo/évincé ET pas legacy) : drill-down
+                        // non restaurable → on le SIGNALE (pas de perte silencieuse).
+                        if (!rowsi) { droppedDrill = true; continue; }
+                        var merged = _withAllRows(si, rowsi);
+                        var tabInfo = self.addTab(
+                            td.label || 'Onglet',
+                            merged.columns, merged.allRows, merged.sql,
+                            merged.totalRowCount, null,
+                            td.closable !== false
+                        );
+                        if (tabInfo && tabInfo.grid) {
+                            tabInfo.grid._restoreFromState(merged);
+                            if (typeof tabInfo.grid._refreshView === 'function') tabInfo.grid._refreshView();
+                            if (typeof tabInfo.grid._updateSortIndicators === 'function') tabInfo.grid._updateSortIndicators();
+                        }
+                    }
+                    // ── Onglet actif ── (seulement si on a (re)construit l'arbo)
+                    var activeIdx = light.activeTabIndex || 0;
+                    if (activeIdx >= 0 && activeIdx < self.tabs.length) self._switchTab(activeIdx);
+                }
+
+                if (droppedDrill && typeof window !== 'undefined'
+                        && typeof window.showToast === 'function') {
+                    window.showToast(
+                        "Onglets de détail non restaurés (cache navigateur "
+                        + "indisponible). Rouvrez-les depuis le tableau si besoin.",
+                        'warning'
+                    );
+                }
+            } catch (e) {
+                // État corrompu — la grille reste dans son état backend (non vide).
             }
-        } catch (e) {
-            // Données corrompues — ignorer, la grille reste dans son état par défaut
+        };
+
+        if (isLegacy) {
+            applyRestore(null); // données déjà dans le light → restauration synchrone
+        } else if (typeof window !== 'undefined' && window.GridStore) {
+            window.GridStore.get(this._persistId)
+                .then(function (heavy) { applyRestore(heavy); })
+                .catch(function () { applyRestore(null); });
+        } else {
+            applyRestore(null); // pas de GridStore → intention seule (rows backend conservées)
         }
     };
 
@@ -16817,7 +18783,15 @@ var SqlResultGrid = (function() {
                 }
             }
             for (var j = 0; j < toRemove.length; j++) {
-                localStorage.removeItem(toRemove[j]);
+                try { localStorage.removeItem(toRemove[j]); } catch (e) { /* noop */ }
+                // Supprime aussi la donnée lourde correspondante (IndexedDB +
+                // repli ``gs1:``) — sinon elle resterait orpheline après
+                // « Effacer la conversation » (fuite + croissance non bornée).
+                try {
+                    if (typeof window !== 'undefined' && window.GridStore) {
+                        window.GridStore.del(toRemove[j]);
+                    }
+                } catch (e) { /* noop */ }
             }
         } catch (e) { /* ignore */ }
     };
@@ -16843,18 +18817,18 @@ var SqlResultGrid = (function() {
             var toRemove = [];
             for (var i = 0; i < localStorage.length; i++) {
                 var key = localStorage.key(i);
-                if (!key || key.indexOf('grid-') !== 0) continue;
-                // Heuristique : exclure les clés non-Iris ('grid-*' réservé
-                // ici aux états de SqlResultGrid Iris). Si un autre module
-                // utilise ce préfixe à l'avenir, ajouter une discriminante.
+                // Clés "intention" : chat ``grid-*`` ET dashboard
+                // ``u{id}-dash{id}-w*``. Ces dernières n'étaient JAMAIS purgées
+                // (l'ancien filtre ne matchait que ``grid-``) → accumulation
+                // indéfinie sur poste partagé jusqu'au quota (bug F5 du design).
+                if (!key || !_isGridLightKey(key)) continue;
                 try {
                     var raw = localStorage.getItem(key);
                     if (!raw) { toRemove.push(key); continue; }
                     var parsed = JSON.parse(raw);
                     var savedAt = parsed && parsed._savedAt;
-                    // Pas de _savedAt = legacy pré-Mo3 OU format inattendu :
-                    // on drop par sécurité (l'user perdra l'état d'une vieille
-                    // conv qu'il ne consulte plus depuis 30j+ probablement).
+                    // Pas de _savedAt = legacy OU format inattendu : on drop par
+                    // sécurité (état d'une vieille conv non consultée depuis 30j+).
                     if (!savedAt || (now - savedAt) > ttl) {
                         toRemove.push(key);
                     }
@@ -16866,10 +18840,22 @@ var SqlResultGrid = (function() {
             for (var j = 0; j < toRemove.length; j++) {
                 try {
                     localStorage.removeItem(toRemove[j]);
+                    // Supprime aussi la donnée lourde correspondante (IndexedDB).
+                    if (typeof window !== 'undefined' && window.GridStore) {
+                        window.GridStore.del(toRemove[j]);
+                    }
                     purged++;
                 } catch (rmErr) { /* noop */ }
             }
         } catch (e) { /* localStorage indispo : noop */ }
+        // Sweep des données lourdes en IndexedDB (+ repli ``gs1:``) par TTL pour
+        // TOUS les préfixes grille — couvre aussi un heavy orphelin dont
+        // l'intention localStorage aurait déjà disparu.
+        try {
+            if (typeof window !== 'undefined' && window.GridStore) {
+                window.GridStore.sweep({ prefixes: ['grid-', 'u', 'autorec:'], maxAgeMs: ttl });
+            }
+        } catch (e) { /* noop */ }
         return purged;
     };
 

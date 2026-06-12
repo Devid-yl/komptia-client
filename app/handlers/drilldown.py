@@ -63,7 +63,11 @@ from sqlglot import exp as sqlglot_exp
 
 from app.core.exceptions import QueryError, SageConnectionError
 from app.handlers.base import BaseHandler, _Messages, require_role, is_admin as _is_admin
-from app.services.ai.drilldown import analyze_columns, build_drilldown_query
+from app.services.ai.drilldown import (
+    analyze_columns,
+    build_drill_predicate,
+    build_drilldown_query,
+)
 from app.services.database.sage_connector import get_sage_connector
 from app.utils.logger import get_logger
 from app.utils.rate_limiter import RateLimiter
@@ -228,6 +232,15 @@ _FORBIDDEN_CONTROL_CHARS: Final[frozenset[str]] = frozenset(
 #: privé. On garde le re-export pour ne pas casser la suite de tests
 #: existante (``tests/unit/test_drilldown.py``).
 _skip_sql_string = skip_sql_string
+
+
+# ── Sentinelle de contrôle pour le chemin LLM de drill-down ──────
+#: ``_try_llm_drilldown`` retourne soit un ``str`` (SQL prêt à exécuter), soit
+#: ``_DRILL_DENIED`` (refus data-access, 403 déjà écrite), soit ``None``
+#: (échec doux OU verdict « rien à détailler » → on laisse le programmatique
+#: trancher — cf. S1). On n'a plus de sentinelle « unchanged » dédiée : le
+#: fallback programmatique produit lui-même ``{"unchanged": True}`` au besoin.
+_DRILL_DENIED: Final[object] = object()  # refus data-access (réponse 403 déjà écrite)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -502,6 +515,37 @@ def _check_rate_limit(
         )
 
 
+def _quote_sql_identifier(name: str) -> str:
+    """Bracket-quote un identifiant T-SQL pour usage comme membre gauche de
+    prédicat (``[name]``), en échappant ``]`` → ``]]``.
+
+    Utilisé pour la normalisation de scope du drill-down : quand le marqueur de
+    filtre est dans la requête externe, on binde la COLONNE DE SORTIE plutôt que
+    l'expression interne du LLM (alias de CTE invisible dehors). Même convention
+    que les filtres externes du LLM (``[grpCodeEntite]``) et que le chemin
+    programmatique (``drilldown._build_where_conditions`` → ``f"[{dim}]"``), mais
+    avec échappement défensif de ``]`` (anti-injection sur noms exotiques)."""
+    return "[" + str(name).replace("]", "]]") + "]"
+
+
+def _is_safe_bound_sql(sql: str) -> bool:
+    """Re-vérifie qu'un SQL de détail (drill-down) bindé est une lecture pure.
+
+    ``iris_oneshot.build_drilldown_sql_via_llm`` a déjà validé le squelette via
+    ``_is_safe_select`` ; on revalide APRÈS l'injection locale des prédicats de
+    dimension — premier mot-clé SELECT/WITH + aucun mot-clé SSRF/file-I/O banni.
+    Le ``sage_connector`` re-filtre de toute façon à l'exécution : c'est une
+    couche de défense en profondeur, pas l'unique rempart. Module-level (pas
+    une méthode) pour rester testable indépendamment du handler."""
+    sql_body = strip_leading_sql_comments(sql)
+    first_keyword = sql_body.split(None, 1)[0].upper() if sql_body else ""
+    if first_keyword not in ("SELECT", "WITH"):
+        return False
+    if _CELL_DETAIL_BANNED_RE.search(sql_body):
+        return False
+    return True
+
+
 def _enforce_sql_size(sql: str) -> None:
     """Lève ``HTTPError(413)`` si le SQL dépasse ``MAX_SQL_PAYLOAD_BYTES``.
 
@@ -741,6 +785,14 @@ class ExpandColumnsHandler(BaseHandler):
                     max_rows=MAX_DRILLDOWN_ROWS,
                     pseudonymizer=None,  # contexte HTTP, pas de pseudo
                     cache=None,
+                    # ``user`` (objet ORM) : sans lui, le dry-run interne de
+                    # ``ask_iris`` (execute=False → TOP 5) tournait SANS RLS
+                    # (``enforcer`` loggue « RLS skip ») — un user restreint
+                    # validait alors un SQL qu'il n'a pas le droit d'exécuter,
+                    # incohérent avec l'enforce post-transform plus bas. On
+                    # propage l'objet pour que le RLS s'applique dès le dry-run
+                    # (defense-in-depth, aligné copilot_iris_bridge).
+                    user=user,
                     # ``user.id`` thread le proxy d'anonymisation jusqu'à
                     # ``transform_sql_via_llm`` (pseudonymizer user-scoped
                     # + couche PII regex). Le draft_sql peut contenir des
@@ -762,19 +814,32 @@ class ExpandColumnsHandler(BaseHandler):
         expanded_sql = bridge_result.get("sql") or ""
 
         if not validated or not isinstance(expanded_sql, str) or not expanded_sql.strip():
-            # Les errors du bridge passent maintenant par sanitize côté
-            # bridge/iris_oneshot (cf. fixes adversariaux S6) ; le premier
-            # message reste informatif sans leak de stack trace.
-            user_msg = (
-                bridge_errors[0]
-                if bridge_errors
-                else ("L'IA n'a pas pu produire un SQL élargi valide pour cette requête.")
-            )
+            # Message CLAIR par audience (taxonomie 4-cas, axe distinction
+            # admin/user). Le détail technique du bridge (``sql_server_says`` /
+            # ``suggested_fix`` de l'oracle — ex. « Lis le message SQL Server…
+            # datepart keywords… ») est conçu pour qu'IRIS-AGENT s'auto-corrige,
+            # PAS pour une analyste financière. On le réserve donc aux admins +
+            # logs ; l'utilisateur voit un message métier actionnable. Les cas
+            # fréquents (colonnes en double) sont déjà corrigés en amont par la
+            # déduplication déterministe (``ask_iris``) → ce chemin ne reste que
+            # pour les requêtes réellement non-élargissables.
+            _audience_admin = _is_admin(self.current_user)
+            if _audience_admin and bridge_errors:
+                user_msg = bridge_errors[0]
+            else:
+                user_msg = (
+                    "L'élargissement automatique n'a pas pu être appliqué à cette "
+                    "requête (trop complexe pour l'IA). Le tableau actuel est "
+                    "conservé. Réessaie, ou contacte ton administrateur si le "
+                    "problème persiste."
+                )
             logger.warning(
                 "expand-columns: transformation IA refusée",
                 extra=_log_extra(
                     self,
                     errors_count=len(bridge_errors),
+                    # Détail technique en LOG (traçable admin), jamais au user.
+                    first_error=(str(bridge_errors[0])[:200] if bridge_errors else None),
                     has_suggestions=bool(bridge_result.get("schema_suggestions")),
                 ),
             )
@@ -847,11 +912,20 @@ class ExpandColumnsHandler(BaseHandler):
 
 
 class DrillDownHandler(BaseHandler):
-    """``POST /api/drilldown`` — Exécute une requête drill-down et retourne le détail.
+    """``POST /api/drilldown`` — « Voir le détail » : génère + exécute la requête
+    de détail derrière une cellule agrégée.
 
     Input : ``original_sql``, ``col_index``, ``row_values`` (valeurs de la
     ligne cliquée). Output : single-query (``columns``, ``rows``, ...) ou
     multi-query (``multi=True``, ``results=[...]`` si CTE multiples).
+
+    **Génération via LLM** (``iris_oneshot.build_drilldown_sql_via_llm``) : le
+    LLM reçoit toute la STRUCTURE (SQL d'origine + DDL + colonne cliquée +
+    métadonnées d'analyse) mais JAMAIS les valeurs de la ligne (confidentialité
+    Niveau 4/5) ; il renvoie un squelette SQL + le mapping des dimensions, et le
+    SYSTÈME binde ici les vraies valeurs localement. Le générateur programmatique
+    ``build_drilldown_query`` reste le FALLBACK (LLM indisponible/échec) et le
+    chemin des colonnes multi-CTE (plusieurs result sets — UX préservée).
     """
 
     @require_role("admin", "user")
@@ -865,11 +939,32 @@ class DrillDownHandler(BaseHandler):
         row_values = _require_dict(body, "row_values")
 
         # col_index négatif = pas de dimension ciblée → breadcrumb "tout".
-        # On laisse ``build_drilldown_query`` décider de la suite (peut
-        # retourner None = non-drillable).
-
         column_metadata = analyze_columns(original_sql)
+        breadcrumb = _build_breadcrumb(column_metadata, col_index, row_values)
+        connector = get_sage_connector()
 
+        clicked_meta = (
+            column_metadata[col_index]
+            if isinstance(column_metadata, list) and 0 <= col_index < len(column_metadata)
+            else {}
+        )
+
+        # ── 1. Chemin LLM (mono-requête uniquement) ──
+        # Les colonnes multi-CTE (mesure calculée référençant plusieurs CTE
+        # agrégées) gardent le chemin programmatique : il produit N result sets
+        # distincts (UX multi-blocs) que le one-shot mono-SQL ne reproduit pas.
+        if not (isinstance(clicked_meta, dict) and clicked_meta.get("source_ctes")):
+            llm_outcome = await self._try_llm_drilldown(
+                original_sql, col_index, row_values, column_metadata, clicked_meta
+            )
+            if llm_outcome is _DRILL_DENIED:
+                return  # refus data-access : réponse 403 déjà écrite
+            if isinstance(llm_outcome, str):
+                await self._execute_single(llm_outcome, breadcrumb, connector)
+                return
+            # llm_outcome is None → fallback programmatique ci-dessous
+
+        # ── 2. Fallback programmatique (LLM indisponible/échec, ou multi-CTE) ──
         try:
             drilldown_result = build_drilldown_query(
                 original_sql, col_index, row_values, column_metadata
@@ -886,13 +981,267 @@ class DrillDownHandler(BaseHandler):
             self.write_json({"unchanged": True})
             return
 
-        breadcrumb = _build_breadcrumb(column_metadata, col_index, row_values)
-        connector = get_sage_connector()
-
         if isinstance(drilldown_result, list):
             await self._execute_multi_cte(drilldown_result, breadcrumb, connector)
         else:
             await self._execute_single(drilldown_result, breadcrumb, connector)
+
+    async def _try_llm_drilldown(
+        self,
+        original_sql: str,
+        col_index: int,
+        row_values: dict[str, Any],
+        column_metadata: list[dict[str, Any]],
+        clicked_meta: dict[str, Any],
+    ) -> Any:
+        """Génère le SQL de détail via LLM puis binde LOCALEMENT les valeurs.
+
+        **Confidentialité** : ``row_values`` (vraies données Sage) n'est JAMAIS
+        passé au LLM — seuls les NOMS de colonnes le sont. Les valeurs sont
+        injectées ici, à la place du marqueur ``_DRILL_FILTERS_SENTINEL``.
+
+        Returns:
+            * ``str`` : SQL final prêt à exécuter ;
+            * ``_DRILL_DENIED`` : refus data-access (réponse 403 déjà écrite) ;
+            * ``None`` : échec doux OU verdict LLM « rien à détailler » → le
+              caller bascule sur le fallback programmatique, qui tranche
+              (``{"unchanged": True}`` s'il n'y a vraiment rien). Jamais un
+              crash visible.
+        """
+        from app.services.ai.iris_oneshot import (
+            _DRILL_FILTERS_SENTINEL,
+            build_drilldown_sql_via_llm,
+            marker_outer_scope_over_cte,
+            outer_select_computed_aliases,
+        )
+        from app.services.data_access.error_messages import DataAccessLeakDetectedError
+
+        user = self.current_user
+        clicked_column = ""
+        expected_dims: list[str] = []
+        if isinstance(clicked_meta, dict):
+            clicked_column = str(clicked_meta.get("name") or "")
+            # Vérité-terrain des dimensions de regroupement (analyze_columns) :
+            # sert (a) à guider le LLM dans le prompt, (b) au garde de couverture
+            # fail-closed ci-dessous (F1/F3/F7).
+            raw_fd = clicked_meta.get("filter_dimensions")
+            if isinstance(raw_fd, list):
+                expected_dims = [d for d in raw_fd if isinstance(d, str) and d]
+
+        try:
+            skeleton, dimensions, errors = await build_drilldown_sql_via_llm(
+                original_sql=original_sql,
+                clicked_column=clicked_column,
+                result_columns=list(row_values.keys()),
+                col_index=col_index,
+                column_metadata=column_metadata,
+                expected_dimensions=expected_dims,
+                user_role="admin" if _is_admin(user) else "user",
+                user_id=getattr(user, "id", None),
+            )
+        except DataAccessLeakDetectedError as exc:
+            # Nom de table interdit halluciné par le LLM (mode invisible) →
+            # refus net, PAS de fallback (le nom ne doit pas réapparaître).
+            logger.info(
+                "[DrillDown] refus data_access sur SQL LLM (mode invisible)",
+                extra=_log_extra(self),
+            )
+            self.write_json({"error": exc.user_message}, 403)
+            return _DRILL_DENIED
+        except Exception:
+            logger.warning(
+                "[DrillDown] build_drilldown_sql_via_llm a levé — fallback programmatique",
+                extra=_log_extra(self),
+                exc_info=True,
+            )
+            return None
+
+        if errors or skeleton is None:
+            # Échec doux (parse/troncature/anonymisation/DDL absent) → fallback
+            # programmatique silencieux. On log pour traçabilité.
+            if errors:
+                logger.info(
+                    "[DrillDown] LLM drilldown errors — fallback programmatique",
+                    extra=_log_extra(self, first_error=str(errors[0])[:120]),
+                )
+            return None
+
+        if skeleton == "":
+            # S1 — Le LLM juge la cellule « rien à détailler ». On ne s'y fie
+            # PAS aveuglément : un LLM trop prudent refuserait un drill que le
+            # programmatique trouverait. On bascule donc sur le programmatique,
+            # qui tranche (None → « unchanged » s'il n'y a vraiment rien à
+            # détailler, sinon il produit le détail).
+            logger.info(
+                "[DrillDown] LLM juge non-drillable — arbitrage via programmatique",
+                extra=_log_extra(self),
+            )
+            return None
+
+        # ── Binding LOCAL des valeurs (jamais envoyées au LLM) ──
+        # Normalisation de scope (FIX RACINE incident 2026-06-03) : si le
+        # marqueur de filtre est dans la requête EXTERNE (hors CTE), les alias
+        # de table internes fournis par le LLM (ex. ``Col01.colCodeCollabo``) n'y
+        # sont PAS visibles → SQL Server 4104 « multi-part identifier cannot be
+        # bound ». Dans ce scope on binde la COLONNE DE SORTIE ``[col]`` (qui,
+        # elle, EST visible), exactement comme le chemin programmatique
+        # (``drilldown._build_where_conditions`` R4 : ``amap.get(dim) or [dim]``).
+        # Sinon (marqueur dans le corps d'une CTE), l'expression interne du LLM
+        # est le bon référent. Le système TRANCHE programmatiquement le scope —
+        # le LLM ne devine pas.
+        bind_output_column = marker_outer_scope_over_cte(skeleton)
+        # En scope externe sur CTE : résoudre les alias CALCULÉS dans la requête
+        # externe (``YEAR(c.d) AS annee``) vers leur expression — sinon ``[annee]``
+        # est soit non référençable en WHERE (207), soit pire un shadowing sur une
+        # colonne de base homonyme = filtre faux silencieux (adversarial review,
+        # Q5). Colonnes matérialisées / ``SELECT *`` → absentes de la map →
+        # fallback ``[col]``. Mirror du chemin programmatique R4.
+        outer_alias_map = outer_select_computed_aliases(skeleton) if bind_output_column else {}
+        predicates: list[str] = []
+        bound_cols: set[str] = set()
+        for col, expr in dimensions.items():
+            if col not in row_values:
+                continue
+            if bind_output_column:
+                lhs = outer_alias_map.get(col.lower()) or _quote_sql_identifier(col)
+            else:
+                lhs = expr
+            predicate = build_drill_predicate(lhs, row_values[col])
+            if predicate is not None:
+                predicates.append(predicate)
+                bound_cols.add(col)
+
+        # F1/F3/F7 — Garde de COUVERTURE (fail-closed). Le système connaît la
+        # vérité-terrain des dimensions de regroupement (``filter_dimensions``
+        # d'``analyze_columns``). Si UNE seule n'est pas effectivement bindée,
+        # exécuter le détail produirait un filtrage INCOMPLET = des lignes
+        # d'autres groupes présentées comme « le détail » de cette cellule
+        # (données fausses silencieuses, doctrine Q5). On bascule alors sur le
+        # programmatique.
+        #
+        # Nuance (R3) : pour les causes « LLM a OMIS la dimension » ou « expr
+        # rejetée », le programmatique re-dérive le filtre correct depuis sa
+        # propre analyse → fallback FIABLE. En revanche si la VALEUR elle-même
+        # est inliable (``inf``/``nan``, ou clé absente de ``row_values``),
+        # ``build_drill_predicate`` retourne None dans LES DEUX chemins : le
+        # programmatique sous-filtrera pareil. Ce cas est pratiquement
+        # inatteignable (le front sérialise inf/nan en ``null`` → ``IS NULL``,
+        # bindable ; seul un body JSON forgé envoie ``NaN``/``Infinity``), donc
+        # on accepte la dégradation plutôt que d'ajouter une branche dédiée.
+        expected = {d for d in (expected_dims or []) if isinstance(d, str)}
+        if expected and not expected.issubset(bound_cols):
+            logger.warning(
+                "[DrillDown] dimensions de regroupement non couvertes par le LLM "
+                "— fallback programmatique",
+                extra=_log_extra(self, missing_dims=sorted(expected - bound_cols)[:10]),
+            )
+            return None
+
+        # Bloc de filtres PARENTHÉSÉ (F4/F5, defense-in-depth) : même si une
+        # expression résiduelle contenait un connecteur, le groupe ``( … )``
+        # empêche qu'un OR s'échappe et casse la précédence de l'outer WHERE.
+        filters_sql = (" AND (" + " AND ".join(predicates) + ")") if predicates else ""
+
+        if _DRILL_FILTERS_SENTINEL in skeleton:
+            if not predicates:
+                # Marqueur présent mais AUCUN prédicat bindé → le remplacer par
+                # "" donnerait un détail NON filtré. Fail-closed → programmatique.
+                logger.warning(
+                    "[DrillDown] marqueur présent mais aucun prédicat bindé — fallback",
+                    extra=_log_extra(self),
+                )
+                return None
+            final_sql = skeleton.replace(_DRILL_FILTERS_SENTINEL, filters_sql)
+        elif predicates:
+            # Filtres à poser mais aucun emplacement : exécuter tel quel
+            # donnerait un détail NON filtré (données fausses silencieuses,
+            # pire qu'un crash). Fail-closed → fallback programmatique.
+            logger.warning(
+                "[DrillDown] marqueur de filtre absent malgré des dimensions — fallback",
+                extra=_log_extra(self),
+            )
+            return None
+        else:
+            final_sql = skeleton
+
+        # Aucun marqueur résiduel ne doit subsister dans le SQL exécuté.
+        if _DRILL_FILTERS_SENTINEL in final_sql:
+            logger.warning(
+                "[DrillDown] marqueur résiduel après binding — fallback",
+                extra=_log_extra(self),
+            )
+            return None
+
+        # Defense-in-depth : le SQL bindé doit rester SELECT/WITH sans mot-clé
+        # banni (on n'a ajouté que des prédicats ``<expr> = <litéral>`` / IS NULL).
+        if not _is_safe_bound_sql(final_sql):
+            logger.warning(
+                "[DrillDown] SQL bindé jugé non sûr — fallback",
+                extra=_log_extra(self),
+            )
+            return None
+
+        # ── Filet de sécurité : oracle SSoT AVANT exécution ──
+        # Doctrine « JAMAIS de SQL à l'aveugle » : on valide le SQL bindé via
+        # ``validate_for_iris`` (PARSEONLY/FMTONLY, le MÊME validateur que tous
+        # les autres tools Iris) avant de le rendre exécutable. La normalisation
+        # de scope ci-dessus couvre le cas dominant (alias CTE en scope externe) ;
+        # l'oracle attrape TOUTE autre structure invalide que le LLM aurait
+        # produite (colonne fantôme, CTE incohérente, fonction inconnue…) → on
+        # bascule alors sur le fallback programmatique, safe-by-construction
+        # (réutilise la requête d'origine déjà valide). On n'exploite QUE le
+        # verdict : la réécriture RLS (``sql_used``) est laissée à
+        # ``_execute_single`` (``enforce_for_executor``) pour ne pas appliquer le
+        # RLS deux fois.
+        from app.services.ai.sql_validator import validate_for_iris
+
+        try:
+            verdict = await validate_for_iris(final_sql, user, get_sage_connector())
+        except SageConnectionError:
+            # Defense-in-depth (dead code attendu depuis 2026-06-12) : la
+            # politique d'indisponibilité de l'oracle est désormais centralisée
+            # DANS ``validate_for_iris`` (fail-open marqué / fail-closed env
+            # ``ORACLE_FAIL_CLOSED``) — l'exception ne remonte plus ici. On
+            # garde le catch au cas où, comme les call-sites d'agent_tools.
+            logger.warning(
+                "[DrillDown] oracle injoignable (Sage indisponible) — "
+                "exécution sans pré-vol (le canal d'exécution reportera l'erreur)",
+                extra=_log_extra(self),
+            )
+            return final_sql
+        except Exception:
+            # Crash inattendu du validateur → fail-closed côté LLM-path : on NE
+            # exécute PAS un SQL non validé, on bascule sur le programmatique.
+            logger.error(
+                "[DrillDown] validate_for_iris a levé — fallback programmatique",
+                extra=_log_extra(self),
+                exc_info=True,
+            )
+            return None
+
+        if not verdict.passes:
+            # NB : inclut ORACLE_UNAVAILABLE en mode fail-closed → fallback
+            # programmatique, qui échouera honnêtement sur Sage down (503).
+            logger.warning(
+                "[DrillDown] SQL LLM rejeté par l'oracle — fallback programmatique",
+                extra=_log_extra(self, rule_id=getattr(verdict.proof, "rule_id", None)),
+            )
+            return None
+
+        if getattr(verdict, "oracle_validated", None) is False:
+            # Fail-open : SQL LLM accepté SANS pré-vol SGBD (base injoignable
+            # à la validation). ÉCART DOCUMENTÉ : contrairement aux grilles
+            # /iris (bannière ``oracle_prevalidated``), le payload drill-down
+            # ne propage pas encore le marqueur jusqu'à l'UI — la fenêtre est
+            # minuscule (l'exécution qui suit immédiatement requiert Sage et
+            # échouera en 503 si toujours down) ; on trace pour observabilité.
+            logger.warning(
+                "[DrillDown] SQL LLM exécuté SANS pré-validation SGBD "
+                "(oracle injoignable, fail-open marqué)",
+                extra=_log_extra(self),
+            )
+
+        return final_sql
 
     async def _execute_multi_cte(
         self,
@@ -987,9 +1336,7 @@ class DrillDownHandler(BaseHandler):
         except QueryError as exc:
             logger.warning(
                 "[DrillDown] query error",
-                extra=_log_extra(
-                    self, error=exc.__class__.__name__, raw_error=str(exc)[:200]
-                ),
+                extra=_log_extra(self, error=exc.__class__.__name__, raw_error=str(exc)[:200]),
             )
             # P2.4 — catégorisation + sanitization PII via SSoT.
             _audience = "admin" if _is_admin(self.current_user) else "user"
@@ -1001,9 +1348,7 @@ class DrillDownHandler(BaseHandler):
         except SageConnectionError as exc:
             logger.error(
                 "[DrillDown] Sage indisponible",
-                extra=_log_extra(
-                    self, error=exc.__class__.__name__, raw_error=str(exc)[:200]
-                ),
+                extra=_log_extra(self, error=exc.__class__.__name__, raw_error=str(exc)[:200]),
                 exc_info=True,
             )
             # P2.4 — SageConnectionError contient depuis P1.1 le SQLSTATE +
@@ -1138,9 +1483,7 @@ class CellDetailExecuteHandler(BaseHandler):
         except QueryError as exc:
             logger.warning(
                 "[CellDetail] query error",
-                extra=_log_extra(
-                    self, error=exc.__class__.__name__, raw_error=str(exc)[:200]
-                ),
+                extra=_log_extra(self, error=exc.__class__.__name__, raw_error=str(exc)[:200]),
             )
             # P2.4 — catégorisation + sanitization PII via SSoT.
             _audience = "admin" if _is_admin(self.current_user) else "user"
@@ -1152,9 +1495,7 @@ class CellDetailExecuteHandler(BaseHandler):
         except SageConnectionError as exc:
             logger.error(
                 "[CellDetail] Sage indisponible",
-                extra=_log_extra(
-                    self, error=exc.__class__.__name__, raw_error=str(exc)[:200]
-                ),
+                extra=_log_extra(self, error=exc.__class__.__name__, raw_error=str(exc)[:200]),
                 exc_info=True,
             )
             _audience = "admin" if _is_admin(self.current_user) else "user"

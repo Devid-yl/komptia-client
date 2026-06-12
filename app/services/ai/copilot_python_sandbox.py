@@ -28,7 +28,10 @@ import ast
 import logging
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:  # import runtime LOCAL dans _get_sandbox_executor (lazy)
+    from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +410,13 @@ _ALLOWED_BUILTINS: Dict[str, Any] = {
 # max ~1088 positions) ; 5000 couvre des cas plus grands sans permettre un DoS.
 _MAX_CELLS = 5000
 _MAX_OVERRIDES = 5000
+# Alias PUBLICS (SSoT, tâche #20) : les payloads STATIQUES des outils
+# terminaux (emit_tab rows/sheet_content/cellDetails, rows_overrides,
+# patch_tab patches) sont capés aux MÊMES bornes que la génération
+# add_cell/add_override du sandbox — une seule vérité sur « combien de
+# cellules un emit peut porter », côté code généré comme côté args directs.
+MAX_EMIT_CELLS = _MAX_CELLS
+MAX_EMIT_OVERRIDES = _MAX_OVERRIDES
 _MAX_LOG_LINES = 200
 _MAX_LOG_LINE_LEN = 500
 
@@ -418,6 +428,73 @@ _MAX_LOG_LINE_LEN = 500
 # l'allocation runtime de structures massives.
 _DEFAULT_TIMEOUT_S = 60.0
 _MAX_INSTRUCTIONS = 10_000_000
+
+
+#: Pool de threads PRIVÉ du sandbox (eXamine 2026-06-10 CRITICAL) : ne PAS
+#: utiliser asyncio.to_thread (default executor) — il est partagé avec le
+#: bcrypt du login (auth.py), le datastore, le SMTP… Un sandbox peut occuper
+#: son thread > 80s (thread non tuable au timeout mur) : sur le pool partagé,
+#: quelques runs lourds simultanés mettraient l'AUTH de tous les users en
+#: famine. Pool dédié borné = le sandbox ne peut affamer que lui-même.
+#: Bonus : les workers de ce pool sont les seuls à recevoir sys.settrace.
+#: 2 workers : les exécutions sandbox sont rares et séquentielles PAR run ;
+#: 2 couvre la concurrence multi-users sans ouvrir un vecteur de saturation
+#: CPU (chaque worker peut brûler un cœur en op C-pure orpheline).
+_SANDBOX_POOL_SIZE = 2
+_sandbox_executor: Optional["ThreadPoolExecutor"] = None
+
+
+def _get_sandbox_executor() -> "ThreadPoolExecutor":
+    global _sandbox_executor
+    if _sandbox_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _sandbox_executor = ThreadPoolExecutor(
+            max_workers=_SANDBOX_POOL_SIZE,
+            thread_name_prefix="copilot-sandbox",
+        )
+    return _sandbox_executor
+
+
+async def run_sandboxed(fn, /, *args, **kwargs):
+    """Exécute ``fn(*args, **kwargs)`` sur le pool PRIVÉ du sandbox.
+
+    Point d'entrée unique des callers async (SSoT) — remplace
+    ``asyncio.to_thread`` pour les raisons documentées sur
+    ``_SANDBOX_POOL_SIZE``. À combiner avec ``asyncio.wait_for(...,
+    timeout=wall_timeout_for(...))`` côté caller pour la borne temps-mur.
+    """
+    import asyncio
+    import functools
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _get_sandbox_executor(), functools.partial(fn, *args, **kwargs)
+    )
+
+
+def wall_timeout_for(timeout_s: float = _DEFAULT_TIMEOUT_S) -> float:
+    """Borne TEMPS-MUR pour les callers async (fix event-loop 2026-06-10).
+
+    Le timeout coopératif ``timeout_s`` (settrace) ne borne que le bytecode
+    Python — une opération C-pure (tri géant, multiplication de séquences)
+    peut le dépasser arbitrairement. Les callers async enveloppent donc
+    l'exécution dans ``asyncio.wait_for(asyncio.to_thread(...),
+    timeout=wall_timeout_for(...))`` : marge de 25% + 5s au-dessus du
+    coopératif pour le laisser conclure proprement d'abord (son message
+    d'erreur est plus utile au LLM que le timeout mur).
+
+    SSoT : dérivée du timeout coopératif — ne pas hardcoder de borne mur
+    indépendante côté caller. Limitation documentée : au déclenchement du
+    wait_for, le THREAD n'est pas tué (asyncio.to_thread n'est pas
+    annulable) — l'event loop est libéré mais le calcul orphelin continue
+    jusqu'à son terme (ou au prochain check settrace pour du Python pur).
+    La vraie isolation (subprocess + resource.setrlimit) reste l'upgrade
+    prévu par la docstring du module.
+    """
+    return timeout_s * 1.25 + 5.0
+
+
 _MAX_INT_LITERAL = 1_000_000
 # Cap sur les littéraux string/bytes — combiné avec _MAX_INT_LITERAL,
 # borne `"x" * 999_999` à ~1MB. Chaînage possible mais chaque étape
@@ -788,6 +865,12 @@ def run_code_with_helpers(
         # bretelles : compile peut révéler des erreurs plus tardives.
         raise SandboxError(f"Compilation échouée : {exc}") from exc
 
+    # Save/restore (eXamine 2026-06-10 BLOCKING) : depuis le passage au pool
+    # de threads, ce code tourne sur un worker RÉUTILISÉ — forcer None dans
+    # le finally détruirait la trace d'un coverage/profiler/debugger posée
+    # sur ce worker (couverture silencieusement fausse). On restaure la
+    # trace PRÉCÉDENTE, pas None.
+    _prev_trace = sys.gettrace()
     sys.settrace(_trace)
     try:
         exec(compiled, namespace, namespace)
@@ -798,7 +881,7 @@ def run_code_with_helpers(
         # dans le message pour qu'il puisse la corriger au tour suivant.
         raise SandboxError(f"Erreur runtime dans le code : {type(exc).__name__}: {exc}") from exc
     finally:
-        sys.settrace(None)
+        sys.settrace(_prev_trace)
 
     # Check budget session après exec (même si emit_via_code est typiquement
     # le terminal call, le caller peut enchaîner run_python après)
@@ -893,6 +976,9 @@ def run_exploration(
     except SyntaxError as exc:
         raise SandboxError(f"Compilation échouée : {exc}") from exc
 
+    # Save/restore de la trace — même raison que run_code_with_helpers
+    # (worker de pool réutilisé, cf. commentaire là-bas).
+    _prev_trace = sys.gettrace()
     sys.settrace(_trace)
     try:
         exec(compiled, namespace, namespace)
@@ -901,7 +987,7 @@ def run_exploration(
     except Exception as exc:
         raise SandboxError(f"Erreur runtime : {type(exc).__name__}: {exc}") from exc
     finally:
-        sys.settrace(None)
+        sys.settrace(_prev_trace)
 
     _enforce_session_budget(session)
 

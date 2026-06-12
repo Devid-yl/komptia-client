@@ -24,9 +24,12 @@ Confidentialité : le fichier session contient les réponses utilisateur (qui
 peuvent inclure des noms métier sensibles). Permissions forcées à 0600 sur
 chaque écriture pour éviter l'exposition cross-user sur poste partagé.
 
-Concurrence : chaque écriture est atomique (tempfile + os.replace) et
-protégée par un lock fichier (`fcntl.flock` POSIX). Deux scripts en
-parallèle qui appendent à la session ne perdent pas de données.
+Concurrence : l'ISOLATION entre runs concurrents vient du `ContextVar`
+(`set_session_file` — chaque asyncio.Task a son propre chemin de session, donc
+deux `run_pipeline` simultanés n'écrivent PAS dans le même fichier). Le lock
+fichier (`fcntl.flock` POSIX) + l'écriture atomique (tempfile + os.replace) ne
+protègent donc QUE le cas d'un chemin PARTAGÉ (CLI multi-process sur le défaut,
+ou même tâche) — ils ne sont plus la barrière d'isolation principale.
 
 Usage typique :
 
@@ -41,6 +44,7 @@ Usage typique :
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -52,9 +56,59 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Chemin par défaut. Modifiable via set_session_file() pour les tests.
+# #39 — cap anti-bourrage des champs Q/R injectés dans le prompt NL→SQL.
+# Relevé de 2000 → 8000 : une réponse de clarification LÉGITIME (ex. une liste
+# de codes/dossiers à filtrer) dépasse facilement 2000 chars, et la couper
+# silencieusement produisait un SQL à critères partiels. 8000 reste très en
+# dessous du bourrage de prompt tout en couvrant les cas réels.
+_MAX_PROMPT_FIELD_CHARS = 8000
+
+# #39 review (Moyen) — budget AGRÉGÉ du bloc Q/R injecté. Le cap PAR CHAMP ne
+# suffit pas : N rounds de clarification × 8000 chars pourraient dépasser le
+# contexte modèle, auquel cas le PROVIDER tronque la FIN du prompt (= les
+# instructions NL→SQL) → SQL faux/vide silencieux. On garde donc les précisions
+# les PLUS RÉCENTES qui tiennent dans ce budget, avec un marqueur explicite pour
+# les plus anciennes omises.
+_MAX_QA_BLOCK_CHARS = 24000
+
+
+def _select_recent_within_budget(
+    entries: list[dict[str, Any]], budget: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Garde les entries les PLUS RÉCENTES dont la somme Q+A tient dans ``budget``.
+
+    Retourne ``(kept_chronological, n_omitted)``. La 1re entry (la plus récente)
+    est toujours gardée même si elle dépasse seule le budget (le cap par-champ
+    la borne déjà), pour ne jamais renvoyer un bloc vide quand il y a des Q/R.
+    """
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for entry in reversed(entries):  # récent → ancien
+        cost = len(str(entry.get("question", ""))) + len(str(entry.get("answer", "")))
+        if kept and used + cost > budget:
+            break
+        kept.append(entry)
+        used += cost
+    kept.reverse()  # ordre chronologique d'origine
+    return kept, len(entries) - len(kept)
+
+# Chemin par défaut = FALLBACK éphémère hors volume (non un oubli). Il ne sert
+# QUE hors d'un run pipeline (tests, accès isolé). Pendant un run, run_pipeline
+# pose un chemin PER-RUN sous le volume via set_session_file (cf. ci-dessous).
 _DEFAULT_PATH = Path(__file__).resolve().parents[3] / "outputs" / "user_qa_session.json"
-_session_file: Path = _DEFAULT_PATH
+
+# Le chemin de session est un ContextVar, PAS un module-global — ISOLATION
+# PER-RUN sous concurrence (review consolidée 2026-06-02). Plusieurs
+# ``run_pipeline`` concurrents (users différents) tournent dans des asyncio.Task
+# distinctes ; ``create_task`` copie le contexte → chaque tâche a sa propre
+# valeur → AUCUN partage/clobber du fichier de session (réponses = noms métier
+# confidentiels, perms 0600). ``run_pipeline`` appelle ``set_session_file`` sur
+# l'output_dir PER-RUN (sous le volume komptia-data) : la session est alors à la
+# fois isolée par run ET persistée proprement (car non partagée). Hors run, la
+# valeur reste ``_DEFAULT_PATH`` (éphémère, sûr car non partagé non plus).
+_session_file_var: contextvars.ContextVar[Path] = contextvars.ContextVar(
+    "user_qa_session_file", default=_DEFAULT_PATH
+)
 
 # Permission restrictive sur les fichiers de session (rw owner only). Le
 # contenu peut inclure des réponses utilisateur révélant des noms métier.
@@ -72,13 +126,21 @@ except ImportError:
 
 
 def set_session_file(path: Path) -> None:
-    """Override le chemin de la session (utile pour les tests / scripts custom)."""
-    global _session_file
-    _session_file = Path(path)
+    """Pointe la session vers ``path`` POUR LE CONTEXTE COURANT (asyncio.Task).
+
+    Isole les runs concurrents : chaque tâche a sa propre valeur (le ContextVar
+    est copié à la création de la tâche, ``create_task``), donc deux
+    ``run_pipeline`` simultanés (users différents) ne partagent/clobberent pas
+    leur fichier de session. ``run_pipeline`` appelle ceci sur l'output_dir
+    per-run au début de chaque run (pas de reset : le runner lit la session
+    APRÈS run_pipeline dans la même tâche ; le contexte de la tâche est jeté à
+    sa fin → aucun leak inter-run).
+    """
+    _session_file_var.set(Path(path))
 
 
 def get_session_file() -> Path:
-    return _session_file
+    return _session_file_var.get()
 
 
 # =============================================================================
@@ -167,15 +229,16 @@ def _compute_src_fingerprint(source_file: Path) -> str | None:
 
 def _read_raw_session() -> dict[str, Any]:
     """Lit le fichier brut sans nettoyer les erreurs (usage interne)."""
-    if not _session_file.exists():
+    sf = get_session_file()
+    if not sf.exists():
         return {"qa": []}
     try:
-        return json.loads(_session_file.read_text(encoding="utf-8"))
+        return json.loads(sf.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         # Backup le fichier corrompu pour postmortem, ne perd pas silencieusement.
-        broken = _session_file.with_suffix(_session_file.suffix + ".broken")
+        broken = sf.with_suffix(sf.suffix + ".broken")
         try:
-            _session_file.rename(broken)
+            sf.rename(broken)
             logger.warning(
                 "user_qa_session: fichier corrompu (%s) — sauvegardé sous %s, "
                 "session réinitialisée vide",
@@ -207,7 +270,7 @@ def init_session(src_fingerprint: str | None = None) -> None:
     payload: dict[str, Any] = {"qa": []}
     if src_fingerprint is not None:
         payload["src_fingerprint"] = src_fingerprint
-    _atomic_write(_session_file, json.dumps(payload, ensure_ascii=False, indent=2))
+    _atomic_write(get_session_file(), json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def maybe_init_session(source_file: Path | None = None) -> bool:
@@ -226,8 +289,9 @@ def maybe_init_session(source_file: Path | None = None) -> bool:
     Returns:
         True si la session a été (re)initialisée, False si conservée.
     """
-    with _file_lock(_session_file):
-        if not _session_file.exists():
+    sf = get_session_file()
+    with _file_lock(sf):
+        if not sf.exists():
             fp = _compute_src_fingerprint(source_file) if source_file is not None else None
             init_session(src_fingerprint=fp)
             return True
@@ -294,7 +358,8 @@ def add_qa(
     if auto_submitted:
         entry["auto_submitted"] = True
 
-    with _file_lock(_session_file):
+    sf = get_session_file()
+    with _file_lock(sf):
         data = _read_raw_session()
         qa = data.get("qa", [])
         if not isinstance(qa, list):
@@ -302,7 +367,7 @@ def add_qa(
         qa.append(entry)
         data["qa"] = qa
         _atomic_write(
-            _session_file,
+            sf,
             json.dumps(data, ensure_ascii=False, indent=2),
         )
 
@@ -314,7 +379,10 @@ def _escape_for_prompt(s: str) -> str:
     - Newlines remplacés par espaces (sinon l'utilisateur peut commencer
       une nouvelle "section" de prompt avec `# ...`).
     - Triple-backticks neutralisés (échappe le marqueur de code-fence).
-    - Tronqué à 2000 chars pour éviter le bourrage de prompt.
+    - Tronqué à ``_MAX_PROMPT_FIELD_CHARS`` pour éviter le bourrage de prompt,
+      AVEC un marqueur explicite (#39) : un « … » nu serait indiscernable du
+      texte user → le LLM du pipeline NL→SQL croirait la réponse complète et
+      générerait un SQL à critères PARTIELS (résultats incomplets silencieux).
 
     Le wrap par marqueurs explicites (`<answer>...</answer>`) est appliqué
     par le caller, pas ici — pour que cette fonction reste utilisable dans
@@ -324,8 +392,21 @@ def _escape_for_prompt(s: str) -> str:
         return ""
     cleaned = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     cleaned = cleaned.replace("```", "ʼʼʼ")
-    if len(cleaned) > 2000:
-        cleaned = cleaned[:2000] + "…"
+    if len(cleaned) > _MAX_PROMPT_FIELD_CHARS:
+        # #39 — marqueur EXPLICITE (pas un « … » nu) pour que le LLM sache
+        # que la réponse est tronquée et demande confirmation si les critères
+        # semblent incomplets. + log pour observabilité de la troncature.
+        logger.warning(
+            "user_qa_session: champ de prompt tronqué %d→%d chars "
+            "(réponse de clarification trop longue)",
+            len(cleaned),
+            _MAX_PROMPT_FIELD_CHARS,
+        )
+        cleaned = (
+            cleaned[:_MAX_PROMPT_FIELD_CHARS]
+            + " [⚠ RÉPONSE UTILISATEUR TRONQUÉE — la suite manque ;"
+            " demande confirmation si les critères semblent incomplets]"
+        )
     return cleaned
 
 
@@ -364,6 +445,12 @@ def format_for_prompt() -> str:
         else:
             user_entries.append(entry)
 
+    # #39 review (Moyen) — borne agrégée : garde les précisions les plus
+    # récentes qui tiennent dans le budget du bloc, avec marqueur si on en omet.
+    user_entries, _n_omitted_user = _select_recent_within_budget(
+        user_entries, _MAX_QA_BLOCK_CHARS
+    )
+
     lines: list[str] = []
     if user_entries:
         lines.extend(
@@ -376,6 +463,13 @@ def format_for_prompt() -> str:
                 "",
             ]
         )
+        if _n_omitted_user > 0:
+            lines.append(
+                f"⚠ {_n_omitted_user} précision(s) plus ANCIENNE(s) omise(s) "
+                "(bloc tronqué au budget) — si une contrainte semble manquante, "
+                "redemande à l'utilisateur plutôt que de supposer."
+            )
+            lines.append("")
         for entry in user_entries:
             concept = entry.get("concept")
             phase = entry.get("phase", "?")

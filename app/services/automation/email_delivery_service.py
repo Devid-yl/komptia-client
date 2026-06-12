@@ -20,6 +20,7 @@ Design :
 
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -157,6 +158,34 @@ def _dedup_preserve(items: Iterable[str]) -> List[str]:
         seen.add(key)
         result.append(item.strip())
     return result
+
+
+# -----------------------------------------------------------------------------
+# Corps du mail (texte brut -> HTML)
+# -----------------------------------------------------------------------------
+
+
+def plain_text_to_email_html(text: object) -> str:
+    """Convertit un corps d'email saisi en TEXTE BRUT vers du HTML sur.
+
+    Contrat partage par les steps ``email`` et ``email_wait_response`` :
+    le champ ``body`` de la config est du texte brut. Il est echappe HTML
+    (un ``<b>`` colle par l'utilisateur s'affiche litteralement — pas
+    d'injection HTML dans le mail) et les sauts de ligne deviennent des
+    ``<br/>``. Les fins de ligne CRLF/CR (saisie API ou Windows) sont
+    normalisees en LF d'abord pour ne pas laisser de CR orphelins.
+
+    Args:
+        text: Corps en texte brut. Coerce en ``str`` si autre type —
+            une config poussee hors UI ne doit pas crasher l'envoi.
+
+    Returns:
+        Fragment HTML sur ("" si texte vide ou None).
+    """
+    if text is None:
+        return ""
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    return html.escape(normalized).replace("\n", "<br/>")
 
 
 # -----------------------------------------------------------------------------

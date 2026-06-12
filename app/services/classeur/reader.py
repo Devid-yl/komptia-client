@@ -38,47 +38,70 @@ from typing import Any, Dict, Optional, Tuple
 
 import tornado.web
 
+from app.utils.gzip_safe import GunzipError, gunzip_first_member, is_gzip_magic
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Pratiquement infini (1 TiB). La VRAIE limite par classeur = quota
-# stockage de l'utilisateur (config admin globale via /admin/performance,
-# lu depuis AIConfig.STORAGE_QUOTA_PER_USER_BYTES). Si l'agrégation
-# quota_used + classeur_size > quota_limit, l'upload est refusé par
-# StorageManager.check_quota(). Pas de cap classeur indépendant.
-MAX_CLASSEUR_SIZE = 1024 * 1024 * 1024 * 1024  # 1 TiB
+# SOURCE UNIQUE de toutes les limites de classeur = le quota de stockage par
+# user défini par l'admin (/admin/performance → STORAGE_QUOTA_PER_USER_BYTES),
+# résolu au runtime via ``storage_manager.get_storage_quota_bytes[_sync]``.
+# Plus AUCUN cap de décompression hardcodé : ni taille disque, ni taille
+# décompressée. Le quota borne les deux (et donc aussi la RAM de décompression —
+# cf. la docstring de get_storage_quota_bytes : l'admin dimensionne vs conteneur).
 
 
-#: Magic bytes gzip (RFC 1952 §2.3.1). Toute compression gzip commence par
-#: ces 2 octets — détection 100% fiable, pas d'ambiguïté avec un JSON ASCII.
-_GZIP_MAGIC: bytes = b"\x1f\x8b"
+def decode_afz_bytes(
+    raw: bytes,
+    *,
+    source: str = "",
+    max_decompressed_bytes: Optional[int] = None,
+) -> Any:
+    """Décode des octets ``.afz.json`` (gzip transparent) → objet JSON parsé.
+
+    SINGLE SOURCE OF TRUTH pour transformer des octets de classeur en données :
+    web UI (``_load_json_sync``), automation (``workbook_loader``), copilot, scan
+    anonymisation, cleanup job. Détecte le gzip (magic bytes), décompresse en
+    streaming BORNÉ + TOLÉRANT aux octets de queue (cf. ``gunzip_first_member``),
+    puis ``json.loads``. Rétrocompat : les classeurs ante-gzip (JSON brut) passent
+    directement par ``json.loads``.
+
+    Lève ``json.JSONDecodeError`` sur TOUT échec (décompression bornée/tronquée OU
+    parsing JSON) — contrat conservé pour les callers existants qui l'attrapent
+    déjà (``read_classeur``, ``workbook_loader``). Un échec de décompression est
+    aussi loggé en WARNING avec la cause réelle (diagnostic — auparavant avalé).
+
+    Borne de décompression : ``max_decompressed_bytes`` si fourni, sinon le quota
+    de stockage admin (SSoT, version sync cache-only car on peut être dans un
+    thread). Plus aucun cap hardcodé.
+    """
+    if max_decompressed_bytes is None:
+        from app.services.storage_manager import get_storage_quota_bytes_sync
+
+        cap = get_storage_quota_bytes_sync()
+    else:
+        cap = max_decompressed_bytes
+    if is_gzip_magic(raw):
+        try:
+            raw = gunzip_first_member(raw, cap)
+        except GunzipError as exc:
+            logger.warning("Décompression .afz.json échouée (%s) : %s", source or "?", exc)
+            raise json.JSONDecodeError(
+                f"Gzip décompression échouée : {exc}", source or "<gzip>", 0
+            ) from exc
+    return json.loads(raw.decode("utf-8"))
 
 
 def _load_json_sync(path: Path) -> Any:
     """Charge un .afz.json depuis le disque, transparent gzip ou brut.
 
-    Détecte automatiquement si le fichier est gzippé (magic bytes
-    ``0x1f 0x8b``) et décompresse à la volée. Sinon parse comme JSON
-    brut. Permet la rétrocompat avec les classeurs créés avant le
-    refacto gzip — aucune migration nécessaire.
+    Lit les octets puis délègue à :func:`decode_afz_bytes` (SSoT) qui détecte le
+    gzip, décompresse de façon bornée + tolérante, et parse le JSON. Rétrocompat
+    avec les classeurs créés avant le refacto gzip — aucune migration nécessaire.
     """
-    import gzip as _gzip
-
     with open(path, "rb") as f:
-        head = f.read(2)
-        f.seek(0)
         raw = f.read()
-
-    if head == _GZIP_MAGIC:
-        try:
-            decompressed = _gzip.decompress(raw)
-        except (OSError, _gzip.BadGzipFile) as exc:
-            raise json.JSONDecodeError(f"Gzip décompression échouée : {exc}", str(path), 0)
-        return json.loads(decompressed.decode("utf-8"))
-
-    # Fallback : JSON brut (classeur ante-gzip).
-    return json.loads(raw.decode("utf-8"))
+    return decode_afz_bytes(raw, source=str(path))
 
 
 async def read_classeur(user_id: int, filename: str) -> dict:
@@ -90,6 +113,7 @@ async def read_classeur(user_id: int, filename: str) -> dict:
     Raises HTTPError pour fichier manquant, invalide ou trop volumineux.
     """
     from app.handlers.datastore import _safe_path, _user_dir
+    from app.services.storage_manager import get_storage_quota_bytes
 
     if not filename.endswith(".json"):
         raise tornado.web.HTTPError(400, "Fichier non supporte (doit etre .json)")
@@ -99,10 +123,14 @@ async def read_classeur(user_id: int, filename: str) -> dict:
     if target is None or not target.exists() or not target.is_file():
         raise tornado.web.HTTPError(404, "Classeur introuvable")
 
+    # SOURCE UNIQUE : le quota admin borne la taille (un fichier ne peut pas
+    # dépasser le quota total du user). Décompression bornée par le même quota
+    # (cf. _load_json_sync → decode_afz_bytes → get_storage_quota_bytes_sync).
+    quota = await get_storage_quota_bytes()
     size = target.stat().st_size
-    if size > MAX_CLASSEUR_SIZE:
+    if size > quota:
         raise tornado.web.HTTPError(
-            413, f"Classeur trop volumineux (max {MAX_CLASSEUR_SIZE // (1024 * 1024)} Mo)"
+            413, f"Classeur trop volumineux (max {quota // (1024 * 1024)} Mo)"
         )
 
     try:
@@ -180,16 +208,33 @@ def extract_source_data(
     return columns, rows, label, source_sql
 
 
-def list_classeurs_sync(user_dir: Path) -> list:
+def list_classeurs_sync(user_dir: Path, include_hidden: bool = False) -> list:
     """Scanne le datastore utilisateur pour les fichiers de type classeur.
 
     Appelé via asyncio.to_thread depuis les handlers.
     Retourne liste de {filename, name, size, modified}.
+
+    ``include_hidden=False`` (défaut) exclut les dossiers cachés — notamment
+    ``.widgets/`` (classeurs internes des widgets grille de dashboard) : ils
+    ne doivent PAS apparaître dans les pickers (/api/workbooks,
+    /api/reports/classeurs) car leurs rows sont des snapshots figés au
+    dernier save du widget — les consommer comme source = données périmées
+    silencieuses. ``include_hidden=True`` est réservé aux jobs système qui
+    doivent voir TOUT le datastore (cleanup anonymisation : les termes
+    vivant uniquement dans un classeur de widget seraient sinon purgés
+    comme orphelins).
     """
     results = []
     for p in user_dir.rglob("*.json"):
         if not p.is_file():
             continue
+        if not include_hidden:
+            try:
+                rel_parts = p.relative_to(user_dir).parts
+            except ValueError:
+                continue
+            if any(part.startswith(".") for part in rel_parts):
+                continue
         name_lower = p.name.lower()
         if "classeur" not in name_lower and ".afz" not in name_lower:
             continue

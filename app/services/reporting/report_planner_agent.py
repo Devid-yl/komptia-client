@@ -63,6 +63,18 @@ from app.services.reporting.report_planner_tools import (
     dispatch_report_tool,
 )
 
+# Compression mid-loop : SSoT partagée (extraite de ce fichier — cf. docstring
+# "factorisation agent_tool_loop", décision 2026-05-09). Ré-exportée ici pour
+# la compat des imports existants (tests + call-site interne).
+from app.services.ai.llm_compression import (  # noqa: F401
+    _COMPRESS_KEEP_RECENT,
+    _COMPRESS_TRIGGER_PCT,
+    _TOOL_RESULT_COMPRESSIBLE_LEN,
+    _compress_tool_result_payload,
+    _estimate_messages_tokens,
+    _maybe_compress_messages,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,23 +107,6 @@ MEMORY_HARD_CAP_BYTES = int(os.environ.get("KOMPTIA_REPORT_MEMORY_CAP_MB", "100"
 #: au cap du modèle via :func:`clamped_max_tokens` — donc pas de magic int
 #: sur les call-sites concrets (cf. CLAUDE.md règle anti-hardcode).
 _DEFAULT_TURN_MAX_TOKENS = 16000
-
-#: Compression mid-loop : trigger quand l'historique cumulé dépasse ce
-#: pourcentage du budget input du modèle actif. Pattern aligné
-#: ``agent_service.py:1189`` (Iris). 75% laisse une marge confortable pour
-#: une réponse complète au turn suivant + le system prompt.
-_COMPRESS_TRIGGER_PCT = 0.75
-
-#: Nombre de messages récents à GARDER INTACTS lors de la compression.
-#: 10 = ~5 paires (assistant + user/tool_results). Suffisant pour que le
-#: LLM garde une visibilité fine sur ses 5 derniers tours, et compresse
-#: tout ce qui est plus ancien.
-_COMPRESS_KEEP_RECENT = 10
-
-#: Seuil au-delà duquel un tool_result est compressible. Sous ce seuil, ça
-#: vaut moins le coup d'altérer le message (peu de gain).
-_TOOL_RESULT_COMPRESSIBLE_LEN = 500
-
 
 # Import paresseux pour éviter le cycle d'import (llm_report_planner →
 # report_planner_agent → llm_report_planner pour _validate_plan).
@@ -179,157 +174,6 @@ def _scan_residual_tokens(plan_dict: Dict[str, Any]) -> int:
     return count
 
 
-def _estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
-    """Estimation rough des tokens cumulés dans ``messages``. Pattern aligné
-    ``agent_service.py:6745-6753`` : 4 chars ≈ 1 token (heuristique latine).
-    """
-    total_chars = 0
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        else:
-            try:
-                total_chars += len(json.dumps(content, ensure_ascii=False, default=str))
-            except (TypeError, ValueError):
-                total_chars += len(str(content))
-    return total_chars // 4
-
-
-def _compress_tool_result_payload(raw: str) -> str:
-    """Compresse un tool_result JSON en gardant l'essentiel (déterministe,
-    sans appel LLM secondaire). Pattern adapté de ``agent_service.py:6972``.
-
-    On garde les champs informationnels (status, ok, dataset_id, agg,
-    groups_count, row_count, error, columns…) et on drop les payloads
-    volumineux (rows, groups, distinct_sample). Le LLM voit ainsi qu'il a
-    fait l'appel et avec quel résultat de haut niveau, mais perd les
-    détails fins (qu'il a déjà consommés au tour où le tool a été appelé).
-
-    NB : on ne touche JAMAIS aux ``tool_use`` blocks (les inputs du LLM)
-    pour préserver le contrat input/output côté API.
-    """
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return raw[:_TOOL_RESULT_COMPRESSIBLE_LEN] + "...[compressed-trunc]"
-    if not isinstance(data, dict):
-        return raw[:_TOOL_RESULT_COMPRESSIBLE_LEN] + "...[compressed-trunc]"
-
-    # Champs essentiels conservés (info de haut niveau, sans données brutes)
-    summary: Dict[str, Any] = {"_compressed": True}
-    for key in (
-        "ok",
-        "error",
-        "reason",
-        "dataset_id",
-        "datasets",
-        "label",
-        "row_count",
-        "row_count_total",
-        "rows_returned",
-        "rows_processed",
-        "rows_filtered_out",
-        "agg",
-        "group_by",
-        "value_column",
-        "groups_count",
-        "truncated",
-        "truncation_warning",
-        # #27 — troncature SOURCE (≠ tool-level) : DOIT survivre à la compression
-        # mid-loop, sinon le planner perd l'info « agrégat partiel » et présente
-        # des chiffres faux comme exhaustifs.
-        "source_truncated",
-        "source_truncation_warning",
-        "rows_skipped_over_cap",
-        "count",
-        "total",
-        "columns",
-        "section_index",
-        "total_sections",
-        "stored_chars",
-        "overwritten",
-        "title",
-        "sections_emitted",
-        "has_intro",
-        "next_start",
-    ):
-        if key in data:
-            value = data[key]
-            # Tronque listes volumineuses (columns à 30 max — assez pour le LLM)
-            if isinstance(value, list) and len(value) > 30:
-                summary[key] = value[:30]
-                summary[f"{key}_truncated_count"] = len(value)
-            elif isinstance(value, str) and len(value) > 200:
-                summary[key] = value[:200] + "..."
-            else:
-                summary[key] = value
-    # On droppe explicitement les gros payloads (rows, groups, distinct_sample)
-    return json.dumps(summary, ensure_ascii=False, default=str)
-
-
-def _maybe_compress_messages(
-    messages: List[Dict[str, Any]],
-    *,
-    context_window: int,
-    reserved_output: int,
-) -> int:
-    """Compresse les vieux tool_results IN-PLACE si les messages dépassent
-    ``_COMPRESS_TRIGGER_PCT`` du budget input. Garde les
-    ``_COMPRESS_KEEP_RECENT`` derniers messages intacts.
-
-    Args:
-        messages: la liste de messages (mutée IN-PLACE).
-        context_window: fenêtre du modèle actif (cf. constants_ai).
-        reserved_output: tokens réservés pour la réponse LLM (effort["max_tokens"]).
-
-    Returns:
-        Nombre de blocs compressés (0 si pas nécessaire). Loggé en INFO.
-    """
-    if context_window <= 0 or reserved_output <= 0:
-        return 0
-    budget_input = max(1000, context_window - reserved_output)
-    threshold = int(budget_input * _COMPRESS_TRIGGER_PCT)
-    estimated = _estimate_messages_tokens(messages)
-    if estimated < threshold:
-        return 0
-
-    # Garde les N derniers intacts
-    end_idx = max(0, len(messages) - _COMPRESS_KEEP_RECENT)
-    if end_idx == 0:
-        return 0  # rien à compresser, tout est récent
-
-    compressed = 0
-    for i in range(end_idx):
-        msg = messages[i]
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") != "tool_result":
-                continue  # JAMAIS toucher aux tool_use
-            raw = block.get("content", "")
-            if not isinstance(raw, str) or len(raw) <= _TOOL_RESULT_COMPRESSIBLE_LEN:
-                continue
-            block["content"] = _compress_tool_result_payload(raw)
-            compressed += 1
-
-    if compressed:
-        new_estimated = _estimate_messages_tokens(messages)
-        logger.info(
-            "report_planner_agent: compression mid-loop — %d blocs compressés, "
-            "~%d tokens → ~%d tokens (seuil %d, budget %d)",
-            compressed,
-            estimated,
-            new_estimated,
-            threshold,
-            budget_input,
-        )
-    return compressed
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -381,6 +225,10 @@ async def run_report_agent(
           :func:`llm_report_planner._validate_plan`)
     """
     _validate_plan, ReportPlanError, ReportPlan = _get_validators()
+
+    # NB : l'alerte budget LLM est posée en amont dans ``plan_report``
+    # (llm_report_planner) pour couvrir les DEUX modes (oneshot + agent) ;
+    # inutile de la dupliquer ici.
 
     # 1. Garde-fous d'entrée -------------------------------------------------
     if not datasets:
@@ -564,6 +412,7 @@ async def run_report_agent(
                     messages,
                     context_window=_ctx_window,
                     reserved_output=effort["max_tokens"],
+                    caller="report_planner",
                 )
 
         # ``temperature=0.3`` (vs copilot 0.2) : la planification de rapport
@@ -924,6 +773,13 @@ async def run_report_agent(
         title=validated["title"],
         introduction=validated.get("introduction"),
         sections=validated["sections"],
+        # #56 — sections non incluses = cut/invalides de _validate_plan PLUS les
+        # refus au cap d'émission agent (le vrai limiteur en mode agent, sinon
+        # invisible à l'utilisateur). Les deux causes → même note « partiel ».
+        sections_omitted=(
+            int(validated.get("sections_omitted", 0) or 0)
+            + int(getattr(state, "sections_refused", 0) or 0)
+        ),
     )
 
 

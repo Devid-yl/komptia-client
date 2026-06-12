@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,42 @@ logger = logging.getLogger(__name__)
 
 
 MAX_TURNS = 40
+
+#: Borne TEMPS-MUR du run agent (fix 2026-06-11). MAX_TURNS=40 autorise
+#: ~20 min de run alors qu'en prod nginx coupe le long-poll à
+#: ``proxy_read_timeout`` (300s, deployment/nginx/komptia.conf — couplage
+#: documenté là-bas) : le client recevait un 504 et TOUT le travail était
+#: perdu. On termine PROPREMENT avant la coupure proxy, via le chemin
+#: ``max_turns_reached`` (actions déjà produites packées + invitation à
+#: reprendre — fail-closed depuis le fix 2026-06-10). Défaut 270s = 30s de
+#: marge sous le proxy. Configurable par env (déploiement direct sans
+#: proxy : monter la valeur).
+_DEFAULT_RUN_TIME_BUDGET_S = 270.0
+
+
+def _run_time_budget_seconds() -> float:
+    """Budget temps du run, env-configurable, fail-soft sur valeur invalide."""
+    raw = os.environ.get("KOMPTIA_COPILOT_RUN_BUDGET_S")
+    if raw is None:
+        return _DEFAULT_RUN_TIME_BUDGET_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "KOMPTIA_COPILOT_RUN_BUDGET_S invalide (%r) — fallback %ss.",
+            raw,
+            _DEFAULT_RUN_TIME_BUDGET_S,
+        )
+        return _DEFAULT_RUN_TIME_BUDGET_S
+    if val <= 0:
+        logger.warning(
+            "KOMPTIA_COPILOT_RUN_BUDGET_S doit être > 0 (%r) — fallback %ss.",
+            raw,
+            _DEFAULT_RUN_TIME_BUDGET_S,
+        )
+        return _DEFAULT_RUN_TIME_BUDGET_S
+    return val
+
 
 # Mode "max effort" Anthropic — deux leviers qui augmentent significativement
 # la qualité des sorties sans changer l'architecture :
@@ -245,73 +282,23 @@ def _build_copilot_system_prompt(
     # systeme. La validation ZoneInfo est ce qui rend le fallback propre :
     # avant ce fix, "AST" en config gagnait toujours et levait à chaque
     # build du prompt.
-    import zoneinfo as _zoneinfo
-
-    def _candidate_tz_names():
-        # 1. Config admin
-        try:
-            from app.config import config as _app_config
-
-            cfg_tz = str(getattr(getattr(_app_config, "server", None), "timezone", "") or "")
-            if cfg_tz:
-                yield ("config.server.timezone", cfg_tz)
-        except Exception:
-            pass
-        # 2. Env var TZ
-        try:
-            import os as _os
-
-            env_tz = _os.environ.get("TZ", "").strip()
-            if env_tz:
-                yield ("env TZ", env_tz)
-        except Exception:
-            pass
-        # 3. Symlink /etc/localtime → IANA key
-        try:
-            import os as _os
-
-            link = _os.readlink("/etc/localtime")
-            marker = "zoneinfo/"
-            idx = link.find(marker)
-            if idx >= 0:
-                yield ("/etc/localtime", link[idx + len(marker) :])
-        except Exception:
-            pass
-        # 4. Fallback abréviation locale (probablement invalide en ZoneInfo
-        #    mais on tente — sinon le bloc final utilise tzinfo direct).
-        try:
-            abbr = clock.now().astimezone().tzinfo.tzname(None)
-            if abbr:
-                yield ("system abbrev", abbr)
-        except Exception:
-            pass
-
-    tz = None
-    tz_name = "Local"
-    for source, candidate in _candidate_tz_names():
-        try:
-            tz = _zoneinfo.ZoneInfo(candidate)
-            tz_name = candidate
-            break
-        except Exception as exc:
-            logger.debug(
-                "copilot_system_prompt: candidat tz `%s` (depuis %s) "
-                "rejeté par ZoneInfo (%s) — essaie le suivant.",
-                candidate,
-                source,
-                exc,
-            )
-    if tz is None:
-        # Aucun candidat n'a passé ZoneInfo : on utilise la tzinfo locale
-        # directement. L'offset reste correct, juste le nom IANA absent.
-        tz = clock.now().astimezone().tzinfo
-        try:
-            tz_name = tz.tzname(None) or "Local"
-        except Exception:
-            tz_name = "Local"
-
-    now = clock.now().astimezone(tz)
-    current_date = now.strftime("%A %d %B %Y, %H:%M")
+    # Contexte date/heure pour le LLM — heure SERVEUR via la SSoT clock
+    # (config.server.timezone → machine_tz ; fallback UTC + warning one-shot gérés
+    # DANS clock.machine_tz). Remplace une résolution de fuseau maison qui
+    # dupliquait clock.machine_tz_name / machine_tz (parallel-SSoT, sa priorité #1
+    # était déjà config.server.timezone). Un copilot = backend : pas de navigateur
+    # pour convertir → heure serveur.
+    now = clock.now_local()
+    # tz_name dérivé du tzinfo RÉELLEMENT résolu (cohérent avec l'heure affichée) :
+    # si config.server.timezone est invalide, machine_tz() tombe sur UTC → on
+    # annonce "UTC" + heure UTC, PAS un nom de fuseau qui contredit l'heure (un
+    # `machine_tz_name()` brut renverrait l'alias invalide « AST » alors que
+    # l'heure serait en UTC). ZoneInfo expose `.key`, pytz `.zone`, timezone.utc
+    # ni l'un ni l'autre → "UTC".
+    tz_name = getattr(now.tzinfo, "key", None) or getattr(now.tzinfo, "zone", None) or "UTC"
+    # strftime_fr : noms de jour/mois FR indépendamment de la locale système
+    # (python:slim n'a pas de locale fr_FR → "%B" rendrait « June »).
+    current_date = clock.strftime_fr(now, "%A %d %B %Y, %H:%M")
 
     # Bloc "À propos de l'utilisateur" : vide (chaîne) si ``user_profile`` est
     # ``None``. ``render_user_context_block`` produit déjà son propre retour
@@ -432,6 +419,25 @@ async def run_copilot_agent(
 
     if not instruction or not instruction.strip():
         return {"error": "Instruction vide."}
+
+    # Alerte budget LLM PARTAGÉE (denial-of-wallet — cf. llm_call_tracker).
+    # Placée APRÈS les early-returns (auto-fill / instruction vide) qui ne font
+    # AUCUN appel LLM, pour ne pas requêter la BDD ni logger une fausse alerte.
+    # Mode ALERTE : log sans bloquer (une automatisation critique ne s'arrête
+    # pas en silence). user_id est ``Any`` côté wire → coercition int.
+    from app.services.ai.llm_call_tracker import check_user_budget
+
+    _budget_uid = user_id if isinstance(user_id, int) else None
+    _over, _cur, _cap = await check_user_budget(_budget_uid)
+    if _over:
+        logger.warning(
+            "Étape format d'automatisation exécutée AU-DELÀ du plafond budget "
+            "LLM (user=%s, %.2f $ / %.2f $) — mode alerte, non bloquée "
+            "(suivi : /admin/ai-performance).",
+            _budget_uid,
+            _cur,
+            _cap,
+        )
 
     try:
         await ensure_providers_from_db()
@@ -783,6 +789,16 @@ async def run_copilot_agent(
     if copilot_memory:
         copilot_memory_cleartext = pseudo.deanonymize_text(copilot_memory)
         copilot_memory_anon = pseudo.anonymize_text(copilot_memory_cleartext)
+        # Strip des placeholders PII éphémères hérités (tâche #21) : une
+        # mémoire LEGACY (écrite avant le fix) peut porter des ``[EMAIL_1]``
+        # du run qui l'a produite — leur mapping est mort, et le run COURANT
+        # va générer ses propres ``[EMAIL_1]`` (autre valeur) → collision
+        # silencieuse dans le prompt + restauration fausse si recopiés.
+        # L'écriture strip déjà (summarize_copilot_run) ; la lecture couvre
+        # le stock existant.
+        from app.services.ai.copilot_memory import strip_ephemeral_pii_tokens
+
+        copilot_memory_anon = strip_ephemeral_pii_tokens(copilot_memory_anon)
     else:
         copilot_memory_anon = ""
 
@@ -852,8 +868,22 @@ async def run_copilot_agent(
 
     total_llm_ms = 0
     total_turns = 0
+    # Deadline temps-mur du run (cf. _run_time_budget_seconds) — vérifiée en
+    # tête de tour : on ne COUPE pas un appel LLM en vol, on s'arrête de
+    # commencer un tour de plus. Le break atterrit sur le packing
+    # ``max_turns_reached`` (fin propre, travail conservé).
+    run_deadline = t_start + _run_time_budget_seconds()
     for turn in range(MAX_TURNS):
         total_turns = turn + 1
+        if turn > 0 and time.monotonic() > run_deadline:
+            logger.warning(
+                "Copilot agent: budget TEMPS épuisé (%.0fs, %d tours) — fin "
+                "propre avant le timeout proxy (cf. KOMPTIA_COPILOT_RUN_BUDGET_S).",
+                time.monotonic() - t_start,
+                total_turns - 1,
+            )
+            total_turns -= 1  # ce tour n'a pas eu lieu
+            break
         # Expose le numéro de turn (1-based) au ctx pour la boucle agent.
         ctx.turn_count = total_turns
         # Re-calcul à CHAQUE tour : si l'admin switch le provider via
@@ -861,6 +891,31 @@ async def run_copilot_agent(
         # les params s'adaptent au prochain appel au lieu de rester figés
         # sur l'ancien provider. Coût négligeable (1 getattr + 1 lookup dict).
         effort = _effort_params_for_provider(manager)
+
+        # Gap B (audit 2026-06-09) : compression mid-loop AVANT l'appel. Sur 40
+        # tours avec des read_tab_rows (tab SELECT * large = centaines de KB par
+        # appel), l'historique `messages` cumulé peut dépasser le context window
+        # OU le budget rate-limit (Anthropic Tier 1 = 50k tok/min). Ici le 429
+        # est FATAL (RetryPolicy.NONE → abort user), donc on rabote les vieux
+        # tool_results de façon déterministe (SSoT `llm_compression`, même
+        # mécanisme que report_planner). On garde les 10 derniers messages
+        # intacts et on skip les 5 premiers tours (overhead inutile).
+        if turn >= 5:
+            from app.constants_ai import get_context_window_for_model
+            from app.services.ai.llm_compression import _maybe_compress_messages
+
+            try:
+                _ctx_window = get_context_window_for_model(manager.default_model_name)
+            except Exception:  # noqa: BLE001 — registre BDD indispo → skip compression
+                _ctx_window = 0
+            if _ctx_window > 0:
+                _maybe_compress_messages(
+                    messages,
+                    context_window=_ctx_window,
+                    reserved_output=effort["max_tokens"],
+                    caller="copilot",
+                )
+
         request = LLMRequest(
             prompt="",  # messages portent la conversation
             system=system_prompt,
@@ -908,6 +963,10 @@ async def run_copilot_agent(
             # ne contient pas "overloaded" en lowercase).
             from app.services.ai.llm_runtime import LLMCallError as _LLMErr
 
+            # ``error_kind`` machine-readable (fix 2026-06-11) : le handler
+            # classifie le code HTTP dessus — plus de matching de substrings
+            # sur des messages français destinés aux humains (source du bug
+            # « cancel → 422 » et de l'incohérence 504/500 du fail-closed).
             if isinstance(exc, _LLMErr):
                 if exc.kind == "overloaded":
                     return {
@@ -915,14 +974,19 @@ async def run_copilot_agent(
                             "⏳ Service LLM temporairement surchargé. "
                             "Ce n'est pas un bug de la demande — réessaie dans 1-2 minutes."
                         ),
+                        "error_kind": "overloaded",
                     }
                 if exc.kind == "rate_limit":
                     return {
                         "error": (
                             "⏳ Quota LLM dépassé (rate limit). Réessaie dans " "quelques minutes."
                         ),
+                        "error_kind": "rate_limit",
                     }
-            return {"error": "Erreur interne du service LLM. Réessaie la demande."}
+            return {
+                "error": "Erreur interne du service LLM. Réessaie la demande.",
+                "error_kind": "internal",
+            }
         total_llm_ms += round((time.monotonic() - t_llm) * 1000)
 
         content = response.get("content") or []
@@ -994,6 +1058,7 @@ async def run_copilot_agent(
                     "tâche (ex : émets un onglet partiel puis étends via "
                     "`patch_tab`, ou simplifie la demande)."
                 ),
+                "error_kind": "llm_truncated",
             }
 
         # Accumule la réponse assistant (text + tool_use) telle quelle dans les
@@ -1058,6 +1123,9 @@ async def run_copilot_agent(
                     {
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
+                        # default=str : le tool_result est du TEXTE pour le
+                        # LLM — coercer datetime/Decimal en str est voulu
+                        # (crasher serait pire), pas une perte de types.
                         "content": json.dumps(result, ensure_ascii=False, default=str),
                     }
                 )
@@ -1268,7 +1336,101 @@ async def run_copilot_agent(
             ]
             final_text = "\n".join(t for t in text_blocks if t).strip()
             if ctx.terminal_result:
+                # Terminal d'ERREUR résiduel (ex. emit_tab_error posé par un
+                # handler) et le LLM a répondu par du texte au lieu de
+                # réessayer : on retourne l'erreur. Volontairement équivalent
+                # au chemin ``abandon`` — pas de résumé mémoire (réservé aux
+                # runs aboutis), mais ``_full_restore`` dé-anonymise bien le
+                # payload (verdict tâche #25 : pas un contournement).
                 return _full_restore(ctx.terminal_result)
+
+            # ── Relance de protocole (incident 2026-06-12) ──────────────
+            # Le LLM a conclu en TEXTE sans appeler ``done``/``abandon`` —
+            # slip classique d'un petit modèle quand le dernier tool_result
+            # (« tab_updated ») se lit comme une confirmation finale. Avant :
+            # on jetait ``ctx.emits``/``ctx.modifications`` et on retournait
+            # 422 — un run dont le travail était FAIT côté serveur était
+            # perdu, avec un message d'agent prétendant le contraire à
+            # l'utilisateur. Doctrine projet : « tout comportement qui DOIT
+            # être respecté → dans le code » — le SYSTÈME exige le terminal
+            # au lieu d'espérer l'obéissance. Une SEULE relance (flag ctx,
+            # anti-boucle) ; le message assistant est déjà appendé plus haut
+            # → l'alternance des rôles est respectée. Même pattern que le
+            # widget_planner (agent.py « réponse sans tool_use — incite »).
+            if not ctx.end_turn_nudge_sent:
+                ctx.end_turn_nudge_sent = True
+                logger.warning(
+                    "Copilot: end_turn sans terminal (turn %d, %d emits, "
+                    "%d modifications) — relance de protocole.",
+                    total_turns,
+                    len(ctx.emits),
+                    len(ctx.modifications),
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "[système] Tu as terminé par du texte sans "
+                                    "appeler d'outil terminal — RIEN n'est livré "
+                                    "à l'utilisateur dans cet état. Appelle "
+                                    "`done(summary)` si toute la demande est "
+                                    "satisfaite, continue tes actions si elle ne "
+                                    "l'est pas encore, ou `abandon(reason)` si "
+                                    "elle est infaisable."
+                                ),
+                            }
+                        ],
+                    }
+                )
+                continue
+
+            # 2e fin texte MALGRÉ la relance. S'il y a du travail accumulé,
+            # on ne le jette pas : même packing que le chemin « budget tours
+            # épuisé » (type ``max_turns_reached`` réutilisé tel quel → le
+            # frontend existant applique les emits/modifications sans aucun
+            # changement JS), avec un message HONNÊTE — mode dégradé affiché
+            # comme dégradé, pas un succès maquillé du texte victorieux du
+            # LLM.
+            if ctx.emits or ctx.modifications:
+                logger.warning(
+                    "Copilot: end_turn persistant après relance — rescue de "
+                    "%d emits + %d modifications (end_turn_rescue).",
+                    len(ctx.emits),
+                    len(ctx.modifications),
+                )
+                rescue_payload: Dict[str, Any] = {
+                    "type": "max_turns_reached",
+                    "message": (
+                        "L'agent a conclu sans finaliser proprement son run. "
+                        "Ce qu'il a produit a été appliqué au classeur — "
+                        "vérifie le résultat. Pour qu'il poursuive ou "
+                        "corrige, tape de quoi le relancer (par exemple "
+                        "« continue », « vérifie ton travail »)."
+                    ),
+                    "emits": list(ctx.emits),
+                    "modifications": list(ctx.modifications),
+                    "metrics": {
+                        "llm_ms": total_llm_ms,
+                        "total_ms": round((time.monotonic() - t_start) * 1000),
+                        "turns": total_turns,
+                        "pseudonym_entries": len(pseudo) if pseudo else 0,
+                        # Symétrie avec le chemin budget-épuisé (revue LOW-1) :
+                        # les deux sont la même forme « complétion dégradée »
+                        # pour tout consommateur télémétrie futur ;
+                        # ``end_turn_rescue`` distingue la cause.
+                        "max_turns_reached": True,
+                        "end_turn_rescue": True,
+                    },
+                }
+                if ctx.substitutions:
+                    rescue_payload["metrics"]["substitutions"] = list(ctx.substitutions)
+                return _restore_max_turns_payload_failclosed(rescue_payload, _full_restore)
+
+            # Aucun travail accompli malgré la relance : vraie fin sans
+            # production — erreur explicite, comme avant.
             # Le final_text du LLM contient potentiellement des tokens
             # anonymisés — on dé-anonymise avant d'afficher à l'utilisateur.
             # Chain pseudo + PII regex pour symétrie avec ``_full_restore``.
@@ -1280,6 +1442,7 @@ async def run_copilot_agent(
                     "Le copilot a répondu sans émettre d'onglet. Message : "
                     f"{final_text_clear[:400] or '(vide)'}"
                 ),
+                "error_kind": "no_terminal",
             }
         # Note : stop_reason=="max_tokens" est intercepté en AMONT de la boucle
         # tool_use (cf. le bloc early-return plus haut) pour éviter de
@@ -1288,7 +1451,7 @@ async def run_copilot_agent(
         # tout autre stop_reason inattendu.
         if stop_reason and stop_reason != "tool_use":
             logger.warning("Copilot agent stop_reason inattendu: %s", stop_reason)
-            return {"error": f"Arrêt LLM inattendu : {stop_reason}"}
+            return {"error": f"Arrêt LLM inattendu : {stop_reason}", "error_kind": "internal"}
 
     # Budget tours épuisé sans avoir atteint un outil terminal explicite
     # (``done`` / ``abandon``). On packe les actions DÉJÀ effectuées
@@ -1325,17 +1488,54 @@ async def run_copilot_agent(
     }
     if ctx.substitutions:
         payload["metrics"]["substitutions"] = list(ctx.substitutions)
-    # Désanonymise les emits/modifications pour le frontend (mêmes règles
-    # que le chemin terminal_result classique). Chain pseudo + PII regex.
-    if pseudo and (payload["emits"] or payload["modifications"]):
-        try:
-            payload["emits"] = _full_restore(payload["emits"])
-            payload["modifications"] = _full_restore(payload["modifications"])
-        except Exception as exc:
-            logger.warning(
-                "max_turns_reached: dé-anonymisation des emits/mods a échoué : %s",
-                exc,
-            )
+    return _restore_max_turns_payload_failclosed(payload, _full_restore)
+
+
+def _restore_max_turns_payload_failclosed(
+    payload: Dict[str, Any],
+    full_restore: Any,
+) -> Dict[str, Any]:
+    """Dé-anonymise les ``emits``/``modifications`` du payload
+    ``max_turns_reached`` — FAIL-CLOSED (fix 2026-06-10).
+
+    ``full_restore`` chaîne pseudo + PII regex. Deux invariants gardés par
+    ``tests/unit/test_copilot_max_turns_failclosed.py`` :
+
+    * la restauration n'est PAS conditionnée au pseudonymizer (un
+      Pseudonymizer VIDE est falsy alors que la couche PII regex peut avoir
+      des placeholders ``[EMAIL_N]`` à restaurer) — elle tourne dès qu'il y
+      a quelque chose à livrer ;
+    * si la restauration échoue, on ne livre RIEN (erreur explicite) plutôt
+      que des emits avec tokens ``§…§``/``[PII_N]`` non résolus — le
+      frontend APPLIQUE les emits de ``max_turns_reached`` au classeur
+      (iris-grid.js:9175). Perdre le travail du run est moins grave que des
+      données visuellement corrompues / partiellement masquées. Aligné sur
+      le chemin ``done`` (exception → erreur générique, rien d'appliqué).
+    """
+    if not (payload.get("emits") or payload.get("modifications")):
+        return payload
+    try:
+        payload["emits"] = full_restore(payload["emits"])
+        payload["modifications"] = full_restore(payload["modifications"])
+    except Exception as exc:
+        logger.error(
+            "max_turns_reached: dé-anonymisation échouée — résultat "
+            "abandonné fail-closed (%d emits, %d modifications) : %s",
+            len(payload.get("emits") or []),
+            len(payload.get("modifications") or []),
+            exc,
+        )
+        return {
+            "error": (
+                "Budget de raisonnement épuisé et le résultat n'a pas pu "
+                "être finalisé en toute sécurité — aucune modification "
+                "n'a été appliquée au classeur. Relance ta demande."
+            ),
+            # "internal" (pas "budget_exhausted") : la cause racine est un
+            # crash du walker de dé-anonymisation, un bug serveur — 500,
+            # cohérent avec le même crash sur le chemin done (eXamine #4).
+            "error_kind": "internal",
+        }
     return payload
 
 
@@ -1392,7 +1592,10 @@ def _build_user_preamble(
             for c in selected_cells[:20]
             if isinstance(c, dict) and isinstance(c.get("r"), int) and isinstance(c.get("c"), int)
         ]
-        extra = len(selected_cells) - len(coords)
+        # max(0, total-20) et pas ``total - len(coords)`` : les entrées
+        # malformées filtrées des 20 premières ne sont pas des « autres »
+        # (sur-estimation du compte — verdict tâche #25).
+        extra = max(0, len(selected_cells) - 20)
         coords_str = ", ".join(coords)
         if extra > 0:
             coords_str += f" (+{extra} autres)"

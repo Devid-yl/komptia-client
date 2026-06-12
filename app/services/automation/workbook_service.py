@@ -36,6 +36,7 @@ def rows_to_workbook(
     *,
     tab_label: str,
     sql: Optional[str] = None,
+    truncated: bool = False,
 ) -> Dict[str, Any]:
     """Convertit une liste de dicts (resultat SQL brut) en workbook a 1 onglet.
 
@@ -44,6 +45,10 @@ def rows_to_workbook(
         tab_label: Nom de l'onglet (obligatoire, champ `name` du node source
             par convention).
         sql: SQL d'origine (optionnel, stocke dans l'onglet pour audit).
+        truncated: #133 — la source SQL a-t-elle été TRONQUÉE au cap admin ?
+            Posé sur ``tab["truncated"]`` pour que la chaîne aval
+            (_tabs_to_datasets → plan_report → marqueur « TRONQUÉ À LA SOURCE »)
+            avertisse l'agent au lieu d'agréger un sous-ensemble en silence.
 
     Returns:
         Workbook dict au format `.afz.json` a 1 onglet.
@@ -57,6 +62,7 @@ def rows_to_workbook(
         "columns": columns,
         "rows": all_rows,
         "totalRowCount": len(rows),
+        "truncated": bool(truncated),
     }
     if sql:
         tab["sql"] = sql
@@ -233,9 +239,31 @@ def workbook_snapshot_for_db(
     Returns:
         Workbook tronque, meta enrichies (`_snapshot_truncated`).
     """
+    # Garde racine (revue 2026-06-12, F2) : un checkpoint corrompu peut
+    # donner un workbook non-dict — ``workbook.get`` lèverait AttributeError
+    # AVANT même la boucle, y compris sur le chemin « waiting » (snapshot du
+    # record) où l'exception échappe à la sentinelle anti-bascule et
+    # convertirait une suspension récupérable en échec dur. Dégradé propre.
+    if not isinstance(workbook, dict):
+        return {
+            "version": 1,
+            "tabs": [],
+            "_snapshot_truncated": False,
+            "_snapshot_corrupt": True,
+            "_snapshot_max_rows_per_tab": max_rows_per_tab,
+        }
+
     snapshot_tabs: List[Dict[str, Any]] = []
     any_truncated = False
     for tab in workbook.get("tabs", []):
+        # Garde de type (audit 2026-06-12, M1) : un workbook désérialisé
+        # depuis un checkpoint corrompu peut contenir un onglet non-dict —
+        # ``tab.get`` lèverait AttributeError, et au call-site du RESUME
+        # (snapshot du step_output, hors garde de node) ça faisait échouer
+        # tout le bloc final de reprise. Skip défensif : mieux vaut un
+        # snapshot sans l'onglet corrompu qu'une reprise entière en échec.
+        if not isinstance(tab, dict):
+            continue
         rows = tab.get("rows", [])
         total = len(rows)
         if total > max_rows_per_tab:

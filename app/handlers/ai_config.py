@@ -441,6 +441,200 @@ def _enforce_https_for_sensitive_keys(handler: BaseHandler, body: dict[str, Any]
     return False
 
 
+class AIModelsRefreshHandler(BaseHandler):
+    """``POST /api/ai/models/refresh`` — découverte + enrichissement en 1 passe.
+
+    Relie les deux mondes jusqu'ici déconnectés :
+
+    1. ``sync_from_provider(provider)`` — upsert dans ``llm_models`` les modèles
+       que l'API du provider expose (fenêtre provisoire 200K, ``verified=False``).
+    2. ``enrich_from_litellm(force_refresh=True)`` — corrige ``context_window`` +
+       pricing depuis le registre public LiteLLM et marque ``verified=True`` les
+       fenêtres confirmées.
+
+    Déclenché par le bouton « Tester » de ``/admin/ai-config`` après la
+    sauvegarde de la clé. Avant cet endpoint, un modèle choisi dans la dropdown
+    (peuplée en direct par l'API du provider via ``/api/ai/models``)
+    n'atterrissait jamais dans ``llm_models`` → ``get_context_window_for_model``
+    tombait sur le fallback 200K et « Mettre à jour fenêtres & tarifs » était
+    impuissant (``skipped_unknown``). Cf. bug « 200K peu importe le modèle ».
+
+    **Concurrence** : réutilise ``_CONFIG_WRITE_LOCK`` — deux « Tester »
+    simultanés (ou un save config concurrent) sont sérialisés, évitant des
+    inserts dupliqués. **Lock DB** : chaque commit passe par ``retry_on_locked``
+    (la base SQLite locale peut être occupée par un run Iris).
+
+    **Dégradé** : si l'enrich LiteLLM échoue (réseau / GitHub down), les modèles
+    découverts gardent une fenêtre provisoire ``verified=False`` → l'indicateur
+    affiche « à confirmer », jamais un chiffre faux. ``enrich_failed=True`` est
+    remonté pour que l'UI prévienne l'admin.
+
+    Retour : ``{success, provider, discovered, updated, enriched, enrich_failed,
+    unverified, models}``.
+    """
+
+    @admin_required
+    async def post(self) -> None:
+        from app.core.db_retry import retry_on_locked
+        from app.models.llm_model import LlmModel
+        from app.services.ai.llm_model_registry import get_llm_model_registry
+        from sqlalchemy import select
+
+        # Body toléré vide (``{}``) : le provider peut venir de la config.
+        body_raw = self.request.body
+        try:
+            body = json.loads(body_raw) if body_raw else {}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            self.write_json({"success": False, "error": "JSON invalide"}, status=400)
+            return
+        if not isinstance(body, dict):
+            self.write_json(
+                {"success": False, "error": "Le corps JSON doit être un objet"}, status=400
+            )
+            return
+
+        # Provider : body explicite > ``primary_provider`` configuré. Le JS
+        # « Tester » sauvegarde la clé+provider AVANT d'appeler ce refresh, donc
+        # ``primary_provider`` est à jour ; on accepte aussi un override explicite.
+        provider = body.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            try:
+                cfg = await get_ai_config_service().get_all()
+                provider = cfg.get(AIConfigKey.PRIMARY_PROVIDER.value) or ""
+            except SQLAlchemyError:
+                provider = ""
+        provider = (provider or "").strip()
+        if not provider:
+            self.write_json(
+                {
+                    "success": False,
+                    "error": (
+                        "Aucun provider à rafraîchir : renseignez une clé API "
+                        "(le provider est auto-détecté) ou passez 'provider'."
+                    ),
+                },
+                status=400,
+            )
+            return
+
+        await ensure_providers_from_db()
+        registry = get_llm_model_registry()
+
+        # Sessions fraîches PAR tentative (retry_on_locked rejoue le factory) —
+        # une session post-rollback ne doit pas être réutilisée.
+        async def _do_sync() -> dict[str, Any]:
+            async with self.db_session() as session:
+                return await registry.sync_from_provider(provider, session)
+
+        async def _do_enrich() -> dict[str, Any]:
+            async with self.db_session() as session:
+                return await registry.enrich_from_litellm(session, force_refresh=True)
+
+        # Section critique sérialisée (même lock que le save config).
+        async with _get_config_write_lock():
+            # 1. Découverte. sync_from_provider gère en interne l'échec
+            # ``list_models`` (retourne stats avec 'error') ; ici on ne traite
+            # que l'échec de commit (lock épuisé après retries / BDD).
+            sync_stats: dict[str, Any] = {}
+            try:
+                sync_stats = await retry_on_locked(_do_sync, operation_name="models-refresh-sync")
+            except SQLAlchemyError:
+                logger.error(
+                    "Refresh modèles : sync_from_provider (commit) a échoué", exc_info=True
+                )
+                self.write_json(
+                    {
+                        "success": False,
+                        "error": (
+                            "Découverte des modèles impossible (base de données "
+                            "occupée). Réessayez dans un instant."
+                        ),
+                    },
+                    status=503,
+                )
+                return
+
+            # sync_from_provider avale l'échec de ``list_models`` (provider down,
+            # clé invalide) et le renvoie dans ``stats['error']`` sans lever. On
+            # le remonte explicitement : sinon l'admin verrait « discovered: 0 »
+            # avec success:True, indistinguable d'un provider qui n'a simplement
+            # aucun nouveau modèle (revue adversariale 2026-06-03, finding F1).
+            discovery_failed = bool(sync_stats.get("error"))
+            if discovery_failed:
+                logger.warning(
+                    "Refresh modèles : découverte provider '%s' a signalé une "
+                    "erreur (list_models) : %s",
+                    provider,
+                    sync_stats.get("error"),
+                )
+
+            # 2. Enrichissement (best-effort, ne bloque jamais la découverte).
+            # Échec fetch LiteLLM = ``stats['error']`` ; échec commit = exception.
+            # Dans les deux cas les modèles restent ``verified=False`` → « à
+            # confirmer » côté UI, jamais un faux chiffre.
+            enrich_stats: dict[str, Any] = {}
+            enrich_failed = False
+            try:
+                enrich_stats = await retry_on_locked(
+                    _do_enrich, operation_name="models-refresh-enrich"
+                )
+                if enrich_stats.get("error"):
+                    enrich_failed = True
+                    logger.warning(
+                        "Refresh modèles : enrich LiteLLM a signalé une erreur : %s",
+                        enrich_stats.get("error"),
+                    )
+            except Exception as exc:  # noqa: BLE001 — enrich best-effort
+                enrich_failed = True
+                logger.warning("Refresh modèles : enrich LiteLLM a échoué (non bloquant) : %s", exc)
+
+        # Liste à jour pour la dropdown (reflète la table après refresh).
+        models: list[dict[str, Any]] = []
+        unverified = 0
+        try:
+            async with self.db_session() as session:
+                rows = (
+                    (
+                        await session.execute(
+                            select(LlmModel).where(
+                                LlmModel.provider == provider,
+                                LlmModel.deprecated_at.is_(None),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for r in rows:
+                    models.append(
+                        {
+                            "name": r.name,
+                            "display_name": r.display_name or r.name,
+                            "context_window": r.context_window,
+                            "context_window_verified": r.context_window_verified,
+                        }
+                    )
+                    if not r.context_window_verified:
+                        unverified += 1
+        except SQLAlchemyError:
+            logger.warning("Refresh modèles : lecture liste post-refresh échouée", exc_info=True)
+
+        self.write_json(
+            {
+                "success": True,
+                "provider": provider,
+                "discovered": int(sync_stats.get("inserted", 0) or 0),
+                "updated": int(sync_stats.get("updated", 0) or 0),
+                "enriched": int(enrich_stats.get("updated", 0) or 0),
+                "discovery_failed": discovery_failed,
+                "discovery_error": sync_stats.get("error") if discovery_failed else None,
+                "enrich_failed": enrich_failed,
+                "unverified": unverified,
+                "models": models,
+            }
+        )
+
+
 class AIConfigResetHandler(BaseHandler):
     """Remet la configuration aux valeurs par défaut + vide l'historique de
     consommation API. `POST /api/ai/config/reset`.
@@ -903,12 +1097,29 @@ class AIHealthCheckHandler(BaseHandler):
             )
             return
 
+        # « Dernière sync » : SOURCE UNIQUE = la table schema_syncs (la même que
+        # /admin/ai-training), via le checker de fraîcheur. Auparavant le front
+        # lisait `data.last_sync` que cet endpoint n'émettait JAMAIS (champ sans
+        # backend) → toujours affiché « - ». Émis en ISO HORODATÉ (offset +00:00)
+        # via clock.iso_utc ; le front (KomptiaFormat, heure NAVIGATEUR) le formate
+        # — un ISO naïf serait mal-parsé par new Date() (+Nh). clock.iso_utc gère
+        # None→None (champ absent → front affiche « - »).
+        last_sync_iso: Optional[str] = None
+        try:
+            from app.services.ai.schema_freshness import get_freshness_checker
+
+            last_sync_dt = await get_freshness_checker().get_last_sync_time()
+            last_sync_iso = clock.iso_utc(last_sync_dt)
+        except Exception:
+            logger.warning("Health check IA : échec récupération dernière sync", exc_info=True)
+
         self.write_json(
             {
                 "success": True,
                 "healthy": health.get("status") == "ok",
                 "tables_count": health.get("tables_count", 0),
                 "views_count": health.get("views_count", 0),
+                "last_sync": last_sync_iso,
                 "health": health,
             }
         )

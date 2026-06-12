@@ -11,7 +11,7 @@ from app.core import clock
 from app.utils.logger import get_logger
 from app.models.automation import Automation
 from app.models.execution import Execution
-from app.core.database import get_session_factory
+from app.core.database import dedicated_session_scope, get_session_factory
 from app.services.automation.scheduler import get_scheduler
 from app.services.automation.executor import execute_automation
 from app.services.email.smtp_client import run_then_drain_email_log
@@ -118,7 +118,15 @@ def _run_automation_sync(auto_id: int) -> None:
     Args:
         auto_id: ID de l'automatisation à exécuter
     """
-    asyncio.run(run_then_drain_email_log(_run_automation_with_kill_switch_check(auto_id)))
+
+    async def _job() -> None:
+        # Engine async DÉDIÉ à CETTE boucle asyncio.run (thread scheduler) : ne PAS
+        # réutiliser l'engine global poolé, lié à la boucle Tornado (sinon cross-loop
+        # → « Future attached to a different loop »). Cf. dedicated_session_scope.
+        async with dedicated_session_scope():
+            await run_then_drain_email_log(_run_automation_with_kill_switch_check(auto_id))
+
+    asyncio.run(_job())
 
 
 async def load_active_automations():

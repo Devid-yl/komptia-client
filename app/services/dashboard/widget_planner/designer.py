@@ -120,9 +120,53 @@ def _build_user_payload(
 
     parts.append("Données APRÈS transformation (c'est ce qui sera rendu) :")
     parts.append("```json")
-    parts.append(json.dumps(transformed_shape, ensure_ascii=False, default=str)[:4000])
+    # #18f (verdict #51) — couper PAR ITEMS, pas par chars : l'ancien
+    # ``[:4000]`` tronquait le JSON en pleine structure (le LLM lisait un
+    # objet corrompu sans le savoir). On réduit rows/labels item par item
+    # jusqu'à tenir le budget — JSON toujours valide, flags *_truncated
+    # posés en conséquence.
+    _shape = transformed_shape
+    _shape_json = json.dumps(_shape, ensure_ascii=False, default=str)
+    if len(_shape_json) > 4000 and isinstance(_shape, dict):
+        _shape = dict(_shape)
+        for _key in ("rows", "labels"):
+            _seq = _shape.get(_key)
+            while isinstance(_seq, list) and len(_seq) > 1 and len(_shape_json) > 4000:
+                _seq = _seq[:-1]
+                _shape[_key] = _seq
+                _shape[f"{_key}_truncated"] = True
+                _shape_json = json.dumps(_shape, ensure_ascii=False, default=str)
+    # Plafond DUR de dernier recours (revue adv. lot 3) : la boucle ne
+    # réduit que rows/labels — un shape pathologique (autres clés énormes)
+    # ne doit pas produire un prompt non borné. JSON cassé assumé ET
+    # annoncé (le flag ci-dessous neutralise les superlatifs).
+    if len(_shape_json) > 8000:
+        _shape_json = _shape_json[:8000] + "\n… [payload tronqué à 8000 chars]"
+        if isinstance(_shape, dict):
+            _shape = dict(_shape)
+            _shape["rows_truncated"] = True
+    parts.append(_shape_json)
     parts.append("```")
     parts.append("")
+
+    _is_partial = isinstance(_shape, dict) and (
+        _shape.get("rows_truncated")
+        or _shape.get("labels_truncated")
+        or _shape.get("datasets_truncated")
+        # #48 — chart à agg non additive (avg/min/max) dont des catégories ont été
+        # droppées (Top N sur Y) : l'insight ne doit pas affirmer un superlatif
+        # global (le vrai max peut être dans les catégories non affichées).
+        or _shape.get("truncated_categories")
+    )
+    if _is_partial:
+        parts.append(
+            "⚠ ATTENTION : les données ci-dessus sont un ÉCHANTILLON PARTIEL "
+            "(voir rows_truncated/labels_truncated et row_count/label_count). "
+            "INTERDIT d'affirmer un max/min/classement/superlatif GLOBAL dans "
+            "`insight` — il peut être faux sur les données complètes. Dans ce "
+            "cas : insight=null, ou limité aux totaux/structures certains."
+        )
+        parts.append("")
 
     parts.append(
         "MINIMALISME — style Power BI. Pas de phrases en trop. Les visuels "

@@ -77,7 +77,7 @@
             <button type="button"
                     id="komptia-schedule-btn"
                     class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-100 dark:hover:bg-gray-800 transition-colors"
-                    title="Définit quand l'automation se déclenche : une fois, tous les jours, toutes les semaines, tous les mois, ou cron avancé. TZ stockage Europe/Paris, affichage TZ navigateur."
+                    title="Définit quand l'automation se déclenche : une fois, tous les jours, toutes les semaines, tous les mois, ou cron avancé. TZ stockage {{ server_timezone }}, affichage TZ navigateur."
                     aria-label="Configurer la planification">
                 <i class="bi bi-calendar2-event text-xs" aria-hidden="true"></i>
                 <span>Planification</span>
@@ -354,7 +354,7 @@
                                    class="input w-32">
                         </div>
                         <p class="text-xs text-gray-500 dark:text-gray-400 pb-2">
-                            Tous les jours à cette heure (TZ Europe/Paris côté serveur).
+                            Tous les jours à cette heure (TZ {{ server_timezone }} côté serveur).
                         </p>
                     </div>
                 </div>
@@ -486,9 +486,9 @@
    source of truth avec /iris). Charge en bas pour ne pas bloquer le
    rendu initial du canvas. Le navigateur cache deja le fichier si
    l'utilisateur a deja visite /iris.
-   Tokenizer d'anonymisation chargé juste avant : miroir Py↔JS dont
-   iris-grid délègue tokenize/auto-pseudo via window.AnonTokenizer. #}
-<script src="/static/js/anonymization/tokenizer.js" nonce="{{ handler.csp_nonce }}"></script>
+   Hard-deps du grid (tokenizer + save-helpers + grid-store) via le partial
+   SSoT — save-helpers.js manquait ici avant. #}
+{% include "../partials/_grid_deps.html" %}
 {# Détail d'un terme anonymisé (coverage + audit). Chargé pour que le modal
    "Confidentialité" d'iris-grid puisse ouvrir le panneau détail depuis la
    preview workbook. Le composant crée son DOM à la volée. #}
@@ -589,24 +589,24 @@
     // localStorage clé `automations_edit_v1`. User peut Passer/X.
     if (window.KomptiaOnboarding && typeof window.KomptiaOnboarding.start === 'function') {
         window.KomptiaOnboarding.start({
-            key: 'automations_edit_v1',
+            key: 'automations_edit_v2',
             title: 'Éditeur d\'automatisation',
             steps: [
                 {
                     icon: 'sparkle',
                     title: 'Glisser-déposer une étape',
-                    text: 'À gauche, la palette propose 4 catégories d\'étapes : Source (récupérer des données), Agent IA (transformer un classeur avec l\'agent Iris), Conversion (générer un PDF ou un export Excel/CSV) et Sortie (envoi par email, sauvegarde…). Glissez le type voulu dans l\'espace de travail pour créer une étape.',
+                    text: 'À gauche, la palette propose 4 catégories d\'étapes : Source (récupérer des données), Agent IA (transformer un classeur avec l\'agent Iris), Conversion (générer un PDF ou un export Excel/CSV) et Sortie (envoi par email, sauvegarde…). Glissez le type voulu dans l\'espace de travail pour créer une étape.'
                 },
                 {
                     icon: 'zap',
                     title: 'Relier les étapes',
-                    text: 'Reliez la sortie d\'une étape à l\'entrée de la suivante en traçant un trait. Komptia vérifie la compatibilité : une étape Source ou Format produit un classeur, une étape Rapport produit un fichier prêt à envoyer. Les connexions incompatibles sont refusées avec un message clair.',
+                    text: 'Reliez la sortie d\'une étape à l\'entrée de la suivante en traçant un trait. Komptia vérifie la compatibilité : une étape Source ou Agent IA produit un classeur, une étape Conversion produit un fichier prêt à envoyer. Les connexions incompatibles sont refusées avec un message clair.'
                 },
                 {
                     icon: 'shield',
-                    title: 'Tester avant d\'activer',
-                    text: 'Le bouton « Aperçu » sur une étape sélectionnée la lance immédiatement et affiche le résultat (classeur, PDF, e-mail). Le bouton « Vérifier » contrôle l\'ensemble : étapes complètes, bien reliées, aucune boucle. L\'interrupteur « Actif » refuse l\'activation tant que des erreurs subsistent, avec la liste détaillée à corriger.',
-                },
+                    title: 'Tester puis valider',
+                    text: 'Sélectionnez une étape et cliquez sur « Aperçu » pour la lancer immédiatement et voir ce qu\'elle produit (classeur, PDF, e-mail) — en mode dry-run, aucun email n\'est envoyé et aucun fichier n\'est écrit. Quand tout est prêt, le bouton « Valider » en haut contrôle l\'ensemble du workflow puis active l\'automatisation en une fois. S\'il reste des erreurs, la liste complète s\'affiche, chaque ligne cliquable pour corriger l\'étape concernée.'
+                }
             ],
         });
     }

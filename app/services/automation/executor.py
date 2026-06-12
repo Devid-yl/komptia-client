@@ -10,7 +10,7 @@ import threading
 import traceback
 from html import escape as html_escape  # noqa: F401 — re-export utilisé par test_executor_workflow
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +24,7 @@ from app.models.automation import Automation
 from app.models.automation_edge import AutomationEdge
 from app.models.automation_step import AutomationStep
 from app.models.execution import Execution
-from app.core.database import get_session_factory
+from app.core.database import dedicated_session_scope, get_session_factory
 from app.services.database.query_executor import QueryExecutor
 from app.services.email.template_names import EmailTemplate as _EmailTemplate
 
@@ -94,11 +94,14 @@ class AutomationExecutor:
     # l'admin config en priorité ; ce constant n'est utilisé QUE quand
     # ``max_duration_seconds is None`` (auto historique sans setting).
     EXECUTION_TIMEOUT_SECONDS = 300
-    # Timeouts par étape (en secondes) pour éviter qu'une étape bloque tout le pipeline
-    # La somme (45+150+90=285s) doit rester < EXECUTION_TIMEOUT_SECONDS (300s)
+    # Timeouts par étape (en secondes) pour éviter qu'une étape bloque tout le
+    # pipeline. Bornes hautes PAR étape ; le cap TOTAL du run reste
+    # EXECUTION_TIMEOUT_SECONDS (300s). La chaîne SQL la plus longue
+    # (45+150+90=285s) reste < 300s.
     STEP_TIMEOUT_SQL_GEN = 45  # Génération NL → SQL
     STEP_TIMEOUT_SQL_EXEC = 150  # Exécution SQL sur Sage
     STEP_TIMEOUT_REPORT = 90  # Génération du rapport (PDF/CSV)
+    STEP_TIMEOUT_FORMAT = 90  # Formatage LLM (copilot) — borne l'appel LLM du step format
     # Cluster-K (K2) 2026-05-26 — Supprimé l'ancien ``MAX_RESULT_ROWS = 1B``
     # qui était un double cap silencieux. L'admin SSoT = ``db_conn.max_rows``
     # via /admin/database (et l'override per-auto ``automation.max_total_rows``).
@@ -161,6 +164,13 @@ class AutomationExecutor:
             trigger_source = "manual" if manual else "scheduled"
         execution = None
         execution_id = None
+        # Audit 2026-06-12 (C1) — état du verdict pipeline, consulté par
+        # l'except extérieur pour ne JAMAIS requalifier en échec un run dont
+        # le livrable est déjà parti (sentinelle anti-bascule).
+        _dag_records: Optional[List[Any]] = None
+        _finalized_label: Optional[str] = None
+        _finalized_output: Optional[str] = None
+        _finalized_rows = 0
 
         try:
             # Créer session async
@@ -330,7 +340,7 @@ class AutomationExecutor:
                             if has_steps and not has_edges
                             else None
                         )
-                        results, output_file = await asyncio.wait_for(
+                        results, output_file, _dag_records = await asyncio.wait_for(
                             self._run_dag_pipeline(
                                 session,
                                 automation,
@@ -375,18 +385,22 @@ class AutomationExecutor:
                 #     (cas fail_policy='continue' avec fan-out)
                 #   else                                         → 'success'
                 # ────────────────────────────────────────────────
-                from sqlalchemy import select as _select
-                from app.models.step_execution import StepExecution
-
-                _step_execs = (
-                    (
-                        await session.execute(
-                            _select(StepExecution).where(StepExecution.execution_id == execution.id)
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
+                # Audit 2026-06-12 (C1) — source de vérité du verdict : les
+                # records EN MÉMOIRE du run (toujours complets), PAS un
+                # re-SELECT du journal F_STEP_EXECUTION. Le journal est
+                # BEST-EFFORT (cf. _persist_dag_step_results) : s'il est
+                # vide/partiel — incident du jour : TypeError de sérialisation
+                # sur TOUS les flushes — un re-SELECT rendait un statut FAUX
+                # (p.ex. step failed flushé mais sink success non flushé →
+                # run livré re-marqué FAILED + mail « Échec » après le mail
+                # de succès). Les StepExecutionRecord exposent les champs QUE
+                # CE VERDICT LIT (status, step_id, step_name, error_message,
+                # error_class — PAS le PK ``.id`` du modèle) : code aval
+                # inchangé. NB chemin LEGACY (_run_pipeline) : il arrive ici
+                # avec ``_dag_records=None`` → liste vide → branche success,
+                # ce qui est correct UNIQUEMENT parce que ``_run_pipeline``
+                # LÈVE sur tout échec (jamais de retour partiel silencieux).
+                _step_execs = list(_dag_records or [])
                 _has_failed = any(s.status == "failed" for s in _step_execs)
                 _has_waiting = any(s.status == "waiting" for s in _step_execs)
                 _all_skipped = bool(_step_execs) and all(s.status == "skipped" for s in _step_execs)
@@ -402,7 +416,11 @@ class AutomationExecutor:
                 }
                 _sinks_executed = [s for s in _step_execs if s.step_id in _sink_step_ids]
                 _any_sink_success = any(s.status == "success" for s in _sinks_executed)
-                bool(_sinks_executed) and not _any_sink_success
+                # #33 fix 2026-06-11 — supprimé une expression morte
+                # ``bool(_sinks_executed) and not _any_sink_success`` : résultat
+                # jamais affecté ni utilisé (no-op). Son intention (sinks lancés
+                # mais aucun succès) est déjà couverte par le path
+                # ``_has_failed and not _any_sink_success`` → failed (ci-dessous).
 
                 output_file_path = str(output_file) if output_file is not None else None
 
@@ -495,6 +513,19 @@ class AutomationExecutor:
                     )
                     _status_label = "success"
 
+                # Sentinelle anti-bascule (audit 2026-06-12, C1) : le verdict
+                # du PIPELINE est rendu. Tout ce qui suit (compteurs d'échecs,
+                # commit, notifications) n'est que de la comptabilité — si
+                # l'un de ces maillons lève (verrou SQLite, disque, bug),
+                # l'except extérieur consulte ces variables et PRÉSERVE le
+                # statut réel au lieu de requalifier en échec un run dont le
+                # livrable est déjà parti (mail « Échec » après le mail de
+                # succès = l'incident du jour, en pire).
+                execution_id = execution.id
+                _finalized_label = _status_label
+                _finalized_output = output_file_path
+                _finalized_rows = len(results)
+
                 # **Phase 2.5.6.bis (#99)** — Compteur d'échecs consécutifs
                 # non-RLS. Reset à 0 sur success. Incrément sur failed
                 # (sauf si _is_data_access_denied qui a son propre path
@@ -508,6 +539,11 @@ class AutomationExecutor:
                 # dans la même transaction, donc safe pour 2 executors
                 # concurrents qui fail le même automation_id.
                 from sqlalchemy import update as _sa_update
+
+                # ENGINE-1 — tracker une éventuelle AUTO-PAUSE de ce run pour
+                # FORCER la notif owner (même si ``notify_on_failure=False``) :
+                # une pause silencieuse laisse l'owner croire que tout tourne.
+                _auto_paused_reason: Optional[str] = None
 
                 if _status_label == "success":
                     if automation.consecutive_failure_count > 0:
@@ -534,6 +570,7 @@ class AutomationExecutor:
                         automation.is_active = False
                         automation.paused_reason = "too_many_failures"
                         automation.paused_at = clock.now()
+                        _auto_paused_reason = "too_many_failures"
                         logger.warning(
                             "Auto %d auto-paused après %d échecs consécutifs "
                             "non-RLS (LLM/SMTP/BDD/timeout). Réactivable via "
@@ -590,10 +627,26 @@ class AutomationExecutor:
                 # - partial / failed : toujours (notify_on_failure OU explicite)
                 if _status_label == "success":
                     if automation.notify_on_success:
+                        # ENGINE-1-once (#50) — si c'est une automation « une fois »
+                        # qui s'achève + se désactive (paused_reason posé ci-dessus),
+                        # joindre une note NEUTRE « terminée et désactivée » à l'email
+                        # de succès (cadrage positif, ≠ pause-erreur). On RESPECTE
+                        # ``notify_on_success`` : pas de notif forcée — la fin d'une
+                        # « once » est ATTENDUE (contrairement à une auto-pause sur
+                        # échec qui, elle, force la notif).
+                        _once_done = automation.paused_reason == "once_completed"
                         await self._send_execution_notification(
-                            session, automation, execution, success=True
+                            session,
+                            automation,
+                            execution,
+                            success=True,
+                            paused_reason="once_completed" if _once_done else None,
                         )
-                elif automation.notify_on_failure or _is_data_access_denied:
+                elif (
+                    automation.notify_on_failure
+                    or _is_data_access_denied
+                    or _auto_paused_reason
+                ):
                     # Couvre 'failed' ET 'partial'. L'utilisateur doit savoir
                     # qu'il y a eu un probleme, meme partiel.
                     # **Phase 2.5.6.quater (#101)** — Override
@@ -601,8 +654,18 @@ class AutomationExecutor:
                     # l'user doit savoir qu'un de ses accès a été retiré,
                     # sinon l'auto se tait à jamais (cf. justification dans
                     # legacy path ligne ~540).
+                    # ENGINE-1 — idem pour une AUTO-PAUSE (too_many_failures) :
+                    # forcer la notif + joindre la raison de pause pour la
+                    # bannière email, même si ``notify_on_failure=False``.
+                    _notif_pause_reason = _auto_paused_reason
+                    if _notif_pause_reason is None and _is_data_access_denied:
+                        _notif_pause_reason = "data_access_denied"
                     await self._send_execution_notification(
-                        session, automation, execution, success=False
+                        session,
+                        automation,
+                        execution,
+                        success=False,
+                        paused_reason=_notif_pause_reason,
                     )
 
                 return {
@@ -625,6 +688,67 @@ class AutomationExecutor:
                 automation_id,
                 exc_info=True,
             )
+
+            # Anti-bascule (audit 2026-06-12, C1) : le pipeline avait DÉJÀ
+            # rendu un verdict AVEC livrable (success/partial — rapport
+            # généré, email parti). L'exception vient donc de la comptabilité
+            # AVAL (compteur d'échecs, commit, notification), pas du
+            # pipeline. On ne requalifie JAMAIS en échec et on n'envoie PAS
+            # de mail « Échec » après le mail de succès : on persiste le
+            # statut réel en last-resort (session neuve, garde 'running'
+            # idempotente — no-op si le commit nominal était déjà passé) et
+            # on rend le résultat réel au caller. Contrepartie assumée : la
+            # notification de succès optionnelle peut manquer pour CE run
+            # (loggé ci-dessous) — préférable à une fausse alerte d'échec.
+            if _finalized_label in ("success", "partial") and execution_id is not None:
+                logger.error(
+                    "Comptabilité post-exécution en échec APRÈS verdict '%s' "
+                    "(execution %d) — statut réel conservé, notification "
+                    "d'échec supprimée (le livrable est déjà parti).",
+                    _finalized_label,
+                    execution_id,
+                )
+                try:
+                    from sqlalchemy import update as _sa_update_keep
+
+                    async with get_session_factory()() as _keep_session:
+                        await _keep_session.execute(
+                            _sa_update_keep(Execution)
+                            .where(Execution.id == execution_id)
+                            .where(Execution.status == "running")
+                            # ``duration_seconds`` volontairement omis (il
+                            # faudrait relire started_at) : les templates
+                            # /executions None-guardent tous ce champ —
+                            # une durée absente sur un run rescué est un
+                            # dégradé assumé, pas une incohérence.
+                            .values(
+                                status=_finalized_label,
+                                finished_at=clock.now(),
+                                result_rows=_finalized_rows,
+                                output_file_path=_finalized_output,
+                            )
+                        )
+                        await _keep_session.commit()
+                except Exception:  # noqa: BLE001 — dernier filet
+                    logger.critical(
+                        "Impossible de persister le statut réel '%s' de "
+                        "l'execution %d (rescue en échec) — le moniteur peut "
+                        "afficher 'running' jusqu'au cleanup.",
+                        _finalized_label,
+                        execution_id,
+                        exc_info=True,
+                    )
+                return {
+                    "success": _finalized_label == "success",
+                    "status": _finalized_label,
+                    "execution_id": execution_id,
+                    "rows": _finalized_rows,
+                    "output_file": _finalized_output,
+                    "warning": (
+                        "Comptabilité post-exécution incomplète (journal/"
+                        "notification) — le livrable a bien été produit."
+                    ),
+                }
 
             # Phase 2.5.6 (#77) — Détection refus data_access (RLS).
             # ``DataAccessDeniedError`` est levée par l'enforcer quand l'auto
@@ -681,8 +805,10 @@ class AutomationExecutor:
 
             # Toujours marquer l'exécution comme échouée (évite les exécutions bloquées RUNNING)
             if execution:
+                # ENGINE-robust (#51) — capturer l'id AVANT le try : le rescue de
+                # l'except en a besoin même si la création de session échoue.
+                execution_id = execution.id
                 try:
-                    execution_id = execution.id
                     session_factory = get_session_factory()
                     async with session_factory() as session:
                         execution = await session.get(Execution, execution_id)
@@ -746,13 +872,51 @@ class AutomationExecutor:
                                 execution,
                                 success=False,
                                 error_message=user_msg,
+                                # ENGINE-1 (revue [4]) — l'auto a été pausée
+                                # (data_access_denied) sur ce chemin : joindre la
+                                # raison pour la bannière « ⏸ EN PAUSE », cohérent
+                                # avec le chemin principal.
+                                paused_reason=(
+                                    "data_access_denied" if is_data_access_denied else None
+                                ),
                             )
-                except SQLAlchemyError:
+                except Exception:  # noqa: BLE001 — ENGINE-robust (#51) : PAS que SQLAlchemyError
+                    # Un échec NON-SQLA dans le handler d'erreur (ConnectionError,
+                    # asyncio.TimeoutError, bug) propageait → l'exécution restait
+                    # 'running' indéfiniment (zombie dans le moniteur). On log + rescue.
                     logger.error(
-                        "Erreur sauvegarde echec execution %d",
+                        "Erreur sauvegarde echec execution %d (handler d'erreur "
+                        "lui-même en échec)",
                         execution_id,
                         exc_info=True,
                     )
+                    # ENGINE-robust (#51) — last-resort : UPDATE minimal dans une
+                    # session NEUVE pour ne PAS laisser un run fantôme 'running'.
+                    # Gardé par ``status == 'running'`` (idempotent : n'écrase pas
+                    # un état déjà finalisé). Si ça échoue aussi → CRITICAL (le
+                    # watchdog/cleanup BDD reste le dernier filet).
+                    try:
+                        from sqlalchemy import update as _sa_update_rescue
+
+                        async with get_session_factory()() as _rescue_session:
+                            await _rescue_session.execute(
+                                _sa_update_rescue(Execution)
+                                .where(Execution.id == execution_id)
+                                .where(Execution.status == "running")
+                                .values(
+                                    status="failed",
+                                    finished_at=clock.now(),
+                                    error_message=user_msg,
+                                )
+                            )
+                            await _rescue_session.commit()
+                    except Exception:  # noqa: BLE001 — dernier filet
+                        logger.critical(
+                            "Execution %d possiblement bloquée RUNNING : handler "
+                            "d'erreur ET rescue ont échoué",
+                            execution_id,
+                            exc_info=True,
+                        )
 
             return {
                 "success": False,
@@ -780,7 +944,7 @@ class AutomationExecutor:
             )
 
         try:
-            results = await asyncio.wait_for(
+            results, source_truncated = await asyncio.wait_for(
                 self._execute_query(session, sql_query, execution_id),
                 timeout=self.STEP_TIMEOUT_SQL_EXEC,
             )
@@ -791,8 +955,13 @@ class AutomationExecutor:
             )
 
         try:
+            # #133 — propage la troncature SOURCE au rapport. Le PDF affiche une
+            # bannière « tronqué à la source » (surface lossless). La surface
+            # CSV/Excel + corps d'email reste suivie séparément (#134).
             output_file = await asyncio.wait_for(
-                self._generate_report(automation, execution_id, results),
+                self._generate_report(
+                    automation, execution_id, results, truncated=source_truncated
+                ),
                 timeout=self.STEP_TIMEOUT_REPORT,
             )
         except asyncio.TimeoutError:
@@ -972,7 +1141,7 @@ class AutomationExecutor:
                         if not sql:
                             raise ValueError(f"Etape '{step.name}': requete SQL manquante")
                         try:
-                            results = await asyncio.wait_for(
+                            results, source_truncated = await asyncio.wait_for(
                                 self._execute_query(session, sql, execution_id),
                                 timeout=self.STEP_TIMEOUT_SQL_EXEC,
                             )
@@ -983,6 +1152,9 @@ class AutomationExecutor:
                             )
                         context.rows = results
                         context.columns = list(results[0].keys()) if results else []
+                        # #133 — propage la troncature SOURCE au contexte; le step
+                        # report la repercute dans single_tab["truncated"].
+                        context.truncated = source_truncated
                         logger.info(
                             "Workflow etape %d (%s): %d lignes extraites",
                             step.step_order,
@@ -1000,10 +1172,14 @@ class AutomationExecutor:
                                 "label": automation.name or "Donnees",
                                 "columns": list(context.columns or []),
                                 "rows": list(context.rows or []),
+                                # #133 — repercute la troncature SOURCE pour que le
+                                # planner marque « TRONQUE A LA SOURCE » (sinon les
+                                # agregats du rapport IA seraient faux silencieux).
+                                "truncated": bool(context.truncated),
                             }
                         ]
                         try:
-                            output_file = await asyncio.wait_for(
+                            output_file, report_warnings = await asyncio.wait_for(
                                 self._generate_llm_report(
                                     automation,
                                     execution_id,
@@ -1019,6 +1195,11 @@ class AutomationExecutor:
                                 f"({self.STEP_TIMEOUT_REPORT}s)"
                             )
                         context.generated_files.append(str(output_file))
+                        # T8 — surface les warnings de matérialisation (onglet SQL
+                        # en échec/RLS/tronqué) plutôt que de les jeter.
+                        for w in report_warnings:
+                            if w not in context.warnings:
+                                context.warnings.append(w)
                         logger.info(
                             "Workflow etape %d (%s): rapport PDF (IA) genere",
                             step.step_order,
@@ -1291,10 +1472,34 @@ class AutomationExecutor:
             adapter,
             trigger_data=trigger_data,
             edges_override=edges_override,
+            # ENGINE-2 — flush incrémental après chaque niveau (progression live
+            # du moniteur). Idempotent → le commit final ci-dessous reste un
+            # backstop sans risque de doublon.
+            on_level_complete=lambda recs: self._persist_dag_step_results(
+                execution_id, recs
+            ),
         )
 
-        # Persister les step executions avec les snapshots observabilite
-        await self._persist_dag_step_results(execution_id, records)
+        # Persister les step executions avec les snapshots observabilite.
+        # BEST-EFFORT (incident 2026-06-12) : le pipeline a DÉJÀ produit son
+        # résultat (SQL exécuté, rapport généré, email parti) — un échec du
+        # JOURNAL ne doit JAMAIS requalifier l'exécution en échec (l'user
+        # recevait un mail « Échec » juste après le mail de succès du rapport).
+        # Même doctrine que ``_persist_step_results`` legacy (« Best-effort :
+        # ne pas casser le pipeline pour du tracking ») et que le flush
+        # incrémental par niveau (dag_executor, « échoué … continue »).
+        # ``except Exception`` délibéré : quelle que soit la panne du journal
+        # (sérialisation, disque plein, verrou), le run garde son vrai statut.
+        try:
+            await self._persist_dag_step_results(execution_id, records)
+        except Exception:  # noqa: BLE001 — tracking only, fail-soft délibéré
+            logger.error(
+                "Échec persistance du journal des étapes (execution %d) — "
+                "l'exécution garde son statut réel, détail des étapes "
+                "possiblement incomplet dans l'historique.",
+                execution_id,
+                exc_info=True,
+            )
 
         # Remonter les resultats pour compat avec le format (rows, output_file).
         # On prend le dernier node sink (email/report) execute avec succes ;
@@ -1340,7 +1545,11 @@ class AutomationExecutor:
                 output_file = f
                 break
 
-        return last_rows, output_file
+        # ``records`` retournés au caller (audit 2026-06-12, C1) : le calcul
+        # du statut final dans ``execute_automation`` doit se faire sur CES
+        # records en mémoire (toujours complets), pas sur le journal
+        # F_STEP_EXECUTION qui est best-effort (peut être vide/partiel).
+        return last_rows, output_file, records
 
     async def _persist_dag_step_results(
         self,
@@ -1359,10 +1568,29 @@ class AutomationExecutor:
         # Le module-level import explose les imports circulaires (StepExecution
         # importe Execution importe Automation importe ...), d'ou l'import lazy.
         from app.models.step_execution import StepExecution
+        from sqlalchemy import select as _sa_select
 
         session_factory = get_session_factory()
         async with session_factory() as session:
+            # ENGINE-2 — idempotent : skip les (step_id, attempt_number) DÉJÀ
+            # persistés pour cette exécution. Permet d'appeler cette fonction
+            # plusieurs fois (flush incrémental par niveau pour la progression
+            # live + commit final backstop) SANS doublon dans l'historique des
+            # steps. Les appels sont séquentiels (par niveau, puis final) → la
+            # lecture-puis-insert est sûre (pas de race intra-run ; execution_id
+            # unique par run → pas de collision inter-run).
+            _existing_res = await session.execute(
+                _sa_select(
+                    StepExecution.step_id, StepExecution.attempt_number
+                ).where(StepExecution.execution_id == execution_id)
+            )
+            _seen = {(sid, att) for sid, att in _existing_res.all()}
+            _added = 0
             for rec in records:
+                if (rec.step_id, rec.attempt_number) in _seen:
+                    continue
+                _seen.add((rec.step_id, rec.attempt_number))
+                _added += 1
                 se = StepExecution(
                     execution_id=execution_id,
                     step_id=rec.step_id,
@@ -1390,7 +1618,8 @@ class AutomationExecutor:
                     sql_executed=rec.sql_executed,
                 )
                 session.add(se)
-            await session.commit()
+            if _added:
+                await session.commit()
 
     async def _persist_step_results(
         self, execution_id: int, step_records: List[Dict[str, Any]]
@@ -1556,6 +1785,12 @@ class AutomationExecutor:
                     "columns": columns,
                     "rows": rows,
                     "row_count": len(rows),
+                    # #123 — PROPAGER la troncature SOURCE (load_workbook > cap lignes
+                    # pose tab["truncated"]). Sans ce flag, la whitelist du planner
+                    # (report_planner_agent:432, #27) le lit à vide → les tools exposent
+                    # source_truncated=False → agrégats/comptages du rapport d'automation
+                    # FAUX silencieux sur un sous-ensemble. Booléen structurel (pas de PII).
+                    "truncated": bool(tab.get("truncated")),
                 }
             )
         return datasets
@@ -1611,7 +1846,7 @@ class AutomationExecutor:
         output_format: str,
         filename_hint: Optional[str],
         anonymize: bool = False,
-    ) -> Path:
+    ) -> tuple[Path, List[str]]:
         """Convertit des onglets de classeur en fichier Excel ou CSV.
 
         Branche sur les composants existants :
@@ -1623,6 +1858,15 @@ class AutomationExecutor:
           a plusieurs feuilles on prend la premiere »).
 
         Le path est valide via ``_safe_output_path`` (anti-traversal + symlink).
+
+        Returns:
+            ``(output_path, export_warnings)`` — **#18b (triage caps
+            2026-06-10)** : les ``warnings`` et ``truncated_tabs`` produits
+            par le builder étaient JETÉS ici → un export amputé (onglet
+            tronqué au cap, RLS refusée, SQL en échec) partait par email
+            sans AUCUN signal. Le caller DOIT verser ces warnings dans
+            ``extras["warnings"]`` (historique d'exécution) ET
+            ``context.warnings`` (récap HTML de l'email).
         """
         from app.services.automation.workbook_export import sanitize_filename_hint
 
@@ -1653,7 +1897,14 @@ class AutomationExecutor:
             result = await build_iris_xlsx(payload, user, anonymize=anonymize)
             output_path = self._safe_output_path(f"{stem}.xlsx")
             output_path.write_bytes(result["content"])
-            return output_path
+            export_warnings = list(result.get("warnings") or [])
+            truncated_tabs = (result.get("stats") or {}).get("truncated_tabs") or []
+            for tab_label in truncated_tabs:
+                export_warnings.append(
+                    f"Export Excel : onglet « {tab_label} » TRONQUÉ au cap de "
+                    "lignes — le fichier ne contient pas toutes les données."
+                )
+            return output_path, export_warnings
 
         if fmt == "csv":
             from app.services.export.iris_xlsx_builder import (
@@ -1672,24 +1923,39 @@ class AutomationExecutor:
                 raise ValueError(f"Automation {automation.id}: aucun onglet apres materialisation")
             # Anonymisation après matérialisation SQL (sur données fraîches),
             # avant l'écriture CSV. Fail-closed (RuntimeError propagé → step échoue).
+            # #31 — on capture term_count (via _meta) pour la PARITÉ avec l'export
+            # XLSX : warner si 0 terme configuré (sinon asymétrie silencieuse).
+            _anon_term_count = None
             if anonymize:
                 from app.services.anonymization.export_filter import (
-                    anonymize_tabs_for_export,
+                    anonymize_tabs_for_export_meta,
                 )
 
-                hydrated_tabs = await anonymize_tabs_for_export(
+                _anon_csv = await anonymize_tabs_for_export_meta(
                     getattr(user, "id", None), hydrated_tabs
                 )
+                hydrated_tabs = _anon_csv["tabs"]
+                _anon_term_count = _anon_csv["term_count"]
             first_tab = hydrated_tabs[0]
             output_path = self._safe_output_path(f"{stem}.csv")
 
             def _write_csv_first_tab() -> None:
                 from app.services.export.csv_export import to_csv_bytes
+                from app.services.automation.report_generator import TRUNCATION_MARKER
 
                 dict_rows = tab_to_dict_rows(first_tab)
                 columns = list(first_tab.get("columns") or [])
                 if not columns and dict_rows:
                     columns = list(dict_rows[0].keys())
+                # #42 (review) — marqueur DANS le fichier, pas seulement dans
+                # l'email recap : le payload consommé = le CSV SAUVEGARDÉ. Un
+                # collaborateur qui rouvre la pièce jointe sans l'email voyait
+                # sinon un fichier complet trompeur (garde d'effet au bout de
+                # chaîne). SSoT du libellé partagé avec report_generator.
+                if first_tab.get("truncated") and columns:
+                    marker_row = {c: "" for c in columns}
+                    marker_row[columns[0]] = TRUNCATION_MARKER
+                    dict_rows = [*dict_rows, marker_row]
                 # SSoT `to_csv_bytes` : BOM UTF-8 + sanitisation anti-injection
                 # formule (CWE-1236) sur en-têtes ET cellules. Ce CSV part vers
                 # des destinataires EXTERNES par email ; un pseudonyme /data-privacy
@@ -1698,7 +1964,44 @@ class AutomationExecutor:
                 output_path.write_bytes(to_csv_bytes(dict_rows, columns))
 
             await asyncio.to_thread(_write_csv_first_tab)
-            return output_path
+            export_warnings = list(materialization.get("warnings") or [])
+            # #31 fix 2026-06-11 — PARITÉ avec l'export XLSX (iris_xlsx_builder:263) :
+            # si l'anonymisation est demandée mais qu'AUCUN terme n'est configuré
+            # sur /data-privacy, le CSV est identique au clair → on le signale
+            # (anti fausse-impression de sécurité). Avant : le CSV passait par la
+            # façade sans term_count → asymétrie silencieuse vs XLSX.
+            if _anon_term_count == 0:
+                export_warnings.append(
+                    "Export anonymisé demandé mais aucun terme n'est configuré sur "
+                    "/data/privacy — le fichier est identique à un export en clair."
+                )
+            # #17/#18f (2026-06-10) — le CSV mono-fichier ne porte que la
+            # PREMIÈRE feuille : depuis le retrait du ZIP multi-CSV, les
+            # onglets 2..N étaient JETÉS sans signal (perte de données
+            # silencieuse dans la chaîne d'automatisation). Fail-loud.
+            if len(hydrated_tabs) > 1:
+                _dropped = [
+                    str(t.get("label") or t.get("name") or f"onglet {i + 2}")
+                    for i, t in enumerate(hydrated_tabs[1:])
+                ]
+                _shown = ", ".join(_dropped[:5]) + ("…" if len(_dropped) > 5 else "")
+                export_warnings.append(
+                    f"Export CSV : seule la feuille « "
+                    f"{first_tab.get('label') or first_tab.get('name') or '1'} » est "
+                    f"exportée — {len(_dropped)} autre(s) onglet(s) NON inclus "
+                    f"({_shown}). Utilisez le format Excel pour un export "
+                    "multi-onglets."
+                )
+            # Le CSV n'emporte que la PREMIÈRE feuille : seule sa troncature
+            # rend le FICHIER incomplet (les warnings RLS/SQL des autres
+            # onglets restent utiles au diagnostic, on les garde).
+            if first_tab.get("truncated"):
+                export_warnings.append(
+                    f"Export CSV : la feuille « {first_tab.get('label') or first_tab.get('name') or '1'} » "
+                    "est TRONQUÉE au cap de lignes — le fichier ne contient "
+                    "pas toutes les données."
+                )
+            return output_path, export_warnings
 
         raise ValueError(f"Format d'export invalide '{output_format}' (attendu : excel, csv)")
 
@@ -1709,8 +2012,16 @@ class AutomationExecutor:
         tabs: List[Dict[str, Any]],
         user_prompt: Optional[str],
         user_title_hint: Optional[str],
-    ) -> Path:
+        max_rows: Optional[int] = None,
+    ) -> Tuple[Path, List[str]]:
         """Genere un rapport PDF analytique via l'IA des rapports.
+
+        Retourne ``(chemin_pdf, warnings)``. T8 (2026-06-10) — les ``warnings``
+        de matérialisation (onglet SQL en échec/RLS/tronqué) étaient JETÉS : un
+        PDF généré sur un snapshot Sage périmé ou des onglets partiels partait
+        par email SANS aucun signal (donnée fausse silencieuse). Le caller les
+        verse désormais dans le record du step ET le récap email, comme le step
+        ``export_workbook`` le fait déjà (parité SSoT).
 
         Cable sur la meme chaine que ``POST /api/reports/generate-llm``
         (cf. ``ReportGenerateLLMHandler``) :
@@ -1749,11 +2060,20 @@ class AutomationExecutor:
             materialize_workbook_sql_tabs,
         )
 
+        # PREV-2 — en APERÇU, ``max_rows`` borne la re-matérialisation SQL au cap
+        # preview (sinon le rapport ré-exécute le SQL JUSQU'À 100k lignes/onglet
+        # sur Sage alors que l'aperçu n'a besoin que de ~100 lignes). En run réel,
+        # ``max_rows=None`` → le cap par défaut (production) de
+        # ``materialize_workbook_sql_tabs`` s'applique.
+        _mat_kwargs: Dict[str, Any] = {}
+        if max_rows is not None and max_rows > 0:
+            _mat_kwargs["max_rows_per_tab"] = max_rows
         materialization = await materialize_workbook_sql_tabs(
             tabs,
             user,
             rls_source="automation_report_pdf",
             logger_prefix=f"automation_report[auto={automation.id}]",
+            **_mat_kwargs,
         )
         hydrated_tabs = materialization["tabs"]
         # materialize_workbook_sql_tabs retourne rows en array-of-arrays
@@ -1789,7 +2109,7 @@ class AutomationExecutor:
         output_path = self._safe_output_path(filename)
 
         output_path.write_bytes(pdf_bytes)
-        return output_path
+        return output_path, list(materialization.get("warnings") or [])
 
     async def _generate_report_from_context(
         self,
@@ -1798,25 +2118,31 @@ class AutomationExecutor:
         results: List[Dict[str, Any]],
         output_format: str,
         title: str,
+        *,
+        truncated: bool = False,
     ) -> Path:
-        """Genere un rapport a partir du contexte workflow."""
+        """Genere un rapport a partir du contexte workflow.
+
+        #133 — ``truncated`` est forwardé au PDF (parité avec ``_generate_report``)
+        pour ne pas re-droper le flag si un call-site câble cette méthode.
+        """
         timestamp = clock.now().strftime("%Y%m%d_%H%M%S")
         ext = output_format if output_format != "excel" else "xlsx"
         filename = f"auto_{automation.id}_exec_{execution_id}_{timestamp}.{ext}"
         output_path = self._safe_output_path(filename)
 
         if output_format == "csv":
-            self._generate_csv(output_path, results)
+            self._generate_csv(output_path, results, truncated=truncated)
         elif output_format == "excel":
-            self._generate_excel(output_path, results)
+            self._generate_excel(output_path, results, truncated=truncated)
         elif output_format == "pdf":
             pdf_obj = type("A", (), {"name": title, "description": ""})()
-            self._generate_pdf(output_path, pdf_obj, results)
+            self._generate_pdf(output_path, pdf_obj, results, truncated=truncated)
             csv_fallback = output_path.with_suffix(".csv")
             if csv_fallback.exists() and not output_path.exists():
                 output_path = csv_fallback
         else:
-            self._generate_csv(output_path, results)
+            self._generate_csv(output_path, results, truncated=truncated)
 
         return output_path
 
@@ -1929,7 +2255,7 @@ class AutomationExecutor:
 
     async def _execute_query(
         self, session: AsyncSession, sql_query: str, execution_id: int
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         """
         Exécute la requête SQL sur la base Sage
 
@@ -1939,7 +2265,11 @@ class AutomationExecutor:
             execution_id: ID exécution (pour logs)
 
         Returns:
-            Liste de résultats
+            ``(rows, truncated)`` — #133 : ``truncated=True`` si le connecteur a
+            atteint le cap admin (``db_conn.max_rows``). AVANT, on ne renvoyait
+            que ``rows`` en jetant ``query_result.truncated`` → les rapports
+            d'automation agrégeaient une source tronquée en silence. On remonte
+            le flag (miroir de ``preview_service._execute_query_with_limit``).
         """
         logger.info("Execution SQL pour execution #%d", execution_id)
 
@@ -1967,20 +2297,35 @@ class AutomationExecutor:
         # (``db_conn.max_rows`` via /admin/database, SSoT).
         query_result = await self.query_executor.execute(sql_query, max_rows=None, **rls_kwargs)
 
-        # Convertir QueryResult en liste de dicts
-        results = []
-        if query_result.rows:
-            columns = query_result.columns
-            for row in query_result.rows:
-                row_dict = dict(zip(columns, row))
-                results.append(row_dict)
+        # V12 (2026-06-10) — Normalisation via la SSoT ``QueryResult.to_dicts()``
+        # (sage_connector). MÊME conversion que preview_service (plus de
+        # divergence preview↔run) ET dédup des colonnes homonymes (SELECT a.id,
+        # b.id → id, id_2). Avant, le zip inline ``dict(zip(columns, row))``
+        # écrasait silencieusement deux colonnes de même nom (perte de données)
+        # et dupliquait la logique → un fix de normalisation ne se propageait pas.
+        results = query_result.to_dicts()
 
-        logger.info("%d lignes retournees pour execution #%d", len(results), execution_id)
+        source_truncated = bool(getattr(query_result, "truncated", False))
+        if source_truncated:
+            logger.warning(
+                "Source SQL TRONQUEE au cap admin (execution #%d) — %d lignes."
+                " Le flag est propage en aval (rapport/agregats) pour eviter des"
+                " resultats faux silencieux.",
+                execution_id,
+                len(results),
+            )
+        else:
+            logger.info("%d lignes retournees pour execution #%d", len(results), execution_id)
 
-        return results
+        return results, source_truncated
 
     async def _generate_report(
-        self, automation: Automation, execution_id: int, results: List[Dict[str, Any]]
+        self,
+        automation: Automation,
+        execution_id: int,
+        results: List[Dict[str, Any]],
+        *,
+        truncated: bool = False,
     ) -> Path:
         """
         Génère le rapport dans le format demandé
@@ -1989,6 +2334,9 @@ class AutomationExecutor:
             automation: Automatisation
             execution_id: ID exécution
             results: Résultats de la requête
+            truncated: #133 — la source a-t-elle été tronquée au cap admin ?
+                Le PDF affiche alors une bannière « tronqué à la source »
+                (surface lossless). CSV/Excel/email = suivi séparément (#134).
 
         Returns:
             Chemin du fichier généré
@@ -2011,13 +2359,13 @@ class AutomationExecutor:
         )
 
         if output_format == "csv":
-            self._generate_csv(output_path, results)
+            self._generate_csv(output_path, results, truncated=truncated)
 
         elif output_format == "excel":
-            self._generate_excel(output_path, results)
+            self._generate_excel(output_path, results, truncated=truncated)
 
         elif output_format == "pdf":
-            self._generate_pdf(output_path, automation, results)
+            self._generate_pdf(output_path, automation, results, truncated=truncated)
             # Check if fallback to CSV occurred (suffix changed by _generate_pdf)
             csv_fallback = output_path.with_suffix(".csv")
             if csv_fallback.exists() and not output_path.exists():
@@ -2029,23 +2377,39 @@ class AutomationExecutor:
         logger.info("Rapport genere: %s", output_path)
         return output_path
 
-    def _generate_csv(self, output_path: Path, results: List[Dict[str, Any]]):
-        """Délègue à :func:`report_generator.generate_csv`."""
+    def _generate_csv(
+        self, output_path: Path, results: List[Dict[str, Any]], *, truncated: bool = False
+    ):
+        """Délègue à :func:`report_generator.generate_csv`.
+
+        #134 — forwarde ``truncated`` pour que le CSV en pièce jointe porte le
+        marqueur de troncature (parité avec le PDF), sinon données partielles
+        envoyées aux collaborateurs SANS signal.
+        """
         from app.services.automation.report_generator import generate_csv
 
-        generate_csv(output_path, results)
+        generate_csv(output_path, results, truncated=truncated)
 
-    def _generate_excel(self, output_path: Path, results: List[Dict[str, Any]]):
-        """Délègue à :func:`report_generator.generate_excel`."""
+    def _generate_excel(
+        self, output_path: Path, results: List[Dict[str, Any]], *, truncated: bool = False
+    ):
+        """Délègue à :func:`report_generator.generate_excel` (forwarde ``truncated``, #134)."""
         from app.services.automation.report_generator import generate_excel
 
-        generate_excel(output_path, results)
+        generate_excel(output_path, results, truncated=truncated)
 
-    def _generate_pdf(self, output_path: Path, automation, results: List[Dict[str, Any]]):
+    def _generate_pdf(
+        self,
+        output_path: Path,
+        automation,
+        results: List[Dict[str, Any]],
+        *,
+        truncated: bool = False,
+    ):
         """Délègue à :func:`report_generator.generate_pdf`."""
         from app.services.automation.report_generator import generate_pdf
 
-        generate_pdf(output_path, automation, results)
+        generate_pdf(output_path, automation, results, truncated=truncated)
 
     async def _load_smtp_config(self, session: AsyncSession) -> Optional[Dict[str, Any]]:
         """Charge la configuration SMTP depuis la BDD ou .env.
@@ -2123,6 +2487,7 @@ class AutomationExecutor:
         execution: Execution,
         success: bool,
         error_message: Optional[str] = None,
+        paused_reason: Optional[str] = None,
     ) -> None:
         """Délègue à :func:`email_dispatcher.send_execution_notification`.
 
@@ -2168,6 +2533,8 @@ class AutomationExecutor:
             # P5.3 — propage ``execution_id`` au dispatcher pour qu'il inclue
             # un lien actionnable « Voir le détail complet » dans l'email.
             execution_id=execution.id,
+            # ENGINE-1 — raison de pause auto → bannière + sujet ⏸ dans l'email.
+            paused_reason=paused_reason,
         )
 
 
@@ -2230,15 +2597,57 @@ def resume_automation_job(
     from app.services.email.smtp_client import run_then_drain_email_log
 
     async def _async_resume() -> None:
-        await _resume_automation_async(execution_id, step_id, wait_token_id)
+        # Engine dédié à cette boucle asyncio.run (cross-loop : pas l'engine global poolé).
+        async with dedicated_session_scope():
+            await run_then_drain_email_log(
+                _resume_automation_async(execution_id, step_id, wait_token_id)
+            )
 
     try:
-        _asyncio.run(run_then_drain_email_log(_async_resume()))
+        _asyncio.run(_async_resume())
     except Exception:  # noqa: BLE001
         logger.exception(
             "resume_automation_job: crash asyncio.run pour exec #%d",
             execution_id,
         )
+        # Audit 2026-06-12 (H4) — sans rescue, un crash du bloc FINAL de
+        # ``_resume_automation_async`` (commit sous verrou, statut…) laissait
+        # l'exécution 'running' POUR TOUJOURS (zombie dans le moniteur) : le
+        # wrapper de job ne marquait rien — contrairement au chemin principal
+        # qui a son last-resort ENGINE-robust (#51). Même filet ici : UPDATE
+        # minimal running→failed dans une boucle/session neuves. On ne touche
+        # PAS un statut 'waiting' (le destinataire peut re-soumettre).
+        try:
+
+            async def _rescue() -> None:
+                async with dedicated_session_scope():
+                    from sqlalchemy import update as _sa_update_rescue
+
+                    async with get_session_factory()() as _s:
+                        await _s.execute(
+                            _sa_update_rescue(Execution)
+                            .where(Execution.id == execution_id)
+                            .where(Execution.status == "running")
+                            .values(
+                                status="failed",
+                                finished_at=clock.now(),
+                                error_message=(
+                                    "La reprise de l'automatisation a été "
+                                    "interrompue par une erreur interne. "
+                                    "Relancez-la ou contactez l'administrateur."
+                                ),
+                            )
+                        )
+                        await _s.commit()
+
+            _asyncio.run(_rescue())
+        except Exception:  # noqa: BLE001 — dernier filet
+            logger.critical(
+                "resume_automation_job: rescue impossible pour exec #%d — "
+                "exécution possiblement bloquée 'running'",
+                execution_id,
+                exc_info=True,
+            )
 
 
 async def _resume_automation_async(
@@ -2445,7 +2854,33 @@ async def _resume_automation_async(
     pre_outputs: Dict[int, Optional[Dict[str, Any]]] = dict(checkpoint["step_outputs"])
     pre_files: Dict[int, Any] = dict(checkpoint["step_output_files"])
     pre_outputs[step_id] = response_wb
-    skip_ids: List[int] = list(set(pre_outputs.keys()))
+
+    # #11 fix 2026-06-11 (donnée fausse silencieuse au resume).
+    # Le skip-set (steps à NE PAS ré-exécuter) doit être dérivé du STATUT RÉEL
+    # des StepExecution (SSoT), PAS de ``pre_outputs.keys()``. Raison : dans
+    # ``step_outputs``, la valeur ``None`` est AMBIGUË — dag_executor y stocke
+    # ``None`` aussi bien pour un step ÉCHOUÉ (dag_executor.py:1117) que pour un
+    # SINK réussi sans workbook (email/save → output ``None``, :1084). L'ancien
+    # ``list(set(pre_outputs.keys()))`` skippait donc les steps ÉCHOUÉS (jamais
+    # re-tentés → leur ``None`` se propageait en fan-in aval = données partielles
+    # silencieuses). Un filtre naïf ``wb is not None`` ferait l'inverse pire :
+    # re-jouer un email réussi (= re-envoi). On se base donc sur le statut :
+    #   - status='success' → skippé (déjà fait, y compris un sink à output None) ;
+    #   - tout autre statut (failed/skipped) → PAS skippé → re-tenté au resume
+    #     (et s'il échoue encore, le warning fan-in #10 le rend visible).
+    from app.models.step_execution import StepExecution as _StepExecution
+
+    async with sf() as _sess_skip:
+        _sx_rows = await _sess_skip.execute(
+            _select(_StepExecution.step_id).where(
+                _StepExecution.execution_id == execution_id,
+                _StepExecution.status == "success",
+                _StepExecution.step_id.isnot(None),
+            )
+        )
+        _success_ids = {int(s) for s in _sx_rows.scalars().all() if s is not None}
+    _success_ids.add(step_id)  # le step wait résolu (marqué success ci-dessus)
+    skip_ids: List[int] = sorted(_success_ids)
 
     resume_state = {
         "step_outputs": pre_outputs,
@@ -2553,7 +2988,23 @@ async def _resume_automation_async(
         sx_all_q = await sess3.execute(
             _select(StepExecution).where(StepExecution.execution_id == execution_id)
         )
-        sx_all = sx_all_q.scalars().all()
+        sx_journal = sx_all_q.scalars().all()
+        # C1-bis (revue adversariale 2026-06-12) — le verdict du RESUME ne
+        # doit pas dépendre du SEUL journal best-effort : si le persist
+        # ci-dessus a échoué (sérialisation, verrou, disque), le re-SELECT
+        # rend un statut FAUX — p.ex. le sink email de la reprise a livré
+        # mais sa ligne manque → run re-marqué failed + mail « Échec » après
+        # le livrable (l'incident du jour, version resume). On FUSIONNE :
+        # journal (seule trace de la phase PRÉ-wait) + records EN MÉMOIRE de
+        # la phase de reprise (toujours complets), priorité aux records sur
+        # les clés (step_id, attempt_number) communes.
+        _mem_records = list(records or [])
+        _mem_keys = {(r.step_id, r.attempt_number) for r in _mem_records}
+        sx_all = [
+            s
+            for s in sx_journal
+            if (s.step_id, s.attempt_number) not in _mem_keys
+        ] + _mem_records
         has_failed = any(s.status == "failed" for s in sx_all)
         has_waiting_again = any(s.status == "waiting" for s in sx_all)
 
@@ -2827,12 +3278,26 @@ def _build_executor_adapter(
             sql = (step_cfg.get("sql") or "").strip()
             if not sql:
                 raise ValueError(f"Etape '{node.name}': requete SQL manquante")
-            rows = await asyncio.wait_for(
+            rows, source_truncated = await asyncio.wait_for(
                 self._execute_query(session, sql, execution_id),
                 timeout=self.STEP_TIMEOUT_SQL_EXEC,
             )
+            # #14 fix 2026-06-11 — résultat VIDE (0 ligne) signalé explicitement.
+            # Avant : 0 ligne passait en silence (step success), un rapport/export/
+            # email en aval était généré VIDE sans aucune alerte. On NE fail PAS
+            # (0 ligne peut être légitime : « factures en retard » → 0 = OK), mais
+            # on pose un WARNING qui remonte au StepExecutionRecord et se propage
+            # aux steps aval (cf. fix #10) pour que l'utilisateur le voie.
+            if not rows:
+                extras["warnings"].append(
+                    f"Etape '{node.name}': la requete SQL n'a retourne AUCUNE ligne "
+                    f"(0 resultat) — tout rapport/export/email en aval sera VIDE. "
+                    f"Verifiez la requete ou les donnees source si ce n'est pas attendu."
+                )
             tab_label = (step_cfg.get("tab_label") or node.name).strip() or node.name
-            output_wb = rows_to_workbook(rows, tab_label=tab_label, sql=sql)
+            output_wb = rows_to_workbook(
+                rows, tab_label=tab_label, sql=sql, truncated=source_truncated
+            )
             extras["sql_executed"] = sql
             return output_wb, extras
 
@@ -2879,7 +3344,7 @@ def _build_executor_adapter(
             sql = sql.strip()
             if not sql:
                 raise ValueError(f"Etape '{node.name}': fichier '{sql_path}' est vide")
-            rows = await asyncio.wait_for(
+            rows, source_truncated = await asyncio.wait_for(
                 self._execute_query(session, sql, execution_id),
                 timeout=self.STEP_TIMEOUT_SQL_EXEC,
             )
@@ -2888,7 +3353,9 @@ def _build_executor_adapter(
                 or sql_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
                 or node.name
             ).strip() or node.name
-            output_wb = rows_to_workbook(rows, tab_label=tab_label, sql=sql)
+            output_wb = rows_to_workbook(
+                rows, tab_label=tab_label, sql=sql, truncated=source_truncated
+            )
             extras["sql_executed"] = sql
             extras["sql_path"] = sql_path
             return output_wb, extras
@@ -2917,13 +3384,34 @@ def _build_executor_adapter(
                 # idempotent-skip d'un vrai success (UI peut afficher
                 # un badge dédié au lieu de "Succès" trompeur).
                 extras["idempotent_skipped"] = True
-                return input_workbook, extras
+                # #15 fix 2026-06-11 — le skip ne produit AUCUN output_file ; un
+                # email/export aval part donc SANS ce rapport en pièce jointe, de
+                # façon SILENCIEUSE (le fichier du run précédent n'est pas persisté
+                # → non récupérable). On propage le warning dans le WORKBOOK
+                # retourné (pas seulement extras) pour qu'il atteigne le record des
+                # steps AVAL via le fix #10, rendant l'absence VISIBLE. Copie
+                # défensive : on ne mute PAS l'input partagé (seule la liste
+                # warnings est remplacée ; tabs/rows inchangés).
+                _skip_msg = (
+                    f"Etape '{node.name}': rapport NON regenere ce run (idempotent) "
+                    f"-> aucun fichier produit ; un email/export aval n'aura PAS ce "
+                    f"rapport en piece jointe."
+                )
+                # #38 fix 2026-06-11 (revue adv.) — aussi dans extras["warnings"]
+                # (pas seulement _skipped_wb) : si ce report est un SINK TERMINAL
+                # (sans enfant), le warning ne voyagerait nulle part via #10 et
+                # n'apparaîtrait pas dans son PROPRE record. extras garantit la
+                # visibilité dans le record du step lui-même, terminal ou non.
+                extras["warnings"].append(_skip_msg)
+                _skipped_wb = dict(input_workbook)
+                _skipped_wb["warnings"] = list(input_workbook.get("warnings") or []) + [_skip_msg]
+                return _skipped_wb, extras
 
             # Mode "analyse IA" exclusif : meme chaine que /api/reports/generate-llm
             # (plan_report → build_pdf_from_plan). Consomme TOUS les onglets
             # (un dataset par onglet) — l'IA peut comparer entre sources fan-in.
             try:
-                out_path = await self._generate_llm_report(
+                out_path, report_warnings = await self._generate_llm_report(
                     automation,
                     execution_id,
                     tabs=tabs,
@@ -2937,6 +3425,15 @@ def _build_executor_adapter(
                 # silencieux au re-run + warning trompeur « déjà généré »).
                 await _release_in_dedicated_session(key)
                 raise
+            # T8 — warnings de matérialisation (onglet SQL en échec/RLS/tronqué)
+            # versés dans le record du step ET le récap email (avant : JETÉS →
+            # un rapport sur snapshot périmé/partiel partait sans signal). Même
+            # pattern que le step export_workbook (dédup vs context.warnings car
+            # un même classeur ancêtre peut être matérialisé par 2 steps).
+            for w in report_warnings:
+                extras["warnings"].append(w)
+                if w not in context.warnings:
+                    context.warnings.append(w)
             # B7 — fichier propage UNIQUEMENT via step_output_files[node.id]
             # (peuple par dag_executor:363 depuis extras["output_file"]).
             # context.variables["_output_file"] etait last-writer-wins entre
@@ -2980,10 +3477,23 @@ def _build_executor_adapter(
             if already:
                 extras["warnings"].append("Export deja genere aujourd'hui (idempotent skip)")
                 extras["idempotent_skipped"] = True  # Cluster-E 2026-05-26
-                return input_workbook, extras
+                # #15 fix 2026-06-11 — idem report : le skip ne produit pas
+                # d'output_file → email aval sans pièce jointe SILENCIEUX. On
+                # propage le warning dans le workbook (copie défensive) pour qu'il
+                # atteigne le record des steps aval via le fix #10.
+                _skip_msg = (
+                    f"Etape '{node.name}': export NON regenere ce run (idempotent) "
+                    f"-> aucun fichier produit ; un email aval n'aura PAS cet export "
+                    f"en piece jointe."
+                )
+                # #38 fix 2026-06-11 (revue adv.) — aussi dans extras (sink terminal).
+                extras["warnings"].append(_skip_msg)
+                _skipped_wb = dict(input_workbook)
+                _skipped_wb["warnings"] = list(input_workbook.get("warnings") or []) + [_skip_msg]
+                return _skipped_wb, extras
 
             try:
-                out_path = await self._generate_workbook_export(
+                out_path, export_warnings = await self._generate_workbook_export(
                     automation,
                     execution_id,
                     tabs=selected_tabs,
@@ -2998,6 +3508,16 @@ def _build_executor_adapter(
                 # silencieux au re-run + warning trompeur « déjà généré »).
                 await _release_in_dedicated_session(key)
                 raise
+            # #18b — warnings du builder (onglets tronqués, RLS, SQL en échec)
+            # versés dans le step record ET le récap email (avant : JETÉS →
+            # un export amputé partait par email sans signal).
+            for w in export_warnings:
+                extras["warnings"].append(w)
+                # Dédup (revue adv.) : un même classeur ancêtre peut être
+                # matérialisé par le step Export ET la conversion implicite
+                # email → même texte 2× dans le récap sinon.
+                if w not in context.warnings:
+                    context.warnings.append(w)
             # B7 — fichier propage UNIQUEMENT via step_output_files[node.id].
             extras["output_file"] = out_path
             extras["exported_tabs"] = len(selected_tabs)
@@ -3008,8 +3528,45 @@ def _build_executor_adapter(
             from app.services.automation.email_delivery_service import (
                 VALID_DELIVERY_STRATEGIES,
                 apply_delivery_strategy,
+                plain_text_to_email_html,
                 resolve_recipients,
             )
+
+            # #17 fix 2026-06-11 (= Cluster-R / S7) — owner_is_active FAIL-CLOSED.
+            # Avant : le step email DAG envoyait même pour un compte propriétaire
+            # DÉSACTIVÉ (is_active=False) → bypass du soft-delete RGPD / containment
+            # sécu d'un compte coupé. Le chemin LINÉAIRE checkait déjà (cf.
+            # _send_workflow_email), mais le DAG appelle resolve_recipients + SMTP
+            # en direct, court-circuitant le dispatcher qui porte la garde. On
+            # vérifie donc ICI, en TÊTE (avant toute résolution/envoi), fail-closed :
+            # lookup KO ou user orphelin → inactif → pas d'envoi.
+            _owner_active = False
+            try:
+                from app.models.user import User as _User
+
+                _owner = await session.get(_User, automation.user_id)
+                if _owner is not None:
+                    _owner_active = bool(getattr(_owner, "is_active", False))
+            except Exception:  # noqa: BLE001 — best-effort, fail-closed
+                logger.warning(
+                    "Etape '%s' (email DAG): lookup owner_is_active échoué "
+                    "(auto=%s, user=%s) → fail-closed, email NON envoyé.",
+                    node.name,
+                    automation.id,
+                    automation.user_id,
+                    exc_info=True,
+                )
+            if not _owner_active:
+                extras["warnings"].append(
+                    f"Etape '{node.name}': compte proprietaire desactive -> email "
+                    f"NON envoye (fail-closed securite/compliance, S7)."
+                )
+                logger.info(
+                    "Etape '%s' (email DAG): owner inactif (auto=%s) -> email skip.",
+                    node.name,
+                    automation.id,
+                )
+                return None, extras
 
             to_list = step_cfg.get("to") or step_cfg.get("recipients") or []
             if isinstance(to_list, str):
@@ -3048,17 +3605,22 @@ def _build_executor_adapter(
                 resolved["to"] = list(automation.recipients or [])
 
             subject = step_cfg.get("subject") or f"Rapport — {automation.name}"
-            body = step_cfg.get("body") or ""
+            # Corps du mail : TEXTE BRUT saisi dans le panneau config
+            # (schema EMAIL.body). str() coercitif : une config poussee
+            # hors UI (body non-string) ne doit pas crasher l'envoi.
+            # strip() comme EMAIL_WAIT_RESPONSE : un body whitespace-only
+            # compte comme vide (fallback objet-en-contenu plus bas).
+            body = str(step_cfg.get("body") or "").strip()
 
             # S3 — Anti-CRLF sur le SUBJECT uniquement (axe sécu 6, OWASP
             # Email Header Injection). Le subject est un en-tête SMTP : un
             # \r\n smuggle des en-têtes arbitraires (BCc spoof, Reply-To
             # malicieux). is_valid_email couvre les destinataires mais pas
-            # le subject. Le body, lui, est passé en MIMEText(body, "html",
-            # "utf-8") qui encode quoted-printable côté SMTPClient — les
-            # \n y sont LÉGITIMES (HTML multi-ligne). Bloquer body casserait
-            # 100% des emails WYSIWYG. Le SMTPClient applique déjà
-            # _sanitize_header sur les vrais headers (from/to/cc/bcc).
+            # le subject. Le body, lui, n'est PAS un en-tête : il est
+            # converti texte-brut -> HTML sur (plain_text_to_email_html :
+            # escape + \n -> <br/>) au moment du send — les \n y sont
+            # LÉGITIMES. Le SMTPClient applique déjà _sanitize_header sur
+            # les vrais headers (from/to/cc/bcc).
             from app.utils.validators import assert_no_crlf
 
             try:
@@ -3130,7 +3692,7 @@ def _build_executor_adapter(
                 step_obj = steps_by_id.get(aid)
                 ancestor_name = (step_obj.name if step_obj else None) or f"etape_{aid}"
                 try:
-                    xlsx_path = await self._generate_workbook_export(
+                    xlsx_path, conv_warnings = await self._generate_workbook_export(
                         automation,
                         execution_id,
                         tabs=tabs,
@@ -3141,6 +3703,12 @@ def _build_executor_adapter(
                         # produits par un step Export gardent LEUR réglage.
                         anonymize=step_cfg.get("export_anonymized") is True,
                     )
+                    # #18b — même traitement que le step Export : un xlsx
+                    # implicite amputé ne part pas en pièce jointe sans signal.
+                    for w in conv_warnings:
+                        extras["warnings"].append(w)
+                        if w not in context.warnings:
+                            context.warnings.append(w)
                 except Exception as exc:
                     logger.warning(
                         "Etape '%s': conversion implicite workbook→xlsx echec "
@@ -3222,7 +3790,27 @@ def _build_executor_adapter(
                 body=body,
             )
             if not tickets:
-                extras["warnings"].append("Email sans destinataire apres resolution — envoi annule")
+                # #27 fix 2026-06-11 — destinataires vides APRÈS résolution (liste
+                # de diffusion vidée, adresses toutes filtrées/invalides). On NE
+                # fait PAS échouer (une liste vide peut être légitime ce cycle —
+                # même doctrine que le résultat SQL vide #14), mais on rend le
+                # « non-envoi » EXPLICITE et NOMMÉ dans le record (warnings sont
+                # persistés + surfacés à l'UI), au lieu d'un message générique :
+                # l'utilisateur voit clairement que CE step n'a rien envoyé et
+                # pourquoi. (Pas de flag `extras[...]` dédié : `idempotent_skipped`
+                # est aujourd'hui set-only/non lu — on n'ajoute pas de code mort.)
+                extras["warnings"].append(
+                    f"Etape '{node.name}': aucun destinataire apres resolution "
+                    f"(liste de diffusion vide / adresses filtrees) — AUCUN email "
+                    f"envoye. Verifiez la configuration des destinataires si ce "
+                    f"n'est pas attendu."
+                )
+                # #37 fix 2026-06-11 (revue adv.) — relâcher le claim d'idempotence :
+                # il a été pris (plus haut) AVANT ce check, mais aucun email n'est
+                # parti → cohérence Cluster-E #5b (on ne garde un claim que si le
+                # sink a effectivement produit/livré). Sinon claim orphelin (sans
+                # impact réel car la clé inclut les destinataires vides, mais propre).
+                await _release_in_dedicated_session(key)
                 return None, extras
 
             # Envoi direct via SMTPClient (cc_emails/bcc_emails honores
@@ -3266,10 +3854,19 @@ def _build_executor_adapter(
                     from html import escape as _html_escape_v
 
                     safe_subject_fallback = _html_escape_v(str(ticket.subject or ""))
+                    # ticket.body = texte brut user (config step). Conversion
+                    # HTML sure A LA FRONTIERE SMTP uniquement : les tickets
+                    # et la preview gardent le texte tel que saisi. body_text
+                    # porte l'alternative plain-text MIME (deliverabilite).
                     result = await smtp_client.send_email(
                         to_emails=ticket.to,
                         subject=ticket.subject,
-                        body_html=ticket.body or f"<p>{safe_subject_fallback}</p>",
+                        body_html=(
+                            plain_text_to_email_html(ticket.body)
+                            if ticket.body
+                            else f"<p>{safe_subject_fallback}</p>"
+                        ),
+                        body_text=ticket.body or None,
                         cc_emails=ticket.cc or None,
                         bcc_emails=ticket.bcc or None,
                         attachments=ticket_attachments or None,
@@ -3357,6 +3954,19 @@ def _build_executor_adapter(
             input_workbook = dict(input_workbook)
             input_workbook["tabs"] = hydrated_tabs
             extras["warnings"].extend(materialization.get("warnings") or [])
+            # #18b (revue adv. 2026-06-10) — la troncature au cap admin de
+            # l'INPUT du copilot LLM doit être visible : le copilot transforme
+            # alors un classeur amputé, et le résultat (donc toute la suite de
+            # l'automatisation) en hérite. Avant : truncated_tabs jeté ici.
+            for _trunc_label in materialization.get("truncated_tabs") or []:
+                _w = (
+                    f"Format copilot : onglet « {_trunc_label} » TRONQUÉ au cap "
+                    "de lignes admin — la transformation IA porte sur des "
+                    "données partielles."
+                )
+                extras["warnings"].append(_w)
+                if _w not in context.warnings:
+                    context.warnings.append(_w)
 
             try:
                 output_wb = await format_workbook_for_automation(
@@ -3583,6 +4193,8 @@ def _build_executor_adapter(
             # run scheduled (sinon 2 instances waiting concurrentes). Pour
             # les autos one-shot ou manuelles : fallback 30 jours.
             from app.services.automation.wait_resume import (
+                _MAX_WAIT_HOURS,
+                _MIN_WAIT_HOURS,
                 compute_wait_expires_at,
                 send_wait_request_email,
                 serialize_wait_checkpoint,
@@ -3592,6 +4204,19 @@ def _build_executor_adapter(
                 automation,
                 requested_hours=wait_timeout_hours,
             )
+            # #18f (verdict #43, 2026-06-10) — clamp VISIBLE dans le monitor
+            # d'exécution (context.warnings → récap), pas seulement en log :
+            # l'admin qui configure 45j doit voir que le lien expirera à 30j.
+            if wait_timeout_hours and not (
+                _MIN_WAIT_HOURS <= wait_timeout_hours <= _MAX_WAIT_HOURS
+            ):
+                _w_clamp = (
+                    f"Attente configurée à {wait_timeout_hours}h mais bornée à "
+                    f"{_MIN_WAIT_HOURS}h..{_MAX_WAIT_HOURS}h (sécurité des liens) "
+                    "— le lien de réponse expirera plus tôt/tard que configuré."
+                )
+                if _w_clamp not in context.warnings:
+                    context.warnings.append(_w_clamp)
 
             # Generation du token
             token_public, token_hash = issue_token()
@@ -3653,7 +4278,9 @@ def _build_executor_adapter(
                     step_obj = steps_by_id.get(aid)
                     ancestor_name = (step_obj.name if step_obj else None) or f"etape_{aid}"
                     try:
-                        xlsx_path = await self._generate_workbook_export(
+                        # #18b — tuple (path, warnings) ; les warnings de
+                        # troncature partent dans le récap du mail d'attente.
+                        xlsx_path, wait_conv_warnings = await self._generate_workbook_export(
                             automation,
                             execution_id,
                             tabs=tabs,
@@ -3661,6 +4288,9 @@ def _build_executor_adapter(
                             filename_hint=ancestor_name,
                         )
                         attachments.append(str(xlsx_path))
+                        for w in wait_conv_warnings:
+                            if w not in context.warnings:
+                                context.warnings.append(w)
                     except Exception:
                         logger.warning(
                             "email_wait_response: conversion implicite workbook→xlsx "
@@ -3945,11 +4575,18 @@ def _build_executor_adapter(
         # tres anciennes survivantes au purge BDD). Pas de fallback silent
         # vers WorkflowEngine — le user doit savoir que le step est mort
         # plutot que de croire qu'il s'execute.
+        # #26 fix 2026-06-11 — liste des types valides DÉRIVÉE de la SSoT
+        # ``NODE_TYPE_SIGNATURES`` (dag_validator) au lieu d'un hardcode qui
+        # omettait ``iris`` et ``email_wait_response`` (message trompeur). Les
+        # clés de NODE_TYPE_SIGNATURES == EXACTEMENT les branches gérées par cet
+        # adapter (vérifié), donc la liste reste juste sans drift quand on ajoute
+        # un type. Exclut bien les types transform linéaire-only (filter_rows…).
+        from app.services.automation.dag_validator import NODE_TYPE_SIGNATURES
+
         raise ValueError(
             f"Etape '{node.name}' : type d'etape '{step_type}' non supporte "
-            "par ce moteur. Types valides : extract_sql, "
-            "load_workbook, load_saved_query, format_copilot, report, "
-            "export_workbook, email, save_to_datastore."
+            f"par ce moteur. Types valides : "
+            f"{', '.join(sorted(NODE_TYPE_SIGNATURES.keys()))}."
         )
 
     return adapter

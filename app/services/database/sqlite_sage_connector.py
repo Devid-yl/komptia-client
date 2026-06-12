@@ -231,13 +231,41 @@ class SqliteSageConnector:
                 "ORDER BY name"
             )
 
+        # CROSS JOIN sys.sql_modules m WHERE m.object_id = ?
+        # Pattern : chunked DDL retrieval PAR OBJECT_ID (forme préférée depuis
+        # 2026-06-09, cf. schema_sync._DEF_CHUNK_QUERY_BY_OBJECT_ID — l'id
+        # vient du catalogue sys.views/sys.objects, pas de re-résolution
+        # OBJECT_ID(nom) qui peut renvoyer NULL en prod restreinte). Côté
+        # SQLite, l'object_id émis par la règle SYS.VIEWS ci-dessous est le
+        # rowid de _sage_views — on reconstitue les chunks par rowid.
+        if "SYS.SQL_MODULES" in normalized and "M.OBJECT_ID = ?" in normalized:
+            return (
+                "WITH RECURSIVE chunks(n) AS ("
+                "  SELECT 1 UNION ALL SELECT n+1 FROM chunks WHERE n < 64"
+                "), input_id AS (SELECT ? AS oid), "
+                "view_def AS ("
+                "  SELECT v.definition AS definition, "
+                "         length(v.definition) AS total_len "
+                "  FROM _sage_views v, input_id i "
+                "  WHERE v.rowid = i.oid "
+                "  LIMIT 1"
+                ") "
+                "SELECT c.n AS chunk_idx, "
+                "       substr(d.definition, (c.n - 1) * 2000 + 1, 2000) AS chunk_data, "
+                "       d.total_len AS total_len "
+                "FROM chunks c, view_def d "
+                "WHERE (c.n - 1) * 2000 < d.total_len "
+                "ORDER BY c.n"
+            )
+
         # CROSS JOIN sys.sql_modules m WHERE m.object_id = OBJECT_ID(?)
-        # Pattern : chunked DDL retrieval (cf. app/services/ai/schema_sync.py
-        # `_load_view_ddl_chunked`). Le caller récupère la DDL d'UNE vue par
-        # chunks de 2000 chars (max 64 chunks = 128 KB). On reconstitue depuis
-        # _sage_views.definition côté SQLite via une CTE récursive équivalente.
-        # Plus spécifique que SYS.VIEWS (a OBJECT_ID(...) — le `(` distingue
-        # l'appel de fonction de la colonne `object_id`).
+        # Pattern : chunked DDL retrieval PAR NOM (fallback legacy de
+        # schema_sync._DEF_CHUNK_QUERY_BY_NAME). Le caller récupère la DDL
+        # d'UNE vue par chunks de 2000 chars (max 64 chunks = 128 KB). On
+        # reconstitue depuis _sage_views.definition côté SQLite via une CTE
+        # récursive équivalente. Plus spécifique que SYS.VIEWS (a
+        # OBJECT_ID(...) — le `(` distingue l'appel de fonction de la
+        # colonne `object_id`).
         if "SYS.SQL_MODULES" in normalized and "OBJECT_ID(" in normalized:
             return (
                 "WITH RECURSIVE chunks(n) AS ("
@@ -261,7 +289,7 @@ class SqliteSageConnector:
 
         # SELECT v.name, m.definition FROM sys.views v JOIN sys.sql_modules m
         # Pattern : récupération de TOUTES les vues + leur DDL (utilisé par
-        # schema_enricher view mining ligne 1458). Doit être avant la règle
+        # le view mining de schema_enricher). Doit être avant la règle
         # SYS.VIEWS générique qui ne retourne que les noms.
         if "SYS.SQL_MODULES" in normalized and "SYS.VIEWS" in normalized:
             return (
@@ -273,9 +301,13 @@ class SqliteSageConnector:
             )
 
         # sys.views JOIN sys.schemas → _sage_views
+        # ``object_id`` (= rowid SQLite) ajouté 2026-06-09 : schema_sync
+        # réutilise l'object_id du catalogue pour lire les définitions
+        # (règle « M.OBJECT_ID = ? » ci-dessus). Colonne additive — les
+        # callers qui ne lisent que schema_name/view_name sont inchangés.
         if "SYS.VIEWS" in normalized:
             return (
-                "SELECT schema_name, view_name "
+                "SELECT schema_name, view_name, rowid AS object_id "
                 "FROM _sage_views "
                 "ORDER BY schema_name, view_name"
             )

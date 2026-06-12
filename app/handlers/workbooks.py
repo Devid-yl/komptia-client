@@ -187,7 +187,7 @@ _MAX_SEPARATOR_LEN: Final[int] = 4
 _RATE_MAX_LIST: Final[int] = 60
 
 #: Rate-limit lecture classeur (60/min/user). ``read_classeur`` lit un
-#: fichier JSON (~MiB), bornée par ``MAX_CLASSEUR_SIZE``. Similaire à list.
+#: fichier JSON (~MiB), borné par le quota de stockage admin (SSoT). Similaire à list.
 _RATE_MAX_READ: Final[int] = 60
 
 #: Rate-limit chargement Excel/CSV (20/min/user). Parse CPU + RAM en

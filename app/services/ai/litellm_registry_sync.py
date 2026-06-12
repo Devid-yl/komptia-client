@@ -154,9 +154,7 @@ async def refresh_baseline_from_live() -> int:
     """
     fresh = await _http_fetch_registry()
     if not fresh:
-        raise RuntimeError(
-            "fetch LiteLLM live échoué — réseau requis pour rafraîchir la baseline"
-        )
+        raise RuntimeError("fetch LiteLLM live échoué — réseau requis pour rafraîchir la baseline")
     path = _baseline_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
@@ -456,7 +454,16 @@ async def _enrich_locked(
         if entry is None:
             stats["skipped_unknown"] += 1
             continue
-        diff = _compute_diff(row, entry, allow_regression=allow_regression, stats=stats)
+        # Match EXACT (clé présente telle quelle) vs PRÉFIXE (modèle voisin).
+        # Seul l'exact autorise la confirmation de fenêtre — cf. _compute_diff.
+        is_exact = row.name in registry
+        diff = _compute_diff(
+            row,
+            entry,
+            allow_regression=allow_regression,
+            stats=stats,
+            is_exact_match=is_exact,
+        )
         if diff is None:
             continue
         stats["updated"] += 1
@@ -511,14 +518,14 @@ async def _enrich_from_ollama(
         Dict stats ``{enabled, scanned, upserted, skipped_overridden,
         skipped_missing_caps, errors}``.
     """
-    from app.services.ai.config_service import get_ai_config_service
+    from app.services.ai.config_service import default_local_llm_base_url, get_ai_config_service
 
     cs = get_ai_config_service()
     enabled = bool(await cs.get("local_llm_enabled"))
     if not enabled:
         return {"enabled": False, "skipped": "local_llm_disabled"}
 
-    base_url = (await cs.get("local_llm_base_url")) or "http://localhost:11434/v1"
+    base_url = (await cs.get("local_llm_base_url")) or default_local_llm_base_url()
     # Ollama natif tourne sur /api/* (pas /v1/*). Strip le suffixe /v1 si
     # présent (l'admin configure l'URL OpenAI-compat dans /admin/ai-config).
     ollama_base = base_url.rstrip("/")
@@ -604,6 +611,10 @@ async def _enrich_from_ollama(
                     continue
                 existing.context_window = ctx
                 existing.max_output_tokens = max_out
+                # Fenêtre lue depuis ``/api/show`` (``<arch>.context_length``) =
+                # source fiable → vérifiée (pas de « à confirmer » sur un modèle
+                # Ollama dont la fenêtre est connue).
+                existing.context_window_verified = True
                 if not existing.provider:
                     existing.provider = "ollama"
                 stats["upserted"] += 1
@@ -616,6 +627,7 @@ async def _enrich_from_ollama(
                         max_output_tokens=max_out,
                         input_price_per_mtok_usd=0.0,
                         output_price_per_mtok_usd=0.0,
+                        context_window_verified=True,
                     )
                 )
                 stats["upserted"] += 1
@@ -653,9 +665,14 @@ def _compute_diff(
     *,
     allow_regression: bool,
     stats: Dict[str, Any],
+    is_exact_match: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Calcule + applique les changements pour une ligne. ``None`` si rien
-    à mettre à jour ou si toutes les valeurs candidates sont invalides."""
+    à mettre à jour ou si toutes les valeurs candidates sont invalides.
+
+    ``is_exact_match`` : True ssi ``entry`` provient d'un match EXACT du nom
+    (pas d'un longest-prefix-match vers un modèle voisin). Conditionne le
+    marquage ``context_window_verified`` (fail-closed par défaut : False)."""
     new_cw = _validate_int_in_range(
         entry.get("max_input_tokens"), _MIN_CONTEXT_WINDOW, _MAX_CONTEXT_WINDOW
     )
@@ -722,6 +739,31 @@ def _compute_diff(
     _maybe_apply_price("output_price_per_mtok_usd", new_out_price)
     _maybe_apply_price("cache_read_price_per_mtok_usd", new_cache_read_price)
     _maybe_apply_price("cache_creation_price_per_mtok_usd", new_cache_creation_price)
+
+    # Confirmation de la fenêtre de contexte — FAIL-CLOSED (revue adversariale
+    # 2026-06-03). On ne marque ``verified=True`` QUE si les DEUX conditions
+    # tiennent :
+    #   (a) ``is_exact_match`` : la fenêtre vient d'un match EXACT du nom dans
+    #       LiteLLM — un longest-prefix-match donne la fenêtre d'un modèle
+    #       VOISIN (ex. ``...-20260101`` résolu vers le préfixe nu), pas du
+    #       modèle exact → on ne peut pas affirmer qu'elle est juste ;
+    #   (b) ``row.context_window == new_cw`` : la fenêtre stockée correspond
+    #       bien à celle annoncée par LiteLLM. Exclut le cas anti-régression
+    #       où ``_maybe_apply_int`` a CONSERVÉ une valeur provisoire (200K)
+    #       que LiteLLM contredit (fenêtre plus petite) — confirmer ce 200K
+    #       reviendrait à estampiller « vérifié » un chiffre faux.
+    # Hors de ces cas, la fenêtre reste « à confirmer » côté UI (honnête)
+    # plutôt qu'un faux positif. Un modèle découvert à 200K provisoire dont
+    # LiteLLM connaît la VRAIE fenêtre (appliquée) passe bien vérifié.
+    if (
+        new_cw is not None
+        and is_exact_match
+        and row.context_window == new_cw
+        and not row.context_window_verified
+    ):
+        row.context_window_verified = True
+        diff["context_window_verified"] = {"old": False, "new": True}
+        changed = True
 
     # Plan dynamicité 2026-05-14 option B : déduction des 5 flags Komptia-
     # spécifiques que LiteLLM ne couvre pas (extended_thinking,

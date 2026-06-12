@@ -49,7 +49,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
+import unicodedata
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from app.services.anonymization.patterns import resolve_label
@@ -211,23 +214,117 @@ def _make_token(
 
 
 def _canonical_key_runtime(value: str) -> str:
-    """Clé canonique pour le matching forward case-insensitive ET
+    """Clé canonique pour le matching forward case-, accent- ET
     whitespace-insensible.
 
-    Réutilise la SSoT :func:`repository._canonical_key` (NFKC + casefold,
-    même notion d'identité que la dédup BDD) PUIS collapse les runs de
-    whitespace internes — la BDD source peut renvoyer une même valeur avec
-    une casse ET/OU un espacement ≠ du terme /data-privacy configuré (padding
-    CHAR de SQL Server, double espace). Les deux variations sont la même
-    classe de fuite PII silencieuse, traitées ensemble. Le matching reste
-    donc un SUR-ensemble de l'identité BDD (plus permissif = plus protecteur).
+    Réutilise la SSoT :func:`repository._canonical_key` (NFKD strip-accents +
+    casefold, même notion d'identité que la dédup BDD) PUIS collapse les runs
+    de whitespace internes — la BDD source peut renvoyer une même valeur avec
+    une casse, un accent ET/OU un espacement ≠ du terme /data-privacy configuré
+    (``"SOFIGEC  PAP"`` vs ``"Sofigec Pap"``, ``"CREDIT"`` vs ``"Crédit"``,
+    padding CHAR de SQL Server, double espace). Ces variations sont la même
+    classe de fuite PII silencieuse, traitées ensemble. Le matching reste donc
+    un SUR-ensemble de l'identité BDD (plus permissif = plus protecteur).
+
+    **SSoT** : délègue à :func:`repository._canonical_match_key` (la MÊME clé
+    de match stockée en colonne ``term_canonical`` et utilisée par les lectures
+    SQL scopées) — runtime et lectures DB partagent ainsi exactement la même
+    notion de matching (case+accent+whitespace).
 
     Import paresseux pour éviter le cycle pseudonymizer ↔ extract ↔
     repository. ``sys.modules`` cache le module après le 1er appel.
     """
-    from app.services.anonymization.repository import _canonical_key
+    from app.services.anonymization.repository import _canonical_match_key
 
-    return " ".join(_canonical_key(value).split())
+    return _canonical_match_key(value)
+
+
+def _build_accent_equivalence() -> Dict[str, str]:
+    """Carte ``lettre-de-base → classe de variantes accentuées`` (casefold),
+    **pour les lettres LATINES uniquement** (français/européen).
+
+    Construite **programmatiquement** depuis les propriétés Unicode (aucune
+    liste de caractères / langue hardcodée — règle GÉNÉRICITÉ ; le périmètre
+    Latin est un choix de couverture pragmatique, pas une donnée métier) : on
+    parcourt les plages latines (ASCII + Latin-1 Supplement + Latin
+    Extended-A/B, ``0x41``..``0x24F``), on décompose chaque lettre en NFKD, on
+    retire ses marques combinantes pour obtenir sa base, et on regroupe par
+    base. Exemple : base ``"e"`` → ``"eèéêë…"``, base ``"c"`` → ``"cç"``,
+    base ``"n"`` → ``"nñ"``.
+
+    Seules les bases ayant **au moins une variante accentuée** sont retournées
+    (sinon une lettre sans variante — ``"b"``, ``"k"`` — n'a aucun intérêt à
+    devenir une classe ``[b]`` et ne ferait que grossir la regex). Les vraies
+    lettres distinctes (``"æ"``, ``"ø"`` : pas de décomposition NFKD vers une
+    base ASCII) ne sont **pas** fusionnées avec une autre lettre — elles
+    restent littérales, ce qui est correct (``"æ"`` ≠ ``"a"``).
+
+    La notion de base (``_strip_diacritics`` ∘ casefold) est **identique** à
+    celle de :func:`repository._canonical_key`, pour que la regex de
+    *détection* et l'index de *résolution* (``_forward_ci``) restent synchros :
+    tout candidat matché par la classe se résout via la même clé canonique.
+    """
+    groups: Dict[str, set] = {}
+    # 0x41='A' → 0x250 couvre ASCII + Latin-1 Supplement + Latin Extended-A/B,
+    # soit l'essentiel des accents européens (français, allemand, ibérique…).
+    for cp in range(0x41, 0x250):
+        ch = chr(cp)
+        if not ch.isalpha():
+            continue
+        # Base = lettre sans diacritique, casefoldée. NFKD peut produire
+        # plusieurs codepoints (ligatures) → on n'accepte qu'une base d'UNE
+        # lettre ASCII (ß→"ss" len 2 exclu, æ→"æ" non-ASCII exclu).
+        base = "".join(
+            c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c)
+        ).casefold()
+        if len(base) != 1 or not base.isascii() or not base.isalpha():
+            continue
+        groups.setdefault(base, set()).add(base)
+        # On n'ajoute QUE les variantes mono-codepoint : le casefold de certains
+        # caractères produit plusieurs codepoints (ex: ``"İ"`` turc → ``"i̇"`` =
+        # i + point combinant) qui, inséré dans une classe ``[...]``, y
+        # ajouterait le point combinant comme élément parasite (matche un
+        # diacritique isolé). On les écarte — leur base ``i`` garde de toute
+        # façon ses vraies variantes ``ìíîï``.
+        cf = ch.casefold()
+        if len(cf) == 1:
+            groups[base].add(cf)
+    return {
+        base: "".join(sorted(variants))
+        for base, variants in groups.items()
+        if len(variants) > 1
+    }
+
+
+#: Carte précalculée une fois au chargement du module (cf.
+#: :func:`_build_accent_equivalence`). Lecture seule au runtime. L'assertion
+#: garde contre une rupture silencieuse de la normalisation Unicode (carte vide
+#: ⇒ regex non accent-insensible ⇒ fuite PII silencieuse).
+_ACCENT_EQUIVALENCE: Dict[str, str] = _build_accent_equivalence()
+assert _ACCENT_EQUIVALENCE, "accent equivalence map vide — normalisation Unicode cassée ?"
+
+
+def _char_to_accent_class(ch: str) -> str:
+    """Convertit un caractère en fragment regex accent-insensible.
+
+    - Lettre accentuable (``"e"``, ``"é"``, ``"C"``, ``"ç"``…) → classe de
+      caractères ``[eèéêë…]`` couvrant toutes les variantes de sa base. La
+      casse est gérée par ``re.IGNORECASE`` au compile (la classe ne liste que
+      les formes casefoldées). ``"é"`` et ``"e"`` produisent la MÊME classe.
+    - Tout autre caractère (consonne sans variante, chiffre, ponctuation,
+      lettre non-latine) → simplement ``re.escape(ch)`` (comportement
+      historique inchangé).
+
+    Les variantes étant des lettres (``isalpha``), elles sont sûres dans une
+    classe ``[...]`` sans échappement (pas de ``]``, ``\\``, ``^``, ``-``).
+    """
+    base = "".join(
+        c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c)
+    ).casefold()
+    variants = _ACCENT_EQUIVALENCE.get(base)
+    if variants is not None:
+        return "[" + variants + "]"
+    return re.escape(ch)
 
 
 class Pseudonymizer:
@@ -527,16 +624,25 @@ class Pseudonymizer:
         substring. On garde une regex simple qui match `§…§` exact.
         """
 
+        def _expand_accent(token: str) -> str:
+            # Chaque lettre accentuable devient une classe ``[base+variantes]``
+            # pour que la regex DÉTECTE le candidat quelle que soit la forme
+            # accentuée présente dans le texte source (``"Crédit"`` config doit
+            # matcher ``"CREDIT"`` Sage, et inversement). La résolution du token
+            # se fait ensuite via l'index canonique ``_forward_ci`` qui partage
+            # la même notion de base. cf. :func:`_char_to_accent_class`.
+            return "".join(_char_to_accent_class(c) for c in token)
+
         def _key_to_pattern(k: str) -> str:
-            # Tolère les variations de whitespace INTERNE (double espace, tab,
-            # padding CHAR de SQL Server) : on découpe sur les runs de
-            # whitespace et on rejoint par `\s+`. Une clé mono-token (ou
-            # vide) est simplement échappée → comportement inchangé. Même
-            # classe de fuite PII que la casse (variation BDD↔config).
-            parts = k.split()
-            if len(parts) <= 1:
-                return re.escape(k)
-            return r"\s+".join(re.escape(p) for p in parts)
+            # ``k.split()`` découpe sur TOUT run de whitespace (interne ET
+            # bords) → on tolère le double espace, le tab, le padding CHAR de
+            # SQL Server, ET on neutralise un éventuel whitespace de bord, pour
+            # rester cohérent avec ``_canonical_key_runtime`` (qui strip les
+            # bords via le même ``split``) — sinon la regex inclurait un espace
+            # littéral de bord que l'index canonique a retiré. Chaque token est
+            # ensuite étendu en classes accent-insensibles. Même classe de fuite
+            # PII que la casse/accents (variation BDD↔config).
+            return r"\s+".join(_expand_accent(p) for p in k.split())
 
         def _compile_forward(keys: List[str]) -> Optional[re.Pattern[str]]:
             if not keys:
@@ -562,12 +668,12 @@ class Pseudonymizer:
             # substring. Pattern alternation simple.
             return re.compile("(?:" + escaped + ")")
 
-        # Index canonique pour la résolution case-insensitive du forward
+        # Index canonique pour la résolution case/accent-insensible du forward
         # (cf. _resolve_forward). First-wins sur collision canonique : les
-        # termes /data-privacy sont dédupés par _canonical_key côté BDD,
-        # donc collision quasi-nulle au runtime ; côté classeur, deux
-        # variantes de casse de la MÊME valeur partagent alors un token
-        # (acceptable : même entité).
+        # termes /data-privacy sont dédupés par _canonical_key (qui retire
+        # désormais les accents) côté BDD, donc collision quasi-nulle au
+        # runtime ; côté classeur, deux variantes de casse/accent de la MÊME
+        # valeur partagent alors un token (acceptable : même entité).
         forward_ci: Dict[str, str] = {}
         for _cleartext, _token in self._forward.items():
             forward_ci.setdefault(_canonical_key_runtime(_cleartext), _token)
@@ -579,9 +685,10 @@ class Pseudonymizer:
     def anonymize_text(self, text: str) -> str:
         """Substitue dans `text` toutes les occurrences de valeurs en table
         par leur token anonymisé. Le texte revient inchangé si aucune
-        correspondance. Le matching est case-insensitive (cf.
-        :meth:`_resolve_forward`) : la BDD source peut renvoyer une valeur
-        dans une casse ≠ de celle configurée dans /data-privacy."""
+        correspondance. Le matching est case-, accent- et whitespace-insensible
+        (cf. :meth:`_resolve_forward`) : la BDD source peut renvoyer une valeur
+        dans une casse / un accent ≠ de ceux configurés dans /data-privacy
+        (``"CREDIT"`` vs ``"Crédit"``)."""
         if not isinstance(text, str) or not text:
             return text
         if self._fwd_pattern is None:
@@ -594,20 +701,21 @@ class Pseudonymizer:
         """Résout le token anonymisé pour un match forward.
 
         1. Match EXACT d'abord (`_forward`) — préserve le comportement
-           historique quand la casse coïncide.
-        2. Fallback CASE/WHITESPACE-INSENSIBLE via l'index canonique
-           `_forward_ci` (NFKC+casefold+collapse whitespace) — couvre le cas
-           critique où la valeur Sage ("SOFIGEC  PAP") diffère par la casse
-           et/ou l'espacement du terme configuré ("Sofigec Pap"). Sans ça, le
-           vrai nom partait en clair au LLM.
+           historique quand la casse ET l'accent coïncident.
+        2. Fallback CASE/ACCENT/WHITESPACE-INSENSIBLE via l'index canonique
+           `_forward_ci` (NFKD strip-accents + casefold + collapse whitespace)
+           — couvre le cas critique où la valeur Sage ("SOFIGEC  PAP",
+           "CREDIT") diffère par la casse, l'accent et/ou l'espacement du terme
+           configuré ("Sofigec Pap", "Crédit"). Sans ça, le vrai nom partait en
+           clair au LLM.
         3. Aucun token résolu : inatteignable pour les variations
-           casse/whitespace (couvertes par `_forward_ci`) ; ne reste qu'un cas
-           Unicode pathologique où re.IGNORECASE matche là où NFKC+casefold
-           diverge. FAIL-CLOSED — on RAISE (doctrine du module : "fail loud
-           plutôt que leak silencieux") : le pattern a identifié une valeur
-           sensible qu'on ne sait pas masquer → on REFUSE de la laisser partir
-           en clair. Le caller (anonymize_for_llm) remonte l'erreur, comme
-           pour un terme manquant dans `_load_user_pseudonymizer`.
+           casse/accent/whitespace (couvertes par `_forward_ci`) ; ne reste
+           qu'un cas Unicode pathologique où le pattern matche là où
+           NFKD+casefold diverge. FAIL-CLOSED — on RAISE (doctrine du module :
+           "fail loud plutôt que leak silencieux") : le pattern a identifié une
+           valeur sensible qu'on ne sait pas masquer → on REFUSE de la laisser
+           partir en clair. Le caller (anonymize_for_llm) remonte l'erreur,
+           comme pour un terme manquant dans `_load_user_pseudonymizer`.
         """
         matched = m.group(0)
         token = self._forward.get(matched)
@@ -830,14 +938,41 @@ def coerce_to_numeric(
         # le maquille pas en 1.0.
         return None
     if isinstance(val, (int, float)):
-        return float(val)
+        # Contrat : ne JAMAIS renvoyer un float non-fini. ``coerce_to_numeric``
+        # sert l'agrégation (``_aggregate_core`` fait ``total += numeric_val``) ;
+        # un seul ``float('nan')`` empoisonnerait toute la somme silencieusement
+        # (FAUSSE) et ``inf`` la rendrait infinie. Un ``nan`` peut atteindre ce
+        # helper via un ``.afz.json`` (``json`` Python sérialise/relit ``NaN``
+        # par défaut). int ne peut pas être non-fini ; le check ne mord que sur
+        # float. Cohérent avec la branche Decimal ci-dessous (parité #149).
+        f = float(val)
+        return f if math.isfinite(f) else None
+    if isinstance(val, Decimal):
+        # Decimal = colonnes MONEY/NUMERIC/DECIMAL SQL Server (pyodbc).
+        # Defense-in-depth (#147/#148) : aujourd'hui les cellules sheet_content
+        # sont déjà des float (converties par _coerce_number_or_str au load
+        # .afz.json), donc ce helper d'agrégation reçoit du float — mais si un
+        # caller futur passe un Decimal natif, sans cette branche il tomberait
+        # dans « type inattendu → None » et la cellule serait droppée de la
+        # SOMME silencieusement (FAUSSE). NaN/inf filtrés : ils empoisonneraient
+        # un sum() (contexte agrégation, ≠ comparaison #148).
+        try:
+            f = float(val)
+        except (ValueError, OverflowError):
+            return None
+        return f if math.isfinite(f) else None
     if isinstance(val, str):
         # Cas nominal : string numérique cleartext.
         stripped = val.strip()
         try:
-            return float(stripped)
+            f = float(stripped)
         except ValueError:
             pass
+        else:
+            # Contrat « jamais non-fini » : "nan"/"inf" littéral n'est pas une
+            # valeur d'agrégation → on NE retourne pas, on tombe au warning→None.
+            if math.isfinite(f):
+                return f
         # Token-shape ? tente déanonymisation puis re-parse.
         if pseudonymizer is not None and _TOKEN_SHAPE_RE.search(stripped):
             try:
@@ -853,9 +988,12 @@ def coerce_to_numeric(
                 return None
             if cleartext != stripped:
                 try:
-                    return float(cleartext.strip())
+                    f = float(cleartext.strip())
                 except ValueError:
                     pass
+                else:
+                    if math.isfinite(f):
+                        return f
         # Échec final : surface le bug, ne reste pas silencieux.
         logger.warning(
             "coerce_to_numeric: valeur non-parseable comme float (val=%r, "

@@ -143,7 +143,7 @@
                            heure locale via ``toLocaleString``. Fallback sans-JS = SSR
                            strftime SUFFIXÉ ``UTC`` pour ne pas tromper le user (review
                            adversariale 2026-04-30). #}
-                        <time datetime="{{ u.last_login.isoformat() }}" data-fmt-local="datetime">{{ u.last_login.strftime('%d/%m/%Y %H:%M') }} UTC</time>
+                        <time datetime="{{ iso_utc(u.last_login) }}" data-fmt-local="datetime">{{ u.last_login.strftime('%d/%m/%Y %H:%M') }} UTC</time>
                         {% else %}
                         <span class="text-gray-400 dark:text-gray-500">Jamais</span>
                         {% end %}
@@ -180,32 +180,8 @@
         </table>
     </div>
 
-    <!-- Pagination -->
-    {% if total_pages > 1 %}
-    <div class="flex items-center justify-center gap-2 px-4 py-3 border-t border-gray-200 dark:border-gray-800">
-        <button
-            class="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed dark:hover:bg-gray-800 dark:border-gray-700"
-            data-action="goToPage" data-page="{{ current_page - 1 }}"
-            {% if current_page <= 1 %}disabled{% end %}
-        >Precedent</button>
-
-        {% for p in range(1, total_pages + 1) %}
-            {% if p == current_page %}
-            <button class="px-3 py-1.5 text-sm rounded bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900">{{ p }}</button>
-            {% elif p == 1 or p == total_pages or (p >= current_page - 2 and p <= current_page + 2) %}
-            <button class="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 dark:hover:bg-gray-800 dark:border-gray-700" data-action="goToPage" data-page="{{ p }}">{{ p }}</button>
-            {% elif p == current_page - 3 or p == current_page + 3 %}
-            <span class="text-gray-400 text-sm dark:text-gray-500">...</span>
-            {% end %}
-        {% end %}
-
-        <button
-            class="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed dark:hover:bg-gray-800 dark:border-gray-700"
-            data-action="goToPage" data-page="{{ current_page + 1 }}"
-            {% if current_page >= total_pages %}disabled{% end %}
-        >Suivant</button>
-    </div>
-    {% end %}
+    {# Pagination unifiée (UIModule, cf. app/ui_modules.py) #}
+    {% module Pagination(page=current_page, total_pages=total_pages) %}
 </div>
 
 <!-- Modal Creer utilisateur — aria-modal (Bug 2026-05-26 Agent 2 F5) -->
@@ -363,11 +339,6 @@
 
     function navigateWithFilters(overrides) {
         window.location.href = buildUrl(overrides);
-    }
-
-    // ── Navigation ──
-    function goToPage(page) {
-        navigateWithFilters({ page: page });
     }
 
     // ── Sorting ──
@@ -841,7 +812,6 @@
         if (action === 'closeCreateModal') closeCreateModal();
         else if (action === 'closeEditModal') closeEditModal();
         else if (action === 'closeSessionsModal') closeSessionsModal();
-        else if (action === 'goToPage') goToPage(parseInt(target.dataset.page));
         else if (action === 'sortColumn') sortColumn(target.dataset.sort);
         else if (action === 'openEditModal') {
             openEditModal(
@@ -870,13 +840,13 @@
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'admin_users_v1',
+                key: 'admin_users_v2',
                 title: 'Gérer les utilisateurs Komptia',
                 steps: [
                     {
                         icon: 'sparkle',
                         title: 'Créer un compte',
-                        text: 'Le bouton « Nouvel utilisateur » en haut à droite ouvre un formulaire : identifiant, email, mot de passe initial, rôle (administrateur ou utilisateur standard). L\'utilisateur sera invité à changer son mot de passe à la première connexion.'
+                        text: 'Le bouton « Nouvel utilisateur » en haut à droite ouvre un formulaire : nom d\'utilisateur, email, mot de passe et rôle (administrateur ou utilisateur). C\'est l\'email qui sert d\'identifiant de connexion. Communiquez le mot de passe initial à la personne ; vous pourrez le réinitialiser à tout moment via « Modifier ».'
                     },
                     {
                         icon: 'shield',

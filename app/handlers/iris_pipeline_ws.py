@@ -442,6 +442,12 @@ class IrisPipelineWebSocketHandler(tornado.websocket.WebSocketHandler):
     async def _action_unsubscribe(self, payload: dict) -> None:
         run_id = payload.get("run_id")
         if not isinstance(run_id, int):
+            # FIX (hunt it.49, BF5) : parité avec ``_action_subscribe`` — un ``run_id``
+            # non-int était SILENCIEUSEMENT ignoré (return nu) → le client croyait
+            # s'être désabonné mais continuait à recevoir les events (état faux). On
+            # renvoie la MÊME erreur que subscribe pour que le client sache que son
+            # unsubscribe a échoué (et puisse renvoyer un int).
+            await self._safe_send({"type": "error", "message": "run_id requis (int)."})
             return
         bus = get_event_bus()
         await bus.unsubscribe(run_id, self._subscriber_id)
@@ -512,7 +518,46 @@ class IrisPipelineWebSocketHandler(tornado.websocket.WebSocketHandler):
         async def _cb(event: dict) -> None:
             # Enrichit chaque event sortant avec le run_id (le bus le porte
             # déjà côté serveur, mais le client multi-runs en a besoin).
-            payload = {**event, "run_id": run_id}
+            #
+            # L6O2 (S6b) — les champs `str(exc)` bruts (stack/path/SQL) sont
+            # destinés à Iris (l'AGENT bridge a sa PROPRE souscription bus,
+            # server-side, et les surface au LLM pour diagnostic/recovery) — PAS
+            # au navigateur. On strip `traceback` (tous events) et on remplace
+            # le message brut par un message client générique (SSoT
+            # `sanitize_pipeline_error_for_client`, partagé avec le chemin REST).
+            # Le raw vit sous DEUX clés selon l'event : `message` pour
+            # `pipeline_failed`, `error_message` pour `phase_failed` (publié AVANT
+            # `pipeline_failed`). On couvre les deux.
+            from app.services.data_access.error_messages import (
+                redact_filesystem_paths,
+                sanitize_pipeline_error_for_client,
+            )
+
+            payload = {k: v for k, v in event.items() if k != "traceback"}
+            payload["run_id"] = run_id
+            if event.get("type") == "pipeline_failed" and event.get("message"):
+                payload["message"] = await sanitize_pipeline_error_for_client(
+                    event["message"], self.current_user
+                )
+            if event.get("error_message"):
+                payload["error_message"] = await sanitize_pipeline_error_for_client(
+                    event["error_message"], self.current_user
+                )
+            # S8 (défense en profondeur) — strip les chemins absolus d'un éventuel
+            # ``metadata_summary`` libre (event ``phase_complete``).
+            # FIX (hunt it.49, BF6) : la rédaction ne couvrait QUE le cas ``str`` ; un
+            # ``metadata_summary`` dict/list (cf. ``pipeline_runner`` qui le json.dumps en
+            # persistance) traversait la shallow-copy (l.~536) NON-rédigé → fuite latente de
+            # chemins FS absolus. On rédige quel que soit le type : dict/list → ``json.dumps``
+            # puis redact (cohérent avec la persistance + le contrat texte-libre côté client),
+            # str → redact direct. (Latent aujourd'hui : l'event ne porte que duration_seconds.)
+            _meta_summary = event.get("metadata_summary")
+            if isinstance(_meta_summary, str) and _meta_summary:
+                payload["metadata_summary"] = redact_filesystem_paths(_meta_summary)
+            elif isinstance(_meta_summary, (dict, list)) and _meta_summary:
+                payload["metadata_summary"] = redact_filesystem_paths(
+                    json.dumps(_meta_summary, default=str, ensure_ascii=False)
+                )
             await self._safe_send(payload)
 
         return _cb

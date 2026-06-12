@@ -170,6 +170,16 @@ class AnonymizationTerm(BaseModel):
     #: ``anon_terms.MAX_VALUE_LEN``). Au-delà : skippé en amont par le
     #: tokenizer (pollution regex + perte de pertinence).
     term: Mapped[str] = mapped_column(String(500), nullable=False)
+    #: Clé canonique du terme (NFKD strip-accents + casefold) — cf.
+    #: ``repository._canonical_key``. Permet aux lectures SQL scopées
+    #: (``get_state_for_user(scope_tokens=…)``, ``strategies`` proper-noun
+    #: lookup) de matcher case- ET accent-insensiblement, là où un
+    #: ``func.lower(term)`` SQL ne couvre que l'ASCII et ne retire pas les
+    #: accents. **Dérivée** de ``term`` (jamais saisie), peuplée à l'écrit par
+    #: ``upsert_terms`` et backfillée au boot pour les rows historiques
+    #: (``database._backfill_anonymization_term_canonical``). ``None`` =
+    #: row pré-migration pas encore backfillée (transitoire). Ajout 2026-06-09.
+    term_canonical: Mapped[str | None] = mapped_column(String(500), nullable=True)
     #: Middle du pseudo-token (``§middle§``). ``None`` ⇒ auto-généré par
     #: ``Pseudonymizer._make_token`` (consonnes + md5[:3]). Rester court
     #: (cap 128) pour éviter d'exploser la taille des prompts LLM.
@@ -215,8 +225,7 @@ class AnonymizationTerm(BaseModel):
     #: Dernière fois que le terme a été vu dans une extraction (workbook
     #: ouvert, message Iris envoyé). Permet TTL et tri "récents".
     #: Critical #37 review : ``timezone=True`` pour empêcher le drift TZ
-    #: silencieux. Cohérent avec ``value_mapping_archive.archived_at``
-    #: et le helper ``ensure_utc`` côté Python.
+    #: silencieux. Cohérent avec le helper ``ensure_utc`` côté Python.
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     #: Compteur d'apparitions cumulées (heat — affichage badge "X occurrences").
     usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -273,6 +282,12 @@ class AnonymizationTerm(BaseModel):
         #: (``WHERE user_id = ? AND confirmed = ?``) — lecture chaude au
         #: copilot reconcile et au PUT panneau.
         Index("ix_anonymization_term_user_confirmed", "user_id", "confirmed"),
+        #: 2026-06-09 : index pour les lectures scopées case/accent-insensibles
+        #: (``WHERE user_id = ? AND term_canonical IN (…)``) — copilot scope +
+        #: strategies proper-noun lookup. Non-unique : deux variantes
+        #: casse/accent d'une même valeur peuvent partager une canonical (rows
+        #: legacy non encore dédupées) — c'est attendu et géré côté lecture.
+        Index("ix_anonymization_term_user_canonical", "user_id", "term_canonical"),
         #: Critical #37 review : CHECK constraints sur les enums textuels.
         #: Defense-in-depth : un INSERT direct via SQL ad-hoc ou script
         #: avec ``risk_level="MAXIMUM"`` (typo, valeur inventée) cassait

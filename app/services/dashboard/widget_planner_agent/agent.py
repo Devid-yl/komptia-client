@@ -68,7 +68,12 @@ class WidgetPlannerAgentError(Exception):
 # call-sites paramétrisent leurs caps localement.
 
 
-def _build_system_prompt(memory_text: str, columns: list[str], real_row_count: int) -> str:
+def _build_system_prompt(
+    memory_text: str,
+    columns: list[str],
+    real_row_count: int,
+    sample_truncated: bool = False,
+) -> str:
     """System prompt de l'agent. Memory recompute injectée — pas de migration BDD.
 
     Strictement aligné sur la doctrine Komptia :
@@ -76,6 +81,20 @@ def _build_system_prompt(memory_text: str, columns: list[str], real_row_count: i
     - Il doit appeler ≥1 ``propose_widget`` avant ``commit_widgets``
     - Sur SQL 0 ligne / impossible → ``abort(reason)``
     """
+    # #50 — quand le peek est tronqué au cap, ``real_row_count`` est la TAILLE
+    # de l'échantillon, pas le total de la requête. Sans ce signal explicite,
+    # l'agent prend 200 pour le total réel et fabrique des KPI/insights
+    # « total/max/classement » portant sur l'échantillon comme s'ils étaient
+    # globaux (donnée fausse silencieuse au pied du widget).
+    if sample_truncated:
+        peek_line = (
+            f"- Lignes ramenées (ÉCHANTILLON, peek) : {real_row_count} — "
+            "⚠ la requête a PLUS de lignes (total réel inconnu ici). "
+            "N'affirme AUCUN total/somme/moyenne/max/classement GLOBAL : ces "
+            "valeurs ne porteraient que sur l'échantillon."
+        )
+    else:
+        peek_line = f"- Nombre de lignes ramenées (peek) : {real_row_count}"
     return f"""Tu es l'agent qui compose un mini-dashboard (1-6 widgets) à partir \
 d'un résultat SQL pré-exécuté par l'utilisateur.
 
@@ -91,7 +110,7 @@ les données sont multi-dim).
 
 CONTEXTE SQL EXÉCUTÉ :
 - Colonnes disponibles : {columns}
-- Nombre de lignes ramenées (peek) : {real_row_count}
+{peek_line}
 - Tu peux explorer via les tools ci-dessous. Le SQL N'EST PAS RÉ-EXÉCUTÉ — \
 toutes les opérations sont en mémoire sur l'échantillon.
 
@@ -159,7 +178,7 @@ async def run_widget_planner_agent(
     # RLS data_access. Sans user, l'enforcer logue 'RLS skip' fail-OPEN
     # (cf. _execute_sql docstring pipeline.py:552-556).
     try:
-        columns, rows, real_row_count = await _execute_sql(sql, user=user)
+        columns, rows, real_row_count, sample_truncated = await _execute_sql(sql, user=user)
     except WidgetPipelineError as exc:
         raise WidgetPlannerAgentError(str(exc)) from exc
 
@@ -172,6 +191,10 @@ async def run_widget_planner_agent(
     # ── 2. Profile déterministe (zéro LLM) ──────────────────────────────
     profile = profile_columns(columns, rows)
     profile["real_row_count"] = real_row_count
+    # #50 — le peek est plafonné à _PEEK_MAX_ROWS : si tronqué, row_count
+    # n'est PAS le total réel. Propagé au profil pour que le prompt LLM de
+    # l'agent l'annonce (cf. _build_profile_section / sample_note).
+    profile["sample_truncated"] = sample_truncated
     _ = columns_by_role(profile)  # gardé pour évolution future (hints)
 
     # ── 3. Prep anonymisation (2 couches /data/privacy) ─────────────────
@@ -274,7 +297,9 @@ async def run_widget_planner_agent(
     from app.services.ai.agent_roles import OUTPUT_STYLE_RULES
 
     system_prompt = (
-        _build_system_prompt(memory_text, columns, real_row_count) + "\n\n" + OUTPUT_STYLE_RULES
+        _build_system_prompt(memory_text, columns, real_row_count, sample_truncated)
+        + "\n\n"
+        + OUTPUT_STYLE_RULES
     )
     # Sanitize user_hint contre prompt injection (fix HIGH #S2 review
     # adversariale finale 2026-05-18) : sans ce passage, un user qui tape

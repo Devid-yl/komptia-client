@@ -310,7 +310,7 @@ class QueryExecutor:
         params: Tuple[Any, ...] = None,
         max_rows: Optional[int] = None,
         add_limit: bool = True,
-        timeout: int = 30,
+        timeout: Optional[int] = None,
         user: Any = None,
         *,
         rls_source: str = "query_executor",
@@ -332,7 +332,15 @@ class QueryExecutor:
                 hardcoder un cap caller ignore cette config et casse
                 l'asymétrie /iris vs /datastore (incident 2026-05-20).
             add_limit: Ajouter TOP automatiquement
-            timeout: Timeout en secondes (défaut: 30)
+            timeout: Timeout d'exécution (wall-clock) en secondes. ``None``
+                (défaut) = utiliser le timeout admin configuré dans
+                ``/admin/database`` (``DatabaseConnection.timeout``, propagé
+                au connector via ``_reload_sage_connector``). Un int explicite
+                l'emporte (ex: pré-vol rapide qui doit échouer vite). Même
+                doctrine "admin = UNIQUE source de vérité" que ``max_rows`` :
+                hardcoder 30s ici ignorait silencieusement la config admin
+                (incident dashboard 2026-06-08 : widget tué à 30s alors que
+                l'admin avait configuré 120s).
             user: Utilisateur authentifié pour application RLS. Cas :
                 - User réel → enforcement appliqué (filter+check) si ON
                 - ``enforcer.SYSTEM_USER`` → bypass explicite (sync, jobs)
@@ -403,6 +411,38 @@ class QueryExecutor:
             # l'unique source de vérité via /admin/database.
             effective_max_rows = 10000
 
+        # ── Résolution du timeout (MÊME doctrine "admin = source unique" que
+        # ``max_rows`` ci-dessus). ``None`` (défaut) → timeout configuré par
+        # l'admin sur ``/admin/database`` (``DatabaseConnection.timeout``,
+        # propagé au connector via ``_reload_sage_connector``). S'il met 120s,
+        # on attend 120s. Hardcoder 30s ici ignorait SILENCIEUSEMENT la config
+        # admin — incident dashboard 2026-06-08 : le widget (et tous les autres
+        # call-sites qui ne passent pas ``timeout``) était tué à 30s alors que
+        # l'admin avait configuré 120s.
+        #
+        # ``isinstance(... > 0)`` défensif : connector mocké sans ``timeout``
+        # (tests, ``getattr`` → None), valeur corrompue (0/négatif/non-numérique)
+        # → fallback 30 (le défaut PARTAGÉ de ``SageConfig.timeout`` et
+        # ``DatabaseConnection.timeout`` — borné 1..600 par check constraint BDD).
+        # Ce n'est PAS un cap applicatif : un int admin valide est toujours
+        # respecté tel quel. Un timeout 0/non-int passé à ``asyncio.wait_for``
+        # planterait (échec instantané / TypeError) = donnée fausse silencieuse.
+        if timeout is not None:
+            effective_timeout = timeout
+        else:
+            _connector_timeout = getattr(self.connector, "timeout", None)
+            # ``not isinstance(bool)`` : en Python ``isinstance(True, int)`` est
+            # vrai → sans cette exclusion, un ``connector.timeout = True`` corrompu
+            # passerait la garde et donnerait ``wait_for(timeout=True)`` = 1s
+            # silencieux (la donnée fausse que la garde prétend justement écarter).
+            effective_timeout = (
+                _connector_timeout
+                if isinstance(_connector_timeout, (int, float))
+                and not isinstance(_connector_timeout, bool)
+                and _connector_timeout > 0
+                else 30
+            )
+
         # Ajouter limite (TOP N) si demandé.
         if add_limit:
             query = self.add_row_limit(query, effective_max_rows)
@@ -431,7 +471,7 @@ class QueryExecutor:
             # + threading.Timer). Hors scope cette session (refactor étendu).
             result = await asyncio.wait_for(
                 self.connector.execute(query, params, max_rows, cancel_event=cancel_event),
-                timeout=timeout,
+                timeout=effective_timeout,
             )
 
             total_time = (clock.now() - start_time).total_seconds() * 1000
@@ -448,8 +488,8 @@ class QueryExecutor:
             return result
 
         except asyncio.TimeoutError:
-            logger.error("Query timeout after %ds", timeout, extra={"query": query[:200]})
-            raise QueryError(f"Requête dépassée: timeout après {timeout} secondes")
+            logger.error("Query timeout after %ds", effective_timeout, extra={"query": query[:200]})
+            raise QueryError(f"Requête dépassée: timeout après {effective_timeout} secondes")
         except (pyodbc.Error, OSError, ConnectionError):
             logger.error("Query failed", extra={"query": query[:200]}, exc_info=True)
             raise

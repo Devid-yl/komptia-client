@@ -18,6 +18,23 @@ services:
     environment:
       - ENVIRONMENT=production
       - DEBUG=false
+      # Fuseau horaire du conteneur = SOURCE DE VÉRITÉ de l'affichage daté.
+      # Komptia stocke tout en UTC puis convertit à l'affichage vers ce fuseau
+      # (clock.format_local_fr ← config.server.timezone ← TZ). Renseigner
+      # `TZ=America/Guadeloupe` (ou autre nom IANA) dans .env. Défaut UTC
+      # (générique, fail-safe) si absent — sinon les dates s'affichent en UTC
+      # (ex. +4h pour Guadeloupe qui est UTC−4).
+      - TZ=${TZ:-UTC}
+      # Endpoint LLM local par défaut = sidecar Ollama, joint par DNS Docker
+      # (résolu sur le réseau compose). N'a d'effet QUE si l'admin active le LLM
+      # local (/admin/ai-config) ET démarre le sidecar (profil llm-local) ;
+      # sinon totalement ignoré. L'admin peut surcharger l'URL dans
+      # /admin/ai-config (la valeur BDD reste prioritaire). Pour un Ollama sur
+      # l'HÔTE plutôt qu'en sidecar : poser OLLAMA_BASE_URL dans .env (ex.
+      # http://172.17.0.1:11434/v1, IP bridge Docker sur Linux). La substitution
+      # ci-dessous respecte .env et retombe sur le sidecar sinon (sans ça, un
+      # `environment:` en dur écraserait toujours la valeur du .env).
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434/v1}
     volumes:
       # Données persistantes (DB, rapports, logs)
       - komptia-data:/opt/komptia/data
@@ -28,7 +45,12 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      # 180s (et non 10s) : l'app fait son init bloquante (DB/migrations/
+      # diagnostics) AVANT de bind le port (architecture init-then-listen) ; le
+      # port n'écoute pas tant que le boot n'est pas fini. Avec 10s, Docker
+      # marquait « unhealthy » un boot long légitime (cold-start import Python).
+      # Aligné sur le HEALTH_TIMEOUT du Makefile (_wait-healthy).
+      start_period: 180s
     logging:
       driver: json-file
       options:
@@ -44,7 +66,43 @@ services:
           memory: 3G
           cpus: "2.0"
 
+  # ── LLM local (Ollama) — OPTIONNEL, désactivé par défaut ──────────────────
+  # Gardé derrière le profil `llm-local` → ne démarre PAS avec un `make up` nu.
+  # Deux façons de l'allumer :
+  #   • Persistant (recommandé) : poser `COMPOSE_PROFILES=llm-local` dans .env
+  #     (Compose v2 le lit) → `make up` / `make update` démarrent le sidecar
+  #     automatiquement. Raccourci : `make llm-local-enable`.
+  #   • Ponctuel : `docker compose --profile llm-local up -d` (ou `make llm-local-up`).
+  # Sert 2 usages Komptia : auto-anonymisation des classeurs et fallback runtime
+  # quand le LLM cloud est indisponible. CPU only (aucun GPU requis) — adapté à un
+  # serveur LAN. L'app le joint via le DNS Docker `http://ollama:11434` (cf.
+  # OLLAMA_BASE_URL du service app). Aucun port publié sur l'hôte : joignable
+  # uniquement sur le réseau compose interne. PAS de `depends_on` côté app : le
+  # LLM local est fail-soft (l'app boote et tourne même si le sidecar est absent).
+  ollama:
+    image: ollama/ollama:latest
+    container_name: komptia-ollama
+    profiles: ["llm-local"]
+    restart: unless-stopped
+    volumes:
+      # Modèles téléchargés (plusieurs Go) — persistants entre recreate.
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # llama3.2:3b ≈ 2-3 Go en RAM (CPU). Ajuster selon le modèle/serveur.
+          memory: 4G
+
 volumes:
   komptia-data:
     name: komptia-data
+    driver: local
+  ollama-models:
+    name: komptia-ollama-models
     driver: local

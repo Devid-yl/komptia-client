@@ -499,9 +499,13 @@ class ConfidentialityManager:
             # On remplace de droite à gauche pour ne pas décaler les positions
             replacements: list[tuple[int, int, str, str]] = []  # (start, end, token, word)
 
+            from app.services.anonymization.repository import _canonical_match_key
+
             for word, match in detected_nouns:
-                # Chercher dans ValueMapping d'abord
-                anon_form = vm_lookup.get(word.lower())
+                # Lookup via la clé CANONIQUE (case + accent + whitespace) —
+                # même notion que ``_lookup_anonymized_forms`` (qui clé son dict
+                # sur ``term_canonical``).
+                anon_form = vm_lookup.get(_canonical_match_key(word))
                 if anon_form:
                     token = f"~{anon_form.replace(' ', '_')}"
                 else:
@@ -555,10 +559,19 @@ class ConfidentialityManager:
         vide). Sans ``user_id``, le lookup est skip (fail-safe vs. fuite
         cross-user — voir review adversariale).
 
+        Match CANONIQUE (case + accent insensible) via la colonne
+        ``term_canonical`` (NFKD strip-accents + casefold, cf.
+        ``repository._canonical_key``) depuis 2026-06-09. Avant, le match
+        ``func.lower(term) IN (...)`` ne couvrait que l'ASCII et ratait les
+        accents : ``"Crédit"`` configuré n'était pas retrouvé pour ``"CREDIT"``
+        → le pseudo CONFIGURÉ n'était pas appliqué (le mot restait masqué via
+        le fallback ``_generate_anon_token``, mais pas avec le pseudo choisi).
+        Le caller fait son lookup avec la MÊME clé ``_canonical_key(word)``.
+
         Returns:
-            Dict ``{mot_lower: pseudo}`` pour les mots ayant un pseudo configuré
-            par ce user. Vide si ``user_id`` est None ou si la BDD est down
-            (fail-silent local — le caller voit le mot original, jamais une
+            Dict ``{term_canonical: pseudo}`` pour les mots ayant un pseudo
+            configuré par ce user. Vide si ``user_id`` est None ou si la BDD est
+            down (fail-silent local — le caller voit le mot original, jamais une
             fuite involontaire vers un pseudo d'un autre user).
         """
         if not words or user_id is None:
@@ -567,27 +580,47 @@ class ConfidentialityManager:
         try:
             from app.core.database import get_session
             from app.models.anonymization_term import AnonymizationTerm
-            from sqlalchemy import select, func
+            from app.services.anonymization.repository import _canonical_match_key
+            from sqlalchemy import select
 
-            lowers = list({w.lower() for w in words})
+            # Match CANONIQUE (case + accent + whitespace insensible) via
+            # ``term_canonical`` (cf. caveat ci-dessus, corrigé 2026-06-09). Le
+            # caller fait le lookup avec la MÊME clé ``_canonical_match_key``.
+            # On filtre les clés vides (token dégénéré sans contenu canonique).
+            canon_words = list(
+                {
+                    k
+                    for w in words
+                    if isinstance(w, str) and w
+                    for k in (_canonical_match_key(w),)
+                    if k
+                }
+            )
+            if not canon_words:
+                return {}
 
             async with get_session() as session:
                 stmt = (
                     select(
-                        func.lower(AnonymizationTerm.term).label("term_lower"),
+                        AnonymizationTerm.term_canonical.label("term_canon"),
                         AnonymizationTerm.pseudo_middle,
                     )
                     .where(
                         AnonymizationTerm.user_id == user_id,
-                        func.lower(AnonymizationTerm.term).in_(lowers),
+                        AnonymizationTerm.term_canonical.in_(canon_words),
                         AnonymizationTerm.enabled.is_(True),
                         AnonymizationTerm.pseudo_middle.isnot(None),
                         AnonymizationTerm.pseudo_middle != "",
                     )
-                    .distinct()
+                    # ORDER BY id : si plusieurs rows partagent une canonical
+                    # (variantes casse/accent legacy avec pseudos différents),
+                    # le dict ci-dessous garde le DERNIER → gagnant DÉTERMINISTE
+                    # (plus grand id) au lieu d'un ordre BDD arbitraire. cf.
+                    # review migration findings #7/#14.
+                    .order_by(AnonymizationTerm.id)
                 )
                 result = await session.execute(stmt)
-                return {row.term_lower: row.pseudo_middle for row in result}
+                return {row.term_canon: row.pseudo_middle for row in result}
         except Exception as e:
             logger.debug("anonymization_terms lookup failed: %s", e)
             return {}
@@ -680,8 +713,16 @@ class ConfidentialityManager:
             Texte avec toutes les valeurs restaurées
         """
         result = text
-        for placeholder, original in mapping.items():
-            result = result.replace(placeholder, original)
+        # Longest-first : un token court (``~DPNT``) peut être un PRÉFIXE d'un
+        # token de collision (``~DPNT_2``) — ``_generate_anon_token`` est
+        # non-injectif et désambiguïse par suffixe ``_N``. Sans tri, le replace
+        # du token court corromp le long (``~DPNT_2`` → ``DUPONT_2`` au lieu de
+        # ``DUPOONT``) = valeur restituée FAUSSE et plausible à l'utilisateur,
+        # silencieuse. Aligné sur ``proxy.py::_pii_restore_recursive``. Les
+        # tokens PII ``[TYPE_N]`` sont auto-délimités par ``]`` (pas de
+        # collision de préfixe) ; le tri ne leur nuit pas.
+        for placeholder in sorted(mapping, key=len, reverse=True):
+            result = result.replace(placeholder, mapping[placeholder])
         return result
 
     async def restore_anonymized_values(
@@ -778,29 +819,41 @@ class ConfidentialityManager:
 
         _logger = _logging.getLogger(__name__)
 
-        # Phase 1 : Collecter TOUTES les occurrences de TOUS les placeholders
-        # sous forme (position, longueur_match, placeholder, param_value)
+        # Phase 1 : parcourir les littéraux QUOTÉS une seule fois. Pour chacun qui
+        # contient ≥1 placeholder, restaurer TOUS les placeholders présents
+        # LONGEST-FIRST (collision-safe) puis émettre UNE substitution → UN ``?``.
+        #
+        # Avant ce correctif (#146), on bouclait PAR placeholder avec un pattern
+        # ``'…<placeholder>…'``. Conséquences :
+        #  - Collision : un token substring d'un autre (``~DPNT`` ⊂ ``~DPNT_2``)
+        #    matchait AUSSI le littéral de l'autre → la même position enregistrée
+        #    2× avec une valeur fausse (``DUPONT_2`` au lieu de ``DUPOONT``).
+        #  - Plusieurs tokens dans un même littéral (``'~A et ~B'``) → littéral
+        #    enregistré 1× par token.
+        # Dans les deux cas : nb de ``?`` ≠ nb de params → crash ODBC (mismatch
+        # de paramètres), OU filtre WHERE faux. Le parcours PAR LITTÉRAL règle les
+        # deux : 1 littéral = 1 ``?`` = 1 param, restauration interne longest-first
+        # (même doctrine que :meth:`restore_response`).
+        sorted_placeholders = sorted((p for p in pii_mapping if p), key=len, reverse=True)
         substitutions: list[tuple[int, int, str]] = []
+        quoted_found: set[str] = set()
 
-        for placeholder, real_value in pii_mapping.items():
-            if placeholder not in sql:
+        for m in _re.finditer(r"'([^']*)'", sql):
+            inner = m.group(1)
+            present = [p for p in sorted_placeholders if p in inner]
+            if not present:
                 continue
+            param_value = inner
+            for p in present:  # longest-first → pas de corruption de collision
+                param_value = param_value.replace(p, pii_mapping[p])
+            quoted_found.update(present)
+            substitutions.append((m.start(), m.end() - m.start(), param_value))
 
-            escaped = _re.escape(placeholder)
-
-            # Pattern : placeholder dans un contexte quoté '...placeholder...'
-            # Capture le contenu complet entre quotes (incluant % pour LIKE)
-            quoted_pattern = _re.compile(r"'([^']*" + escaped + r"[^']*)'")
-
-            found_quoted = False
-            for m in quoted_pattern.finditer(sql):
-                inner = m.group(1)
-                param_value = inner.replace(placeholder, real_value)
-                substitutions.append((m.start(), m.end() - m.start(), param_value))
-                found_quoted = True
-
-            # Si le placeholder est dans le SQL mais PAS quoté → REFUSER
-            if not found_quoted:
+        # Sécurité : un placeholder présent dans le SQL mais JAMAIS dans un
+        # littéral quoté → non substitué (laissé tel quel) + warning (risque
+        # d'injection si le LLM l'a mis sans quotes).
+        for placeholder in pii_mapping:
+            if placeholder and placeholder in sql and placeholder not in quoted_found:
                 _logger.warning(
                     "Placeholder %s trouvé NON-QUOTÉ dans le SQL — ignoré "
                     "(risque d'injection). Le LLM doit utiliser des quotes : "

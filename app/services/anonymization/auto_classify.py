@@ -70,7 +70,7 @@ class AutoClassifyResult:
     """
 
     flagged: Set[str] = field(default_factory=set)
-    status: str = "ok"  # "ok" | "not_configured" | "timeout" | "error"
+    status: str = "ok"  # "ok" | "not_configured" | "timeout" | "unreachable" | "error"
     message: Optional[str] = None
 
 
@@ -350,8 +350,25 @@ async def auto_classify_chunk(
             ),
         )
     except _LLMErr as exc:
-        # Discriminer timeout vs autre pour préserver l'observabilité
-        # ciblée (ops a besoin de savoir si Ollama est lent vs cassé).
+        # Discriminer timeout vs injoignable vs autre pour préserver
+        # l'observabilité ciblée (ops a besoin de savoir si Ollama est lent
+        # vs ARRÊTÉ — message + status distincts, pas de « timeout » trompeur).
+        if exc.kind == "unreachable":
+            logger.warning(
+                "auto_classify_chunk: LLM local injoignable (service arrêté ?) "
+                "sur chunk de %d tokens — abandon immédiat.",
+                len(tokens_list),
+            )
+            # status="unreachable" DISTINCT : le frontend STOPPE la boucle de
+            # scan + affiche un message actionnable (« démarre le LLM local »),
+            # au lieu de continuer à marteler un service éteint chunk par chunk.
+            return AutoClassifyResult(
+                status="unreachable",
+                message=(
+                    "Le LLM local est configuré mais ne répond pas "
+                    "(service arrêté ?). Démarre-le puis réessaie."
+                ),
+            )
         if exc.kind == "network":
             logger.warning(
                 "auto_classify_chunk: timeout LLM local (%.0fs) sur chunk de %d tokens",
@@ -471,7 +488,12 @@ async def probe_local_llm() -> Optional[float]:
         )
         duration_ms = (time.monotonic() - start) * 1000.0
     except _LLMErr as exc:
-        if exc.kind == "network":
+        if exc.kind == "unreachable":
+            logger.warning(
+                "probe_local_llm: LLM local injoignable (connexion refusée) — "
+                "Ollama arrêté ? Vérifier `ollama serve` + `ollama list`.",
+            )
+        elif exc.kind == "network":
             logger.warning(
                 "probe_local_llm: timeout %.0fs — Ollama très lent ou bloqué. "
                 "Vérifier `pkill -9 ollama && ollama serve` + `ollama list` "

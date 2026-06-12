@@ -148,6 +148,17 @@ async def _scrub_dashboard_data_for_user(
                 dst = widget.get("data_source_type")
                 if dst == "sql":
                     dsc["query"] = await _maybe_scrub(dsc.get("query"))
+                    # Onglets SQL additionnels (feature menu [+] « Requête
+                    # SQL ») : leur requête/titre sont aussi lisibles dans la
+                    # config côté client → même scrub que la requête principale
+                    # (cohérence mode-invisible rétroactif). dsc est déjà
+                    # deep-copié, mutation des sous-dicts sûre.
+                    extra_tabs = dsc.get("extra_tabs")
+                    if isinstance(extra_tabs, list):
+                        for _t in extra_tabs:
+                            if isinstance(_t, dict):
+                                _t["label"] = await _maybe_scrub(_t.get("label"))
+                                _t["query"] = await _maybe_scrub(_t.get("query"))
                 elif dst == "static":
                     dsc["title"] = await _maybe_scrub(dsc.get("title"))
                     dsc["content"] = await _maybe_scrub(dsc.get("content"))
@@ -332,6 +343,20 @@ class DashboardBuilderService:
         await session.delete(dashboard)
         await session.commit()
 
+        # Les widgets partent en cascade BDD (ondelete=CASCADE) sans hook
+        # par-widget → nettoyer les classeurs de widgets du dashboard ici
+        # (glob par préfixe, best-effort, quota libéré).
+        from app.services.dashboard import widget_workbook_store as wbstore
+
+        try:
+            await wbstore.delete_dashboard_workbooks(user_id, dashboard_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Nettoyage des classeurs widgets du dashboard %s échoué",
+                dashboard_id,
+                exc_info=True,
+            )
+
         logger.info("Dashboard supprimé: id=%s", dashboard_id)
         return True
 
@@ -361,7 +386,9 @@ class DashboardBuilderService:
 
         # Capturer les données des widgets avant toute opération
         widget_configs = []
+        widget_src_ids = []
         for w in original.widgets:
+            widget_src_ids.append(w.id)
             widget_configs.append(
                 {
                     "title": w.title,
@@ -384,10 +411,13 @@ class DashboardBuilderService:
         session.add(clone)
         await session.flush()
 
-        # Cloner les widgets
-        for wc in widget_configs:
+        # Cloner les widgets (refs gardées : la copie des classeurs de widgets
+        # grille a besoin des NOUVEAUX ids, connus après flush).
+        cloned_widgets = []
+        for src_id, wc in zip(widget_src_ids, widget_configs):
             widget = DashboardWidget(dashboard_id=clone.id, **wc)
             session.add(widget)
+            cloned_widgets.append((widget, src_id))
 
         # Cloner les filtres
         from app.models.dashboard import DashboardFilter
@@ -404,6 +434,33 @@ class DashboardBuilderService:
                 position_order=f.position_order,
             )
             session.add(filter_clone)
+
+        # Mode classeur : copier le fichier classeur de chaque widget grille
+        # vers les ids du clone. Copie impossible (source disparue, quota) →
+        # retirer le pointeur du clone (fallback legacy via le miroir config,
+        # JAMAIS un fichier partagé entre deux widgets).
+        # Limite connue (revue adv. 2026-06-10) : si le commit du clone échoue
+        # APRÈS la copie, les fichiers copiés + leur quota restent orphelins
+        # (réconciliables via StorageManager.sync_user_storage) — événement
+        # rare (retry DB en amont), accepté.
+        await session.flush()
+        from app.services.dashboard import widget_workbook_store as wbstore
+
+        for widget, src_id in cloned_widgets:
+            cfg = widget.data_source_config
+            if not (
+                widget.widget_type == "grid" and isinstance(cfg, dict) and cfg.get("workbook_file")
+            ):
+                continue
+            new_rel = await wbstore.copy_workbook(
+                user_id, dashboard_id, src_id, clone.id, widget.id
+            )
+            new_cfg = dict(cfg)
+            if new_rel:
+                new_cfg["workbook_file"] = new_rel
+            else:
+                new_cfg.pop("workbook_file", None)
+            widget.data_source_config = new_cfg
 
         data = clone.to_dict()
         await session.commit()
@@ -530,11 +587,38 @@ class DashboardBuilderService:
                     value = value.strip()
                 if value in ("", "auto"):
                     value = None
+            elif field == "data_source_config":
+                # ``workbook_file`` est GÉRÉ PAR LE SERVEUR (mode classeur du
+                # widget grille). La modale d'édition envoie un snapshot de
+                # config figé au render de la page (data-widget) : s'il ne
+                # porte pas la clé (page chargée avant le 1er « Enregistrer »
+                # du widget), un PUT légitime (renommage du titre, édition du
+                # SQL) DÉTACHERAIT silencieusement le classeur — feuilles
+                # manuelles/mise en forme perdues + retour à l'ancienne
+                # requête, avec 200 OK partout. On reporte la clé d'office
+                # (revue adv. 2026-06-10, finding critique C0).
+                existing_cfg = widget.data_source_config
+                if (
+                    isinstance(value, dict)
+                    and isinstance(existing_cfg, dict)
+                    and existing_cfg.get("workbook_file")
+                    and "workbook_file" not in value
+                ):
+                    value = dict(value)
+                    value["workbook_file"] = existing_cfg["workbook_file"]
             setattr(widget, field, value)
 
         errors = widget.validate()
         if errors:
             raise ValueError("; ".join(errors))
+
+        # Mode classeur : répercuter une éventuelle édition du SQL (modale du
+        # widget) dans le classeur — sinon le chargement (qui lit le classeur,
+        # source de vérité) ignorerait silencieusement la modification.
+        if widget.widget_type == "grid" and "data_source_config" in updates:
+            await self._sync_workbook_sql_sheets(
+                user_id, dashboard_id, widget_id, widget.data_source_config or {}
+            )
 
         data = widget.to_dict()
         await session.commit()
@@ -544,6 +628,503 @@ class DashboardBuilderService:
 
         schedule_target_rescan(user_id, "dashboard", dashboard_id)
         return data
+
+    async def set_widget_extra_tabs(
+        self,
+        session: AsyncSession,
+        widget_id: int,
+        dashboard_id: int,
+        user_id: int,
+        extra_tabs: Any,
+    ) -> Optional[dict]:
+        """Remplace la liste des onglets SQL additionnels d'un widget grille.
+
+        Feature menu [+] « Requête SQL ». **Read-modify-write côté SERVEUR** :
+        le client n'envoie QUE la liste d'onglets — jamais la config complète.
+        On lit la config actuelle du widget et on n'y remplace que la clé
+        ``extra_tabs``. Cela évite tout clobber de la requête principale /
+        transformation par une copie cliente périmée (le littéral
+        ``json_encode`` du template est figé au render ; un autre onglet
+        navigateur a pu modifier la config entre-temps) — anti données fausses
+        silencieuses.
+
+        Owner-only (join ``Dashboard.user_id``). Retourne le widget mis à jour,
+        ou ``None`` si introuvable / non-propriétaire. Lève ``ValueError``
+        (→ 400) si la validation échoue (requête non SELECT, trop d'onglets,
+        titre vide, etc.).
+        """
+        from app.models.dashboard import Dashboard, DashboardWidget
+
+        stmt = (
+            select(DashboardWidget)
+            .join(Dashboard)
+            .where(
+                DashboardWidget.id == widget_id,
+                DashboardWidget.dashboard_id == dashboard_id,
+                Dashboard.user_id == user_id,
+            )
+        )
+        result = await session.execute(stmt)
+        widget = result.scalar_one_or_none()
+        if not widget:
+            return None
+
+        if widget.widget_type != "grid":
+            raise ValueError("Les onglets SQL ne concernent que les widgets grille.")
+
+        # Fail-closed : un body sans clé ``extra_tabs`` (ou non-liste, ex.
+        # ``{"extra_tabs": null}``) ne doit PAS persister ``extra_tabs: None`` —
+        # ``validate()`` laisse passer (le bloc est gardé par ``is not None``) →
+        # config polluée. On rejette explicitement, comme ``set_widget_sheets``
+        # pour ``sheets``.
+        if not isinstance(extra_tabs, list):
+            raise ValueError("Les onglets SQL (extra_tabs) doivent être une liste.")
+        # Normalise : ne garder que {label, query} (drop des clés client
+        # parasites). Les entrées de type invalide sont laissées telles quelles
+        # → signalées par validate() avec un message clair plutôt que
+        # silencieusement ignorées.
+        normalized: Any = [
+            {"label": t.get("label"), "query": t.get("query")} if isinstance(t, dict) else t
+            for t in extra_tabs
+        ]
+
+        # setattr d'un NOUVEAU dict (≠ mutation in-place) pour que SQLAlchemy
+        # détecte le changement (colonne JSON simple, pas MutableDict) et bumpe
+        # updated_at (onupdate) → invalide le cache widget.
+        new_config = dict(widget.data_source_config or {})
+        if isinstance(normalized, list) and not normalized:
+            new_config.pop("extra_tabs", None)  # liste vide → config propre
+        else:
+            new_config["extra_tabs"] = normalized
+        widget.data_source_config = new_config
+
+        errors = widget.validate()
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        # Mode classeur : garder le classeur (source de vérité exécutée)
+        # aligné avec le miroir modifié via cette API.
+        await self._sync_workbook_sql_sheets(user_id, dashboard_id, widget_id, new_config)
+
+        data = widget.to_dict()
+        await session.commit()
+
+        logger.info("Onglets SQL widget mis à jour: id=%s", widget_id)
+        from app.services.anonymization.auto_scan import schedule_target_rescan
+
+        schedule_target_rescan(user_id, "dashboard", dashboard_id)
+        return data
+
+    async def set_widget_sheets(
+        self,
+        session: AsyncSession,
+        widget_id: int,
+        dashboard_id: int,
+        user_id: int,
+        sheets: Any,
+    ) -> Optional[dict]:
+        """Remplace TOUTES les feuilles SQL d'un widget grille depuis une liste
+        ORDONNÉE unique (« widget grille piloté par les feuilles »).
+
+        La feuille **0** est la feuille PRINCIPALE : son ``query`` va dans
+        ``data_source_config["query"]`` (son ``label`` est IGNORÉ — l'onglet
+        principal porte le titre du widget, pas de champ label en base). Les
+        feuilles **1..n** vont dans ``extra_tabs`` (``[{label, query}]``).
+
+        **Read-modify-write côté SERVEUR** (comme :meth:`set_widget_extra_tabs`) :
+        on ne remplace QUE ``query`` + ``extra_tabs`` dans la config existante
+        (``transformation`` / ``render_spec`` / ``drill_column`` préservés) — le
+        client n'envoie JAMAIS la config complète (pas de clobber par une copie
+        périmée, anti données fausses silencieuses).
+
+        Owner-only (join ``Dashboard.user_id``). Retourne le widget mis à jour,
+        ou ``None`` si introuvable / non-propriétaire. Lève ``ValueError`` (→ 400)
+        si la validation échoue (liste vide, requête principale absente, requête
+        non SELECT, trop d'onglets, titre vide…).
+        """
+        from app.models.dashboard import Dashboard, DashboardWidget
+
+        stmt = (
+            select(DashboardWidget)
+            .join(Dashboard)
+            .where(
+                DashboardWidget.id == widget_id,
+                DashboardWidget.dashboard_id == dashboard_id,
+                Dashboard.user_id == user_id,
+            )
+        )
+        result = await session.execute(stmt)
+        widget = result.scalar_one_or_none()
+        if not widget:
+            return None
+
+        if widget.widget_type != "grid":
+            raise ValueError("Les feuilles SQL ne concernent que les widgets grille.")
+
+        # Une grille a TOUJOURS au moins sa feuille principale (``query``
+        # obligatoire). Liste vide / non-liste = refus EXPLICITE — ne JAMAIS
+        # effacer silencieusement la requête principale.
+        if not isinstance(sheets, list) or not sheets:
+            raise ValueError("Au moins une feuille SQL est requise.")
+
+        primary = sheets[0]
+        primary_query = primary.get("query") if isinstance(primary, dict) else None
+        # ``not primary_query.strip()`` : une requête BLANCHE (« "   " ») est un
+        # str → passerait un simple isinstance, puis ``validate()`` la laisse
+        # passer (le bloc SELECT/WITH est gardé par ``query.strip()`` et
+        # « query required » est faux car « "   " » est truthy) → on écraserait
+        # SILENCIEUSEMENT la requête principale valide existante (200 au save,
+        # grille cassée au render). Parité avec la garde des onglets additionnels.
+        if not isinstance(primary_query, str) or not primary_query.strip():
+            raise ValueError("La feuille principale doit comporter une requête SQL.")
+
+        # Feuilles additionnelles : ne garder que {label, query} (drop des clés
+        # client parasites). Entrées invalides laissées telles quelles → message
+        # clair via validate() plutôt qu'ignorées silencieusement.
+        extras: Any = [
+            {"label": t.get("label"), "query": t.get("query")} if isinstance(t, dict) else t
+            for t in sheets[1:]
+        ]
+
+        # NOUVEAU dict (≠ mutation in-place) → SQLAlchemy détecte le changement
+        # (colonne JSON simple) et bumpe updated_at → invalide le cache widget.
+        new_config = dict(widget.data_source_config or {})
+        new_config["query"] = primary.get("query")
+        if extras:
+            new_config["extra_tabs"] = extras
+        else:
+            new_config.pop("extra_tabs", None)  # plus d'onglet additionnel → config propre
+        widget.data_source_config = new_config
+
+        errors = widget.validate()
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        # Mode classeur : garder le classeur (source de vérité exécutée)
+        # aligné avec le miroir modifié via cette API.
+        await self._sync_workbook_sql_sheets(user_id, dashboard_id, widget_id, new_config)
+
+        data = widget.to_dict()
+        await session.commit()
+
+        logger.info(
+            "Feuilles SQL widget mises à jour: id=%s (%s feuille(s))", widget_id, len(sheets)
+        )
+        from app.services.anonymization.auto_scan import schedule_target_rescan
+
+        schedule_target_rescan(user_id, "dashboard", dashboard_id)
+        return data
+
+    async def save_widget_workbook(
+        self,
+        session: AsyncSession,
+        widget_id: int,
+        dashboard_id: int,
+        user_id: int,
+        raw_bytes: bytes,
+        expected_hash: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Sauvegarde MANUELLE du classeur d'un widget grille (bouton
+        « Enregistrer » du widget — Ctrl+S de la grille embarquée).
+
+        Le payload est un classeur Komptia complet (``serialize()`` de la
+        grille, gzip ou JSON brut) : TOUT l'état du widget — feuilles SQL avec
+        leur requête, feuilles manuelles, cellules éditées, mise en forme,
+        tris/filtres, cellules SQL (cellDetails). Un seul chemin de
+        persistance : peu importe QUI a modifié le SQL (éditeur manuel,
+        copilot, collage), la sauvegarde capture l'état réel affiché.
+
+        Après sauvegarde, le classeur devient la SOURCE DE VÉRITÉ exécutée au
+        chargement (cf. ``_fetch_sql_data`` mode classeur) ;
+        ``config.query``/``extra_tabs`` sont mis à jour comme MIROIR dérivé
+        (modale d'édition, exports, rétro-compat).
+
+        Owner-only (join ``Dashboard.user_id``). Retourne ``None`` si widget
+        introuvable / non-propriétaire. Lève ``ValueError`` (→ 400),
+        :class:`~app.services.dashboard.widget_workbook_store.WorkbookConflictError`
+        (→ 412) ou
+        :class:`~app.services.dashboard.widget_workbook_store.WorkbookQuotaError`
+        (→ 413).
+        """
+        import asyncio as _asyncio
+        import json as _json
+
+        from app.models.dashboard import Dashboard, DashboardWidget
+        from app.services.ai.sql_validator import check_sql_dangerous
+        from app.services.classeur.reader import decode_afz_bytes
+        from app.services.dashboard import widget_workbook_store as wbstore
+
+        stmt = (
+            select(DashboardWidget)
+            .join(Dashboard)
+            .where(
+                DashboardWidget.id == widget_id,
+                DashboardWidget.dashboard_id == dashboard_id,
+                Dashboard.user_id == user_id,
+            )
+        )
+        result = await session.execute(stmt)
+        widget = result.scalar_one_or_none()
+        if not widget:
+            return None
+        if widget.widget_type != "grid":
+            raise ValueError("La sauvegarde de classeur ne concerne que les widgets grille.")
+
+        from app.services.storage_manager import get_storage_quota_bytes_sync
+
+        # Cap de décompression DÉCOUPLÉ du quota disque (revue adv.
+        # 2026-06-10 : une bombe gzip de ~500 Ko explosait jusqu'au quota —
+        # 500 Mio de texte JSON en RAM, puis json.loads ×N). Erreur explicite
+        # (GunzipTooLargeError → 400), jamais de troncature silencieuse.
+        decompress_cap = min(get_storage_quota_bytes_sync(), wbstore.MAX_WORKBOOK_JSON_BYTES)
+        try:
+            data = await _asyncio.to_thread(
+                decode_afz_bytes,
+                raw_bytes,
+                source=f"widget:{widget_id}",
+                max_decompressed_bytes=decompress_cap,
+            )
+        except (_json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("Classeur illisible (JSON/gzip invalide).") from exc
+
+        if (
+            not isinstance(data, dict)
+            or data.get("app") != "komptia"
+            or not isinstance(data.get("tabs"), list)
+        ):
+            raise ValueError("Format de classeur invalide.")
+        tabs = data["tabs"]
+        if not tabs or not all(isinstance(t, dict) for t in tabs):
+            raise ValueError("Format de classeur invalide (onglets).")
+        if len(tabs) > DashboardWidget.MAX_GRID_WORKBOOK_TABS:
+            raise ValueError(
+                f"Trop de feuilles : {len(tabs)} "
+                f"(maximum {DashboardWidget.MAX_GRID_WORKBOOK_TABS})."
+            )
+
+        sql_sheets = wbstore.extract_sql_sheets(data)
+        if not sql_sheets:
+            raise ValueError("Le classeur doit contenir au moins une feuille SQL.")
+        if len(sql_sheets) > 1 + DashboardWidget.MAX_GRID_EXTRA_TABS:
+            raise ValueError(
+                f"Trop de feuilles SQL : {len(sql_sheets)} "
+                f"(maximum {1 + DashboardWidget.MAX_GRID_EXTRA_TABS})."
+            )
+
+        # Mêmes gardes que le save legacy (validate + _execute_grid_extra_tabs) :
+        # SELECT/WITH, NUL (CWE-158), patterns dangereux, cap longueur — par
+        # feuille SQL, avec un message qui NOMME la feuille fautive.
+        for sheet in sql_sheets:
+            q = sheet["query"]
+            label = sheet["label"] or f"feuille {sheet['index'] + 1}"
+            if "\x00" in q:
+                raise ValueError(f"Caractère NUL interdit dans la requête (« {label} »).")
+            s_upper = q.strip().upper()
+            if not (s_upper.startswith("SELECT") or s_upper.startswith("WITH")):
+                raise ValueError(f"Seules les requêtes SELECT sont autorisées (« {label} »).")
+            if check_sql_dangerous(q):
+                raise ValueError(f"Seules les requêtes SELECT sont autorisées (« {label} »).")
+            if len(q) > DashboardWidget.MAX_GRID_TAB_QUERY_LEN:
+                raise ValueError(
+                    f"Requête trop longue (« {label} », maximum "
+                    f"{DashboardWidget.MAX_GRID_TAB_QUERY_LEN} caractères)."
+                )
+
+        # Cellules SQL (cellDetails) : leur SQL est ré-exécuté à la demande
+        # via /api/cell-detail/execute (qui re-valide) — defense-in-depth :
+        # on refuse dès le save tout SQL d'écriture persisté.
+        for ti, tab in enumerate(tabs):
+            cell_details = tab.get("cellDetails")
+            if not isinstance(cell_details, dict):
+                continue
+            for cell_key, detail in cell_details.items():
+                if not isinstance(detail, dict):
+                    continue
+                d_sql = detail.get("sql")
+                if not isinstance(d_sql, str) or not d_sql.strip():
+                    continue
+                if "\x00" in d_sql or check_sql_dangerous(d_sql):
+                    raise ValueError(
+                        f"SQL de cellule non autorisé (feuille {ti + 1}, cellule {cell_key})."
+                    )
+
+        # Miroir config construit et VALIDÉ AVANT toute écriture fichier
+        # (revue adv. 2026-06-10) : un save refusé (400) ne doit JAMAIS
+        # laisser un fichier « refusé » devenir la source de vérité exécutée.
+        extras = [
+            {
+                "label": (s["label"] or f"Requête {i + 2}")[
+                    : DashboardWidget.MAX_GRID_TAB_LABEL_LEN
+                ],
+                "query": s["query"],
+            }
+            for i, s in enumerate(sql_sheets[1:])
+        ]
+        new_config = dict(widget.data_source_config or {})
+        new_config["query"] = sql_sheets[0]["query"]
+        if extras:
+            new_config["extra_tabs"] = extras
+        else:
+            new_config.pop("extra_tabs", None)
+        new_config["workbook_file"] = wbstore.workbook_rel_path(dashboard_id, widget_id)
+        widget.data_source_config = new_config
+
+        errors = widget.validate()
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        # Bump EXPLICITE de updated_at (revue adv. 2026-06-10) : un save
+        # « mise en forme seule » laisse le miroir IDENTIQUE → SQLAlchemy
+        # n'émet aucun UPDATE → onupdate ne tire pas → le cache de résultats
+        # (version = updated_at dans la clé) servirait le classeur PRÉ-save
+        # pendant tout le TTL, avec un hash périmé (412 fantôme au save
+        # suivant). Le bump force l'invalidation dans tous les cas.
+        from app.core import clock as _clock
+
+        widget.updated_at = _clock.now()
+
+        # Verrou par widget : check If-Match + écriture ATOMIQUES (sinon
+        # TOCTOU — deux PUT porteurs du même hash passent tous deux le check
+        # puis s'écrasent en silence, exactement ce que le 412 doit empêcher).
+        async with wbstore.widget_lock(user_id, dashboard_id, widget_id):
+            # Anti-clobber multi-onglets (axe 22) : If-Match optimiste sur le
+            # hash du fichier courant. Premier save (pas de fichier) → skip.
+            if expected_hash:
+                current = await wbstore.current_hash(user_id, dashboard_id, widget_id)
+                if current is not None and current != expected_hash:
+                    raise wbstore.WorkbookConflictError(
+                        "Ce widget a été modifié dans un autre onglet. "
+                        "Rechargez la page avant d'enregistrer."
+                    )
+
+            rel_path, file_hash = await wbstore.save_workbook(
+                user_id, dashboard_id, widget_id, data
+            )
+
+        widget_data = widget.to_dict()
+        await session.commit()
+
+        logger.info("Classeur widget sauvegardé : widget=%s (%s)", widget_id, rel_path)
+        from app.services.anonymization.auto_scan import schedule_target_rescan
+
+        schedule_target_rescan(user_id, "dashboard", dashboard_id)
+        return {"widget": widget_data, "workbook_hash": file_hash}
+
+    async def _sync_workbook_sql_sheets(
+        self, user_id: int, dashboard_id: int, widget_id: int, config: Any
+    ) -> None:
+        """Répercute le miroir config (``query`` + ``extra_tabs``) dans le
+        CLASSEUR du widget quand il existe.
+
+        Sans cette sync, éditer le SQL via la modale du widget (ou les
+        endpoints extra-tabs) divergerait du classeur — qui est la source de
+        vérité exécutée au chargement → l'édition serait silencieusement
+        ignorée. Appelée AVANT commit par ``update_widget`` /
+        ``set_widget_sheets`` / ``set_widget_extra_tabs``. No-op si pas de
+        classeur ou si rien n'a changé. Quota dépassé ou cap de feuilles
+        atteint → ``ValueError`` (400).
+
+        Limite connue (documentée, revue adv. 2026-06-10) : le fichier est
+        écrit avant le commit du caller — un échec de commit (rare, retry DB
+        en amont) laisse le classeur en avance d'une édition sur le miroir ;
+        le prochain save/édition réaligne.
+        """
+        from app.models.dashboard import DashboardWidget
+        from app.services.dashboard import widget_workbook_store as wbstore
+
+        wb_ref = config.get("workbook_file") if isinstance(config, dict) else None
+        if not isinstance(wb_ref, str) or not wb_ref:
+            return
+
+        desired: list[tuple[Optional[str], str]] = [(None, str(config.get("query") or ""))]
+        for t in config.get("extra_tabs") or []:
+            if isinstance(t, dict):
+                desired.append((str(t.get("label") or ""), str(t.get("query") or "")))
+
+        # Verrou par widget : load → patch → save atomique vis-à-vis d'un
+        # « Enregistrer » manuel concurrent (sinon ce read-modify-write
+        # réécrirait le classeur ENTIER depuis une copie périmée et
+        # annulerait silencieusement le save de l'utilisateur).
+        async with wbstore.widget_lock(user_id, dashboard_id, widget_id):
+            wb = await wbstore.load_workbook(user_id, dashboard_id, widget_id)
+            if wb is None:
+                # Fichier absent/corrompu : le chargement retombera en mode
+                # legacy (miroir config) — ne pas bloquer l'édition.
+                return
+
+            wb_sheets = wbstore.extract_sql_sheets(wb)
+            current = [
+                (None if i == 0 else s["label"], s["query"]) for i, s in enumerate(wb_sheets)
+            ]
+            if current == desired:
+                return
+
+            tabs = wb.get("tabs") or []
+
+            # Appariement par IDENTITÉ de requête d'abord, position en repli
+            # (revue adv. 2026-06-10) : un patch purement positionnel
+            # ré-attribuait libellé/mise en forme à la MAUVAISE requête quand
+            # une feuille SQL intermédiaire était retirée du miroir.
+            unused = list(range(len(wb_sheets)))
+            assignment: list[Optional[int]] = []
+            for _label, q in desired:
+                match_pos = next((p for p in unused if wb_sheets[p]["query"] == q), None)
+                if match_pos is not None:
+                    unused.remove(match_pos)
+                assignment.append(match_pos)
+            for di in range(len(assignment)):
+                if assignment[di] is None and unused:
+                    assignment[di] = unused.pop(0)
+
+            # Cap : tout ce que le serveur écrit doit rester ré-enregistrable
+            # par le client (sinon le prochain « Enregistrer » serait rejeté
+            # « Trop de feuilles » à cause d'un état créé par le serveur).
+            n_appends = sum(1 for p in assignment if p is None)
+            if len(tabs) + n_appends > DashboardWidget.MAX_GRID_WORKBOOK_TABS:
+                raise ValueError(
+                    f"Trop de feuilles dans le classeur du widget "
+                    f"(maximum {DashboardWidget.MAX_GRID_WORKBOOK_TABS}). "
+                    "Supprimez des feuilles avant d'ajouter des requêtes."
+                )
+
+            # 1) Patch des feuilles appariées (query + label pour les extras).
+            for di, (label, q) in enumerate(desired):
+                pos = assignment[di]
+                if pos is None:
+                    continue
+                tab = tabs[wb_sheets[pos]["index"]]
+                src = tab.get("externalSource")
+                if isinstance(src, dict):
+                    src["query"] = q
+                tab["sql"] = q
+                if di > 0 and label:
+                    tab["label"] = label
+            # 2) Feuilles SQL nouvelles → feuilles minimales (les données
+            # seront remplies par la ré-exécution au prochain chargement).
+            for di, (label, q) in enumerate(desired):
+                if assignment[di] is not None:
+                    continue
+                tabs.append(
+                    {
+                        "label": label or "Requête SQL",
+                        "closable": True,
+                        "sql": q,
+                        "columns": [],
+                        "rows": [],
+                        "totalRowCount": 0,
+                        "isArrayFormat": True,
+                        "externalSource": {"type": "sql_query", "query": q},
+                    }
+                )
+            # 3) Feuilles SQL non réclamées par le miroir → suppression
+            # (indexes décroissants pour ne pas décaler les restantes).
+            for pos in sorted(unused, key=lambda p: -wb_sheets[p]["index"]):
+                del tabs[wb_sheets[pos]["index"]]
+
+            try:
+                await wbstore.save_workbook(user_id, dashboard_id, widget_id, wb)
+            except wbstore.WorkbookQuotaError as exc:
+                raise ValueError(str(exc)) from exc
 
     async def delete_widget(
         self,
@@ -570,8 +1151,27 @@ class DashboardBuilderService:
         if not widget:
             return False
 
+        # Capturer AVANT le delete (l'objet est expiré après commit).
+        had_workbook = widget.widget_type == "grid" and bool(
+            isinstance(widget.data_source_config, dict)
+            and widget.data_source_config.get("workbook_file")
+        )
+
         await session.delete(widget)
         await session.commit()
+
+        if had_workbook:
+            # Cycle de vie du classeur widget : le fichier meurt avec le
+            # widget (quota libéré). Best-effort — un échec ne casse pas la
+            # suppression (fichier orphelin caché, écrasé si l'id est réutilisé).
+            from app.services.dashboard import widget_workbook_store as wbstore
+
+            try:
+                await wbstore.delete_workbook(user_id, dashboard_id, widget_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Suppression du classeur widget %s échouée", widget_id, exc_info=True
+                )
 
         logger.info("Widget supprimé: id=%s", widget_id)
         return True
@@ -698,8 +1298,20 @@ class DashboardBuilderService:
         filter_state: Optional[dict] = None,
         drill_filters: Optional[dict] = None,
         user: Any = None,
+        force_refresh: bool = False,
+        apply_render_cap: bool = True,
     ) -> dict[int, dict]:
-        """Récupère les données de tous les widgets d'un dashboard."""
+        """Récupère les données de tous les widgets d'un dashboard.
+
+        ``force_refresh=True`` (bouton « rafraîchir » du front, ``?refresh=1``)
+        bypasse le cache de résultats et force une exécution Sage fraîche.
+
+        ``apply_render_cap=False`` (chemins EXPORT/EMAIL, revue adv. #18c
+        2026-06-10) : le cap de RENDU 500 (Plotly/DOM) n'a aucun sens pour un
+        fichier — avant, un export de widget table sur 600 lignes livrait la
+        slice de 500 en silence. Les flags ``source_truncated``/``row_count``
+        restent posés (honnêteté), seul le slicing est sauté.
+        """
         from app.models.dashboard import Dashboard, DashboardWidget
 
         # Vérifier accès — strict owner only
@@ -729,6 +1341,21 @@ class DashboardBuilderService:
             filt_result = await session.execute(filt_stmt)
             filter_definitions = [f.to_dict() for f in filt_result.scalars().all()]
 
+        # Cache de résultats (incident lenteur 2026-06-08) : un dashboard
+        # ré-ouvert ne doit pas re-lancer chaque requête Sage lourde à chaque
+        # fois. Keyé par user (isolation cross-user), invalidé par contenu (le
+        # SQL est dans la clé) + TTL court. ``force_refresh`` (?refresh=1) bypasse.
+        from app.services.dashboard.widget_result_cache import get_widget_result_cache
+
+        result_cache = get_widget_result_cache()
+        # Token de version des règles d'accès (RLS) du user : intégré à la clé
+        # pour que tout changement de droits admin invalide AUTOMATIQUEMENT le
+        # cache (sinon un résultat déjà filtré resterait servi jusqu'au TTL =
+        # sur-exposition de données au même user). O(1), aucun accès BDD.
+        from app.services.data_access import enforcer as _da_enforcer
+
+        rls_token = _da_enforcer.rules_cache_token(user_id)
+
         data = {}
         for widget in widgets:
             config = widget.data_source_config or {}
@@ -750,16 +1377,65 @@ class DashboardBuilderService:
                         session, effective_config, widget.widget_type, user_id
                     )
                 elif widget.data_source_type == "sql":
-                    # chart_type=None → inférence automatique côté transform
-                    data[widget.id] = await self._fetch_sql_data(
-                        config,
+                    # Clé = (user, dashboard, widget, SQL, type, filtres, drill,
+                    # période, version). Hit → résultat instantané + méta
+                    # ``_cache`` (âge visible côté front). Miss → exécution + set.
+                    cache_key = result_cache.make_key(
+                        user_id,
+                        dashboard_id,
+                        widget.id,
+                        query=(config.get("query", "") if isinstance(config, dict) else ""),
                         widget_type=widget.widget_type or "table",
                         chart_type=widget.chart_type,
+                        period=period_override,
                         filter_state=effective_filters,
-                        filter_definitions=filter_definitions,
                         drill_filters=drill_filters,
-                        user=user,
+                        version=(getattr(widget, "updated_at", None), rls_token),
                     )
+                    cached = None if force_refresh else result_cache.get(cache_key)
+                    if cached is not None:
+                        data[widget.id] = cached
+                    else:
+                        # Mode classeur (widget grille sauvegardé) : le classeur
+                        # est la SOURCE DE VÉRITÉ exécutée — chargé ici (miss
+                        # uniquement, pas de lecture disque sur hit cache).
+                        # Fichier absent/corrompu → None = fallback legacy
+                        # gracieux dans _fetch_sql_data (config.query miroir).
+                        workbook = None
+                        workbook_hash = None
+                        workbook_missing = False
+                        if widget.widget_type == "grid" and isinstance(config, dict):
+                            wb_ref = config.get("workbook_file")
+                            if isinstance(wb_ref, str) and wb_ref:
+                                from app.services.dashboard import widget_workbook_store
+
+                                workbook, workbook_hash = (
+                                    await widget_workbook_store.load_workbook_with_hash(
+                                        user_id, dashboard_id, widget.id
+                                    )
+                                )
+                                workbook_missing = workbook is None
+                        # chart_type=None → inférence automatique côté transform
+                        sql_result = await self._fetch_sql_data(
+                            config,
+                            widget_type=widget.widget_type or "table",
+                            chart_type=widget.chart_type,
+                            filter_state=effective_filters,
+                            filter_definitions=filter_definitions,
+                            drill_filters=drill_filters,
+                            user=user,
+                            apply_render_cap=apply_render_cap,
+                            workbook=workbook,
+                            workbook_hash=workbook_hash,
+                            workbook_missing=workbook_missing,
+                        )
+                        # Un résultat EXPORT (non cappé au rendu) ne doit PAS
+                        # peupler le cache de la vue live : il serait servi au
+                        # front sans cap (charts non bornés = le freeze que le
+                        # cap de rendu prévient).
+                        if apply_render_cap:
+                            result_cache.set(cache_key, sql_result)
+                        data[widget.id] = sql_result
                 elif widget.data_source_type == "static":
                     data[widget.id] = self._fetch_static_data(config)
                 else:
@@ -934,22 +1610,30 @@ class DashboardBuilderService:
             }
 
         elif metric_name == "daily_searches":
-            # Single GROUP BY query instead of N+1 (was 1 query per day)
-            from sqlalchemy import cast, Date as SADate
-
+            # Single GROUP BY query instead of N+1 (was 1 query per day).
+            # On regroupe via func.date() (renvoie la chaîne 'YYYY-MM-DD') et NON
+            # cast(created_at, Date) : sous SQLite (la BDD locale), CAST(... AS DATE)
+            # applique l'affinité NUMERIC à la chaîne ISO → renvoie un ENTIER → le
+            # result-processor Date de SQLAlchemy (date.fromisoformat) lève
+            # TypeError. L'exception était avalée par le try/except de
+            # _fetch_metric_data → la métrique tombait TOUJOURS en erreur (chart
+            # vide). func.date() est non-typé côté SQLAlchemy → aucune conversion
+            # appliquée → chaîne brute, pas de crash.
             stmt = (
                 select(
-                    cast(SearchHistory.created_at, SADate).label("day"),
+                    func.date(SearchHistory.created_at).label("day"),
                     func.count().label("cnt"),
                 )
                 .where(
                     SearchHistory.user_id == user_id,
                     SearchHistory.created_at >= cutoff,
                 )
-                .group_by(cast(SearchHistory.created_at, SADate))
+                .group_by(func.date(SearchHistory.created_at))
             )
             result = await session.execute(stmt)
-            counts_by_day = {row[0]: row[1] for row in result.all()}
+            # Clés normalisées en 'YYYY-MM-DD' (agnostique backend : SQLite renvoie
+            # déjà une chaîne ; un backend date-typé renverrait un date → str()).
+            counts_by_day = {str(row[0]): row[1] for row in result.all()}
 
             # Build full date range (fill missing days with 0)
             today = clock.now().date()
@@ -959,7 +1643,8 @@ class DashboardBuilderService:
                 rows.append(
                     {
                         "date": day.strftime("%d/%m"),
-                        "count": counts_by_day.get(day, 0),
+                        # day.isoformat() == 'YYYY-MM-DD' → match la clé func.date().
+                        "count": counts_by_day.get(day.isoformat(), 0),
                     }
                 )
             return {
@@ -969,10 +1654,20 @@ class DashboardBuilderService:
             }
 
         elif metric_name == "execution_status":
+            # Filtre fenêtre temporelle (started_at >= cutoff) — cohérent avec
+            # total_searches / success_rate / daily_searches. Sans ce filtre, la
+            # répartition succès/échec agrégeait TOUTES les exécutions de tout
+            # temps, alors que le dashboard applique un period_override à CHAQUE
+            # widget métrique (cf. _fetch_dashboard_widgets) → l'utilisateur qui
+            # sélectionne « 7 derniers jours » voyait en réalité la distribution
+            # depuis toujours (données fausses silencieuses).
             stmt = (
                 select(Execution.status, func.count())
                 .join(Automation)
-                .where(Automation.user_id == user_id)
+                .where(
+                    Automation.user_id == user_id,
+                    Execution.started_at >= cutoff,
+                )
                 .group_by(Execution.status)
             )
             result = await session.execute(stmt)
@@ -1032,7 +1727,11 @@ class DashboardBuilderService:
                     [
                         r[0][:80] if r[0] else "",
                         "OK" if r[1] else "Erreur",
-                        r[2].strftime("%d/%m %H:%M") if r[2] else "",
+                        # Heure SERVEUR (config.server.timezone) : cellule de table
+                        # widget générique sans <time> par cellule → pas de conversion
+                        # navigateur possible ici, donc on rend dans la TZ serveur
+                        # (= TZ du cabinet) plutôt que l'UTC brut (sinon +Nh).
+                        (clock.to_local(r[2]) or r[2]).strftime("%d/%m %H:%M") if r[2] else "",
                     ]
                     for r in rows
                 ],
@@ -1265,6 +1964,57 @@ class DashboardBuilderService:
             "datasets": datasets,
         }
 
+    #: Cap de RENDU des widgets non-grid, appliqué APRÈS transformation/
+    #: agrégation (#18c — l'ancien cap 500 appliqué AVANT faussait les
+    #: agrégats). Ce n'est PAS un cap de données : l'agrégation a vu toutes
+    #: les lignes (jusqu'au cap admin) ; on borne seulement ce que Plotly/
+    #: le HTML statique doivent dessiner, avec flags honnêtes.
+    _WIDGET_RENDER_MAX_ROWS = 500
+
+    def _cap_widget_render(
+        self, result: dict, source_truncated: bool, apply_render_cap: bool = True
+    ) -> dict:
+        """Borne le RENDU d'un résultat de widget non-grid, honnêtement.
+
+        - ``rows`` au-delà de ``_WIDGET_RENDER_MAX_ROWS`` → slice +
+          ``truncated: True`` + ``row_count`` (total avant slice) — mêmes
+          clés que le widget grid, le front affiche le même badge.
+        - ``source_truncated`` (cap admin atteint au FETCH) → propagé tel
+          quel : les agrégats sont alors calculés sur des données partielles,
+          le front doit l'annoncer distinctement (« calculé sur les N
+          premières lignes — cap admin »).
+        """
+        if not isinstance(result, dict):
+            return result
+        rows = result.get("rows")
+        if isinstance(rows, list):
+            result.setdefault("row_count", len(rows))
+            if apply_render_cap and len(rows) > self._WIDGET_RENDER_MAX_ROWS:
+                result["rows"] = rows[: self._WIDGET_RENDER_MAX_ROWS]
+                result["truncated"] = True
+        # Charts : la sortie est {labels, datasets}, PAS rows (revue adv.
+        # 2026-06-10, finding CRITIQUE) — sans ce cap, un group-by haute
+        # cardinalité (ex. GROUP BY numero_facture) envoie N milliers de
+        # buckets entiers à Plotly → freeze/OOM navigateur. ``labels`` est
+        # l'axe X (nb de buckets) ; chaque dataset porte une valeur par
+        # bucket → slicer en parallèle.
+        labels = result.get("labels")
+        if (
+            apply_render_cap
+            and isinstance(labels, list)
+            and len(labels) > self._WIDGET_RENDER_MAX_ROWS
+        ):
+            result.setdefault("row_count", len(labels))
+            keep = self._WIDGET_RENDER_MAX_ROWS
+            result["labels"] = labels[:keep]
+            for ds in result.get("datasets") or []:
+                if isinstance(ds, dict) and isinstance(ds.get("data"), list):
+                    ds["data"] = ds["data"][:keep]
+            result["truncated"] = True
+        if source_truncated:
+            result["source_truncated"] = True
+        return result
+
     def _transform_sql_to_kpi(self, columns: list[str], rows: list[list]) -> dict:
         """Transforme des résultats SQL en format KPI (valeur unique).
 
@@ -1302,6 +2052,10 @@ class DashboardBuilderService:
         filter_definitions: Optional[list[dict]] = None,
         drill_filters: Optional[dict] = None,
         user: Any = None,
+        apply_render_cap: bool = True,
+        workbook: Optional[dict] = None,
+        workbook_hash: Optional[str] = None,
+        workbook_missing: bool = False,
     ) -> dict:
         """Exécute une requête SQL contre Sage et retourne les résultats.
 
@@ -1314,10 +2068,50 @@ class DashboardBuilderService:
                     Pas de transformation (rendu brut via SqlResultGrid).
                     max_rows respecte le cap admin (parité /iris), pas le
                     cap 500 des widgets agrégés.
+
+        **Mode classeur** (``workbook`` non-None, widget grille sauvegardé) :
+        le classeur est la SOURCE DE VÉRITÉ — TOUTES ses feuilles SQL
+        (``externalSource.type='sql_query'``) sont ré-exécutées fraîches ici
+        (la 1ʳᵉ avec l'enveloppe filtres/drill du dashboard, les suivantes
+        indépendantes — parité avec le mode legacy), les feuilles snapshot
+        (manuelles, drill-down) gardent leurs données sauvegardées, et le
+        payload porte ``workbook`` = classeur hydraté que le frontend ouvre
+        via ``loadWorkbook()``. ``config["query"]``/``extra_tabs`` ne sont
+        alors qu'un miroir (modale d'édition / rétro-compat) — pas exécutés.
+        ``workbook_missing=True`` (fichier référencé mais illisible) →
+        fallback legacy + indicateur pour le frontend.
         """
-        query = config.get("query", "")
+        # Mode classeur : substituer les requêtes du classeur AVANT toute
+        # validation/exécution — le miroir config peut être périmé, le
+        # classeur fait foi (single source of truth).
+        wb_sql_sheets: list[dict] = []
+        if workbook is not None and widget_type == "grid":
+            from app.services.dashboard.widget_workbook_store import extract_sql_sheets
+
+            wb_sql_sheets = extract_sql_sheets(workbook)
+            if not wb_sql_sheets:
+                # Classeur sans aucune feuille SQL (état anormal — la grille
+                # widget a toujours sa feuille principale SQL) : fallback
+                # legacy explicite plutôt qu'une grille vide silencieuse.
+                logger.warning("Classeur widget sans feuille SQL — fallback config.")
+                workbook = None
+                workbook_missing = True
+
+        query = (
+            wb_sql_sheets[0]["query"]
+            if (workbook is not None and wb_sql_sheets)
+            else config.get("query", "")
+        )
         if not query:
             return {"error": "Requête SQL vide."}
+
+        # CWE-158 : certains drivers ODBC tronquent silencieusement la requête
+        # au 1er NUL → la requête exécutée diffère de l'affichée (données
+        # fausses silencieuses). Couvre TOUS les widgets SQL (table/chart/kpi/
+        # grid), pas seulement les onglets additionnels. Parité avec
+        # ``/api/datastore/sql/execute`` (datastore.py).
+        if "\x00" in query:
+            return {"error": "Caractère NUL interdit dans la requête."}
 
         # Validate SELECT-only (prevent writes from dashboard widgets).
         # Détection des verbes/patterns dangereux déléguée au validateur SSoT
@@ -1377,14 +2171,29 @@ class DashboardBuilderService:
             # execute() returns QueryResult, supports params natively
             from app.services.data_access.enforcer import DataAccessDeniedError
 
-            # Cap lignes :
-            #  - widgets agrégés (chart/kpi/table) : 500 — protège le rendu front
-            #    (Plotly + HTML statique deviennent injouables au-delà).
-            #  - grid : None → cap admin via DatabaseConnection.max_rows
-            #    (parité /iris, doctrine "no double cap" — la grille SqlResultGrid
-            #    est conçue pour gérer les gros datasets via virtual scrolling).
-            effective_max_rows = None if widget_type == "grid" else 500
+            # Cap lignes : None pour TOUS les types → cap admin
+            # ``DatabaseConnection.max_rows`` (doctrine no-double-cap).
+            #
+            # **#18c (triage caps 2026-06-10)** — l'ancien ``500`` pour les
+            # widgets chart/kpi/table était appliqué AVANT
+            # ``apply_transformation`` : un KPI « total CA » ou un graphe
+            # agrégé était calculé sur les 500 premières lignes de la requête
+            # → CHIFFRES FAUX silencieux sur le dashboard. Le souci de rendu
+            # front (Plotly/HTML au-delà de ~500 points) est un problème de
+            # SORTIE, pas d'entrée : il est géré APRÈS transformation par
+            # ``_cap_widget_render`` (slice honnête + flags truncated/
+            # row_count, mêmes clés que le widget grid).
+            effective_max_rows = None
 
+            # Mode classeur : isoler l'échec de la feuille PRINCIPALE (revue
+            # adv. 2026-06-10). Les feuilles manuelles/snapshot du classeur
+            # n'ont pas besoin de Sage — Sage down ne doit pas rendre
+            # inconsultables des données saisies à la main (le bandeau
+            # d'erreur se pose sur la feuille SQL concernée uniquement,
+            # parité avec l'isolation par onglet des feuilles SQL extras).
+            workbook_grid = workbook is not None and bool(wb_sql_sheets) and widget_type == "grid"
+            qr = None
+            main_error: Optional[str] = None
             try:
                 qr = await executor.execute(
                     effective_query,
@@ -1395,16 +2204,35 @@ class DashboardBuilderService:
                     require_user=True,
                 )
             except DataAccessDeniedError as exc:
-                return {"error": exc.user_message, "blocked_by": "data_access_rule"}
+                if not workbook_grid:
+                    return {"error": exc.user_message, "blocked_by": "data_access_rule"}
+                main_error = exc.user_message
+            except Exception:
+                if not workbook_grid:
+                    # Hors mode classeur : comportement historique (erreur
+                    # widget globale via le except englobant de la méthode).
+                    raise
+                logger.warning(
+                    "Erreur exécution feuille principale (widget classeur)", exc_info=True
+                )
+                main_error = "Erreur lors de l'exécution de la requête SQL."
 
-            columns = qr.columns or []
-            rows_as_dicts = qr.to_dicts()
+            if main_error is not None and not apply_render_cap:
+                # Chemin EXPORT/EMAIL : pas de classeur dans le payload — des
+                # clés plates vides SANS erreur produiraient un fichier vide
+                # silencieux. Erreur explicite comme avant.
+                return {"error": main_error}
 
-            rows = (
-                [[row.get(col) for col in columns] for row in rows_as_dicts]
-                if rows_as_dicts
-                else []
-            )
+            if qr is not None:
+                columns = qr.columns or []
+                rows_as_dicts = qr.to_dicts()
+                rows = (
+                    [[row.get(col) for col in columns] for row in rows_as_dicts]
+                    if rows_as_dicts
+                    else []
+                )
+            else:
+                columns, rows = [], []
 
             # ── Widget "grid" : retour brut, pas de transformation ni
             # d'aggrégation. Le frontend instancie GridTabManager direct
@@ -1412,21 +2240,100 @@ class DashboardBuilderService:
             # On expose row_count + truncated pour que l'UI puisse afficher
             # un badge "tronqué" cohérent avec /iris.
             if widget_type == "grid":
-                return {
+                grid_result = {
                     "type": "grid",
                     "columns": columns,
                     "rows": rows,
                     "sql": effective_query,
+                    # ``source_sql`` = requête D'ORIGINE (config["query"]), AVANT
+                    # tout filtre/période/drill. ``sql`` ci-dessus peut être la
+                    # version filtre-wrappée ``SELECT * FROM (<query>) WHERE …``
+                    # (cf. enveloppe filtres). Le front utilise ``source_sql``
+                    # comme requête de la « feuille » principale (persistance) —
+                    # persister la version wrappée corromprait config["query"].
+                    "source_sql": query,
                     "row_count": getattr(qr, "row_count", len(rows)),
                     "truncated": bool(getattr(qr, "truncated", False)),
                     "execution_time_ms": getattr(qr, "execution_time_ms", 0),
                 }
+                # Onglets SQL additionnels (feature menu [+] « Requête SQL »).
+                # Chacun est une requête INDÉPENDANTE ré-exécutée ici à chaque
+                # affichage — donc toujours fraîche, et survit au refresh sans
+                # snapshot ni localStorage (la requête vit dans la config du
+                # widget, comme le tab principal). On NE les enveloppe PAS dans
+                # les filtres/période du dashboard (décision produit : requêtes
+                # ad-hoc autonomes). Le tab principal reste à plat (columns/rows)
+                # pour rétro-compat (exports/consommateurs existants) ; les
+                # extras vivent sous la clé ``tabs`` (absente si aucun).
+                if workbook is not None and wb_sql_sheets:
+                    # Mode classeur : les onglets SQL additionnels viennent du
+                    # CLASSEUR (source de vérité), pas du miroir config.
+                    wb_extras = [
+                        {"label": s["label"], "query": s["query"]} for s in wb_sql_sheets[1:]
+                    ]
+                    extra_results = (
+                        await self._execute_grid_extra_tabs(executor, wb_extras, user)
+                        if wb_extras
+                        else []
+                    )
+                    if extra_results:
+                        grid_result["tabs"] = extra_results
+                    main_fresh = {
+                        "columns": columns,
+                        "rows": rows,
+                        "sql": query,  # requête d'ORIGINE (jamais filtre-wrappée)
+                        "row_count": grid_result["row_count"],
+                        "truncated": grid_result["truncated"],
+                    }
+                    if main_error is not None:
+                        # Feuille principale en échec : vidée + bandeau (via
+                        # _hydrate_workbook), le reste du classeur reste
+                        # consultable. PAS d'``error`` top-level : il
+                        # déclencherait le rendu « erreur seule » côté front
+                        # et masquerait les feuilles manuelles.
+                        main_fresh["error"] = main_error
+                    grid_result["workbook"] = self._hydrate_workbook(
+                        workbook, wb_sql_sheets, main_fresh, extra_results
+                    )
+                    grid_result["workbook_hash"] = workbook_hash
+                    grid_result["workbook_mode"] = True
+                    # Vue LIVE : les rows vivent UNIQUEMENT dans ``workbook``
+                    # (pas de duplication flat+classeur = payload/cache ×2).
+                    # Chemins EXPORT/EMAIL (apply_render_cap=False) : clés
+                    # plates pleines, ``workbook`` retiré (les exporteurs
+                    # consomment columns/rows/tabs comme avant).
+                    if apply_render_cap:
+                        grid_result["rows"] = []
+                        for t in grid_result.get("tabs", []) or []:
+                            t["rows"] = []
+                    else:
+                        grid_result.pop("workbook", None)
+                    return grid_result
+
+                extra_tabs = config.get("extra_tabs") if isinstance(config, dict) else None
+                if isinstance(extra_tabs, list) and extra_tabs:
+                    grid_result["tabs"] = await self._execute_grid_extra_tabs(
+                        executor, extra_tabs, user
+                    )
+                if workbook_missing:
+                    # Fichier classeur référencé mais absent/corrompu : on a
+                    # servi le miroir config (données justes), mais les
+                    # feuilles manuelles/mise en forme sont perdues — le
+                    # frontend affiche un avertissement explicite (jamais de
+                    # dégradation silencieuse).
+                    grid_result["workbook_missing"] = True
+                return grid_result
 
             # ── Pipeline v2 : si le widget a une transformation persistée
             # (décidée par l'Analyst LLM à la création), on la rejoue en
             # Python ici — la même recette, déterministe, à chaque refresh.
             # Les anciens widgets sans transformation passent dans le chemin
             # historique (backward-compat).
+            # #18c — la troncature SOURCE (cap admin atteint au fetch) fausse
+            # les agrégats : propagée à part (``source_truncated``) car le
+            # message utilisateur diffère du cap de RENDU.
+            source_truncated = bool(getattr(qr, "truncated", False))
+
             recipe = config.get("transformation") if isinstance(config, dict) else None
             if recipe:
                 try:
@@ -1445,7 +2352,7 @@ class DashboardBuilderService:
                         and render_spec.get("chart_type")
                     ):
                         result["chart_type"] = render_spec["chart_type"]
-                    return result
+                    return self._cap_widget_render(result, source_truncated, apply_render_cap)
                 except TransformationError as exc:
                     logger.warning(
                         "Widget transformation invalide : %s — fallback sur SQL brut",
@@ -1455,15 +2362,231 @@ class DashboardBuilderService:
 
             # Chemin historique (pas de transformation persistée ou fallback)
             if widget_type == "chart" and rows:
-                return self._transform_sql_to_chart(columns, rows, chart_type)
+                return self._cap_widget_render(
+                    self._transform_sql_to_chart(columns, rows, chart_type),
+                    source_truncated,
+                    apply_render_cap,
+                )
             elif widget_type == "kpi" and rows:
-                return self._transform_sql_to_kpi(columns, rows)
+                return self._cap_widget_render(
+                    self._transform_sql_to_kpi(columns, rows),
+                    source_truncated,
+                    apply_render_cap,
+                )
 
-            return {"type": "table", "columns": columns, "rows": rows}
+            return self._cap_widget_render(
+                {"type": "table", "columns": columns, "rows": rows},
+                source_truncated,
+                apply_render_cap,
+            )
 
         except Exception:
             logger.warning("Erreur exécution SQL widget", exc_info=True)
             return {"error": "Erreur lors de l'exécution de la requête SQL."}
+
+    def _hydrate_workbook(
+        self,
+        workbook: dict,
+        sql_sheets: list[dict],
+        main_fresh: dict,
+        extra_results: list[dict],
+    ) -> dict:
+        """Fusionne les résultats SQL FRAIS dans le classeur sauvegardé.
+
+        - Feuilles SQL (``sql_sheets``, indexées dans le classeur) : données
+          remplacées par l'exécution fraîche. Une feuille en ERREUR est vidée
+          + porte ``error`` (jamais de snapshot périmé présenté comme frais).
+        - Si les colonnes fraîches diffèrent des colonnes sauvegardées (le SQL
+          a changé de forme), l'état d'affichage indexé par colonne (ordre,
+          masquage, tri, filtres, merges, cellDetails) est RESET — appliquer
+          des index décalés produirait des données fausses silencieuses.
+        - Feuilles snapshot (manuelles, drill-down, imports) : intactes.
+
+        Mute ``workbook`` en place (objet local à la requête ; le cache widget
+        fait sa propre copie profonde au ``set``).
+        """
+        tabs = workbook.get("tabs") or []
+        fresh_by_index: dict[int, dict] = {}
+        if sql_sheets:
+            fresh_by_index[sql_sheets[0]["index"]] = main_fresh
+        for offset, res in enumerate(extra_results or []):
+            if 1 + offset < len(sql_sheets):
+                fresh_by_index[sql_sheets[1 + offset]["index"]] = res
+        for idx, fresh in fresh_by_index.items():
+            if not (0 <= idx < len(tabs)) or not isinstance(tabs[idx], dict):
+                continue
+            tab = tabs[idx]
+            fresh_cols = list(fresh.get("columns") or [])
+            error = fresh.get("error")
+            if error:
+                tab["rows"] = []
+                tab["columns"] = fresh_cols or list(tab.get("columns") or [])
+                tab["totalRowCount"] = 0
+                tab["truncated"] = False
+                tab["error"] = error
+                tab["isArrayFormat"] = True
+                continue
+            stored_cols = list(tab.get("columns") or [])
+            if stored_cols != fresh_cols:
+                for key in (
+                    "columnOrder",
+                    "hiddenCols",
+                    "filters",
+                    "merges",
+                    "columnMetadata",
+                    "cellDetails",
+                ):
+                    tab.pop(key, None)
+                tab["sortColIndex"] = -1
+                tab["sortDirection"] = None
+            tab["columns"] = fresh_cols
+            tab["rows"] = fresh.get("rows") or []
+            tab["totalRowCount"] = fresh.get("row_count", len(tab["rows"]))
+            tab["truncated"] = bool(fresh.get("truncated", False))
+            tab["sql"] = fresh.get("sql") or tab.get("sql") or ""
+            # Les rows fraîches du backend sont TOUJOURS des tableaux de
+            # tableaux. Le flag sauvegardé peut être ``false`` (feuille SQL
+            # enregistrée alors qu'elle retournait 0 ligne) — loadWorkbook
+            # l'appliquerait aux rows fraîches et la grille lirait chaque
+            # cellule par NOM de colonne sur un tableau → « null » partout
+            # avec un compteur de lignes correct (revue adv. 2026-06-10,
+            # données fausses silencieuses).
+            tab["isArrayFormat"] = True
+            tab.pop("error", None)
+        return workbook
+
+    async def _execute_grid_extra_tabs(
+        self, executor: Any, extra_tabs: list, user: Any
+    ) -> list[dict]:
+        """Exécute les onglets SQL additionnels d'un widget grid.
+
+        Contrat (cf. ``_fetch_sql_data`` branche grid) :
+
+        - **Mêmes gardes sécurité que la requête principale** : SELECT/WITH +
+          ``check_sql_dangerous`` (SSoT validateur Iris) + exécution avec RLS
+          par utilisateur (``rls_source="dashboard_widget"``, ``require_user``).
+          Chaque onglet est validé INDIVIDUELLEMENT (defense-in-depth : une
+          config clonée/legacy/éditée en concurrence peut contenir un onglet
+          invalide même si le save a validé).
+        - **Requêtes indépendantes** : pas d'enveloppe par les filtres/période
+          du dashboard (décision produit — ce sont des requêtes ad-hoc).
+        - **Cap admin sur les lignes** (``max_rows=None`` → ``connector.max_rows``),
+          parité avec le tab principal.
+        - **Exécution séquentielle** : un widget peut avoir N onglets et N
+          viewers peuvent rafraîchir en parallèle → on ne sature pas le pool
+          de connexions Sage en lançant tout en parallèle.
+        - **Succès partiel, jamais de donnée fausse silencieuse** : un onglet
+          en échec porte un champ ``error`` explicite (et des colonnes/lignes
+          vides) — distinct d'un résultat réellement vide — sans casser les
+          autres onglets ni le widget.
+        """
+        from app.models.dashboard import DashboardWidget
+        from app.services.ai.sql_validator import check_sql_dangerous
+        from app.services.data_access.enforcer import DataAccessDeniedError
+
+        out: list[dict] = []
+        # Cap dur même si la validation au save a laissé passer (clone/import/
+        # édition concurrente). Borne le coût (N requêtes × viewers × refresh).
+        capped = extra_tabs[: DashboardWidget.MAX_GRID_EXTRA_TABS]
+        for tab in capped:
+            if not isinstance(tab, dict):
+                continue
+            label = tab.get("label") or "Requête"
+            tab_query = tab.get("query")
+            if not isinstance(tab_query, str) or not tab_query.strip():
+                out.append(
+                    {
+                        "label": label,
+                        "sql": "",
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "error": "Requête SQL vide.",
+                    }
+                )
+                continue
+            # CWE-158 : NUL → troncature silencieuse driver ODBC (la requête
+            # exécutée diffère de l'affichée). Defense-in-depth runtime (une
+            # config clonée/legacy/curl pourrait en contenir malgré validate()).
+            if "\x00" in tab_query:
+                out.append(
+                    {
+                        "label": label,
+                        "sql": tab_query,
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "error": "Caractère NUL interdit dans la requête.",
+                    }
+                )
+                continue
+            stripped = tab_query.strip().upper()
+            if not (
+                stripped.startswith("SELECT") or stripped.startswith("WITH")
+            ) or check_sql_dangerous(tab_query):
+                out.append(
+                    {
+                        "label": label,
+                        "sql": tab_query,
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "error": "Seules les requêtes SELECT sont autorisées.",
+                    }
+                )
+                continue
+            try:
+                qr = await executor.execute(
+                    tab_query,
+                    params=None,
+                    max_rows=None,  # cap admin (parité grid principal)
+                    user=user,
+                    rls_source="dashboard_widget",
+                    require_user=True,
+                )
+            except DataAccessDeniedError as exc:
+                out.append(
+                    {
+                        "label": label,
+                        "sql": tab_query,
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "error": exc.user_message,
+                        "blocked_by": "data_access_rule",
+                    }
+                )
+                continue
+            except Exception:
+                logger.warning("Erreur exécution onglet SQL widget", exc_info=True)
+                out.append(
+                    {
+                        "label": label,
+                        "sql": tab_query,
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "error": "Erreur lors de l'exécution de la requête SQL.",
+                    }
+                )
+                continue
+            cols = qr.columns or []
+            # qr.rows (dédup-proof) plutôt que to_dicts() — cf. même fix sur le
+            # tab principal (to_dicts dédup les colonnes → perte silencieuse de
+            # la 2e colonne homonyme). Fix revue adversariale 2026-06-09.
+            tab_rows = [list(r) for r in (qr.rows or [])]
+            out.append(
+                {
+                    "label": label,
+                    "columns": cols,
+                    "rows": tab_rows,
+                    "sql": tab_query,
+                    "row_count": getattr(qr, "row_count", len(tab_rows)),
+                    "truncated": bool(getattr(qr, "truncated", False)),
+                    "execution_time_ms": getattr(qr, "execution_time_ms", 0),
+                }
+            )
+        return out
 
     # ── Export ─────────────────────────────────────────────────────────────
 
@@ -1499,14 +2622,66 @@ class DashboardBuilderService:
         # RLS data-access des widgets SQL (sinon ``user=None`` → bypass legacy
         # de l'executor → export de données Sage NON filtrées, fuite cross-
         # périmètre). Les widgets metric restent scopés via ``user_id``.
+        # ``force_refresh=True`` : un EXPORT doit toujours refléter les données
+        # FRAÎCHES (le fichier n'a aucun indicateur de péremption, contrairement
+        # à la vue live). Servir du cache dans un export = donnée fausse
+        # silencieuse (règle consequences #5).
         all_data = await self.get_all_widget_data(
-            session, dashboard_id, user_id, period_override=period_override, user=user
+            session,
+            dashboard_id,
+            user_id,
+            period_override=period_override,
+            user=user,
+            force_refresh=True,
+            # #18c (revue adv. 2026-06-10) — pas de cap de RENDU sur un
+            # export : la slice 500 (Plotly/DOM) livrait un fichier partiel
+            # en silence. Le cap admin (fetch) reste la seule borne.
+            apply_render_cap=False,
         )
 
         if fmt == "excel":
             return self._export_excel(dash_name, all_data, dashboard_id)
         else:
             return self._export_csv(dash_name, all_data, dashboard_id)
+
+    @staticmethod
+    def _safe_excel_sheet_name(wb: Any, base: str) -> str:
+        """Nom de feuille Excel valide ET unique.
+
+        Excel impose : longueur <= 31, sans les caractères ``[]:*?/\\``, et
+        unicité dans le classeur. ``base`` provient d'un libellé utilisateur
+        (titre d'onglet SQL) → on assainit + tronque + déduplique pour ne PAS
+        faire crasher openpyxl (qui lève sur un nom invalide ou dupliqué).
+        """
+        invalid = set("[]:*?/\\")
+        cleaned = "".join("_" if c in invalid else c for c in (base or "Feuille"))
+        cleaned = cleaned.strip() or "Feuille"
+        cleaned = cleaned[:31]
+        if cleaned not in wb.sheetnames:
+            return cleaned
+        i = 2
+        while True:
+            suffix = f"_{i}"
+            candidate = cleaned[: 31 - len(suffix)] + suffix
+            if candidate not in wb.sheetnames:
+                return candidate
+            i += 1
+
+    @staticmethod
+    def _excel_autowidth(ws: Any) -> None:
+        """Ajuste la largeur des colonnes (cap 50) — même logique que la
+        boucle d'auto-width de ``_export_excel``, factorisée pour les feuilles
+        d'onglets SQL additionnels (créées hors de la boucle principale)."""
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                except (TypeError, AttributeError):
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
 
     def _export_csv(
         self, dash_name: str, all_data: dict, dashboard_id: int
@@ -1565,6 +2740,26 @@ class DashboardBuilderService:
                 for row in rows:
                     writer.writerow([csv_safe_cell(cell) for cell in row])
                 writer.writerow([])  # separator
+                # Onglets SQL additionnels (feature menu [+] « Requête SQL ») :
+                # anti silent data loss — chaque onglet exporté en section
+                # distincte (même politique que le widget principal et que le
+                # bloc ``if error:`` ci-dessus). csv_safe_cell sur toutes les
+                # cellules (OWASP CSV-injection vers le destinataire d'email).
+                for tab in data.get("tabs") or []:
+                    if not isinstance(tab, dict):
+                        continue
+                    tab_label = tab.get("label") or "Onglet"
+                    writer.writerow([f"{widget_title} — {tab_label}"])
+                    if tab.get("error"):
+                        writer.writerow(["Erreur:", csv_safe_cell(tab.get("error"))])
+                    else:
+                        tab_columns = tab.get("columns", [])
+                        tab_rows = tab.get("rows", [])
+                        if tab_columns:
+                            writer.writerow([csv_safe_cell(c) for c in tab_columns])
+                        for row in tab_rows:
+                            writer.writerow([csv_safe_cell(cell) for cell in row])
+                    writer.writerow([])  # separator
             elif data_type == "chart":
                 labels = data.get("labels", [])
                 datasets = data.get("datasets", [])
@@ -1668,6 +2863,32 @@ class DashboardBuilderService:
                         cell.fill = header_fill
                 for row in rows:
                     ws.append([excel_safe_cell(cell) for cell in row])
+                # Onglets SQL additionnels (feature menu [+] « Requête SQL ») :
+                # une feuille par onglet (anti silent data loss). Nom assaini +
+                # dédupliqué ; auto-width inline (la boucle externe ne traite
+                # que la feuille principale ``ws``).
+                for tab in data.get("tabs") or []:
+                    if not isinstance(tab, dict):
+                        continue
+                    tab_label = tab.get("label") or "Onglet"
+                    ws_tab = wb.create_sheet(
+                        title=self._safe_excel_sheet_name(wb, f"{widget_id_str}-{tab_label}")
+                    )
+                    sheet_idx += 1
+                    if tab.get("error"):
+                        ws_tab.append([f"Widget {widget_id_str} — {tab_label}"])
+                        ws_tab.append(["Erreur:", excel_safe_cell(tab.get("error"))])
+                    else:
+                        tab_columns = tab.get("columns", [])
+                        tab_rows = tab.get("rows", [])
+                        if tab_columns:
+                            ws_tab.append([excel_safe_cell(c) for c in tab_columns])
+                            for cell in ws_tab[1]:
+                                cell.font = header_font
+                                cell.fill = header_fill
+                        for row in tab_rows:
+                            ws_tab.append([excel_safe_cell(cell) for cell in row])
+                    self._excel_autowidth(ws_tab)
             elif data_type == "chart":
                 labels = data.get("labels", [])
                 datasets = data.get("datasets", [])

@@ -49,7 +49,6 @@ import secrets
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import tornado.web
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -61,6 +60,7 @@ from app.models.base import ensure_utc
 from app.models.execution import Execution
 from app.models.wait_token import WaitToken
 from app.services.branding import get_company_name
+from app.utils.client_ip import client_ip_for_rate_limit
 from app.utils.logger import get_logger
 from app.utils.rate_limiter import RateLimiter
 from app.utils.wait_token_codec import parse_and_verify
@@ -151,16 +151,8 @@ def _sanitize_filename(name: str, max_len: int = 100) -> str:
     return safe
 
 
-def _client_ip(handler: tornado.web.RequestHandler) -> str:
-    """IP du client (en respectant un eventuel reverse proxy via X-Real-IP)."""
-    return (
-        handler.request.headers.get("X-Real-IP")
-        or handler.request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or handler.request.remote_ip
-        or "unknown"
-    )[
-        :45
-    ]  # cap IPv6
+# SSoT IP rate-limit : cf. app/utils/client_ip.py.
+_client_ip = client_ip_for_rate_limit
 
 
 async def _load_token_row(token_hash: str) -> Optional[WaitToken]:
@@ -485,6 +477,20 @@ class WaitResponseHandler(BaseHandler):
                     # CAS failed : 2e POST concurrent OU expiré entre temps
                     # OU annulé. Re-fetch pour message précis.
                     await session.rollback()
+                    # #28 fix 2026-06-11 — le fichier réponse a été écrit sur
+                    # disque AVANT le CAS (L433). Sur échec CAS (token déjà
+                    # résolu/expiré/annulé par un POST concurrent), il n'est
+                    # référencé par AUCUN token → ORPHELIN (fuite disque non
+                    # bornée, non rattrapée par la rétention qui suit les
+                    # références). Cleanup best-effort (ne bloque pas la réponse).
+                    if saved_file_path:
+                        try:
+                            os.remove(saved_file_path)
+                        except OSError:
+                            logger.warning(
+                                "wait_submit: cleanup fichier orphelin echoue (%s)",
+                                saved_file_path,
+                            )
                     refreshed = await _load_token_row(token_hash)
                     if refreshed and refreshed.status == "resolved":
                         self._render_simple(

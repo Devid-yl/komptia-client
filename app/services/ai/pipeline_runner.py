@@ -352,8 +352,20 @@ class PipelineRunner:
     ):
         self._run_id = run.id
         self._user_id = run.user_id
+        # Conversation Iris d'origine — propagée à ``run_pipeline`` pour attribuer
+        # les appels LLM de la pipeline (le chemin le plus coûteux) à la bonne
+        # conversation dans ``AIPerformanceLog.conversation_id`` (sinon NULL →
+        # sous-évaluation silencieuse de la puce coût /iris). Colonne simple déjà
+        # chargée (ORM-async-safe, même pattern que ``_user_id``).
+        self._conversation_id = run.conversation_id
         self._request_id = run.request_id  # corrélation AIPerformanceLog
         self._output_dir = Path(run.output_dir)
+        # Phase d'arrêt demandée (feature preview Iris — None = run complet).
+        # Capturé ici (run détaché après commit/refresh, colonne simple déjà
+        # chargée — même pattern ORM-async-safe que ``_user_id``). Lu par
+        # ``_build_pipeline_kwargs`` pour passer ``stop_after_phase`` à la
+        # pipeline.
+        self._stop_after_phase = run.stop_after_phase
         self._cancel_event = asyncio.Event()
         self._task: Optional[asyncio.Task[Any]] = None
         # Timer de grace (auto-cancel quand plus aucun subscriber WS).
@@ -709,13 +721,29 @@ class PipelineRunner:
 
             # État final
             final_sql = getattr(state, "final_sql", None) or ""
-            row_count_warning = await self._post_check_row_count(final_sql)
-            # F9 (2026-05-21) — Validation post-exec du grain. Best-effort :
-            # si la pipeline a produit un SQL ET un expected_grain ET use_sage,
-            # on exécute COUNT(*) sur Sage et on compare. Non bloquant — si la
-            # validation échoue (timeout, connector indisponible), on continue
-            # avec grain_validation=None. Coût : 1 round-trip Sage par run.
-            grain_validation = await self._post_check_grain(state, run_data["use_sage"])
+            # Feature preview Iris — un arrêt PROPRE à une phase intermédiaire
+            # est signalé EXPLICITEMENT par la pipeline via
+            # ``state.terminal_reason == "stopped_clean"`` (JAMAIS inféré de
+            # l'absence de final_sql : un crash/cancel a aussi final_sql vide —
+            # CRIT-B, docs/design/iris_stop_at_phase.md). Dans ce cas : pas de
+            # SQL → on saute les post-checks (row_count/grain n'ont aucun sens
+            # sans SQL) et on marque STOPPED_EARLY au lieu de SUCCESS.
+            terminal_reason = getattr(state, "terminal_reason", None)
+            stopped_early = terminal_reason == "stopped_clean"
+            # La pipeline peut RETOURNER (sans lever) un state failed — ex:
+            # phase non convertie (NotImplementedError gérée puis return). On
+            # le traite comme un échec, JAMAIS comme un succès (CRIT-B).
+            returned_failed = terminal_reason == "failed"
+            row_count_warning = False
+            grain_validation = None
+            # Post-checks (row_count/grain) seulement pour un vrai run complet
+            # avec SQL — ni pour un arrêt intermédiaire ni pour un échec.
+            if not stopped_early and not returned_failed:
+                row_count_warning = await self._post_check_row_count(final_sql)
+                # F9 — Validation post-exec du grain. Best-effort : si la
+                # pipeline a produit un SQL ET un expected_grain ET use_sage,
+                # on exécute COUNT(*) sur Sage et on compare. Non bloquant.
+                grain_validation = await self._post_check_grain(state, run_data["use_sage"])
             # Task #73 — récap final : exposer les Q/A de qa_session pour que
             # l'UI Iris affiche (a) les hypothèses retenues automatiquement par
             # Iris (Q sans réponse user ou auto-submited vides), et (b) les
@@ -751,23 +779,78 @@ class PipelineRunner:
                     "auto_assumptions/user_answers.",
                     _qa_exc,
                 )
-            await _update_run_status(
-                self._run_id,
-                lambda r: r.mark_success(final_sql, row_count_warning=row_count_warning),
-            )
-            await get_event_bus().publish(
-                self._run_id,
-                {
-                    "type": "pipeline_complete",
-                    "final_sql": final_sql,
-                    "row_count_warning": row_count_warning,
-                    "auto_assumptions": auto_assumptions,
-                    "user_answers": user_answers,
-                    # F9 — grain_validation peut être None (skip si conditions
-                    # pas réunies) ou un dict avec status/actual/expected/ratio.
-                    "grain_validation": grain_validation,
-                },
-            )
+            # Statut + event terminal. Arrêt intermédiaire propre →
+            # STOPPED_EARLY (pas de SQL) ; sinon SUCCESS. L'event est publié
+            # APRÈS le commit du statut (``_update_run_status`` commit en
+            # premier) pour qu'un client qui (re)connecte lise un statut
+            # cohérent en BDD — T7, anti « zombie SUCCESS sans event reçu ».
+            if stopped_early:
+                _applied = await _update_run_status(
+                    self._run_id, lambda r: r.mark_stopped_early()
+                )
+                # B8 — ne publie l'event terminal QUE si le mark a réellement pris.
+                # Si un cancel concurrent a déjà committé CANCELLED, mark_stopped_early
+                # est un no-op (garde B2) → on n'émet pas un « complete » qui
+                # contredirait la BDD (le handler cancel publie son propre event).
+                if _applied:
+                    await get_event_bus().publish(
+                        self._run_id,
+                        {
+                            "type": "pipeline_complete",
+                            # Pas de SQL : HYPOTHÈSE intermédiaire à valider, jamais
+                            # une réponse finale (carte front T16 / is_hypothesis).
+                            "final_sql": None,
+                            "terminal_reason": "stopped_clean",
+                            "stopped_after_phase": self._stop_after_phase,
+                            "is_hypothesis": True,
+                            "auto_assumptions": auto_assumptions,
+                            "user_answers": user_answers,
+                        },
+                    )
+            elif returned_failed:
+                # CRIT-B (review adversariale finale) : la pipeline a retourné
+                # un state ``terminal_reason="failed"`` SANS lever (ex: phase non
+                # convertie). On le marque FAILED — surtout PAS success — et on
+                # publie l'event d'échec SSoT (symétrique au chemin exception
+                # ci-dessus). Sinon un run crashé serait présenté comme complété.
+                _failed_msg = (
+                    "La pipeline s'est arrêtée sur une erreur interne "
+                    "(phase non finalisée). Relance une nouvelle requête."
+                )
+                _applied = await _update_run_status(
+                    self._run_id, lambda r, _m=_failed_msg: r.mark_failed(_m, None)
+                )
+                if _applied:  # B8 — pas d'event si déjà terminal (race cancel)
+                    await get_event_bus().publish(
+                        self._run_id,
+                        _build_pipeline_failed_event(
+                            message=_failed_msg,
+                            error_kind="pipeline_internal",
+                            exception_class="PipelineReturnedFailed",
+                            traceback_text=None,
+                            unresolved_concept=None,
+                        ),
+                    )
+            else:
+                _applied = await _update_run_status(
+                    self._run_id,
+                    lambda r: r.mark_success(final_sql, row_count_warning=row_count_warning),
+                )
+                if _applied:  # B8 — pas d'event « complete » si déjà terminal (race cancel)
+                    await get_event_bus().publish(
+                        self._run_id,
+                        {
+                            "type": "pipeline_complete",
+                            "final_sql": final_sql,
+                            "terminal_reason": "completed",
+                            "row_count_warning": row_count_warning,
+                            "auto_assumptions": auto_assumptions,
+                            # F9 — grain_validation peut être None (skip si
+                            # conditions pas réunies) ou un dict status/actual/...
+                            "grain_validation": grain_validation,
+                            "user_answers": user_answers,
+                        },
+                    )
         finally:
             if scope_cm is not None:
                 try:
@@ -791,6 +874,9 @@ class PipelineRunner:
             await asyncio.sleep(60)
             await get_event_bus().close_channel(self._run_id)
             await _REGISTRY.unregister(self._run_id)
+            # B7 — évince les locks de phase de ce run terminé (anti croissance
+            # non bornée des dicts en RAM, axe 21).
+            await _evict_phase_locks_for_run(self._run_id)
         except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001
@@ -828,6 +914,11 @@ class PipelineRunner:
             # ``_pipeline_user_id`` dans scripts/pipeline.py). Sans ça, un nom
             # de client tapé par l'utilisateur partait en clair chez le LLM.
             "user_id": self._user_id,
+            # Attribution du coût LLM pipeline à la conversation Iris (puce coût
+            # /iris). ``str`` car ``AIPerformanceLog.conversation_id`` = String(64).
+            "conversation_id": (
+                str(self._conversation_id) if self._conversation_id is not None else None
+            ),
         }
         # Task #93 PR3 (2026-05-21) — ADD-only : propager le contexte
         # complémentaire à ``run_pipeline``. Le param est optionnel côté
@@ -836,6 +927,12 @@ class PipelineRunner:
         # éviter d'écraser un futur usage de la clé.
         if self._additional_context:
             kwargs["additional_context"] = self._additional_context
+        # Feature preview Iris — n'ajoute le param que s'il est positionné
+        # (param optionnel côté run_pipeline, défaut None = run complet). Le
+        # helper ``_build_phases_to_run`` côté pipeline valide la phase
+        # (fail-closed sur valeur inconnue).
+        if self._stop_after_phase:
+            kwargs["stop_after_phase"] = self._stop_after_phase
         return kwargs
 
     def _make_progress_callback(
@@ -1240,19 +1337,24 @@ async def _load_run_data(run_id: int) -> Optional[Dict[str, Any]]:
         }
 
 
-async def _update_run_status(run_id: int, mutator: Callable[[PipelineRun], Any]) -> None:
-    """Charge un run, applique un mutateur, commit. Catch + log si absent."""
+async def _update_run_status(run_id: int, mutator: Callable[[PipelineRun], Any]) -> Any:
+    """Charge un run, applique un mutateur, commit. Catch + log si absent.
+
+    Retourne le résultat du mutateur (B8) : les ``mark_*`` terminaux renvoient
+    un ``bool`` (True = transition appliquée, False = run déjà terminal). Le
+    caller peut ainsi ne publier l'event terminal QUE si la transition a pris
+    (cohérence event ↔ BDD, anti event « complete » sur un run déjà annulé).
+    Retourne ``None`` si le run est introuvable.
+    """
 
     async with get_session_factory()() as session:
         run = await session.get(PipelineRun, run_id)
         if run is None:
             logger.warning("_update_run_status: run_id=%s introuvable", run_id)
-            return
+            return None
         result = mutator(run)
-        # Mutator peut retourner un tuple d'effets (cf. mark_running +
-        # setattr du schema_version) — ignoré, on commit.
-        _ = result
         await session.commit()
+        return result
 
 
 async def _next_attempt_number(session: AsyncSession, run_id: int, phase_id: str) -> int:
@@ -1318,6 +1420,23 @@ async def _get_phase_attempt_lock(run_id: int, phase_id: str) -> asyncio.Lock:
             lock = asyncio.Lock()
             _PHASE_ATTEMPT_LOCKS[key] = lock
     return lock
+
+
+async def _evict_phase_locks_for_run(run_id: int) -> None:
+    """B7 (bug hunt, axe 21) — évince les ``_PHASE_ATTEMPT_LOCKS`` d'un run
+    TERMINÉ pour éviter une croissance non bornée (~9 entrées/run ; le mode
+    preview multiplie les runs).
+
+    SÛR : la clé est ``(run_id, phase_id)`` ; après la fin d'un run, ses phases
+    ne sont jamais ré-attaquées — un resume crée un NOUVEAU run_id (clés
+    distinctes). On NE touche PAS ``_RESUME_SOURCE_LOCKS`` (une source terminée
+    reste resumable → son lock est réutilisé ; l'évincer rouvrirait la fenêtre
+    double-resume que B6 ferme) ni ``_USER_START_LOCKS`` (borné par le nombre
+    d'utilisateurs, pas par les runs).
+    """
+    async with _PHASE_ATTEMPT_LOCKS_GUARD:
+        for _k in [k for k in _PHASE_ATTEMPT_LOCKS if k and k[0] == run_id]:
+            _PHASE_ATTEMPT_LOCKS.pop(_k, None)
 
 
 async def _get_active_phase_exec(
@@ -1396,6 +1515,7 @@ async def start_pipeline_run(
     triggered_via: TriggeredVia = TriggeredVia.IRIS_CHAT,
     request_id: Optional[str] = None,
     additional_context: Optional[str] = None,
+    stop_after_phase: Optional[str] = None,
 ) -> PipelineRun:
     """Crée un ``PipelineRun`` BDD, alloue son output_dir, lance le runner.
 
@@ -1445,6 +1565,7 @@ async def start_pipeline_run(
             triggered_via=triggered_via,
             request_id=request_id,
             additional_context=additional_context,
+            stop_after_phase=stop_after_phase,
         )
 
 
@@ -1461,6 +1582,8 @@ async def _create_and_start_run(
     initial_state_dict: Optional[Dict[str, Any]] = None,
     resume_mode: bool = False,
     additional_context: Optional[str] = None,
+    stop_after_phase: Optional[str] = None,
+    resumed_from_run_id: Optional[int] = None,
 ) -> PipelineRun:
     """Helper interne — extrait du body de ``start_pipeline_run`` pour
     rester appelable sous lock sans relancer le quota check.
@@ -1497,6 +1620,13 @@ async def _create_and_start_run(
             output_dir="",  # placeholder, mis à jour ci-dessous
             request_id=request_id or uuid.uuid4().hex[:16],
             triggered_via=triggered_via,
+            # Feature preview Iris — None pour un run complet (dont les
+            # resume, qui repartent jusqu'au SQL). Persisté dès la création
+            # pour que le runner (capture __init__) le passe à run_pipeline.
+            stop_after_phase=stop_after_phase,
+            # B6 — si ce run est une continuation (resume), trace sa source pour
+            # l'idempotence anti double-resume.
+            resumed_from_run_id=resumed_from_run_id,
         )
         session.add(run)
         await session.flush()  # obtient run.id sans commit
@@ -1647,6 +1777,24 @@ def _truncate_state_at_phase(state: Dict[str, Any], from_phase: str) -> Dict[str
     return out
 
 
+#: Statuts source DEPUIS lesquels un resume est autorisé (T15, fail-closed).
+#: Whitelist plutôt que blacklist : tout statut non listé est refusé par
+#: défaut (un futur statut ajouté à l'enum ne devient pas resumable par
+#: accident). PENDING/RUNNING sont gérés AVANT par un check dédié (message
+#: « annule d'abord »). FAILED/CANCELLED sont EXCLUS : leur ``run.json`` est
+#: tronqué/incohérent (crash ou annulation mid-phase) → reprendre dessus
+#: construirait du SQL sur des phases incomplètes (CRIT-B). Resumables :
+#: SUCCESS (re-jouer depuis une phase), PAUSED (checkpoint durable),
+#: STOPPED_EARLY (continuer un run « preview » arrêté volontairement).
+_RESUMABLE_SOURCE_STATUSES: frozenset[PipelineRunStatus] = frozenset(
+    {
+        PipelineRunStatus.SUCCESS,
+        PipelineRunStatus.PAUSED,
+        PipelineRunStatus.STOPPED_EARLY,
+    }
+)
+
+
 async def resume_pipeline_run(
     *,
     user_id: int,
@@ -1678,6 +1826,9 @@ async def resume_pipeline_run(
       storage / anti-injection LLM).
     - **Source non actif** : ``status`` ∉ ``{PENDING, RUNNING}`` ET pas
       de ``PipelineRunner`` actif en RAM — anti race.
+    - **Source terminée proprement** (T15, fail-closed) : ``status`` ∈
+      :data:`_RESUMABLE_SOURCE_STATUSES` (SUCCESS / PAUSED / STOPPED_EARLY).
+      FAILED/CANCELLED refusés — leur snapshot est tronqué (CRIT-B).
     - **Phases amont complètes** : pour ``from_phase=N``, toutes les
       phases ``< N`` doivent avoir leur champ state non-None dans le
       snapshot — sinon resume incohérent (Phase N consommerait du None).
@@ -1763,6 +1914,47 @@ async def resume_pipeline_run(
                     f"Run #{source_run_id} est encore actif "
                     f"(status={status_str}). Annule-le d'abord avant de "
                     f"le reprendre."
+                )
+
+            # Fail-closed (T15, CRIT-B) : seul un run terminé PROPREMENT est
+            # resumable (whitelist :data:`_RESUMABLE_SOURCE_STATUSES`). Un run
+            # FAILED/CANCELLED a un run.json tronqué/incohérent (crash ou
+            # annulation mid-phase) — reprendre dessus construirait du SQL sur
+            # des phases incomplètes. On refuse plutôt que de produire un
+            # résultat silencieusement faux.
+            if source_run.status not in _RESUMABLE_SOURCE_STATUSES:
+                _st = (
+                    source_run.status.value
+                    if hasattr(source_run.status, "value")
+                    else str(source_run.status)
+                )
+                raise ResumeValidationError(
+                    f"Run #{source_run_id} (status={_st}) ne peut pas être "
+                    f"repris : il s'est terminé en échec ou a été annulé, son "
+                    f"état est incomplet. Relance une nouvelle requête plutôt "
+                    f"que de reprendre celui-ci."
+                )
+
+            # B6 (bug hunt) — idempotence anti double-resume : refuser si la
+            # source a DÉJÀ un run de continuation ENCORE ACTIF (non-terminal).
+            # Cas : bouton « Continuer » rejoué au refresh / multi-onglet (B4
+            # mitige côté front, mais l'API ou un double tool-call LLM peuvent
+            # aussi déclencher 2 resume). On est sous le source_lock déjà tenu :
+            # ce check + la création de l'enfant (plus bas, même lock) sont
+            # sérialisés pour la même source → pas de course. Un enfant TERMINAL
+            # ne bloque PAS (re-resume = intention neuve, légitime).
+            _existing_child = await session.execute(
+                select(PipelineRun.id)
+                .where(
+                    PipelineRun.resumed_from_run_id == source_run_id,
+                    PipelineRun.status.not_in(tuple(PipelineRunStatus.terminal())),
+                )
+                .limit(1)
+            )
+            if _existing_child.scalar_one_or_none() is not None:
+                raise ResumeValidationError(
+                    f"Une reprise du run #{source_run_id} est déjà en cours. "
+                    f"Attends qu'elle se termine avant d'en relancer une."
                 )
 
             # Snapshot des params source pour réutilisation hors-session.
@@ -1883,6 +2075,10 @@ async def resume_pipeline_run(
             request_id=request_id,
             initial_state_dict=truncated_state,
             resume_mode=True,
+            # B6 — trace la source : le nouveau run est une continuation de
+            # source_run_id. Sert au check d'idempotence (refuse un 2e resume
+            # tant que cet enfant est non-terminal).
+            resumed_from_run_id=source_run_id,
         )
 
 
@@ -2061,4 +2257,38 @@ async def cancel_run(run_id: int, by_user_id: int) -> bool:
             return False
         run.mark_cancelled(by_user_id=by_user_id)
         await session.commit()
+    return True
+
+
+#: Fenêtre de grâce (s) avant d'annuler un run dont le bridge chat s'est fermé
+#: SANS cancel explicite (fermeture/refresh d'onglet, coupure WS). Laisse une
+#: courte fenêtre au cas où l'utilisateur reviendrait. Env-configurable
+#: (doctrine anti-hardcode).
+PIPELINE_CHAT_GRACE_SECONDS = float(os.environ.get("PIPELINE_CHAT_GRACE_SECONDS", "30"))
+
+
+async def stop_run_from_chat(run_id: int, by_user_id: int, *, immediate: bool) -> bool:
+    """Stoppe un run lancé depuis le chat Iris quand son bridge se ferme AVANT
+    la fin (Stop explicite, fermeture/refresh d'onglet, coupure WS).
+
+    ``immediate=True`` (Stop explicite) → ``cancel`` direct. Sinon →
+    ``schedule_grace_cancel`` (fenêtre ``PIPELINE_CHAT_GRACE_SECONDS`` ; la
+    grace se ré-annule si un subscriber revient — cf. ``has_subscribers``).
+    Ownership-checked. No-op (``False``) si le runner n'est plus en RAM (déjà
+    terminé / autre process). Idempotent côté runner (cancel/grace le sont).
+
+    Sans ça, un run orphelin continue à brûler des crédits LLM + requêter Sage
+    après que l'utilisateur a quitté ou annulé (audit UX PIPE-1).
+    """
+    if not isinstance(by_user_id, int) or by_user_id <= 0:
+        return False
+    runner = await _REGISTRY.get(run_id)
+    if runner is None:
+        return False
+    if getattr(runner, "_user_id", None) != by_user_id:
+        return False
+    if immediate:
+        await runner.cancel(by_user_id=by_user_id)
+    else:
+        await runner.schedule_grace_cancel(grace_seconds=PIPELINE_CHAT_GRACE_SECONDS)
     return True

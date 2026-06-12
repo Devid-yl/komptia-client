@@ -38,6 +38,7 @@ Références :
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from enum import Enum
 from typing import Any, Final, TypedDict
@@ -682,7 +683,11 @@ DEFAULT_AI_CONFIG: Final[dict[AIConfigKey, AIConfigDefault]] = {
         "value_type": AIConfigValueType.BOOL.value,
     },
     AIConfigKey.LOCAL_LLM_BASE_URL: {
-        "value": "http://localhost:11434/v1",
+        # Valeur de seed initiale : dérivée de l'environnement ``OLLAMA_BASE_URL``
+        # (le docker-compose pose ``http://ollama:11434/v1`` = DNS du sidecar),
+        # sinon localhost pour le bare-metal/dev. L'admin peut surcharger via
+        # /admin/ai-config (la valeur BDD reste prioritaire au runtime).
+        "value": (os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434/v1").strip(),
         "description": "URL OpenAI-compatible du LLM local",
         "category": AIConfigCategory.PROVIDER.value,
         "value_type": AIConfigValueType.STRING.value,

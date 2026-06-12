@@ -233,23 +233,20 @@ def run_daily_triggers_sync() -> dict[str, int]:
     """
     import asyncio
 
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from app.core.database import get_database_url
+    from app.core.database import dedicated_session_scope
 
     async def _runner() -> dict[str, int]:
-        engine = create_async_engine(get_database_url())
-        try:
-            factory = async_sessionmaker(engine, expire_on_commit=False)
+        # Engine async DÉDIÉ à cette boucle asyncio.run (cf. dedicated_session_scope,
+        # SSoT) : le pool de l'engine global est lié à la boucle Tornado et n'est pas
+        # réutilisable ici. Les hooks (PRAGMA key SQLCipher + PRAGMAs) sont câblés par
+        # make_async_engine via le scope → lecture d'une base chiffrée OK.
+        async with dedicated_session_scope() as factory:
             async with factory() as session:
                 return await run_daily_triggers(session)
-        finally:
-            await engine.dispose()
 
     try:
         # APScheduler tourne dans un thread séparé sans event loop.
-        # ``asyncio.run`` crée un loop dédié pour le runner — propre car
-        # le job n'est exécuté qu'1 fois par jour, pas de réutilisation.
+        # ``asyncio.run`` crée un loop dédié pour le runner.
         return asyncio.run(_runner())
     except Exception:  # noqa: BLE001
         logger.exception("run_daily_triggers_sync a échoué")

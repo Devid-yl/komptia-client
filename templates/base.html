@@ -152,6 +152,13 @@
        inline scripts des templates enfantes (cf. mémoire
        feedback_js_load_order_base_html.md). Module idempotent. #}
     <script src="/static/js/format-helpers.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# read-json : single source of truth pour la lecture SÛRE d'une réponse
+       fetch JSON (window.komptiaReadJson). Tue la classe "SyntaxError:
+       Unexpected token <" quand nginx renvoie du HTML (413 oversize, 429
+       rate-limit, 502/504 passerelle) au lieu du JSON attendu. Chargé EN HEAD
+       juste après format-helpers et AVANT session-status pour être dispo dans
+       les inline scripts des templates ET tous les modules. Module idempotent. #}
+    <script src="/static/js/read-json.js" nonce="{{ handler.csp_nonce }}"></script>
     {# session-status : composant global "401/403 -> banner Session expirée +
        redirect /login". Chargé EN HEAD (avant le bloc inline <body> et avant
        feedback-reporter.js + network-status.js du bas du <body>) pour que
@@ -465,6 +472,10 @@
                             <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
                             <span class="sidebar-label">Configuration IA</span>
                         </a>
+                        <a href="/admin/ai-models" title="Mod&egrave;les IA" class="{% if path.startswith('/admin/ai-models') %}sidebar-link-active{% else %}sidebar-link{% end %}">
+                            <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/></svg>
+                            <span class="sidebar-label">Mod&egrave;les IA</span>
+                        </a>
                         <a href="/admin/ai-performance" title="Performance Iris" class="{% if path.startswith('/admin/ai-performance') %}sidebar-link-active{% else %}sidebar-link{% end %}">
                             <svg class="w-4 h-4 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 3v18h18M7 14l4-4 4 4 5-5"/></svg>
                             <span class="sidebar-label">Performance Iris</span>
@@ -598,7 +609,7 @@
          Utilisé pour validation DAG, activation refusée, et autres réponses
          serveur qui retournent un tableau ``data.errors[]``. Évite de réduire
          N erreurs à un toast tronqué illisible (axe 5b/c — taxonomie 4-cas). -->
-    <div class="fixed inset-0 bg-black/50 z-[10010] flex items-center justify-center hidden p-4" id="appShowErrorsModal" role="dialog" aria-modal="true" aria-labelledby="appShowErrorsTitle">
+    <div class="fixed inset-0 bg-black/50 z-[10010] flex items-center justify-center hidden p-4" id="appShowErrorsModal" data-overlay-manual="true" role="dialog" aria-modal="true" aria-labelledby="appShowErrorsTitle">
         <div class="bg-white dark:bg-gray-900 rounded-md w-full max-w-2xl max-h-[80vh] flex flex-col p-6 shadow-xl">
             <h2 class="text-base font-semibold text-gray-900 dark:text-gray-100 mb-3" id="appShowErrorsTitle">Erreurs</h2>
             <div id="appShowErrorsList" class="overflow-y-auto flex-1 mb-4 space-y-2 pr-1"></div>
@@ -959,6 +970,12 @@
        Self-init au DOMContentLoaded ; ne s'active que si une clé sessionStorage
        URL-scopée existe. Coût zéro sur les pages qui n'utilisent pas le helper. #}
     <script src="/static/js/reload-scroll-preserve.js" nonce="{{ handler.csp_nonce }}"></script>
+    {# Pagination unifiée : DOIT être chargé AVANT ``{% block scripts %}`` car les
+       pages enfants à liste AJAX (contacts.js, reports/list.html, email_history.html,
+       privacy-page.js) appellent ``window.KomptiaPagination.render(...)`` dans ce
+       block. Pendant serveur = UIModule ``Pagination`` (même fenêtrage). Self-contained,
+       coût zéro sur les pages qui ne l'utilisent pas. #}
+    <script src="/static/js/pagination.js" nonce="{{ handler.csp_nonce }}"></script>
 
     {% block scripts %}{% end %}
     {% if current_user and not handler.request.path.startswith('/iris') %}
@@ -978,12 +995,14 @@
        initialiser (idempotent via ``window.__komptiaFeedbackInitialized``). #}
     <link rel="stylesheet" href="/static/css/feedback-reporter.css">
     <script src="/static/js/feedback-reporter.js" nonce="{{ handler.csp_nonce }}"></script>
-    {# network-status : composant global offline + retry auto. Charge EN
-       DERNIER (apres feedback-reporter + apres le block scripts) pour etre
-       l'OUTERMOST wrap de window.fetch. Cela garantit que le retry interne
-       re-passe par tous les wraps en dessous (feedback-reporter logging
-       + session-status detection 401/403 chargee EN HEAD). Sans cet ordre,
-       un retry recevant un 401 serait silencieux (pas de redirect login).
+    {# network-status : composant global offline + retry auto. Charge APRES
+       tous les WRAPPEURS de window.fetch (feedback-reporter + session-status
+       chargee EN HEAD + le block scripts) pour etre l'OUTERMOST wrap : le
+       retry interne re-passe ainsi par tous les wraps en dessous (logging,
+       detection 401/403). Sans cet ordre, un retry recevant un 401 serait
+       silencieux (pas de redirect login). Des scripts UI SANS wrap fetch
+       (banners, tooltips, checklists) peuvent etre charges apres — invariant
+       pince par tests/js/test_network_status_wiring.mjs (#8, 2026-06-10).
        Couvre le cas (d) de la taxonomie 4-cas erreurs Komptia. #}
     <script src="/static/js/network-status.js" nonce="{{ handler.csp_nonce }}"></script>
     {# Banner "IA non configurée" : JS minimal pour le bouton dismiss

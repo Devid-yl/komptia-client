@@ -14,6 +14,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
+# #47 — borne de SÉCURITÉ PAR FILTRE pour les clauses IN. L'ancien cap silencieux
+# à 50 AMPUTAIT la sélection user (un widget filtré sur 80 dossiers n'en gardait
+# que 50 → agrégats FAUX présentés comme exhaustifs). On lie désormais TOUTES les
+# valeurs (déjà bornées à ~100 par le dropdown, max_rows=100), et on lève une
+# erreur LOUD au-delà de cette borne plutôt que de tronquer en silence.
+# #47 review (Moyen) — 200 (≫ 100 réaliste) et PAS 1000 : la limite SQL Server
+# est ~2100 params CUMULÉS sur tous les filtres ; à 200/filtre, même ~10 filtres
+# multi-select restent sous le plafond (échec sinon LOUD au caller, pas de donnée
+# fausse silencieuse — c'est le pire qu'on prévient).
+_MAX_FILTER_IN_VALUES = 200
+
 # Validation SELECT-only des sources de filtre SQL : déléguée au validateur
 # SSoT ``app.services.ai.sql_validator.check_sql_dangerous`` (importé localement
 # dans create_filter / _resolve_options). Même garde que les widgets dashboard
@@ -429,11 +440,16 @@ def build_sql_filter_clause(
             params.append(value)
 
         elif ftype == "dropdown_multi" and isinstance(value, list) and value:
-            # Cap at 50 values to prevent huge IN clauses
-            capped = value[:50]
-            placeholders = ", ".join(["?"] * len(capped))
+            # #47 — lier TOUTES les valeurs sélectionnées (plus de cap silencieux
+            # à 50 qui faussait les agrégats). Fail-loud au-delà de la borne large.
+            if len(value) > _MAX_FILTER_IN_VALUES:
+                raise ValueError(
+                    f"Filtre « {col} » : trop de valeurs sélectionnées "
+                    f"({len(value)} > {_MAX_FILTER_IN_VALUES}). Affinez la sélection."
+                )
+            placeholders = ", ".join(["?"] * len(value))
             clauses.append(f"[{col}] IN ({placeholders})")
-            params.extend(capped)
+            params.extend(value)
 
         elif ftype == "date_range" and isinstance(value, dict):
             if value.get("from"):
@@ -491,10 +507,15 @@ def build_drill_down_clause(
             continue
 
         if isinstance(value, list):
-            capped = value[:50]
-            placeholders = ", ".join(["?"] * len(capped))
+            # #47 — idem build_sql_filter_clause : toutes les valeurs, fail-loud.
+            if len(value) > _MAX_FILTER_IN_VALUES:
+                raise ValueError(
+                    f"Drill-down « {col} » : trop de valeurs "
+                    f"({len(value)} > {_MAX_FILTER_IN_VALUES})."
+                )
+            placeholders = ", ".join(["?"] * len(value))
             clauses.append(f"[{col}] IN ({placeholders})")
-            params.extend(capped)
+            params.extend(value)
         else:
             clauses.append(f"[{col}] = ?")
             params.append(value)

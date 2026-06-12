@@ -438,23 +438,51 @@ def get_tracked_tables() -> List[str]:
 
 
 # ── Job APScheduler ───────────────────────────────────────────────────
-# Doit être MODULE-LEVEL (pas une closure imbriquée) pour qu'APScheduler
-# puisse stocker une référence textuelle ``app.services.db_usage:db_usage_recompute_job``
-# et reconstruire le job au redémarrage / hot-reload. Une fonction nichée
-# dans ``start_scheduler`` produit l'erreur :
-#     "This Job cannot be serialized since the reference to its callable
-#      could not be determined."
+# Deux contraintes CUMULATIVES pour un job APScheduler ici :
+# 1. MODULE-LEVEL (pas une closure imbriquée) pour qu'APScheduler puisse
+#    stocker une référence textuelle ``app.services.db_usage:...`` et
+#    reconstruire le job au redémarrage / hot-reload. Une fonction nichée
+#    dans ``start_scheduler`` produit l'erreur :
+#        "This Job cannot be serialized since the reference to its callable
+#         could not be determined."
+# 2. SYNC : le ``BackgroundScheduler`` (threads) appelle ``job.func()``
+#    sans await — une ``async def`` passée directement crée une coroutine
+#    jamais awaitée et le job ne tourne JAMAIS, silencieusement (bug
+#    constaté en prod le 2026-06-11 sur le cleanup iris_sql_write).
 
 
 async def db_usage_recompute_job() -> None:
-    """Wrapper async pour APScheduler — fournit la ``session_factory``.
+    """Recompute async — fournit la ``session_factory``.
 
-    Appelé quotidiennement à 02:00 par ``app.services.automation.scheduler``.
     Itère tous les users, recalcule ``UserStorage.db_bytes_used`` pour
     chacun. Best-effort : exceptions individuelles loggées, n'interrompt
-    pas le batch.
+    pas le batch. NE PAS planifier directement sur APScheduler (async) —
+    utiliser :func:`db_usage_recompute_job_sync`.
     """
     from app.core.database import get_session_factory
 
     session_factory = get_session_factory()
     await update_all_users_db_usage(session_factory)
+
+
+def db_usage_recompute_job_sync() -> None:
+    """Wrapper sync APScheduler pour :func:`db_usage_recompute_job`.
+
+    Bridge ``asyncio.run`` + engine dédié (``dedicated_session_scope``
+    override aussi ``get_session_factory`` via contextvar — l'engine global
+    est lié à la boucle Tornado, le réutiliser depuis la boucle du thread
+    APScheduler lèverait "got Future attached to a different loop").
+    Pattern ``wait_resume.cleanup_wait_tokens_job``.
+    """
+    import asyncio as _asyncio
+
+    from app.core.database import dedicated_session_scope
+
+    async def _job() -> None:
+        async with dedicated_session_scope():
+            await db_usage_recompute_job()
+
+    try:
+        _asyncio.run(_job())
+    except Exception:  # noqa: BLE001 — best-effort, ne pas tuer le job APScheduler
+        logger.exception("db_usage_recompute_job_sync: asyncio.run crash")

@@ -69,6 +69,20 @@ def compute_wait_expires_at(
     # Override explicite (admin) → respect avec clamp
     if requested_hours and requested_hours > 0:
         hours = max(_MIN_WAIT_HOURS, min(requested_hours, _MAX_WAIT_HOURS))
+        # #18f (verdict #43, 2026-06-10) — un wait configuré à 45/90 jours
+        # était ramené à 30j EN SILENCE : le destinataire externe voyait
+        # « lien expiré » avant la date voulue, sans que l'admin sache
+        # pourquoi. Le clamp reste (sécurité HMAC), mais il se DIT.
+        if hours != requested_hours:
+            logger.warning(
+                "Wait d'automatisation clampé : %dh demandées → %dh "
+                "(bornes %dh..%dh) — le lien de réponse expirera plus tôt "
+                "que configuré.",
+                requested_hours,
+                hours,
+                _MIN_WAIT_HOURS,
+                _MAX_WAIT_HOURS,
+            )
         return now + timedelta(hours=hours)
 
     # Auto : derivation depuis le schedule
@@ -79,6 +93,15 @@ def compute_wait_expires_at(
             # Clamp aussi au cap dur (un cron annuel ne ferait pas un
             # wait de 1 an — c'est un over-engineering inutile).
             cap = now + timedelta(hours=_MAX_WAIT_HOURS)
+            if candidate > cap:
+                # Revue adv. lot 3 — symétrie avec le chemin override : un
+                # cron espacé (> 30j) voit son wait clampé, autant le dire.
+                logger.info(
+                    "Wait dérivé du cron clampé au cap %dh (prochain run %s "
+                    "au-delà de la fenêtre de sécurité des liens).",
+                    _MAX_WAIT_HOURS,
+                    candidate.isoformat(),
+                )
             return min(candidate, cap)
 
     # Fallback : 30 jours
@@ -177,8 +200,41 @@ def deserialize_wait_checkpoint(
         raise ValueError("Checkpoint invalide (pas un dict)")
     raw_outputs = checkpoint.get("step_outputs") or {}
     raw_files = checkpoint.get("step_output_files") or {}
+
+    # #23 fix 2026-06-11 — VALIDATION de structure des workbooks re-hydratés.
+    # Avant : les workbooks du checkpoint étaient restaurés VERBATIM. Un workbook
+    # malformé (non-dict, ``tabs`` non-liste, tab non-dict) — par corruption du
+    # stockage BDD ou drift de schéma serialize/deserialize entre versions —
+    # passait au DAG resume, où un step aval (``for t in wb["tabs"]`` /
+    # ``t.get("rows")``...) CRASHAIT ou produisait des données fausses
+    # SILENCIEUSEMENT. On valide ici (SSoT de la reconstruction) : un workbook
+    # malformé fait ``raise`` → le caller (resume) ``mark_failed("Checkpoint
+    # corrompu")`` plutôt que de reprendre sur du garbage (fail-closed). Lenient :
+    # ``None`` (sink sans output) et un ``tabs`` absent restent légitimes — on ne
+    # rejette QUE les formes qui casseraient les consommateurs aval.
+    validated_outputs: Dict[int, Any] = {}
+    for _k, _v in raw_outputs.items():
+        _sid = int(_k)
+        if _v is None:
+            validated_outputs[_sid] = None
+            continue
+        if not isinstance(_v, dict):
+            raise ValueError(
+                f"Checkpoint corrompu : workbook du step {_sid} n'est pas un objet "
+                f"(type {type(_v).__name__})"
+            )
+        _tabs = _v.get("tabs")
+        if _tabs is not None and (
+            not isinstance(_tabs, list) or not all(isinstance(_t, dict) for _t in _tabs)
+        ):
+            raise ValueError(
+                f"Checkpoint corrompu : 'tabs' du step {_sid} malforme "
+                "(doit etre une liste d'objets onglet)"
+            )
+        validated_outputs[_sid] = _v
+
     return {
-        "step_outputs": {int(k): v for k, v in raw_outputs.items()},
+        "step_outputs": validated_outputs,
         "step_output_files": {int(k): Path(v) for k, v in raw_files.items()},
         "executed_step_ids": [int(s) for s in checkpoint.get("executed_step_ids") or []],
         "wait_token_id": int(checkpoint.get("wait_token_id", 0)),
@@ -260,11 +316,13 @@ async def send_wait_request_email(
     else:  # both
         kind_desc = "Une reponse texte ET/OU un fichier (CSV/Excel) sont attendus."
 
-    # Body HTML simple (le body user est inseré tel quel mais escape).
+    # Body HTML simple — SSoT texte-brut -> HTML partagee avec le step
+    # email standard (escape + \n -> <br/>). _html sert aux autres champs
+    # interpoles du template (subject, kind_desc, company_name, ...).
     import html as _html
+    from app.services.automation.email_delivery_service import plain_text_to_email_html
 
-    body_safe = _html.escape(body) if body else ""
-    body_html = body_safe.replace("\n", "<br/>") if body_safe else ""
+    body_html = plain_text_to_email_html(body) if body else ""
 
     html_content = f"""<!DOCTYPE html>
 <html lang="fr">
@@ -748,6 +806,7 @@ def cleanup_wait_tokens_job() -> None:
     """
     import asyncio as _asyncio
 
+    from app.core.database import dedicated_session_scope
     from app.services.email.smtp_client import run_then_drain_email_log
 
     async def _run() -> None:
@@ -770,8 +829,13 @@ def cleanup_wait_tokens_job() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("cleanup_wait_tokens: purge crash")
 
+    async def _job() -> None:
+        # Engine dédié à cette boucle asyncio.run (cross-loop : pas l'engine global poolé).
+        async with dedicated_session_scope():
+            await run_then_drain_email_log(_run())
+
     try:
-        _asyncio.run(run_then_drain_email_log(_run()))
+        _asyncio.run(_job())
     except Exception:  # noqa: BLE001
         logger.exception("cleanup_wait_tokens_job: asyncio.run crash")
 

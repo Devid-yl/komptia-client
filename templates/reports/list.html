@@ -89,10 +89,10 @@
 <div class="flex items-center justify-between mb-6">
     <div>
         <h1 class="text-lg font-semibold text-gray-900 dark:text-gray-100">{{ page_title }}</h1>
-        <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Consultez et gerez les rapports generes</p>
+        <p class="text-sm text-gray-500 mt-0.5 dark:text-gray-400">Consultez et gérez les rapports générés</p>
     </div>
     <div class="flex items-center gap-2">
-        <button id="btn-open-generate" class="btn btn-primary">Generer un rapport IA</button>
+        <button id="btn-open-generate" class="btn btn-primary">Générer un rapport IA</button>
         <button id="btn-open-upload" class="btn btn-secondary">Importer un rapport</button>
     </div>
 </div>
@@ -314,7 +314,7 @@
         </div>
         <div class="p-4">
             <div id="share-content">
-                <p class="text-sm text-gray-600 mb-3 dark:text-gray-400">Generez un lien de partage temporaire. Le lien expire automatiquement.</p>
+                <p class="text-sm text-gray-600 mb-3 dark:text-gray-400">Générez un lien de partage temporaire. Le lien expire automatiquement.</p>
                 <div class="mb-4">
                     <label class="label">Duree de validite</label>
                     <select id="share-expiry" class="input w-full">
@@ -324,7 +324,7 @@
                         <option value="720">30 jours</option>
                     </select>
                 </div>
-                <button id="btn-generate-link" class="btn btn-primary w-full" data-action="generateShareLink">Generer le lien</button>
+                <button id="btn-generate-link" class="btn btn-primary w-full" data-action="generateShareLink">Générer le lien</button>
             </div>
             <div id="share-result" class="hidden">
                 <p class="text-sm text-gray-600 mb-2 dark:text-gray-400">Lien de partage :</p>
@@ -638,20 +638,14 @@ async function loadReports(page) {
 
 // ── Pagination ──
 function renderPagination(page, totalPages, total) {
-    var html = '';
-    if (totalPages > 1) {
-        html += '<button class="btn btn-secondary text-xs py-1 px-2" data-action="goToPage" data-page="' + (page - 1) + '" ' + (page === 1 ? 'disabled' : '') + '>Prec.</button>';
-        for (var i = 1; i <= totalPages; i++) {
-            if (i === 1 || i === totalPages || Math.abs(i - page) <= 2) {
-                html += '<button class="btn ' + (i === page ? 'btn-primary' : 'btn-secondary') + ' text-xs py-1 px-2" data-action="goToPage" data-page="' + i + '">' + i + '</button>';
-            } else if (Math.abs(i - page) === 3) {
-                html += '<span class="text-gray-400 text-xs px-1 dark:text-gray-500">...</span>';
-            }
-        }
-        html += '<button class="btn btn-secondary text-xs py-1 px-2" data-action="goToPage" data-page="' + (page + 1) + '" ' + (page === totalPages ? 'disabled' : '') + '>Suiv.</button>';
-        html += '<span class="text-xs text-gray-500 ml-2 dark:text-gray-400">' + total + ' rapports</span>';
-    }
-    document.getElementById('pagination').innerHTML = html;
+    // Pagination unifiée (static/js/pagination.js — même fenêtrage que l'UIModule serveur).
+    if (!window.KomptiaPagination) { return; }
+    window.KomptiaPagination.render(document.getElementById('pagination'), {
+        page: page,
+        totalPages: totalPages,
+        onNavigate: function (p) { loadReports(p); },
+        countText: total + (total > 1 ? ' rapports' : ' rapport'),
+    });
 }
 
 // ── Sort ──
@@ -837,7 +831,7 @@ async function generateShareLink() {
         var data = await res.json();
         if (res.ok) {
             showShareResult(data.share_url, 0);
-            showToast('Lien de partage genere', 'success');
+            showToast('Lien de partage généré', 'success');
             loadReports();
         } else {
             showToast(data.error || 'Erreur', 'error');
@@ -1859,7 +1853,6 @@ document.addEventListener('click', function(e) {
         e.stopPropagation();  // évite de déclencher toggleClasseur du parent
         toggleAllTabs(target.dataset.filename, target.checked);
     }
-    else if (action === 'goToPage') loadReports(parseInt(target.dataset.page));
     else if (action === 'sort') sortBy(target.dataset.sort);
     else if (action === 'toggleReportMenu') { e.stopPropagation(); toggleReportMenu(target); }
     else if (action === 'download') downloadReport(parseInt(target.dataset.id), target.dataset.filename);
@@ -1913,4 +1906,43 @@ document.querySelectorAll('th[data-action="sort"]').forEach(function(th) {
 loadReports();
 </script>
 </div>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding reports_list_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'reports_list_v1',
+                title: 'Bienvenue dans vos Rapports',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Tous vos rapports au même endroit',
+                        text: 'Cette page rassemble les rapports que vous avez générés, importés ou produits par une automatisation. Le bandeau du haut vous donne d\'un coup d\'œil le nombre de rapports, la taille totale, les rapports partagés et archivés. Utilisez la barre de recherche et les filtres (type PDF/CSV/Excel, actifs ou archivés) pour retrouver le bon document en quelques secondes.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Générer un rapport avec l\'IA',
+                        text: 'Le bouton « Générer un rapport IA » vous laisse choisir les feuilles de vos classeurs à analyser : l\'IA rédige le rapport, choisit la structure et les graphiques. Les données sélectionnées sont envoyées au modèle IA actif pour produire l\'analyse — la jauge de budget vous indique le volume et bascule en « Mode étendu » si la sélection est volumineuse. Vous pouvez aussi importer un PDF, CSV ou Excel existant avec « Importer un rapport ».'
+                    },
+                    {
+                        icon: 'rocket',
+                        title: 'Partager et diffuser',
+                        text: 'Sur chaque ligne, le menu « ⋮ » permet de télécharger un rapport, le prévisualiser (PDF), le partager via un lien temporaire qui expire tout seul, ou l\'envoyer par email à vos contacts et listes de distribution. Besoin d\'agir sur plusieurs rapports d\'un coup ? Cochez-les : une barre d\'actions groupées apparaît pour les archiver, les envoyer ou les supprimer ensemble.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Ranger et garder le contrôle',
+                        text: 'Archivez les rapports terminés pour garder la liste propre sans rien perdre — vous pourrez les restaurer à tout moment. Un badge « Expire » ou « X j restants » vous prévient avant qu\'un rapport ne soit nettoyé automatiquement selon la durée de conservation. Et un lien de partage peut être révoqué à tout instant depuis la fenêtre de partage si vous changez d\'avis.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
 {% end %}

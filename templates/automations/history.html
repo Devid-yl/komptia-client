@@ -99,7 +99,7 @@
                 </div>
 
                 <time class="text-xs text-gray-400 flex-shrink-0 dark:text-gray-500"
-                      datetime="{{ execution.started_at.isoformat() }}+00:00"
+                      datetime="{{ iso_utc(execution.started_at) }}"
                       data-fmt-local="short"
                       title="{{ execution.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC">
                     {{ execution.started_at.strftime('%d/%m %H:%M') }} UTC
@@ -109,21 +109,8 @@
         {% end %}
     </div>
 
-    <!-- Pagination -->
-    {% if total_pages > 1 %}
-    <div class="flex items-center justify-center gap-1 mt-6">
-        {% if page > 1 %}
-        <a href="/automations/history/{{ automation.id }}?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" class="btn btn-secondary">Precedent</a>
-        {% end %}
-        {% for p in range(1, total_pages + 1) %}
-        <a href="/automations/history/{{ automation.id }}?page={{ p }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" 
-           class="px-3 py-1.5 text-sm rounded {% if p == page %}bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900{% else %}border border-gray-300 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-800{% end %} dark:border-gray-700">{{ p }}</a>
-        {% end %}
-        {% if page < total_pages %}
-        <a href="/automations/history/{{ automation.id }}?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}{% if days_filter %}&days={{ days_filter }}{% end %}" class="btn btn-secondary">Suivant</a>
-        {% end %}
-    </div>
-    {% end %}
+    {# Pagination unifiée (UIModule, cf. app/ui_modules.py) #}
+    {% module Pagination(page=page, total_pages=total_pages) %}
 
     {% else %}
     <div class="card px-4 py-12 text-center">
@@ -181,6 +168,13 @@ function renderWebhooks(webhooks) {
         if (!w.is_active) {
             html += '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">Inactif</span>';
         }
+        if (w.signature_required) {
+            // Tooltip natif (title) au survol — préférence David 2026-06-10
+            // (hover prolongé, pas d'icône « i » cliquable) + aria-label a11y.
+            html += '<span class="inline-block px-1.5 py-0.5 text-xs rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300" ' +
+                'title="Chaque appel doit etre signe HMAC-SHA256 avec le secret partage (en-tetes X-Komptia-Timestamp + X-Komptia-Signature). Appel non signe = refuse (401)." ' +
+                'aria-label="Signature HMAC exigee">Signe HMAC</span>';
+        }
         html += '</div>';
 
         // URL with copy button
@@ -231,6 +225,20 @@ function renderWebhooks(webhooks) {
     });
 }
 
+/* Affiche UNE SEULE FOIS le secret HMAC d'un webhook (show-once : le backend
+   ne le renvoie jamais dans la liste). Réutilise appPrompt (modal stylé) avec
+   le secret pré-rempli pour copie manuelle — pas de nouveau composant. */
+function showWebhookSecret(webhook) {
+    if (!webhook || !webhook.hmac_secret || typeof window.appPrompt !== 'function') return;
+    window.appPrompt(
+        'Secret HMAC du webhook — copiez-le MAINTENANT, il ne sera plus jamais affiche. ' +
+        'L\'emetteur doit envoyer les en-tetes X-Komptia-Timestamp (epoch en secondes) et ' +
+        'X-Komptia-Signature = sha256=HMAC_SHA256(secret, "{timestamp}.{corps brut}").',
+        'Secret de signature (affiche une seule fois)',
+        { defaultValue: webhook.hmac_secret }
+    );
+}
+
 function createWebhook() {
     // Cluster-O 2026-05-26 — appPrompt (modal Komptia stylé) remplace
     // window.prompt natif. Fallback console + abort si appPrompt indispo.
@@ -244,25 +252,39 @@ function createWebhook() {
     promptFn.then(function (desc) {
         if (desc === null) return null; // Annulation utilisateur
 
-        btnCreate.disabled = true;
-        btnCreate.textContent = 'Creation...';
+        // Opt-in signature HMAC (FAILLE 2) : un refus/échec du confirm = false
+        // (comportement token-seul historique, jamais bloquant).
+        return appConfirm(
+            'Exiger une signature HMAC-SHA256 ? Chaque appel devra etre signe ' +
+            'avec un secret partage (affiche une seule fois apres creation) — ' +
+            'une URL qui fuite ne suffira plus a declencher l\'automatisation.',
+            'Securiser le webhook'
+        ).then(function (wantSignature) {
+            btnCreate.disabled = true;
+            btnCreate.textContent = 'Creation...';
 
-        return fetch('/api/automations/' + AUTOMATION_ID + '/webhooks', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Xsrftoken': getCookie('_xsrf') || ''
-            },
-            body: JSON.stringify({ description: desc || '' })
-        })
-        .then(function(res) { return res.json(); })
-        .then(function(data) {
-            if (data.success) {
-                showToast('Webhook cree', 'success');
-                loadWebhooks();
-            } else {
-                showToast(data.error || 'Erreur lors de la creation', 'error');
-            }
+            return fetch('/api/automations/' + AUTOMATION_ID + '/webhooks', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Xsrftoken': getCookie('_xsrf') || ''
+                },
+                body: JSON.stringify({
+                    description: desc || '',
+                    require_signature: !!wantSignature
+                })
+            })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (data.success) {
+                    showToast('Webhook cree', 'success');
+                    // Show-once : le secret n'est présent QUE dans cette réponse.
+                    showWebhookSecret(data.webhook);
+                    loadWebhooks();
+                } else {
+                    showToast(data.error || 'Erreur lors de la creation', 'error');
+                }
+            });
         });
     })
     .catch(function() {
@@ -278,8 +300,15 @@ function createWebhook() {
 }
 
 function regenerateWebhook(webhookId) {
+    // Message adapté si le webhook est signé : la rotation régénère AUSSI le
+    // secret HMAC (toutes les anciennes créances sont invalidées d'un coup).
+    var isSigned = webhooksData.some(function (w) {
+        return w.id === webhookId && w.signature_required;
+    });
     appConfirm(
-        "Regenerer le token ? L'ancienne URL ne fonctionnera plus.",
+        isSigned
+            ? "Regenerer le token ET le secret HMAC ? L'ancienne URL et l'ancien secret ne fonctionneront plus."
+            : "Regenerer le token ? L'ancienne URL ne fonctionnera plus.",
         'Regenerer le webhook'
     ).then(function(ok) {
         if (!ok) return;
@@ -291,6 +320,8 @@ function regenerateWebhook(webhookId) {
         .then(function(data) {
             if (data.success) {
                 showToast('Token regenere', 'success');
+                // Show-once : nouveau secret HMAC présent UNIQUEMENT ici.
+                showWebhookSecret(data.webhook);
                 loadWebhooks();
             } else {
                 showToast(data.error || 'Erreur', 'error');
@@ -482,5 +513,44 @@ document.querySelectorAll('.step-toggle').forEach(function(btn) {
         });
     });
 });
+</script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding automations_history_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'automations_history_v1',
+                title: 'Historique d\'une automatisation',
+                steps: [
+                    {
+                        icon: 'chart',
+                        title: 'Suivre chaque exécution',
+                        text: 'Cette page liste toutes les exécutions de cette automatisation, de la plus récente à la plus ancienne. Pour chacune : son statut (Succès, Partiel, Échec, En cours…), sa durée, le nombre de lignes produites et l\'heure de lancement. Les menus « Tous statuts » et « Toute période » en haut vous aident à retrouver rapidement une exécution précise.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Comprendre un échec',
+                        text: 'Quand une exécution s\'est mal passée, le bouton « Voir les étapes » déplie le détail maillon par maillon : quelle étape a réussi, laquelle a échoué, combien de lignes sont entrées et sorties à chaque fois. Le lien « Détail » et le message d\'erreur affiché vous montrent exactement où corriger, sans avoir à relancer à l\'aveugle.'
+                    },
+                    {
+                        icon: 'rocket',
+                        title: 'Récupérer le résultat produit',
+                        text: 'Si une exécution a généré un fichier (rapport PDF, export Excel ou CSV), le lien « Télécharger » apparaît à côté d\'elle : vous récupérez le résultat exact de ce lancement, même ancien. Pratique pour retrouver le rapport d\'un mois précédent sans tout relancer.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Déclencher depuis un autre outil',
+                        text: 'La section « Webhooks » en haut vous donne une URL secrète à appeler en HTTP POST : un autre logiciel peut ainsi lancer cette automatisation tout seul. « Créer un webhook » génère l\'URL, « Copier » la met dans le presse-papier. En cas de doute sur sa confidentialité, « Régénérer » remplace l\'URL (l\'ancienne cesse aussitôt de fonctionner) et « Supprimer » la révoque définitivement.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
 </script>
 {% end %}

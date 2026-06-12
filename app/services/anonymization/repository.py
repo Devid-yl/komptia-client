@@ -16,12 +16,13 @@ La BDD n'encode pas le champ ``version`` — il est ajouté à la lecture.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from sqlalchemy import and_, case, delete, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +33,13 @@ from app.services.anonymization.user_id_guard import is_valid_user_id
 from app.services.anonymization.locks import acquire_user_anon_lock
 
 logger = logging.getLogger(__name__)
+
+#: Au-delà de ce nombre de rows, la sérialisation détaillée
+#: (``get_detailed_state_for_user``) est offloadée sur le thread pool pour ne
+#: pas bloquer la boucle Tornado. ~2000 rows ≈ quelques ms de ``to_dict`` ;
+#: au-delà le blocage event-loop devient perceptible (un user à 91 760 termes
+#: gelait 3 s tout le serveur). Seuil empirique, pas un cap fonctionnel.
+_DETAILED_SERIALIZE_OFFLOAD_THRESHOLD: int = 2000
 
 
 def _warn_invalid_user_id(fn_name: str, user_id: Any) -> None:
@@ -126,20 +134,69 @@ _ORIGINS_MAX_LEN: int = 5000
 _ORIGIN_FIELD_MAX_LEN: int = 200
 
 
-def _canonical_key(term: str) -> str:
-    """Clé canonique pour comparer 2 termes en case-insensitive Unicode-aware.
+def _strip_diacritics(term: str) -> str:
+    """Retire les diacritiques (accents, cédilles, trémas…) d'une chaîne.
 
-    Normalise via NFKC (neutralise variantes Unicode NFC/NFD, ligatures) puis
-    casefold (case-insensitive Unicode-aware ≠ ``lower()`` ASCII-naïf).
+    Décompose en NFKD — ce qui sépare chaque caractère en base + marques
+    combinantes ET neutralise les variantes de compatibilité (ligatures
+    ``ﬁ``→``fi``, formes fullwidth…) — puis supprime les marques combinantes
+    (catégorie Unicode ``Mn``). ``"café"``→``"cafe"``, ``"Crédit"``→``"Credit"``,
+    ``"Müller"``→``"Muller"``, ``"garçon"``→``"garcon"``.
+
+    Volontairement **générique** (fondé sur les propriétés Unicode, pas une
+    liste de caractères figée) — aucune hypothèse sur la langue ou la BDD
+    source (règle GÉNÉRICITÉ Komptia).
+    """
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", term) if not unicodedata.combining(ch)
+    )
+
+
+def _canonical_key(term: str) -> str:
+    """Clé canonique pour comparer 2 termes — insensible à la casse, aux
+    accents ET aux variantes d'encodage Unicode.
+
+    Pipeline : :func:`_strip_diacritics` (NFKD + drop combining marks → retire
+    les accents et neutralise ligatures/compat) PUIS ``casefold``
+    (case-insensitive Unicode-aware ≠ ``lower()`` ASCII-naïf).
+
+    **Insensibilité aux accents (2026-06-09)** : la BDD source peut renvoyer
+    une valeur sans accent (export ASCII, saisie sans accent) là où le terme
+    ``/data-privacy`` en porte un — ou l'inverse. ``"Crédit"`` configuré doit
+    masquer ``"CREDIT"`` renvoyé par Sage, sinon le vrai nom fuite en clair au
+    LLM. C'est la **même classe de fuite PII silencieuse** que la casse et
+    l'espacement, traitée de la même façon (« plus permissif = plus
+    protecteur »). Le matching regex de :mod:`pseudonymizer` étend en
+    conséquence chaque lettre accentuable en classe de caractères pour que la
+    *détection* du candidat soit elle aussi accent-insensible.
 
     Utilisée par ``upsert_terms`` (dédup intra/inter-batch) ET ``replace_state``
     (diff before/after pour les boucles audit) pour garantir que les deux
     fonctions partagent la même notion d'identité de terme — sinon le diff
     audit pense que ``"DUPONT"`` et ``"Dupont"`` sont des termes différents
     alors que la BDD les unifie via la même row (perte silencieuse du terme,
-    cf. ``tests/unit/test_replace_state_case_insensitive.py``).
+    cf. ``tests/unit/test_replace_state_case_insensitive.py`` et
+    ``tests/unit/test_replace_state_accent_insensitive.py``).
     """
-    return unicodedata.normalize("NFKC", term).casefold()
+    return _strip_diacritics(term).casefold()
+
+
+def _canonical_match_key(term: str) -> str:
+    """Clé de **MATCH** (≠ identité de dédup) : :func:`_canonical_key` PUIS
+    collapse des runs de whitespace internes/bords.
+
+    C'est la notion de matching du runtime
+    (``pseudonymizer._canonical_key_runtime`` délègue ici — SSoT) : case +
+    accent + whitespace insensible. Stockée dans la colonne ``term_canonical``
+    pour que les lectures SQL scopées (``get_state_for_user(scope_tokens=…)``,
+    ``strategies`` proper-noun lookup) matchent EXACTEMENT comme la
+    substitution runtime — sinon ``"Crédit  Agricole"`` (double espace en BDD)
+    ne serait pas retrouvé pour ``"Crédit Agricole"`` scanné. Volontairement
+    un SUR-ensemble de l'identité de dédup ``_canonical_key`` (« plus permissif
+    = plus protecteur »). Retourne ``""`` pour un terme sans contenu canonique
+    (uniquement des marques combinantes / whitespace) — le caller doit alors
+    l'écarter (un tel terme n'a aucune valeur de masquage)."""
+    return " ".join(_canonical_key(term).split())
 
 
 def _sanitize_pseudo_value(pseudo: Any) -> Optional[str]:
@@ -319,15 +376,50 @@ async def get_state_for_user(
         AnonymizationTerm.confirmed,
         AnonymizationTerm.category,
         AnonymizationTerm.pseudo_middle,
-    ).where(AnonymizationTerm.user_id == user_id)
+    ).where(
+        AnonymizationTerm.user_id == user_id,
+        # **Filtre état ACTIF (fix perf 2026-06-09)** : le state non-détaillé
+        # ne sert QU'À (1) masquer (le Pseudonymizer ne masque que les
+        # ``enabled``) et (2) marquer le panneau iris-grid (``enabled`` = actif,
+        # ``confirmed=False`` = pending). Un terme « désactivé » (``enabled=0``
+        # ET ``confirmed=1``) n'est NI masqué NI marqué → poids mort. Chez un
+        # user à 92K termes, ces désactivés = 92 % du dico et faisaient durer
+        # le GET ~7,6 s à CHAQUE chargement de page. On les exclut ici : zéro
+        # changement de comportement (ils n'étaient déjà ni masqués ni
+        # marqués), ~13× moins de lignes. La page /data/privacy (détaillée)
+        # garde la vue COMPLÈTE via ``get_detailed_state_for_user``.
+        or_(
+            AnonymizationTerm.enabled.is_(True),
+            AnonymizationTerm.confirmed.is_(False),
+        ),
+    )
     if scope_tokens is not None:
         # Matérialise en list pour bien borner la cardinalité. Une scope
         # vide explicite = on ne lit rien (le pseudonymizer sera vide,
         # ce qui est nominal pour un workbook sans token cleartext).
-        scope_list = [t for t in scope_tokens if isinstance(t, str) and t]
-        if not scope_list:
+        # Match CANONIQUE (case + accent + whitespace insensible) via la
+        # colonne ``term_canonical`` (clé de MATCH ``_canonical_match_key`` ;
+        # backfillée au boot + peuplée à chaque écrit par ``upsert_terms``).
+        # Remplace l'ancien ``term IN`` EXACT qui ratait les variantes
+        # casse/accent du classeur courant (``"Crédit"`` stocké vs ``"CREDIT"``
+        # scanné) → fuite PII en clair sur le path copilot scopé. Corrigé
+        # 2026-06-09 (la collation SQLite ``IN`` est binaire/ASCII : ni accent-
+        # ni case-insensitive). On filtre les clés vides (token dégénéré sans
+        # contenu canonique) pour ne pas matcher d'éventuelles rows ``""``. Le
+        # filtre Python aval ``build_user_pseudonymizer`` reste canonical-aware
+        # (defense-in-depth).
+        scope_canonical = list(
+            {
+                k
+                for t in scope_tokens
+                if isinstance(t, str) and t
+                for k in (_canonical_match_key(t),)
+                if k
+            }
+        )
+        if not scope_canonical:
             return {"version": anon_terms.STATE_VERSION, "terms": {}}
-        stmt = stmt.where(AnonymizationTerm.term.in_(scope_list))
+        stmt = stmt.where(AnonymizationTerm.term_canonical.in_(scope_canonical))
     rows = (await session.execute(stmt)).all()
     terms: Dict[str, Dict[str, Any]] = {}
     for row in rows:
@@ -399,11 +491,29 @@ async def get_detailed_state_for_user(
         .order_by(AnonymizationTerm.term.asc())
     )
     rows = (await session.scalars(stmt)).all()
-    detailed: list[Dict[str, Any]] = []
-    for row in rows:
-        d = row.to_dict()
-        d["auto_pseudo"] = anon_terms._auto_pseudo_middle(row.term, row.category)
-        detailed.append(d)
+
+    # Sérialisation CPU-bound : ``to_dict()`` + ``_auto_pseudo_middle`` sur
+    # 91 760 rows = ~3 s qui BLOQUENT la boucle Tornado → toutes les autres
+    # requêtes (et tous les autres users) gèlent pendant ce temps (incident
+    # prod 2026-06-09). Au-delà d'un seuil, on offload sur le thread pool.
+    # SÛR depuis un thread : les colonnes sont DÉJÀ chargées (``.all()`` dans la
+    # session juste au-dessus, lecture pure sans commit → rows non-expirées) et
+    # ``to_dict``/``_auto_pseudo_middle`` ne lisent que des colonnes SCALAIRES
+    # (aucune relation lazy, aucun I/O, aucun accès session) → pas de
+    # ``MissingGreenlet``. En dessous du seuil, le context-switch coûterait
+    # plus que le gain.
+    def _serialize() -> list[Dict[str, Any]]:
+        out: list[Dict[str, Any]] = []
+        for row in rows:
+            d = row.to_dict()
+            d["auto_pseudo"] = anon_terms._auto_pseudo_middle(row.term, row.category)
+            out.append(d)
+        return out
+
+    if len(rows) > _DETAILED_SERIALIZE_OFFLOAD_THRESHOLD:
+        detailed = await asyncio.to_thread(_serialize)
+    else:
+        detailed = _serialize()
     return {"version": anon_terms.STATE_VERSION, "terms": detailed}
 
 
@@ -544,22 +654,45 @@ async def _upsert_terms_locked_impl(
 
     # Charger les termes existants du user pour matching inter-batch.
     # Coût : un SELECT par appel. Pour 50K termes max c'est <100ms.
-    # task #20 : on lit aussi ``origins`` pour pouvoir merger les origines
-    # d'un re-scan avec les origines déjà en BDD (pas de perte d'historique).
+    # SANS la colonne ``origins`` (fix 2026-06-11, tâche #23) : la charger
+    # pour TOUS les termes du user (VARCHAR ≤5000 chacune) pesait jusqu'à
+    # ~centaines de Mo par scan sur une BDD réelle (90K+ termes) — alors
+    # que le merge n'a besoin des origins QUE pour les termes de CE batch.
     existing_result = await session.execute(
-        select(AnonymizationTerm.term, AnonymizationTerm.origins).where(
-            AnonymizationTerm.user_id == user_id
-        )
+        select(AnonymizationTerm.term).where(AnonymizationTerm.user_id == user_id)
     )
     existing_canonical_to_term: Dict[str, str] = {}
-    existing_origins_by_canonical: Dict[str, Set[Tuple[Optional[str], Optional[str]]]] = {}
-    for existing_term, existing_origins in existing_result:
+    for (existing_term,) in existing_result:
         if isinstance(existing_term, str) and existing_term:
-            key = _canonical_key(existing_term)
-            existing_canonical_to_term[key] = existing_term
+            existing_canonical_to_term[_canonical_key(existing_term)] = existing_term
+
+    # Fetch CIBLÉ des origins : uniquement les termes existants présents
+    # dans le batch entrant (le merge plus bas — ``bdd_origins | batch`` —
+    # ne lit jamais d'autres clés ; les rows hors batch ne sont pas
+    # réécrites donc leurs origins en BDD restent intactes). Chunké pour
+    # rester sous la limite de variables SQLite (999).
+    batch_canonicals: Set[str] = set()
+    for _t in terms:
+        if isinstance(_t, str) and _t and len(_t) <= anon_terms.MAX_VALUE_LEN:
+            batch_canonicals.add(_canonical_key(_t))
+    matched_existing_terms = [
+        existing_canonical_to_term[k] for k in batch_canonicals if k in existing_canonical_to_term
+    ]
+    existing_origins_by_canonical: Dict[str, Set[Tuple[Optional[str], Optional[str]]]] = {}
+    _ORIGINS_FETCH_CHUNK = 500
+    for _i in range(0, len(matched_existing_terms), _ORIGINS_FETCH_CHUNK):
+        _end = _i + _ORIGINS_FETCH_CHUNK
+        _chunk = matched_existing_terms[_i:_end]
+        _rows = await session.execute(
+            select(AnonymizationTerm.term, AnonymizationTerm.origins).where(
+                AnonymizationTerm.user_id == user_id,
+                AnonymizationTerm.term.in_(_chunk),
+            )
+        )
+        for existing_term, existing_origins in _rows:
             parsed = _parse_origins(existing_origins)
             if parsed:
-                existing_origins_by_canonical[key] = parsed
+                existing_origins_by_canonical[_canonical_key(existing_term)] = parsed
 
     seen: Dict[str, Dict[str, Any]] = {}
     values: List[Dict[str, Any]] = []
@@ -567,6 +700,13 @@ async def _upsert_terms_locked_impl(
         if not isinstance(term, str) or not term:
             continue
         if len(term) > anon_terms.MAX_VALUE_LEN:
+            continue
+        # Rejet des termes sans contenu canonique (uniquement marques
+        # combinantes / whitespace → match key vide). Un tel terme n'a aucune
+        # valeur de masquage ET produirait un ``term_canonical=""`` dégénéré
+        # qui sur-matcherait dans les lectures scopées. (cf. review migration
+        # 2026-06-09 finding #1.)
+        if not _canonical_match_key(term):
             continue
         if not isinstance(entry, dict):
             continue
@@ -696,25 +836,38 @@ async def _upsert_terms_locked_impl(
     for record in values:
         batch_origins: Set[Tuple[Optional[str], Optional[str]]] = record.pop("_origins_set", set())
         canonical_for_record = _canonical_key(record["term"])
+        # Peuple ``term_canonical`` avec la clé de MATCH (case+accent+whitespace
+        # insensible) — la MÊME notion que le runtime ``_canonical_key_runtime``
+        # et que les lectures scopées, SSoT via :func:`_canonical_match_key`.
+        # (≠ ``canonical_for_record`` qui sert l'identité de dédup des origines,
+        # sans collapse whitespace.)
+        record["term_canonical"] = _canonical_match_key(record["term"])
         bdd_origins = existing_origins_by_canonical.get(canonical_for_record, set())
         merged = bdd_origins | batch_origins
         record["origins"] = _serialize_origins(merged)
 
     # Dialect-specific UPSERT (SQLite) : on cible la contrainte unique
     # ``uq_anonymization_term_user_term`` pour trancher, et on met à jour
-    # les colonnes d'état. On NE touche PAS ``created_at`` (preserved),
-    # ``updated_at`` sera bougé par le TimestampMixin on refresh.
+    # les colonnes d'état. On NE touche PAS ``created_at`` (preserved).
+    # ``updated_at`` est bumpé EXPLICITEMENT dans le ``set_`` (fix
+    # 2026-06-10) : l'ancien commentaire (« bougé par TimestampMixin on
+    # refresh ») était FAUX pour un upsert Core — le ``onupdate`` ORM ne
+    # s'applique pas à ``on_conflict_do_update``, d'où les rows prod à
+    # ``updated_at=NULL`` jamais rafraîchies (cf. cleanup_job, pathologie
+    # 4647 orphelins 2026-05-17). Le bump alimente aussi le jeton de
+    # révision du verrou optimiste (``get_state_revision``).
     #
     # **Chunking obligatoire** : SQLite a une limite stricte sur le nombre
     # de variables dans une seule statement (``SQLITE_MAX_VARIABLE_NUMBER``,
-    # défaut 999 anciens builds, 32766 récents). Avec ~14 colonnes par row
-    # (user_id, term, pseudo, enabled, confirmed, category, source, source_ref,
-    # usage_count, auto_proposed, risk_level, replacement_strategy, origins),
-    # un batch >70 rows explose sur builds anciens.
-    # Cap conservateur 100 rows/chunk : 100×14 = 1400 vars, marge confortable
-    # même avec build 999. Bug 2026-05-19 : scan datastore d'un classeur
-    # avec ~500 tokens uniques produisait l'erreur ``too many SQL variables``.
-    CHUNK_SIZE = 100
+    # défaut 999 anciens builds, 32766 récents). Avec ~15 colonnes par row
+    # (user_id, term, term_canonical, pseudo, enabled, confirmed, category,
+    # source, source_ref, usage_count, auto_proposed, risk_level,
+    # replacement_strategy, origins), on cape à 60 rows/chunk → 60×15 = 900
+    # vars, SOUS le seuil 999 des builds anciens (l'ajout de term_canonical en
+    # 2026-06-09 a réduit le cap de 100→60 pour rester 999-safe ; cf. review
+    # migration finding #10). Bug 2026-05-19 : scan datastore d'un classeur avec
+    # ~500 tokens uniques produisait ``too many SQL variables`` sans ce chunking.
+    CHUNK_SIZE = 60
     total_affected = 0
     chunk_index = 0
     for i in range(0, len(values), CHUNK_SIZE):
@@ -727,6 +880,31 @@ async def _upsert_terms_locked_impl(
                 "enabled": stmt.excluded.enabled,
                 "confirmed": stmt.excluded.confirmed,
                 "origins": stmt.excluded.origins,
+                # Bump CONDITIONNEL (eXamine 2026-06-10) — uniquement si une
+                # colonne MÉTIER change réellement : un merge d'origins seul
+                # (re-scan sans changement de flags) ne doit pas invalider la
+                # révision du verrou optimiste, sinon chaque scan 409-erait
+                # les panneaux ouverts. ``IS NOT`` = comparaison null-safe
+                # SQLite pour pseudo_middle (nullable). Le onupdate ORM ne
+                # couvre pas les upserts Core (cf. commentaire chunking).
+                # Granularité SECONDE (func.now()) — fenêtre sub-seconde
+                # documentée dans get_state_revision.
+                "updated_at": case(
+                    (
+                        or_(
+                            AnonymizationTerm.enabled != stmt.excluded.enabled,
+                            AnonymizationTerm.confirmed != stmt.excluded.confirmed,
+                            AnonymizationTerm.pseudo_middle.is_not(stmt.excluded.pseudo_middle),
+                        ),
+                        func.now(),
+                    ),
+                    else_=AnonymizationTerm.updated_at,
+                ),
+                # term_canonical : dérivé de ``term`` (clé de conflit), donc
+                # identique sur UPDATE — mais on l'écrit quand même pour
+                # remplir les rows legacy à ``NULL`` dès qu'elles sont touchées
+                # (belt-and-suspenders avec le backfill boot).
+                "term_canonical": stmt.excluded.term_canonical,
                 # Promote conditionnel ``"manual" → autre source réelle``
                 # (cf. docstring upsert_terms § "Promotion source").
                 #
@@ -829,6 +1007,95 @@ async def _upsert_terms_locked_impl(
 _MASS_DELETE_ABSOLUTE_THRESHOLD = 1000
 _MASS_DELETE_RATIO_THRESHOLD = 0.5
 
+#: Périmètres de suppression de :func:`replace_state` (fix 2026-06-10, bug
+#: vécu en prod). Le GET non-détaillé exclut les termes « désactivés »
+#: (``enabled=0 AND confirmed=1``) depuis le fix perf 2026-06-09 — mais le
+#: PUT replace comptait tout terme BDD absent du body comme suppression. Un
+#: client qui a chargé l'état FILTRÉ (panneau iris-grid) re-soumettait donc
+#: un état où ~85k désactivés « manquaient » → ``MassDeleteRefused``
+#: systématique (gros dico) ou purge silencieuse (dico sous les seuils).
+#:
+#: * ``DELETE_SCOPE_FULL`` — sémantique replace historique : le body fait
+#:   foi pour TOUT le dico. Réservé aux clients qui ont chargé l'état
+#:   détaillé (``?detailed=1``, ex. /data/privacy → ``state_scope: "full"``).
+#: * ``DELETE_SCOPE_ACTIVE_STATE`` — défaut FAIL-CLOSED : seuls les termes
+#:   visibles dans le state non-détaillé (même périmètre que le filtre actif
+#:   de :func:`get_state_for_user`, miroir Python :func:`_is_in_active_state`)
+#:   peuvent être supprimés par absence du body. On ne supprime jamais ce que
+#:   le client n'a pas pu voir.
+DELETE_SCOPE_FULL = "full"
+DELETE_SCOPE_ACTIVE_STATE = "active_state"
+
+
+def _is_in_active_state(enabled: Any, confirmed: Any) -> bool:
+    """Prédicat Python du périmètre « état actif » — MIROIR EXACT du filtre
+    SQL du GET non-détaillé (:func:`get_state_for_user` :
+    ``enabled IS TRUE OR confirmed IS FALSE``). Toute évolution de l'un DOIT
+    être répercutée sur l'autre — gardé par
+    ``tests/unit/test_replace_state_delete_scope.py``."""
+    return bool(enabled) or not bool(confirmed)
+
+
+class StaleStateRefused(RuntimeError):
+    """Levée par :func:`replace_state` quand le client fournit un
+    ``expected_revision`` qui ne correspond plus à l'état BDD (fix lost
+    update 2026-06-10) : un autre onglet, la page /data/privacy ou un scan
+    de classeur a modifié les termes ENTRE le GET du client et son PUT.
+    Sans ce verrou optimiste, le PUT replace-state écrasait silencieusement
+    les modifications intermédiaires (last-writer-wins). Le handler HTTP
+    mappe vers ``409 STATE_REVISION_MISMATCH`` — le client re-fetch et
+    rejoue ses modifications sur l'état frais."""
+
+    def __init__(self, expected: str, current: str) -> None:
+        self.expected = expected
+        self.current = current
+        super().__init__(
+            f"Révision périmée : le client connaît {expected!r} mais la BDD "
+            f"est à {current!r} — re-fetch requis avant de réécrire."
+        )
+
+
+async def get_state_revision(session: AsyncSession, user_id: int) -> str:
+    """Jeton de révision OPAQUE de l'état anonymisation d'un user.
+
+    ``count:max(id):sum(epoch(updated_at|created_at))`` — chacune des trois
+    mutations change au moins un composant : DELETE → count (+ la somme
+    perd l'époque de la row) ; INSERT → count + max(id) ; UPDATE →
+    ``updated_at`` de LA row touchée avance (bump explicite du ``set_``
+    upsert), donc la SOMME avance — y compris pour une row qui n'est pas
+    la plus récente (eXamine 2026-06-10 : un ``max(updated_at)`` seul était
+    aveugle aux updates des rows sous le max). ``coalesce(created_at)``
+    couvre les rows legacy à ``updated_at=NULL``.
+
+    Limitation documentée et acceptée : ``func.now()`` SQLite est à la
+    SECONDE — un toggle pur re-modifié dans la même seconde que son
+    précédent bump reste invisible (fenêtre sub-seconde, sans INSERT ni
+    DELETE). Comparé par ÉGALITÉ uniquement ; le client renvoie le jeton
+    tel quel dans ``expected_revision``. Une requête servie par l'index
+    user_id.
+    """
+    if not is_valid_user_id(user_id):
+        return "0:0:0"
+    row = (
+        await session.execute(
+            select(
+                func.count(AnonymizationTerm.id),
+                func.max(AnonymizationTerm.id),
+                func.sum(
+                    func.strftime(
+                        "%s",
+                        func.coalesce(
+                            AnonymizationTerm.updated_at,
+                            AnonymizationTerm.created_at,
+                        ),
+                    )
+                ),
+            ).where(AnonymizationTerm.user_id == user_id)
+        )
+    ).one()
+    count, max_id, sum_epoch = row
+    return f"{count or 0}:{max_id or 0}:{sum_epoch or 0}"
+
 
 class MassDeleteRefused(RuntimeError):
     """Levée par :func:`replace_state` quand un PUT supprimerait un nombre
@@ -865,12 +1132,26 @@ async def replace_state(
     triggered_by: str = "user_panel",
     triggered_by_user_id: Optional[int] = None,
     confirm_mass_delete: bool = False,
+    delete_scope: str = DELETE_SCOPE_ACTIVE_STATE,
+    expected_revision: Optional[str] = None,
 ) -> Dict[str, int]:
     """Remplace *tout* le state d'un user (upsert + delete des termes absents).
+
+    **Verrou optimiste** (``expected_revision``, fix lost update 2026-06-10) :
+    si fourni, comparé sous le lock per-user à :func:`get_state_revision` —
+    mismatch ⇒ :class:`StaleStateRefused`, AUCUNE mutation. ``None`` (défaut)
+    = comportement legacy last-writer-wins (compat clients non migrés).
 
     Usage : ``PUT /api/anonymization/terms`` après édition utilisateur.
     L'utilisateur voit SA liste telle qu'elle est — retirer un terme du
     panneau doit le retirer effectivement de la BDD.
+
+    **Périmètre de suppression** (``delete_scope``, fix 2026-06-10) : par
+    défaut ``DELETE_SCOPE_ACTIVE_STATE`` (fail-closed) — seuls les termes du
+    périmètre actif (ceux que le GET non-détaillé expose) sont supprimables
+    par absence du body ; les désactivés+confirmés, invisibles du panneau,
+    sont préservés. Passer ``DELETE_SCOPE_FULL`` UNIQUEMENT quand le client
+    a chargé l'état détaillé complet (``?detailed=1``).
 
     Retourne un dict de stats : ``{upserted, deleted, audited}``.
 
@@ -904,6 +1185,12 @@ async def replace_state(
     # détectera le lock déjà détenu (réentrance via ContextVar) et
     # sautera son propre acquire.
     async with acquire_user_anon_lock(user_id):
+        # Vérification de révision SOUS le lock (sinon un writer concurrent
+        # peut s'intercaler entre le check et les mutations).
+        if expected_revision is not None:
+            current_revision = await get_state_revision(session, user_id)
+            if current_revision != expected_revision:
+                raise StaleStateRefused(expected_revision, current_revision)
         return await _replace_state_locked_impl(
             session,
             user_id,
@@ -911,6 +1198,7 @@ async def replace_state(
             triggered_by=triggered_by,
             triggered_by_user_id=triggered_by_user_id,
             confirm_mass_delete=confirm_mass_delete,
+            delete_scope=delete_scope,
         )
 
 
@@ -922,6 +1210,7 @@ async def _replace_state_locked_impl(
     triggered_by: str = "user_panel",
     triggered_by_user_id: Optional[int] = None,
     confirm_mass_delete: bool = False,
+    delete_scope: str = DELETE_SCOPE_ACTIVE_STATE,
 ) -> Dict[str, int]:
     """Implémentation de :func:`replace_state` à exécuter UNDER le lock
     per-user (task #23)."""
@@ -932,19 +1221,38 @@ async def _replace_state_locked_impl(
     new_terms = (state or {}).get("terms") or {}
 
     # Snapshot avant : (term -> entry) pour computer le diff post-action.
-    stmt = select(AnonymizationTerm).where(AnonymizationTerm.user_id == user_id)
-    rows_before = (await session.scalars(stmt)).all()
-    before: Dict[str, Dict[str, Any]] = {
-        r.term: {
-            "id": r.id,
-            "enabled": bool(r.enabled),
-            "confirmed": bool(r.confirmed),
-            "pseudo_middle": r.pseudo_middle,
-            "category": r.category,
-            "risk_level": r.risk_level,
+    # **Projection de colonnes (fix perf 2026-06-10, bug vécu « save lent »)** :
+    # ``select(AnonymizationTerm)`` hydratait TOUS les objets ORM du user
+    # (~92k rows, désactivés inclus) à CHAQUE PUT — même pour le toggle d'UN
+    # terme — soit ~1,5-2s d'hydration seule. Le delta-upsert (06-09) avait
+    # optimisé l'ÉCRITURE, pas cette lecture. Même pattern que
+    # ``get_state_for_user`` (gain attendu du même ordre que le ~6× mesuré
+    # là-bas — non re-mesuré sur ce call-site précis, qui lit PLUS de rows
+    # car non filtré). La cardinalité reste COMPLÈTE — le snapshot sert au
+    # diff delete et au garde mass-delete : on PROJETTE, on ne filtre pas.
+    # Colonnes : uniquement celles LUES en aval (id/enabled/confirmed pour
+    # le diff+delete, pseudo_middle pour la comparaison delta/audit) —
+    # category/risk_level, jamais consommés ici, ont été retirés (eXamine
+    # 2026-06-10) pour alléger la matérialisation sur ~92k rows.
+    stmt = select(
+        AnonymizationTerm.id,
+        AnonymizationTerm.term,
+        AnonymizationTerm.enabled,
+        AnonymizationTerm.confirmed,
+        AnonymizationTerm.pseudo_middle,
+    ).where(AnonymizationTerm.user_id == user_id)
+    rows_before = (await session.execute(stmt)).all()
+    before: Dict[str, Dict[str, Any]] = {}
+    for row_before in rows_before:
+        # Déballage par index — l'ordre DOIT matcher le SELECT ci-dessus
+        # (toute nouvelle clé du dict doit être ajoutée aux deux endroits).
+        row_id, row_term, row_enabled, row_confirmed, row_pseudo_middle = row_before
+        before[row_term] = {
+            "id": row_id,
+            "enabled": bool(row_enabled),
+            "confirmed": bool(row_confirmed),
+            "pseudo_middle": row_pseudo_middle,
         }
-        for r in rows_before
-    }
     # Index canonique (NFKC casefold) pour matcher contre new_terms en
     # case-insensitive — sinon un user qui soumet "Dupont" quand "DUPONT"
     # existe en BDD verrait son terme supprimé silencieusement par la boucle
@@ -981,15 +1289,49 @@ async def _replace_state_locked_impl(
             if merged["pseudo"] is None and e_pseudo is not None:
                 merged["pseudo"] = e_pseudo
 
+    # Périmètre de suppression (fix 2026-06-10) — valeur inconnue ⇒ fallback
+    # FAIL-CLOSED sur le scope actif (on ne supprime jamais sur la foi d'un
+    # paramètre corrompu).
+    if delete_scope not in (DELETE_SCOPE_FULL, DELETE_SCOPE_ACTIVE_STATE):
+        logger.warning(
+            "replace_state user=%s: delete_scope inconnu %r — fallback fail-closed sur %r.",
+            user_id,
+            delete_scope,
+            DELETE_SCOPE_ACTIVE_STATE,
+        )
+        delete_scope = DELETE_SCOPE_ACTIVE_STATE
+
+    def _deletable(prev_entry: Dict[str, Any]) -> bool:
+        # En scope "active_state", seuls les termes visibles dans le state
+        # non-détaillé (SSoT : même prédicat que le filtre SQL de
+        # ``get_state_for_user``) sont supprimables par absence du body —
+        # les désactivés+confirmés, que le client n'a jamais vus, sont
+        # préservés (upsert non affecté : un terme présent dans le body
+        # est toujours upserté quel que soit le scope).
+        if delete_scope == DELETE_SCOPE_FULL:
+            return True
+        return _is_in_active_state(prev_entry["enabled"], prev_entry["confirmed"])
+
     # Garde anti mass-delete (incident 2026-05-20). On évalue le delta
     # AVANT tout write : si le PUT supprimerait > absolute_threshold ET
     # > ratio_threshold % du before, on refuse sans flag explicite. Aucun
     # UPSERT n'a tourné, aucun audit non plus → rollback "zéro effet".
+    # Le compte respecte ``delete_scope`` : les termes hors périmètre ne
+    # seront pas supprimés, ils ne doivent donc pas déclencher le garde.
     pending_delete_count = sum(
-        1 for term in before if _canonical_key(term) not in new_canonical_to_term
+        1
+        for term, prev in before.items()
+        if _canonical_key(term) not in new_canonical_to_term and _deletable(prev)
     )
     if pending_delete_count > 0 and not confirm_mass_delete:
-        count_before = len(before)
+        # Dénominateur SCOPE-AWARE (review adversariale 2026-06-10) : en scope
+        # actif, comparer les suppressions d'actifs à la POPULATION D'ACTIFS,
+        # pas au dico complet. Sinon un dico à 85k désactivés dilue le ratio
+        # (1300 actifs purgés / 86500 = 1,5% < 50%) et un body d'actifs
+        # tronqué purge silencieusement — la classe d'incident exacte que ce
+        # garde existe pour attraper. En scope full, ``_deletable`` est True
+        # partout → dénominateur identique à l'historique (len(before)).
+        count_before = sum(1 for prev in before.values() if _deletable(prev))
         ratio = pending_delete_count / count_before if count_before else 0.0
         if (
             pending_delete_count >= _MASS_DELETE_ABSOLUTE_THRESHOLD
@@ -1011,6 +1353,52 @@ async def _replace_state_locked_impl(
                 ratio=ratio,
             )
 
+    # **Delta-upsert (fix perf prod 2026-06-09)** : un PUT panneau renvoie
+    # l'ÉTAT COMPLET (le client fait GET → merge → PUT). Pour un user avec
+    # 91 760 termes, ré-upserter TOUTES les rows à chaque toggle d'UN terme =
+    # 1530 chunks × ~12 ms = 18,7 s observés en prod. On ne ré-upserte donc QUE
+    # les termes NOUVEAUX ou RÉELLEMENT MODIFIÉS → O(changed) au lieu de O(all).
+    #
+    # SÛRETÉ anti-perte silencieuse (consequences.md axe 5) : les SEULS champs
+    # qu'un PUT panneau peut changer sur une row EXISTANTE sont ``pseudo_middle``
+    # / ``enabled`` / ``confirmed`` — le ``ON CONFLICT DO UPDATE`` ne touche pas
+    # ``category``/``risk_level`` ; ``source``/``source_ref`` ne sont promus que
+    # si le caller passe un ``source`` explicite, ce que ``replace_state`` ne
+    # fait PAS (appel sans ``source`` → défaut "manual" → ``source`` préservé) ;
+    # ``origins`` ne bouge pas (``origins_map`` est None ici). On compare donc
+    # EXACTEMENT ces 3 champs, via le MÊME ``_sanitize_pseudo_value`` que
+    # l'écriture (apples-to-apples), et on BIAISE vers l'INCLUSION : un terme
+    # absent de ``before`` = nouveau = inclus ; le moindre doute = inclus.
+    # Faux-modifié = re-upsert inoffensif ; faux-inchangé = perte → interdit.
+    # Détection volontairement alignée sur la boucle d'audit plus bas (même
+    # comparaison prev↔new), à ceci près qu'on inclut AUSSI l'effacement d'un
+    # pseudo (new=None alors que before≠None) que l'upsert applique réellement.
+    changed_ckeys: Set[str] = set()
+    for ckey, merged in new_canonical_to_entry.items():
+        before_term = before_canonical_to_term.get(ckey)
+        before_entry = before.get(before_term) if before_term is not None else None
+        if before_entry is None:
+            changed_ckeys.add(ckey)  # terme nouveau → toujours inclus
+            continue
+        new_pseudo = _sanitize_pseudo_value(merged.get("pseudo"))
+        if (
+            bool(merged.get("enabled")) != before_entry["enabled"]
+            or bool(merged.get("confirmed")) != before_entry["confirmed"]
+            or new_pseudo != before_entry["pseudo_middle"]
+        ):
+            changed_ckeys.add(ckey)
+
+    if len(changed_ckeys) >= len(new_canonical_to_entry):
+        # Tout est nouveau/modifié (1er save d'un user, ou réécriture massive) :
+        # aucun filtrage utile → chemin historique EXACT (zéro risque de régresser).
+        terms_to_upsert = new_terms
+    else:
+        terms_to_upsert = {
+            t: e
+            for t, e in new_terms.items()
+            if isinstance(t, str) and t and _canonical_key(t) in changed_ckeys
+        }
+
     # task #23 fix finding #1 review : on appelle ``_upsert_terms_locked_impl``
     # directement plutôt que la fonction publique ``upsert_terms``. Le
     # lock per-user est déjà acquis par ``replace_state`` (parent). Avec
@@ -1019,7 +1407,7 @@ async def _replace_state_locked_impl(
     # duplique tout overhead futur (logging, metrics, throttling) qu'on
     # ajouterait à ``upsert_terms``. L'appel direct à l'impl est l'intent
     # explicite : "je suis déjà sous le lock, exécute le corps".
-    upserted = await _upsert_terms_locked_impl(session, user_id, new_terms)
+    upserted = await _upsert_terms_locked_impl(session, user_id, terms_to_upsert)
     # NB : on n'exécute PAS le DELETE ici. Il doit tourner APRÈS le flush des
     # audits pour éviter une FK violation. Cf. ci-dessous.
 
@@ -1133,6 +1521,12 @@ async def _replace_state_locked_impl(
         for term, prev in before.items():
             ckey = _canonical_key(term)
             if ckey not in new_canonical_to_term:
+                if not _deletable(prev):
+                    # Scope "active_state" : terme hors du périmètre visible
+                    # du client (désactivé+confirmé, exclu du GET non-détaillé)
+                    # → préservé. Ni audit delete (rien n'est supprimé), ni
+                    # delete_ids.
+                    continue
                 audit_rows.append(
                     AnonymizationAudit(
                         user_id=user_id,
@@ -1178,7 +1572,7 @@ async def _replace_state_locked_impl(
         delete_ids = [
             int(prev["id"])
             for term, prev in before.items()
-            if _canonical_key(term) not in new_canonical_to_term
+            if _canonical_key(term) not in new_canonical_to_term and _deletable(prev)
         ]
     deleted = await _delete_terms_by_ids(session, user_id, delete_ids)
 

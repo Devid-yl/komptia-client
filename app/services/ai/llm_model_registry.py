@@ -169,6 +169,35 @@ class LlmModelRegistry:
             return None
         return cached.get(field)
 
+    def find_utility_model_sync(self, provider: Optional[str]) -> Optional[str]:
+        """API publique : premier modèle ``is_utility`` du provider donné
+        (tri par nom — déterministe), lecture SYNC du cache.
+
+        Le filtre ``provider`` est NON-NÉGOCIABLE : incident 2026-06-12, le
+        résolveur du compact prenait n'importe quel ``is_utility`` tous
+        providers confondus → ``phi3:mini`` (ollama) envoyé à l'API
+        Anthropic → 404 sur CHAQUE compaction → fallback troncature
+        systématique, en silence.
+
+        Le cache exclut déjà les modèles dépréciés au chargement
+        (``_load_cache`` filtre ``deprecated_at IS NULL``) ; le re-check ici
+        est une ceinture pour un cache encore chaud après dépréciation.
+        Cache vide (boot précoce, standalone) → ``None`` fail-soft : le
+        caller retombe sur le modèle par défaut du manager.
+        """
+        if not provider:
+            return None
+        snapshot = dict(self._cache_by_name)
+        candidates = [
+            str(meta["name"])
+            for meta in snapshot.values()
+            if meta.get("is_utility")
+            and meta.get("name")
+            and meta.get("provider") == provider
+            and not meta.get("deprecated_at")
+        ]
+        return min(candidates) if candidates else None
+
     async def reload_from_db(self, session: AsyncSession) -> None:
         """API publique : recharge le cache mémoire depuis la BDD.
 
@@ -478,6 +507,10 @@ class LlmModelRegistry:
                 # (SQLAlchemy serialize les listes en JSON array).
                 cache_ttl_options=list(m.cache_ttl_options) if m.cache_ttl_options else None,
                 manually_overridden=False,
+                # Seed depuis ``_MODELS`` = valeurs hardcodées dans le code,
+                # donc fiables par construction → fenêtre vérifiée d'emblée
+                # (pas de « à confirmer » sur un modèle seedé).
+                context_window_verified=True,
             )
             session.add(row)
             added += 1

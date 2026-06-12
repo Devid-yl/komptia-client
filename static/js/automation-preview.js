@@ -560,7 +560,7 @@
             (t.columns || []).forEach(function (c) {
                 var th = el('th', { text: toText(c) });
                 th.style.padding = '4px 6px';
-                th.style.borderBottom = '1px solid #e5e7eb';
+                th.style.borderBottom = '1px solid var(--border, #e5e7eb)';  // PREV-4 dark-safe
                 th.style.textAlign = 'left';
                 trh.appendChild(th);
             });
@@ -572,7 +572,7 @@
                 (t.columns || []).forEach(function (c) {
                     var td = el('td', { text: toText(row && row[c] !== undefined ? row[c] : '') });
                     td.style.padding = '3px 6px';
-                    td.style.borderBottom = '1px solid #f3f4f6';
+                    td.style.borderBottom = '1px solid var(--border, #f3f4f6)';  // PREV-4 dark-safe
                     tr.appendChild(td);
                 });
                 tbody.appendChild(tr);
@@ -740,7 +740,7 @@
         var wrap = el('div', { class: 'komptia-panel-preview-wrap' });
         wrap.style.marginTop = '0.75rem';
         wrap.style.paddingTop = '0.75rem';
-        wrap.style.borderTop = '1px solid #e5e7eb';
+        wrap.style.borderTop = '1px solid var(--border, #e5e7eb)';  // PREV-4 dark-safe
 
         var btn = el('button', {
             type: 'button',
@@ -762,7 +762,7 @@
                 + ' lignes maximum, sans envoi réel.',
         });
         hint.style.fontSize = '0.7rem';
-        hint.style.color = '#6b7280';
+        hint.style.color = 'var(--text-muted, #6b7280)';  // PREV-4 dark-safe
         hint.style.marginTop = '0.4rem';
 
         wrap.appendChild(btn);

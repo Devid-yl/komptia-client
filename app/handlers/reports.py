@@ -938,13 +938,24 @@ class ReportEmailHandler(BaseHandler):
             message += f". {refused_count} refusé(s) par le serveur SMTP."
         if skipped_unsubscribed:
             message += f" ({skipped_unsubscribed} exclu(s) : désabonné(s) ou inactif(s))"
+        # #52 — pièce(s) jointe(s) SKIPPÉE(s) (rapport trop volumineux, fichier
+        # introuvable…) : ne pas claironner « envoyé » comme si le rapport était
+        # joint alors qu'il a été droppé en silence (promesse non tenue).
+        skipped_att = result.get("skipped_attachments") or []
+        if skipped_att:
+            _names = ", ".join(
+                str(s.get("name")) for s in skipped_att if isinstance(s, dict)
+            )
+            message += f". ⚠ Pièce(s) jointe(s) NON envoyée(s) : {_names}."
+            logger.warning("Envoi rapport : pièce(s) jointe(s) non envoyée(s) : %s", _names)
         return {
             "success": True,
-            "partial_success": bool(refused_count),
+            "partial_success": bool(refused_count) or bool(skipped_att),
             "message": message,
             "recipients_count": delivered,
             "refused_count": refused_count,
             "skipped_unsubscribed": skipped_unsubscribed,
+            "skipped_attachments": skipped_att,
         }
 
     @require_role("admin", "user")

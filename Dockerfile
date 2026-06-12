@@ -89,15 +89,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # `curl -fsSL` (--fail) : sur un HTTP 404 (release Debian non publiée par MS, ex.
 # une future trixie) curl SANS -f écrirait la page d'erreur HTML dans le .deb et
 # retournerait 0 → `dpkg -i` planterait avec « not a Debian format archive », un
-# diagnostic opaque. -f fait échouer curl proprement ; le `file ... | grep` est
-# une 2e barrière fail-loud avec un message actionnable pour l'admin.
+# diagnostic opaque. -f fait échouer curl proprement avec un message actionnable.
+# (Pas de `file` : absent de l'image slim ; dpkg rejette de toute façon un .deb
+# corrompu, et le guard pyodbc plus bas est le filet final.)
 RUN set -e; \
     . /etc/os-release; \
     curl -fsSL -o /tmp/ms-prod.deb \
       "https://packages.microsoft.com/config/debian/${VERSION_ID}/packages-microsoft-prod.deb" \
       || { echo "ERREUR build: packages-microsoft-prod.deb introuvable pour Debian ${VERSION_ID} — release non publiee par Microsoft. Epingler une base Debian supportee (ex. bookworm/12) ou utiliser un miroir interne." >&2; exit 1; }; \
-    file /tmp/ms-prod.deb | grep -q 'Debian binary package' \
-      || { echo 'ERREUR build: /tmp/ms-prod.deb n est pas un paquet Debian valide (reponse HTTP corrompue ?)' >&2; exit 1; }; \
     dpkg -i /tmp/ms-prod.deb; \
     rm -f /tmp/ms-prod.deb; \
     apt-get update; \
@@ -121,6 +120,16 @@ COPY --from=builder /install /usr/local
 # plus bas (COPY config/) — les deux conditions sont nécessaires au runtime.
 RUN python -c "import pyodbc, sys; d = pyodbc.drivers(); expected = {'ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server'}; sys.stderr.write('ODBC drivers: %r\n' % (d,)); sys.exit(0 if expected.intersection(d) else 1)" \
     || { echo 'ERREUR build: aucun driver ODBC SQL Server attendu (17/18) visible par pyodbc (msodbcsql18 absent) — la connexion a la base source casserait au runtime' >&2; exit 1; }
+
+# Garde-fou « costume sans corps » SQLCipher : échouer BRUYAMMENT au build si
+# sqlcipher3 n'est pas fonctionnel (wheel manquant pour la plateforme, ou moteur
+# non-SQLCipher). Sans ce garde, l'image se construirait « verte » puis l'app
+# refuserait de booter dès qu'une SQLCIPHER_KEY est posée (fail-closed
+# setup_encryption), exactement la classe de bug que ce fix élimine. On exige un
+# cipher_version non vide commençant par « 4 » (SQLCipher 4.x). sqlcipher3 est
+# importable ici (copié via /install ci-dessus) si présent dans requirements.
+RUN python -c "import sqlcipher3.dbapi2 as s, sys; v=(s.connect(':memory:').execute('PRAGMA cipher_version').fetchone() or [None])[0]; sys.stderr.write('SQLCipher cipher_version=%r\n' % (v,)); sys.exit(0 if v and str(v).startswith('4') else 1)" \
+    || { echo 'ERREUR build: sqlcipher3 absent ou non fonctionnel (cipher_version vide) — le chiffrement BDD casserait au runtime (fail-closed). Verifier le wheel manylinux sqlcipher3 pour cette plateforme.' >&2; exit 1; }
 
 WORKDIR /opt/komptia
 
@@ -178,19 +187,31 @@ RUN test -n "$(ls docs/guides/*.pdf 2>/dev/null)" \
     || (echo 'ERREUR build: aucun guide PDF dans docs/guides/ — lancer `make guides` avant le build' >&2 && exit 1)
 
 # Cache des modèles d'embeddings — le MODÈLE n'est PAS embarqué dans l'image
-# (image légère). ``HF_HOME`` pointe SOUS le volume de données : le modèle se
-# télécharge À LA DEMANDE au 1er usage Iris, puis PERSISTE dans le volume (pas de
-# re-download à chaque recreate). Si le réseau est indisponible, ``EmbeddingService``
-# dégrade proprement en TF-IDF (les embeddings ne bloquent jamais Iris). Le client
-# gère sa config réseau lui-même ; pour pré-télécharger sur un serveur isolé,
-# ``docker compose exec app python -m scripts.prefetch_models`` reste disponible.
+# (image légère). ``HF_HOME`` pointe SOUS le volume de données : le modèle (~440 Mo)
+# est pré-téléchargé AU DÉPLOIEMENT par ``make first-run``/``make reset`` (étape
+# ``_prefetch-models`` → ``scripts.prefetch_models`` dans le conteneur) pour qu'il
+# soit prêt AVANT le 1er usage Iris, puis PERSISTE dans le volume (pas de re-download
+# à chaque recreate). Repli gracieux : si le serveur est hors-ligne au déploiement,
+# ``EmbeddingService`` re-tente le download À LA DEMANDE au 1er usage et dégrade en
+# TF-IDF entre-temps (les embeddings ne bloquent jamais Iris). Sur serveur isolé,
+# ``make prefetch-models`` relance le téléchargement une fois le réseau rétabli.
 ENV HF_HOME=/opt/komptia/data/hf_cache
+
+# Caches de polices SOUS le volume → matplotlib (``MPLCONFIGDIR``) et fontconfig
+# (``XDG_CACHE_HOME``) ne RECONSTRUISENT PAS leur cache à chaque recreate du
+# conteneur (sinon log « Matplotlib building the font cache » + 1er PDF/graphe
+# lent à chaque ``make update``). Les libs créent ces dossiers au runtime si
+# absents ; le ``mkdir`` ci-dessous fixe les perms komptia pour une install
+# fraîche. HF garde son propre ``HF_HOME`` ci-dessus (pas via XDG_CACHE_HOME).
+ENV MPLCONFIGDIR=/opt/komptia/data/.mpl-cache
+ENV XDG_CACHE_HOME=/opt/komptia/data/.cache
 
 # Répertoires de données (créés dans l'image → leurs perms komptia sont copiées
 # vers le volume au 1er montage, dont ``hf_cache`` pour que le download runtime
 # soit autorisé). Pas de ``HF_HUB_OFFLINE=1`` : le runtime DOIT pouvoir télécharger
 # le modèle à la demande (sinon TF-IDF en repli).
 RUN mkdir -p data/logs data/reports data/backups data/hf_cache \
+        data/.mpl-cache data/.cache \
     && chown -R komptia:komptia /opt/komptia
 
 # Variables d'environnement par défaut
@@ -199,6 +220,20 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV ENVIRONMENT=production
 ENV DEBUG=false
 
+# ── Empreinte mémoire (glibc / torch-BLAS) ────────────────────────────────────
+# Image python:3.12-slim = glibc → ces variables s'appliquent (no-op sur musl).
+# MALLOC_ARENA_MAX=2 : borne le nombre d'arènes glibc (défaut = 8×nbCPU) qui,
+#   avec torch/numpy/BLAS multi-thread, gonfle le RSS par fragmentation.
+# MALLOC_TRIM_THRESHOLD_=131072 : rend la mémoire libérée à l'OS (128 KiB) au lieu
+#   de la conserver dans le heap après un pic transitoire (gros résultat SQL).
+# OMP/MKL/OPENBLAS_NUM_THREADS=2 : les embeddings sont des appels courts batchés ;
+#   cap les threads (et leurs stacks) que torch/BLAS spawneraient sinon (= nbCPU).
+ENV MALLOC_ARENA_MAX=2
+ENV MALLOC_TRIM_THRESHOLD_=131072
+ENV OMP_NUM_THREADS=2
+ENV MKL_NUM_THREADS=2
+ENV OPENBLAS_NUM_THREADS=2
+
 # Passer à l'utilisateur non-root
 USER komptia
 
@@ -206,7 +241,7 @@ USER komptia
 EXPOSE 8888
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
     CMD curl -f http://localhost:8888/health || exit 1
 
 # Démarrage via start.py (charge openssl_legacy.cnf si présent — TLS legacy SQL Server)

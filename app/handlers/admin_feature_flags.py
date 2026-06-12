@@ -28,6 +28,14 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+#: #71 — borne de la description d'un feature flag. Au-delà, on REFUSE (400)
+#: comme le `name` trop long, au lieu de tronquer EN SILENCE : sinon la doc du
+#: flag (pourquoi/quand le couper) revenait amputée au GET sans que le POST
+#: l'ait signalé. DOIT rester égal à la longueur de colonne
+#: ``FeatureFlag.description = String(500)`` (sinon une valeur acceptée ici
+#: déborderait la colonne BDD) — SSoT couplée au modèle.
+_MAX_DESCRIPTION_LEN = 500
+
 
 class FeatureFlagsListHandler(BaseHandler):
     """GET /api/admin/feature-flags — liste tous les flags."""
@@ -72,7 +80,14 @@ class FeatureFlagDetailHandler(BaseHandler):
         if description is not None and not isinstance(description, str):
             description = None
         elif isinstance(description, str):
-            description = description.strip()[:500]
+            description = description.strip()
+            # #71 — fail-loud (cohérent avec le rejet du `name` trop long
+            # ci-dessous) au lieu de tronquer en silence.
+            if len(description) > _MAX_DESCRIPTION_LEN:
+                self.set_status(400)
+                _err = f"Description trop longue (max {_MAX_DESCRIPTION_LEN} caractères)."
+                self.write({"success": False, "error": _err})
+                return
 
         # Sanity : name de URL doit matcher une convention stricte.
         # Deja filtre par la regex de route (voir app/routes.py), mais

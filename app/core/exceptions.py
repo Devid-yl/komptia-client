@@ -67,6 +67,7 @@ __all__ = [
     "QueryError",
     "SageConnectionError",
     "SageDriverMissingError",
+    "DRIVER_MISSING_MARKER",
     # IA
     "AIError",
     "SQLGenerationError",
@@ -168,6 +169,27 @@ class InvalidCredentialsError(AuthenticationError):
     http_status = 401
 
 
+class PasswordTooLongError(AuthenticationError):
+    """Mot de passe trop long pour l'algorithme de hachage (bcrypt = 72 octets).
+
+    Levée par :meth:`PasswordHasher.hash_password` quand un appelant tente de
+    *définir* un mot de passe dont l'encodage UTF-8 dépasse
+    :data:`app.core.constants_auth.PASSWORD_MAX_BYTES`. C'est un **garde-fou de
+    dernier recours** : chaque chemin « set » (création user, changement de mot
+    de passe admin/user, outil Iris, seed CLI) doit valider la longueur en amont
+    et renvoyer une 400 actionnable. Sous-classe de :class:`AuthenticationError`
+    pour que tout ``except AuthenticationError`` existant continue de l'attraper
+    (pas de régression d'exception non gérée), mais ``http_status = 400`` car
+    c'est une erreur de validation d'entrée, pas un échec d'auth runtime.
+
+    NB : le chemin *verify* ne lève jamais — il tronque à 72 octets (compat avec
+    les hashes legacy créés sous bcrypt 4.x, qui tronquait silencieusement).
+    """
+
+    default_code = "AUTH_PASSWORD_TOO_LONG"
+    http_status = 400
+
+
 class SessionExpiredError(AuthenticationError):
     """Session expirée (timeout ou révocation)."""
 
@@ -238,6 +260,17 @@ class SageDriverMissingError(SageConnectionError):
     """
 
     default_code = "DB_DRIVER_MISSING"
+
+
+#: Marqueur lowercase STABLE présent dans le message de
+#: ``sage_connector.discover_sage_odbc_driver`` (« Aucun driver ODBC SQL Server
+#: installé… »). SSoT pour détecter le cas « driver manquant » sur le chemin
+#: STRING-sérialisé (``error_messages._categorize_sql_error``), où l'objet
+#: ``SageDriverMissingError`` est déjà perdu (ex. ``execute_for_ai`` renvoie une
+#: chaîne). Le chemin EXCEPTION, lui, utilise ``isinstance(SageDriverMissingError)``
+#: (déterministe). Un test garde que le message réel contient bien ce marqueur :
+#: toute reformulation casse le test au lieu de dégrader silencieusement.
+DRIVER_MISSING_MARKER: str = "aucun driver odbc sql server"
 
 
 class SageQueryCancelledError(DatabaseError):

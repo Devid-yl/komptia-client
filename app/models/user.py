@@ -39,7 +39,7 @@ class User(BaseModel):
         username: Nom d'utilisateur unique
         email: Email unique
         password_hash: Hash bcrypt du mot de passe
-        role: Rôle (admin, user, reader)
+        role: Rôle (admin, user — cf. ``UserRole``, pas d'autre rôle)
         permissions: Permissions JSON (tables, montants max, etc.)
         is_active: Compte actif ou désactivé
         last_login: Dernière connexion
@@ -77,6 +77,13 @@ class User(BaseModel):
     # conversations Iris de cet utilisateur. Auto-mise à jour fin-de-run
     # via fusion LLM (cf. ``app/services/ai/iris_user_memory.py``). Le user
     # peut consulter/éditer/effacer via ``/data-privacy``.
+    #
+    # ⚠️ INVARIANT CONCURRENCE (it.32) : DEUX écrivains concourants (fusion
+    # fin-de-run + endpoint manuel PUT/DELETE). TOUTE écriture de ``iris_memory``
+    # DOIT se faire sous ``IrisAgent.user_iris_memory_lock(user_id)`` (lock par-user
+    # PARTAGÉ via le singleton ``get_iris_agent()``), sinon lost-update silencieux.
+    # 3 sites sanctionnés seulement — un 4e non-locké casse la garde
+    # ``test_iris_memory_writes_are_lock_guarded`` (anti-régression).
     iris_memory: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Relations

@@ -285,6 +285,21 @@ class DashboardWidget(Base):
     MAX_TEXT_WIDGET_CONTENT_LEN = 5000
     MAX_TEXT_WIDGET_TITLE_LEN = 200
 
+    # Feature "Requête SQL" (menu [+] de la grille) : un widget grid peut
+    # porter, en plus de sa requête principale, N onglets SQL additionnels —
+    # chacun une requête INDÉPENDANTE ré-exécutée à chaque affichage (même
+    # pipeline que le tab principal). Stockés dans data_source_config sous
+    # la clé "extra_tabs": [{"label": str, "query": str}, ...].
+    # SSoT des caps — mirroir côté JS (iris-grid.js _sqlTabContext) et
+    # défense-in-depth côté service (_execute_grid_extra_tabs).
+    MAX_GRID_EXTRA_TABS = 10
+    MAX_GRID_TAB_LABEL_LEN = 100
+    MAX_GRID_TAB_QUERY_LEN = 10000
+    # Mode classeur (sauvegarde du widget grille façon /datastore) : cap du
+    # nombre TOTAL de feuilles (SQL + manuelles + drill-down) d'un classeur
+    # de widget. Les feuilles SQL restent bornées par 1 + MAX_GRID_EXTRA_TABS.
+    MAX_GRID_WORKBOOK_TABS = 30
+
     def __repr__(self):
         return (
             f"<DashboardWidget(id={self.id}, title='{self.title}', " f"type='{self.widget_type}')>"
@@ -367,6 +382,75 @@ class DashboardWidget(Base):
                         "La requête doit commencer par SELECT ou WITH "
                         "(seules les requêtes en lecture sont autorisées)."
                     )
+                # CWE-158 : NUL → troncature silencieuse driver ODBC. Rejet au
+                # save (anti-curl) en parité avec le runtime (_fetch_sql_data)
+                # et /api/datastore/sql/execute.
+                if "\x00" in query:
+                    errors.append("La requête ne doit pas contenir de caractère NUL.")
+                # Cap longueur : parité avec les onglets additionnels (sinon une
+                # requête principale géante — jusqu'au cap body ~256 KiB — serait
+                # ré-exécutée contre Sage + cachée à chaque render/export/email).
+                if len(query) > self.MAX_GRID_TAB_QUERY_LEN:
+                    errors.append(
+                        f"La requête est trop longue "
+                        f"(maximum {self.MAX_GRID_TAB_QUERY_LEN} caractères)."
+                    )
+
+            # Onglets SQL additionnels (feature menu [+] « Requête SQL »).
+            # Mêmes garanties que la requête principale, appliquées à CHAQUE
+            # onglet : SELECT/WITH au save (defense-in-depth anti-curl —
+            # cf. CRIT-4 ci-dessus, étendu aux extra_tabs car ils sont aussi
+            # clonés/exportés/ré-exécutés). check_sql_dangerous reste appliqué
+            # au runtime dans _fetch_sql_data (SSoT validateur Iris).
+            extra_tabs = cfg.get("extra_tabs") if isinstance(cfg, dict) else None
+            if extra_tabs is not None:
+                if not isinstance(extra_tabs, list):
+                    errors.append("Les onglets SQL (extra_tabs) doivent être une liste.")
+                elif len(extra_tabs) > self.MAX_GRID_EXTRA_TABS:
+                    errors.append(
+                        f"Trop d'onglets SQL : {len(extra_tabs)} "
+                        f"(maximum {self.MAX_GRID_EXTRA_TABS})."
+                    )
+                else:
+                    for idx, tab in enumerate(extra_tabs):
+                        pos = idx + 1
+                        if not isinstance(tab, dict):
+                            errors.append(f"Onglet SQL #{pos} : format invalide.")
+                            continue
+                        label = tab.get("label")
+                        if not isinstance(label, str) or not label.strip():
+                            errors.append(f"Onglet SQL #{pos} : le titre est obligatoire.")
+                        elif len(label) > self.MAX_GRID_TAB_LABEL_LEN:
+                            errors.append(
+                                f"Onglet SQL #{pos} : titre trop long "
+                                f"(maximum {self.MAX_GRID_TAB_LABEL_LEN} caractères)."
+                            )
+                        tab_query = tab.get("query")
+                        if not isinstance(tab_query, str) or not tab_query.strip():
+                            errors.append(f"Onglet SQL #{pos} : la requête est obligatoire.")
+                        elif len(tab_query) > self.MAX_GRID_TAB_QUERY_LEN:
+                            errors.append(
+                                f"Onglet SQL #{pos} : requête trop longue "
+                                f"(maximum {self.MAX_GRID_TAB_QUERY_LEN} caractères)."
+                            )
+                        elif "\x00" in tab_query:
+                            # CWE-158 : certains drivers ODBC tronquent
+                            # silencieusement la requête au 1er NUL → la requête
+                            # réellement exécutée diffère de celle affichée
+                            # (données fausses silencieuses). Parité avec la
+                            # requête principale (ci-dessus) et
+                            # ``/api/datastore/sql/execute``.
+                            errors.append(
+                                f"Onglet SQL #{pos} : caractère NUL interdit dans la requête."
+                            )
+                        elif not (
+                            tab_query.strip().upper().startswith("SELECT")
+                            or tab_query.strip().upper().startswith("WITH")
+                        ):
+                            errors.append(
+                                f"Onglet SQL #{pos} : la requête doit commencer par "
+                                f"SELECT ou WITH (lecture seule)."
+                            )
 
         if self.data_source_type not in self.VALID_DATA_SOURCE_TYPES:
             errors.append(

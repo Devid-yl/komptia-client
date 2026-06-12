@@ -49,6 +49,16 @@ class WebhookTrigger(Base):
         nullable=True,
         comment="Description libre du webhook (ex: 'Depuis GitHub Actions')",
     )
+    hmac_secret: Mapped[Optional[str]] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+        comment=(
+            "Secret partagé HMAC-SHA256 (hex/urlsafe, généré côté serveur). "
+            "NULL = signature non exigée (compat token-seul) ; non-NULL = "
+            "l'inbound exige X-Komptia-Signature + X-Komptia-Timestamp"
+        ),
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -83,12 +93,18 @@ class WebhookTrigger(Base):
             f"active={self.is_active})>"
         )
 
-    def to_dict(self, include_url: bool = False, base_url: str = ""):
+    def to_dict(self, include_url: bool = False, base_url: str = "", include_secret: bool = False):
         """Convertit en dict pour JSON API.
 
         Args:
             include_url: Inclure l'URL complète du webhook.
             base_url: Base URL (ex: https://komptia.local:8443).
+            include_secret: Inclure ``hmac_secret`` en clair. Pattern
+                « show-once » : UNIQUEMENT à la création/rotation (le caller
+                doit le noter immédiatement) — JAMAIS dans les listes (un
+                XSS/log/screenshot de la liste ne doit pas exfiltrer les
+                secrets de signature). ``signature_required`` reste toujours
+                exposé pour que l'UI sache l'état sans voir le secret.
         """
         result = {
             "id": self.id,
@@ -96,12 +112,13 @@ class WebhookTrigger(Base):
             "token": self.token,
             "description": self.description,
             "is_active": self.is_active,
-            "last_triggered_at": (
-                self.last_triggered_at.isoformat() if self.last_triggered_at else None
-            ),
+            "signature_required": bool(self.hmac_secret),
+            "last_triggered_at": clock.iso_utc(self.last_triggered_at),
             "trigger_count": self.trigger_count,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": clock.iso_utc(self.created_at),
         }
+        if include_secret and self.hmac_secret:
+            result["hmac_secret"] = self.hmac_secret
         if include_url:
             result["webhook_url"] = f"{base_url}/webhook/{self.token}"
         return result

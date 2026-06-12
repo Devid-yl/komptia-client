@@ -202,10 +202,30 @@
             <table class="w-full text-sm" aria-label="Liste des listes de diffusion">
                 <thead>
                     <tr class="border-b border-gray-200 dark:border-gray-800">
-                        <th scope="col" class="table-header text-left">Nom</th>
-                        <th scope="col" class="table-header text-left">Description</th>
-                        <th scope="col" class="table-header text-left">Membres</th>
-                        <th scope="col" class="table-header text-left">Statut</th>
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="name">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortLists" data-sort-key="name">
+                                Nom
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="description">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortLists" data-sort-key="description">
+                                Description
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="contact_count">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortLists" data-sort-key="contact_count">
+                                Membres
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
+                        <th scope="col" class="table-header text-left" aria-sort="none" data-sort-key="is_active">
+                            <button type="button" class="inline-flex items-center gap-1 font-medium" data-action="sortLists" data-sort-key="is_active">
+                                Statut
+                                <span class="sort-indicator text-gray-400" aria-hidden="true">⇅</span>
+                            </button>
+                        </th>
                         <th scope="col" class="table-header text-left">Actions</th>
                     </tr>
                 </thead>
@@ -500,4 +520,43 @@
 
 {% block scripts %}
 <script src="{{ static_url('js/contacts.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding contacts_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'contacts_v1',
+                title: 'Bienvenue dans vos contacts',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Votre carnet d\'adresses Komptia',
+                        text: 'Cette page regroupe les contacts et les listes de diffusion qui serviront de destinataires à vos emails, rapports et automatisations. Deux onglets en haut : « Contacts » pour les personnes une à une, « Listes de diffusion » pour les regrouper. Tout reste sur votre espace, rien n\'est envoyé à l\'extérieur.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Ajouter ou importer des contacts',
+                        text: 'Cliquez sur « Nouveau contact » pour saisir un email (le reste est optionnel), ou sur « Importer CSV » pour en charger plusieurs d\'un coup. Le fichier a juste besoin d\'une colonne email ; nom, prénom, société et téléphone sont reconnus en français comme en anglais. La barre de recherche et le filtre par statut vous aident à retrouver quelqu\'un rapidement.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Regrouper en listes de diffusion',
+                        text: 'Dans l\'onglet « Listes de diffusion », créez une liste (ex : « Clients VIP ») et ajoutez-y des membres via la recherche. Vous réutilisez ensuite cette liste comme destinataire d\'un rapport automatique ou d\'une relance, au lieu de re-sélectionner les contacts à chaque fois.'
+                    },
+                    {
+                        icon: 'rocket',
+                        title: 'Envoyer un email en un clic',
+                        text: 'Depuis le menu d\'actions d\'un contact ou d\'une liste, choisissez « Envoyer un email », rédigez l\'objet et le message, puis envoyez. Bon à savoir : les contacts désabonnés (RGPD) sont automatiquement exclus de l\'envoi — vous restez en règle sans y penser.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
 {% end %}

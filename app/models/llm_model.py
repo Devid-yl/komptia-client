@@ -76,6 +76,19 @@ class LlmModel(Base):
     # Caractéristiques techniques (admin-editable).
     context_window: Mapped[int] = mapped_column(Integer, nullable=False, default=200_000)
     max_output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=4_096)
+    # ``context_window_verified`` : True ssi ``context_window`` a été CONFIRMÉ
+    # par une source fiable (registre LiteLLM, override admin, ou seed code).
+    # False = valeur provisoire (défaut 200_000 posé par ``sync_from_provider``
+    # parce que l'API provider n'expose pas la fenêtre, et enrich LiteLLM
+    # n'a pas encore — ou pas pu — confirmer). L'indicateur /iris lit ce flag
+    # pour afficher « ≈ à confirmer » au lieu d'un chiffre potentiellement faux
+    # (anti donnée-fausse-silencieuse). ⚠️ Les CALCULS de budget ne lisent
+    # JAMAIS ce flag : ``get_context_window_for_model`` garde son fallback >0,
+    # donc le clamp max_tokens / budget input restent toujours valides. Le flag
+    # ne pilote QUE l'affichage.
+    context_window_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     # Pricing — USD par million de tokens.
     input_price_per_mtok_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
@@ -179,6 +192,7 @@ class LlmModel(Base):
             "display_name": self.display_name,
             "alias_of": self.alias_of,
             "context_window": self.context_window,
+            "context_window_verified": self.context_window_verified,
             "max_output_tokens": self.max_output_tokens,
             "input_price_per_mtok_usd": self.input_price_per_mtok_usd,
             "cache_read_price_per_mtok_usd": self.cache_read_price_per_mtok_usd,

@@ -172,15 +172,42 @@ class DatabaseConfig:
     path: str = field(
         default_factory=lambda: os.getenv("KOMPTIA_DB_PATH") or str(DATA_DIR / "komptia.db")
     )
-    encryption_key: str = field(default_factory=lambda: os.getenv("SQLCIPHER_KEY", ""))
+    # .strip() : un newline/espace de bord (copier-coller dans .env) dériverait
+    # une clé hex DIFFÉRENTE et irreproductible → BDD chiffrée non restaurable
+    # avec la clé « propre ». On normalise dès la lecture.
+    encryption_key: str = field(default_factory=lambda: os.getenv("SQLCIPHER_KEY", "").strip())
     echo: bool = False
+    # Concurrence de l'executor de threads de la BDD SOURCE (Sage) — cf.
+    # sage_connector / sqlite_sage_connector. NE PAS confondre avec les knobs
+    # ``local_*`` ci-dessous (pool du moteur SQLite LOCAL).
     pool_size: int = 5
+    # Pool de connexions du moteur SQLite LOCAL async (cf. init_database) : borne
+    # la concurrence et réutilise les connexions chaudes. Knobs DÉDIÉS, distincts
+    # de ``pool_size`` (Sage) pour éviter toute collision sémantique.
+    local_pool_size: int = field(
+        default_factory=lambda: _safe_int(
+            os.getenv("KOMPTIA_DB_POOL_SIZE"), 10, "KOMPTIA_DB_POOL_SIZE"
+        )
+    )
+    local_max_overflow: int = field(
+        default_factory=lambda: _safe_int(
+            os.getenv("KOMPTIA_DB_MAX_OVERFLOW"), 20, "KOMPTIA_DB_MAX_OVERFLOW"
+        )
+    )
+    local_pool_timeout: int = field(
+        default_factory=lambda: _safe_int(
+            os.getenv("KOMPTIA_DB_POOL_TIMEOUT"), 30, "KOMPTIA_DB_POOL_TIMEOUT"
+        )
+    )
 
     def __repr__(self) -> str:
         return (
             f"DatabaseConfig(path={self.path!r}, "
             f"encryption_key='***REDACTED***', "
-            f"echo={self.echo}, pool_size={self.pool_size})"
+            f"echo={self.echo}, pool_size={self.pool_size}, "
+            f"local_pool_size={self.local_pool_size}, "
+            f"local_max_overflow={self.local_max_overflow}, "
+            f"local_pool_timeout={self.local_pool_timeout})"
         )
 
 
@@ -203,6 +230,20 @@ class SageConfig:
     username: str = field(default_factory=lambda: os.getenv("SAGE_DB_USER", ""))
     password: str = field(default_factory=lambda: os.getenv("SAGE_DB_PASSWORD", ""))
     timeout: int = 30
+    # Timeout de LOGIN ODBC (établissement de connexion) en secondes — DISTINCT
+    # de ``timeout`` ci-dessus (wall-clock d'EXÉCUTION de requête, appliqué par
+    # ``query_executor``). DOIT rester < ``timeout`` : ainsi pyodbc lève une
+    # vraie erreur de connexion AVANT que le wall-clock n'annule la coroutine,
+    # ce qui permet au circuit breaker Sage de s'OUVRIR (une annulation
+    # ``CancelledError`` n'était pas comptée → breaker jamais ouvert → l'app
+    # pendait 30 s par requête quand Sage devenait injoignable — incident prod
+    # 2026-06-08). Court par défaut : un Sage joignable répond en <1 s ; on veut
+    # fail-fast quand il est injoignable (SYN droppé). Override SAGE_DB_CONNECT_TIMEOUT.
+    connect_timeout: int = field(
+        default_factory=lambda: _safe_int(
+            os.getenv("SAGE_DB_CONNECT_TIMEOUT"), 15, "SAGE_DB_CONNECT_TIMEOUT"
+        )
+    )
     # Défaut relevé 1000→10000 le 2026-05-29 (demande user). Reste configurable
     # par connexion via /admin/database (DatabaseConnection.max_rows) ; aucun
     # hard cap applicatif (cf. no_double_cap). Les gardes anti-DoS (taille SQL,
@@ -241,6 +282,7 @@ class SageConfig:
             username=self.username,
             password=self.password,
             timeout=self.timeout,
+            connect_timeout=self.connect_timeout,
         )
 
     def __repr__(self) -> str:
@@ -467,12 +509,16 @@ class BackupConfig:
     )
     retention_count: int = field(
         default_factory=lambda: _safe_int(
-            os.getenv("KOMPTIA_AUTO_BACKUP_RETENTION_COUNT"), 7, "KOMPTIA_AUTO_BACKUP_RETENTION_COUNT"
+            os.getenv("KOMPTIA_AUTO_BACKUP_RETENTION_COUNT"),
+            7,
+            "KOMPTIA_AUTO_BACKUP_RETENTION_COUNT",
         )
     )
     retention_days: int = field(
         default_factory=lambda: _safe_int(
-            os.getenv("KOMPTIA_AUTO_BACKUP_RETENTION_DAYS"), 30, "KOMPTIA_AUTO_BACKUP_RETENTION_DAYS"
+            os.getenv("KOMPTIA_AUTO_BACKUP_RETENTION_DAYS"),
+            30,
+            "KOMPTIA_AUTO_BACKUP_RETENTION_DAYS",
         )
     )
     #: Répertoire off-site (montage NFS/SMB/rclone, USB…) où copier chaque
@@ -685,6 +731,14 @@ class AppConfig:
                 f"doit être strictement positif."
             )
 
+        if self.security.session_remember_timeout_hours <= 0:
+            raise RuntimeError(
+                f"session_remember_timeout_hours="
+                f"{self.security.session_remember_timeout_hours} "
+                f"doit être strictement positif (sinon expiration immédiate "
+                f"ou dans le passé des sessions « rester connecté »)."
+            )
+
         if self.security.rate_limit_login <= 0:
             raise RuntimeError(
                 f"rate_limit_login={self.security.rate_limit_login} doit être strictement positif "
@@ -781,6 +835,11 @@ class AppConfig:
         _apply_yaml_section(config.limits, yaml_config.get("limits"))
         _apply_yaml_section(config.database, yaml_config.get("database"), env_prefix="SQLCIPHER_")
         _apply_yaml_section(config.sage, yaml_config.get("sage"), env_prefix="SAGE_DB_")
+        # `security:` appliqué de façon DÉFENSIVE : `secret_key` (et tout secret)
+        # EXCLU — le secret vient exclusivement de l'env SECRET_KEY ; config.yaml
+        # est tracké git et ne doit jamais porter de secret ni écraser l'env.
+        # Coercition de type explicite des champs whitelistés (cf. helper).
+        _apply_security_yaml(config.security, yaml_config.get("security"))
 
         # Re-valider après mutations YAML — un yaml peut introduire des valeurs
         # qui violent les invariants vérifiés par __post_init__.
@@ -819,6 +878,56 @@ def _apply_yaml_section(target: Any, section: dict | None, env_prefix: str = "")
         if env_prefix and os.getenv(f"{env_prefix}{key.upper()}"):
             continue
         setattr(target, key, value)
+
+
+# Champs de ``SecurityConfig`` surchargeables depuis ``config.yaml`` (section
+# ``security:``). ``secret_key`` est VOLONTAIREMENT absent : c'est un secret,
+# il vient exclusivement de l'env ``SECRET_KEY``.
+_SECURITY_YAML_INT_KEYS = frozenset(
+    {
+        "session_timeout_hours",
+        "session_remember_timeout_hours",
+        "rate_limit_login",
+        "rate_limit_login_window_seconds",
+        "bcrypt_rounds",
+        "user_agent_log_max_length",
+    }
+)
+_SECURITY_YAML_BOOL_KEYS = frozenset({"csrf_enabled"})
+
+
+def _apply_security_yaml(target: Any, section: dict | None) -> None:
+    """Applique la section ``security:`` du YAML de façon DÉFENSIVE.
+
+    - ``secret_key`` (et toute clé non whitelistée) est **ignorée** : le secret
+      vient exclusivement de l'env ``SECRET_KEY``. ``config.yaml`` est tracké
+      dans git et ne doit jamais porter de secret ni écraser l'environnement.
+    - **Coercition de type explicite** : YAML peut quoter un entier
+      (``bcrypt_rounds: "12"``) ou un booléen — sans coercition, ``_validate``
+      lèverait un ``TypeError`` opaque au boot, ou une string truthy
+      (``csrf_enabled: "false"``) contournerait une garde fail-closed. Une
+      valeur non castable est ignorée (le défaut sûr est conservé) + ``warn``.
+    """
+    if not section:
+        return
+    for key, value in section.items():
+        if key in _SECURITY_YAML_INT_KEYS:
+            try:
+                setattr(target, key, int(value))
+            except (TypeError, ValueError):
+                warnings.warn(
+                    f"config.yaml security.{key}={value!r} ignoré "
+                    f"(entier attendu) — valeur par défaut conservée.",
+                    stacklevel=2,
+                )
+        elif key in _SECURITY_YAML_BOOL_KEYS:
+            if isinstance(value, bool):
+                setattr(target, key, value)
+            elif isinstance(value, str):
+                setattr(target, key, value.strip().lower() in ("true", "1", "yes", "on"))
+            else:
+                setattr(target, key, bool(value))
+        # secret_key et clés inconnues : volontairement ignorées.
 
 
 @lru_cache(maxsize=1)

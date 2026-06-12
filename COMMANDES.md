@@ -186,6 +186,8 @@ make first-run
 
 **Garde-fou** : refuse de tourner si le volume contient déjà des données (impossible d'écraser une install existante par erreur). Si tu veux repartir de zéro sur une install existante, utilise `make reset`.
 
+**Serveur isolé (sans réseau sortant)** : au 1er usage d'Iris, le modèle d'embeddings se télécharge dans le volume (`hf_cache/`). Sans réseau, Iris reste fonctionnel en **repli TF-IDF** (qualité RAG réduite, jamais bloquant). Pour activer les vrais embeddings sur un serveur isolé, pré-peupler le cache une fois — voir **annexe E** de `docs/komptia_documentation_technique.md` (Option 1 : accès réseau ponctuel ; Option 2 : pré-télécharger sur un poste connecté puis copier dans le volume).
+
 **Si une étape plante en cours** : tu peux relancer manuellement les étapes restantes :
 
 ```bash

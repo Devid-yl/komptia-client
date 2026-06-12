@@ -155,7 +155,15 @@
     }
 
     // --- Utility: build result table ---
-    function buildResultTable(columns, rows, truncated) {
+    // ``totalRowCount`` (optionnel) : VRAI total serveur quand il diffère de
+    // rows.length (#18a 2026-06-10 — au restore, rows est cappé à 200 côté
+    // persistance mais row_count porte le total réel ; afficher rows.length
+    // comme « total » mentait).
+    // ``oracleUnvalidated`` (optionnel) : true STRICT quand le backend a posé
+    // ``oracle_prevalidated === false`` (oracle fail-open, FAILLE 1) — le
+    // résultat a été exécuté SANS pré-validation SGBD ; l'avertissement doit
+    // suivre sur TOUTES les surfaces (parité avec la bannière de /iris).
+    function buildResultTable(columns, rows, truncated, totalRowCount, oracleUnvalidated) {
         const maxRows = 20;
         const display = rows.slice(0, maxRows);
         let html = '<div class="jw-sql-wrap"><table class="jw-sql-table"><thead><tr>';
@@ -172,10 +180,13 @@
             html += "</tr>";
         });
         html += "</tbody></table></div>";
-        if (rows.length > maxRows) {
+        var totalLabel = (typeof totalRowCount === "number" && totalRowCount > rows.length)
+            ? totalRowCount
+            : rows.length;
+        if (totalLabel > maxRows) {
             html +=
                 '<div class="jw-sql-info">' +
-                rows.length +
+                totalLabel +
                 " lignes au total (affichage limité à " +
                 maxRows +
                 ")</div>";
@@ -190,6 +201,15 @@
                 '<div class="jw-sql-info">⚠ Résultat limité : la requête a ' +
                 "retourné plus de lignes que le plafond admin (toutes ne sont " +
                 "pas incluses).</div>";
+        }
+        // Oracle fail-open (FAILLE 1) — texte = COPIE SYNCHRONE reformulée de
+        // ORACLE_NOT_PREVALIDATED_WARNING (sql_validator.py), comme la bannière
+        // de iris.js (_makeOracleWarn) : garder les formulations en phase.
+        if (oracleUnvalidated === true) {
+            html +=
+                '<div class="jw-sql-info jw-sql-oracle-warning" role="alert">⚠️ ' +
+                "Résultat non pré-validé par le SGBD : la base source était " +
+                "injoignable au moment de la validation.</div>";
         }
         return html;
     }
@@ -431,9 +451,23 @@
                 var sqlBubble = document.createElement("div");
                 sqlBubble.className = "jw-bubble jw-bubble-assistant";
                 sqlBubble.innerHTML = sanitizeHtml(
-                    // #39 (A5-F4) — propager le flag de troncature serveur au
-                    // restore (parité avec la page). Absent legacy → pas de notice.
-                    buildResultTable(sqlData.columns, sqlData.rows, sqlData.truncated || false)
+                    // #39 (A5-F4) — flag cap admin (parité page).
+                    // #18a (2026-06-10) — OR avec la troncature de RESTORE
+                    // (rows persistées cappées à _RESTORE_ROWS_CAP) + dérivation
+                    // legacy row_count > rows.length, et passage du VRAI total
+                    // (revue adv. : le widget affichait « 200 lignes au total »
+                    // pour un résultat de 800).
+                    buildResultTable(
+                        sqlData.columns,
+                        sqlData.rows,
+                        !!(sqlData.truncated
+                            || sqlData.restore_truncated
+                            || (typeof sqlData.row_count === "number"
+                                && sqlData.row_count > sqlData.rows.length)),
+                        sqlData.row_count,
+                        // Oracle fail-open (FAILLE 1) — parité live↔restore.
+                        sqlData.oracle_prevalidated === false
+                    )
                 );
                 sqlWrap.appendChild(sqlBubble);
                 els.messages.appendChild(sqlWrap);
@@ -957,7 +991,14 @@
             // #39 (A5-F4) — flag de troncature serveur en live (parité page +
             // restore widget). Sans ça le widget montrait un résultat coupé
             // comme complet (donnée fausse silencieuse).
-            buildResultTable(data.columns || [], data.rows || [], data.truncated || false)
+            buildResultTable(
+                data.columns || [],
+                data.rows || [],
+                data.truncated || false,
+                undefined,
+                // Oracle fail-open (FAILLE 1) — parité bannière page /iris.
+                data.oracle_prevalidated === false
+            )
         );
         wrap.appendChild(bubble);
         els.messages.appendChild(wrap);
@@ -1300,6 +1341,12 @@
                 conversation_id: conversationId,
                 response: response,
                 source: "widget",
+                // R1 (L0O1) — joindre le mode explicitement (comme sendMessage) :
+                // le widget est execution-only aujourd'hui, mais sans ce champ le
+                // backend retomberait sur `_last_mode` (reset au reconnect) → trappe
+                // latente si le widget gagne un mode « Expliquer ». On fixe tous les
+                // call-sites pour la cohérence.
+                mode: "execution",
             })
         );
     }

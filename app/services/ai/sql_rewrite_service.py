@@ -313,9 +313,15 @@ async def rewrite_sql_for_new_server(
 
     # Dry-run sur Sage pour valider que le LLM a produit quelque chose
     # qui tourne réellement. Réutilise le même pattern que Bug n°4
-    # (validation à l'insertion) : execute avec max_rows=1, add_limit=True,
-    # timeout court. Si crash → needs_human_review (LLM a produit du SQL
-    # plausible mais sémantiquement / syntaxiquement faux).
+    # (validation à l'insertion) : execute avec max_rows=1, add_limit=True.
+    # Si crash → needs_human_review (LLM a produit du SQL plausible mais
+    # sémantiquement / syntaxiquement faux).
+    #
+    # Pas de ``timeout=`` explicite : le coût est déjà borné par ``max_rows=1``
+    # (TOP 1, aucun gros résultat ramené). On hérite donc du timeout admin
+    # (``connector.timeout``). Un hardcode court (ex: 15s) rejetait à tort un
+    # SQL valide sur une Sage lente où l'admin a délibérément configuré plus —
+    # même bug de double-cap que l'incident dashboard 2026-06-08.
     from app.core.exceptions import QueryError, ValidationError
     from app.services.database.query_executor import get_query_executor
 
@@ -325,7 +331,6 @@ async def rewrite_sql_for_new_server(
             new_sql,
             max_rows=1,
             add_limit=True,
-            timeout=15,
             rls_source="feature_7_rewrite_dryrun",
         )
         # Dry-run OK : on retourne le nouveau SQL prêt à persister.

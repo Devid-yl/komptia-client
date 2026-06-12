@@ -36,12 +36,16 @@ import logging
 import os
 from typing import Optional
 
-from sqlalchemy import create_engine, delete, event, select
+from sqlalchemy import delete, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.core.database import get_db_url
+
+# get_db_url est ré-exposé ici (et passé explicitement à make_sync_engine) pour
+# rester monkeypatchable par les tests de cleanup (qui redirigent la BDD vers une
+# base temporaire via patch de ``db_retention.get_db_url``).
+from app.core.database import get_db_url, make_sync_engine
 
 
 def _create_cleanup_engine() -> Engine:
@@ -57,16 +61,8 @@ def _create_cleanup_engine() -> Engine:
     Pour PostgreSQL/MySQL ce PRAGMA n'a aucun effet (les FK sont toujours
     actives) — l'event listener s'exécute mais le PRAGMA est ignoré.
     """
-    engine = create_engine(get_db_url())
-
-    @event.listens_for(engine, "connect")
-    def _enable_sqlite_fk(dbapi_conn, _conn_record):  # type: ignore[no-untyped-def]
-        try:
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA foreign_keys = ON")
-            cursor.close()
-        except Exception:  # noqa: BLE001 — non-SQLite drivers : silently ignore
-            pass
+    # make_sync_engine pose foreign_keys=ON (via setup_pragmas) + PRAGMA key.
+    engine = make_sync_engine(get_db_url())
 
     return engine
 
@@ -403,7 +399,7 @@ def cleanup_audit_logs(retention_days: Optional[int] = None) -> int:
     if retention_days is None:
         retention_days = _get_retention_days("AUDIT_LOGS_RETENTION_DAYS")
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -442,7 +438,7 @@ def cleanup_sql_write_audit(retention_days: Optional[int] = None) -> int:
         SqlWriteStatus.REJECTED_BY_VALIDATOR.value,
     ]
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -464,7 +460,7 @@ def cleanup_search_history(retention_days: Optional[int] = None) -> int:
     if retention_days is None:
         retention_days = _get_retention_days("SEARCH_HISTORY_RETENTION_DAYS")
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -494,7 +490,7 @@ def cleanup_query_diff_history(retention_days: Optional[int] = None) -> int:
     if retention_days is None:
         retention_days = _get_retention_days("QUERY_DIFF_HISTORY_RETENTION_DAYS")
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -515,7 +511,7 @@ def cleanup_ai_performance_logs(retention_days: Optional[int] = None) -> int:
     if retention_days is None:
         retention_days = _get_retention_days("AI_PERFORMANCE_LOGS_RETENTION_DAYS")
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -543,7 +539,7 @@ def cleanup_schema_syncs(retention_days: Optional[int] = None) -> int:
     if retention_days is None:
         retention_days = _get_retention_days("SCHEMA_SYNCS_RETENTION_DAYS")
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -564,7 +560,7 @@ def cleanup_email_logs(retention_days: Optional[int] = None) -> int:
     if retention_days is None:
         retention_days = _get_retention_days("EMAIL_LOGS_RETENTION_DAYS")
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             return _cleanup_table_by_age(
@@ -973,7 +969,7 @@ def cleanup_training_data(retention_days: Optional[int] = None) -> int:
 
     cutoff = clock.now() - datetime.timedelta(days=retention_days)
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     try:
         with Session(engine) as session:
             stmt = delete(TrainingData).where(
@@ -1199,10 +1195,44 @@ def cleanup_db_retention_job() -> None:
         # Task #9 sous-tâche A — F2 brainstorm initial : croissance
         # disque non bornée /uploads/. Cleanup TTL par défaut 30 jours.
         (cleanup_iris_uploads, "iris_uploads"),
+        # Archives ``llm_log.YYYY-MM-DDTHHMMSS.md`` produites par la rotation
+        # de llm_logger. La fonction TTL existait (« à appeler par un job »,
+        # cf. sa docstring) mais n'avait AUCUN appelant jusqu'au 2026-06-10 —
+        # les archives s'accumulaient sans borne (croissance disque, axe 21).
+        (_cleanup_rotated_llm_logs, "llm_log_archives"),
     ):
         try:
             total += fn()
         except Exception:  # noqa: BLE001 — fail-soft per table
             logger.error("cleanup %s: échec, skip", label, exc_info=True)
 
+    # WAL checkpoint TRUNCATE après les purges : les DELETE massifs font
+    # grossir le WAL ; sans checkpoint forcé, le fichier ne redescend qu'au
+    # gré des checkpoints passifs (page cap 5000). Le commentaire de
+    # ``_WAL_AUTOCHECKPOINT_PAGES`` (database.py) promettait ce comportement
+    # depuis le départ — il n'était PAS implémenté (#15, hygiène 2026-06-10).
+    # Fail-soft : un échec (BDD busy) n'invalide pas les purges déjà faites.
+    try:
+        engine = _create_cleanup_engine()
+        try:
+            with engine.connect() as conn:
+                conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            engine.dispose()
+        logger.info("cleanup_db_retention_job: wal_checkpoint(TRUNCATE) exécuté")
+    except Exception:  # noqa: BLE001 — fail-soft, même doctrine que les tables
+        logger.warning("cleanup wal_checkpoint: échec, skip", exc_info=True)
+
     logger.info("cleanup_db_retention_job done: total_deleted=%d", total)
+
+
+def _cleanup_rotated_llm_logs() -> int:
+    """Purge TTL des archives rotées de ``llm_log.md`` (fichiers, pas BDD).
+
+    Wrapper fail-soft autour de ``llm_logger.cleanup_old_rotated_logs`` pour
+    l'intégrer au pool du job quotidien (même cadence, même tolérance aux
+    échecs que les tables). Retourne le nombre de fichiers supprimés.
+    """
+    from app.services.ai.llm_logger import cleanup_old_rotated_logs
+
+    return cleanup_old_rotated_logs()

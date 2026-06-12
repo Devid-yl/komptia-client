@@ -310,6 +310,46 @@ class OnboardingResetHandler(BaseHandler):
         self.write_json({"deleted_count": deleted})
 
 
+class OnboardingSelfResetHandler(BaseHandler):
+    """``POST /api/onboarding/reset`` — l'utilisateur réactive SES propres tours.
+
+    Self-service exposé dans ``/settings`` (section Aide → « Réactiver les
+    tours »). Supprime TOUTES les lignes ``user_onboarding_progress`` du user
+    courant → les tours guidés réapparaissent à sa prochaine visite de chaque
+    page (la source de vérité est le serveur ; ``onboarding-tour.js`` re-fetch
+    l'état vide au prochain ``GET /api/onboarding/state``).
+
+    **Owner-scope strict par construction** : la cible est TOUJOURS
+    ``self.current_user.id``. Le body de la requête est ignoré — il n'existe
+    aucun paramètre ``user_id`` ici (contrairement à
+    :class:`OnboardingResetHandler`, l'utilitaire ``@admin_required`` qui prend
+    un ``user_id`` cible). Forger ``{"user_id": <autre>}`` n'a donc aucun effet :
+    impossible de réinitialiser l'onboarding d'un autre compte.
+
+    Idempotent : un second appel supprime 0 ligne et retourne
+    ``{"deleted_count": 0}`` sans erreur (double-clic, multi-onglets).
+
+    N'affecte que les tours par-utilisateur. La checklist de setup admin
+    (singleton tenant-wide ``tenant_setup_progress``) n'est volontairement PAS
+    touchée — ce serait un effet de bord cross-admin pour une action « mes
+    paramètres » (décision produit 2026-06-09).
+    """
+
+    @authenticated
+    async def post(self) -> None:
+        user_id = self.current_user.id
+        async with self.db_session() as session:
+            deleted = await reset_user_onboarding(session, user_id)
+
+        await _audit(
+            self,
+            action="onboarding_self_reset",
+            entity_id=user_id,
+            details={"deleted_count": deleted},
+        )
+        self.write_json({"deleted_count": deleted})
+
+
 __all__ = (
     "OnboardingStateHandler",
     "OnboardingTourStartHandler",
@@ -321,4 +361,5 @@ __all__ = (
     "TenantSetupDismissHandler",
     "TenantSetupResumeHandler",
     "OnboardingResetHandler",
+    "OnboardingSelfResetHandler",
 )

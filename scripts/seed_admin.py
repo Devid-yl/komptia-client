@@ -50,6 +50,7 @@ from typing import Final, Optional
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from app.core.constants_auth import PASSWORD_MAX_BYTES, password_exceeds_bcrypt_limit
 from app.core.database import get_session, init_database
 from app.models.user import User, UserRole
 from app.services.auth.password_hasher import get_password_hasher
@@ -122,10 +123,11 @@ def _validate_password(value: str) -> Optional[str]:
             f"Le mot de passe doit faire au moins {_PASSWORD_MIN_LENGTH} caractères "
             "(recommandation OWASP ASVS V6.1.2)."
         )
-    # bcrypt tronque silencieusement à 72 bytes : on coupe avant pour éviter
-    # l'illusion d'un mdp long alors que seuls les 72 premiers comptent.
-    if len(value.encode("utf-8")) > 72:
-        return "Le mot de passe ne peut pas dépasser 72 octets (limite bcrypt)."
+    # bcrypt n'utilise que les PASSWORD_MAX_BYTES premiers octets : on rejette
+    # au-delà pour éviter l'illusion d'un mdp long alors que seuls les premiers
+    # comptent (SSoT : app.core.constants_auth, partagé avec les handlers).
+    if password_exceeds_bcrypt_limit(value):
+        return f"Le mot de passe ne peut pas dépasser {PASSWORD_MAX_BYTES} octets (limite bcrypt)."
     return None
 
 

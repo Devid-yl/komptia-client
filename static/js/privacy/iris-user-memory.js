@@ -87,7 +87,64 @@
     }
 
     // ── Fetch helpers ────────────────────────────────────────────────
+
+    // Promesse PARTAGÉE du bundle /api/settings/bootstrap (cf. settings.js).
+    // Guard ``window.__komptiaSettingsBootstrap`` → 1 seul fetch même si
+    // settings.js l'a déjà déclenché. Forme résolue ``{ok, status, data}``.
+    function getSettingsBootstrap() {
+        if (!window.__komptiaSettingsBootstrap) {
+            window.__komptiaSettingsBootstrap = fetch('/api/settings/bootstrap', {
+                method: 'GET',
+                credentials: 'same-origin',
+                headers: { 'Accept': 'application/json' },
+            }).then(function (r) {
+                return r.json().then(
+                    function (d) { return { ok: r.ok, status: r.status, data: d }; },
+                    function () { return { ok: false, status: r.status, data: null }; }
+                );
+            }).catch(function () {
+                return { ok: false, status: 0, data: null };
+            }).then(function (res) {
+                // Ne PAS mémoriser un échec : libère le guard pour un retry
+                // ultérieur (sinon 1 glitch réseau = perte perf permanente).
+                if (!res || !res.ok) window.__komptiaSettingsBootstrap = null;
+                return res;
+            });
+        }
+        return window.__komptiaSettingsBootstrap;
+    }
+
+    // Applique un bloc {memory, char_count, max_chars} à l'UI + state.
+    function applyMemory(data) {
+        var maxC = $('iris-memory-char-max');
+        // ``> 0`` : un cap à 0 (fail-soft backend) bloquerait le textarea à
+        // maxLength=0 (panneau cassé silencieux) → on garde le défaut state.maxChars.
+        if (typeof data.max_chars === 'number' && data.max_chars > 0) {
+            state.maxChars = data.max_chars;
+            if (maxC) maxC.textContent = String(state.maxChars);
+        }
+        state.original = data.memory || '';
+        var ta = $('iris-memory-textarea');
+        if (ta) {
+            ta.value = state.original;
+            ta.maxLength = state.maxChars;
+        }
+        updateCharCount();
+        syncSaveButton();
+        setStatus('', null);
+    }
+
     async function loadMemory() {
+        // 1) Bundle bootstrap partagé (1 fetch pour tout le boot /settings).
+        try {
+            var bs = await getSettingsBootstrap();
+            if (bs && bs.ok && bs.data && bs.data.user_memory &&
+                typeof bs.data.user_memory.memory === 'string') {
+                applyMemory(bs.data.user_memory);
+                return;
+            }
+        } catch (e) { /* bascule sur le fallback ci-dessous */ }
+        // 2) Fallback : appel direct (bootstrap indispo / échec / champ absent).
         try {
             var res = await fetch('/api/iris/user-memory', {
                 method: 'GET',
@@ -99,20 +156,7 @@
             if (!data || data.success !== true) {
                 throw new Error(data && data.error ? data.error : 'Réponse serveur invalide');
             }
-            var maxC = $('iris-memory-char-max');
-            if (typeof data.max_chars === 'number') {
-                state.maxChars = data.max_chars;
-                if (maxC) maxC.textContent = String(state.maxChars);
-            }
-            state.original = data.memory || '';
-            var ta = $('iris-memory-textarea');
-            if (ta) {
-                ta.value = state.original;
-                ta.maxLength = state.maxChars;
-            }
-            updateCharCount();
-            syncSaveButton();
-            setStatus('', null);
+            applyMemory(data);
         } catch (err) {
             setStatus('Erreur de chargement : ' + (err && err.message ? err.message : err), 'error');
         }

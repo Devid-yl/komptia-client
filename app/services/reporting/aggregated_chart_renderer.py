@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")  # Backend sans affichage
 import matplotlib.pyplot as plt
 
+from app.services.reporting.pie_data import prepare_pie_slices
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -129,6 +130,18 @@ def _render_bar(cfg: Dict[str, Any]) -> Optional[Path]:
         ax.set_ylabel(str(cfg["y_label"])[:80])
     if cfg.get("title"):
         ax.set_title(str(cfg["title"])[:120], fontsize=12, pad=14)
+    # #18f (triage caps 2026-06-10) — les barres au-delà du cap sont
+    # DROPPÉES : sans cette mention, le lecteur du rapport PDF croit voir
+    # toutes les catégories (totaux/comparaisons faussés en silence).
+    if len(bars) > _MAX_BARS:
+        ax.annotate(
+            f"⚠ {len(clean)} catégories affichées sur {len(bars)}",
+            xy=(0.99, 1.02),
+            xycoords="axes fraction",
+            ha="right",
+            fontsize=8,
+            color="#b45309",
+        )
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -242,6 +255,30 @@ def _render_line(cfg: Dict[str, Any]) -> Optional[Path]:
         ax.set_ylabel(str(cfg["y_label"])[:80])
     if cfg.get("title"):
         ax.set_title(str(cfg["title"])[:120], fontsize=12, pad=14)
+    # #18f (triage caps 2026-06-10) — séries et/ou points droppés au-delà
+    # des caps : l'annoncer sur le graphe (une courbe de tendance amputée
+    # de ses derniers points = lecture FAUSSE en silence).
+    _trunc_notes = []
+    if len(series_raw) > _MAX_SERIES:
+        _trunc_notes.append(f"{len(clean_series)} séries sur {len(series_raw)}")
+    _pts_truncated = sum(
+        1
+        for s in series_raw[:_MAX_SERIES]
+        if isinstance(s, dict) and len(s.get("points") or []) > _MAX_POINTS_PER_SERIES
+    )
+    if _pts_truncated:
+        _trunc_notes.append(
+            f"{_pts_truncated} série(s) limitée(s) à {_MAX_POINTS_PER_SERIES} points"
+        )
+    if _trunc_notes:
+        ax.annotate(
+            "⚠ " + " ; ".join(_trunc_notes),
+            xy=(0.99, 1.02),
+            xycoords="axes fraction",
+            ha="right",
+            fontsize=8,
+            color="#b45309",
+        )
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -260,20 +297,19 @@ def _render_pie(cfg: Dict[str, Any]) -> Optional[Path]:
     if not slices_raw:
         return None
 
-    clean: List[tuple] = []
-    for s in slices_raw[:_MAX_SLICES]:
-        if not isinstance(s, dict):
-            continue
-        label = str(s.get("label", ""))[:40]
-        val = _safe_float(s.get("value"))
-        if val is None or val <= 0:
-            continue
-        clean.append((label, val))
-    if not clean:
+    # SSoT #143 : agrège la queue au-delà de _MAX_SLICES dans une part « Autres »
+    # (au lieu de la dropper → % faux vs total réel) et compte les parts ≤ 0
+    # exclues (non représentables dans un camembert) pour les surfacer en légende.
+    # Défense en profondeur : sur le chemin LLM→PDF, _clean_slices pré-agrège déjà
+    # (ce passage est alors un no-op idempotent) ; il reste actif pour tout
+    # appelant direct qui passerait des parts brutes (>_MAX_SLICES ou ≤ 0).
+    labels, values, _others_count, excluded_nonpos = prepare_pie_slices(
+        ((s.get("label", ""), s.get("value")) for s in slices_raw if isinstance(s, dict)),
+        max_slices=_MAX_SLICES,
+        label_maxlen=40,
+    )
+    if not values:
         return None
-
-    labels = [c[0] for c in clean]
-    values = [c[1] for c in clean]
 
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     colors = _COLORS[: len(labels)]
@@ -292,6 +328,19 @@ def _render_pie(cfg: Dict[str, Any]) -> Optional[Path]:
         t.set_fontsize(9)
     if cfg.get("title"):
         ax.set_title(str(cfg["title"])[:120], fontsize=12, pad=14)
+
+    # Transparence : signaler les parts non représentables exclues (≤ 0, NaN ou
+    # valeur absente — un camembert ne peut pas les afficher) sinon il prétend
+    # représenter 100 % des données alors qu'il en omet une partie.
+    if excluded_nonpos:
+        fig.text(
+            0.5,
+            0.01,
+            f"{excluded_nonpos} catégorie(s) sans valeur affichable exclue(s)",
+            ha="center",
+            fontsize=8,
+            color="gray",
+        )
 
     fig.tight_layout()
     out = _make_temp_png()

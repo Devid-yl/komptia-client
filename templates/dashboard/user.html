@@ -131,7 +131,7 @@
                         <div class="min-w-0 flex-1">
                             <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ ex._automation_name }}</p>
                             <p class="text-xs text-gray-400 dark:text-gray-500">
-                                {{ ex.started_at.strftime('%d/%m %H:%M') }}
+                                <time datetime="{{ iso_utc(ex.started_at) }}" data-fmt-local="short">{{ ex.started_at.strftime('%d/%m %H:%M') }} UTC</time>
                                 {% if ex.duration_seconds %} &middot; {{ "%.1f" % ex.duration_seconds }}s{% end %}
                                 {% if ex.result_rows is not None %} &middot; {{ ex.result_rows }} lignes{% end %}
                             </p>
@@ -172,7 +172,10 @@
                         <div class="min-w-0 flex-1">
                             <p class="text-xs text-gray-900 truncate dark:text-gray-100">{{ auto.name }}</p>
                             <p class="text-[10px] text-gray-400 dark:text-gray-500">
-                                {{ auto._next_run_time.strftime('%d/%m %H:%M') }}
+                                {# Pas de suffixe « UTC » : _next_run_time est normalisé en TZ
+                                   scheduler (≠ UTC) ; le fallback SSR montre cette heure, le JS
+                                   la reconvertit en heure navigateur via data-fmt-local. #}
+                                <time datetime="{{ iso_utc(auto._next_run_time) }}" data-fmt-local="short">{{ auto._next_run_time.strftime('%d/%m %H:%M') }}</time>
                                 {% if auto.schedule_type == 'daily' %}
                                     &middot; Quotidien
                                 {% elif auto.schedule_type == 'weekly' %}
@@ -217,7 +220,7 @@
                             <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ s.question }}</p>
                             <p class="text-xs text-gray-400 dark:text-gray-500">
                                 {% if s.result_count is not None %}{{ s.result_count }} r&eacute;s. &middot; {% end %}
-                                {{ s.created_at.strftime('%d/%m %H:%M') }}
+                                <time datetime="{{ iso_utc(s.created_at) }}" data-fmt-local="short">{{ s.created_at.strftime('%d/%m %H:%M') }} UTC</time>
                                 {% if s.generation_time %} &middot; {{ "%.1f" % s.generation_time }}s{% end %}
                             </p>
                         </div>
@@ -254,7 +257,7 @@
                         </div>
                         <div class="min-w-0 flex-1">
                             <p class="text-sm text-gray-900 truncate dark:text-gray-100">{{ r.title }}</p>
-                            <p class="text-xs text-gray-400 dark:text-gray-500">{{ r.file_format.upper() }} &middot; {{ r.created_at.strftime('%d/%m %H:%M') }}</p>
+                            <p class="text-xs text-gray-400 dark:text-gray-500">{{ r.file_format.upper() }} &middot; <time datetime="{{ iso_utc(r.created_at) }}" data-fmt-local="short">{{ r.created_at.strftime('%d/%m %H:%M') }} UTC</time></p>
                         </div>
                     </li>
                     {% end %}
@@ -322,29 +325,29 @@ window.DashboardCharts.mount({ isAdmin: false });
 {% if show_onboarding %}
 if (window.KomptiaOnboarding) {
     window.KomptiaOnboarding.start({
-        key: 'dashboard_user_v1',
+        key: 'dashboard_user_v2',
         title: 'Bienvenue sur Komptia',
         steps: [
             {
                 icon: 'sparkle',
                 title: 'Iris répond à vos questions',
-                text: 'Posez votre question en français (par exemple : « Top 10 clients par chiffre d\'affaires ») et Iris vous renvoie le résultat. Pratique pour les analyses ponctuelles, sans passer par Excel.',
+                text: 'Posez votre question en français (par exemple : « Top 10 clients par chiffre d\'affaires ») et Iris vous renvoie le résultat. Pratique pour les analyses ponctuelles, sans passer par Excel. La carte « Mes recherches » vous ramène vers Iris à tout moment.'
             },
             {
                 icon: 'chart',
                 title: 'Vos indicateurs en un coup d\'œil',
-                text: 'Ce tableau de bord récapitule vos recherches, rapports, automatisations et votre stockage. Cliquez sur une carte pour ouvrir le détail correspondant.',
+                text: 'Ce tableau de bord récapitule vos recherches, vos rapports, les emails envoyés par vos automatisations et votre stockage. Chaque carte est cliquable : cliquez dessus pour ouvrir la page détaillée correspondante.'
             },
             {
                 icon: 'bell',
                 title: 'Des automatisations programmées',
-                text: 'Transformez une recherche utile en automatisation hebdomadaire ou mensuelle. Komptia envoie ensuite le rapport par email aux destinataires que vous choisissez, sans intervention de votre part.',
+                text: 'Transformez une recherche utile en automatisation hebdomadaire ou mensuelle. Komptia envoie ensuite le rapport par email aux destinataires que vous choisissez, sans intervention de votre part. Les prochaines exécutions s\'affichent dans la carte « Mes automatisations ».'
             },
             {
                 icon: 'rocket',
                 title: 'Prêt·e à démarrer ?',
-                text: 'Cliquez sur « Iris » dans le menu pour poser votre première question. Et si vous avez un doute sur un libellé du tableau de bord, cliquez sur le petit « i » à côté : une explication courte s\'affiche.',
-            },
+                text: 'Cliquez sur « Iris » dans le menu pour poser votre première question. Et si un libellé du tableau de bord vous paraît obscur, survolez-le : une explication courte s\'affiche au passage de la souris.'
+            }
         ],
     });
 }

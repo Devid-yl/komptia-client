@@ -420,17 +420,16 @@ class ChartBuilder:
             return output_path
 
         # Extraire données et filtrer : matplotlib.pie refuse les valeurs négatives,
-        # nulles, NaN ou infinies. On drop les lignes invalides silencieusement.
-        import math as _math
+        # nulles, NaN ou infinies. SSoT #143 : ``prepare_pie_slices`` filtre ces
+        # valeurs ET compte celles ≤ 0 exclues (``excluded_nonpos``), surfacées en
+        # légende (sinon le camembert prétend représenter 100 % des données). Pas
+        # d'agrégation « Autres » ici (``max_slices=0`` → toutes les parts montrées).
+        from app.services.reporting.pie_data import prepare_pie_slices
 
-        labels: list[str] = []
-        values: list[float] = []
-        for row in data:
-            raw_val = _safe_float(row.get(value_column, 0))
-            if raw_val is None or raw_val <= 0 or not _math.isfinite(raw_val):
-                continue
-            labels.append(str(row.get(label_column, "")))
-            values.append(raw_val)
+        labels, values, _others, excluded_nonpos = prepare_pie_slices(
+            ((row.get(label_column, ""), row.get(value_column, 0)) for row in data),
+            max_slices=0,
+        )
 
         if not values:
             # Toutes les valeurs ont été filtrées — placeholder au lieu de crasher
@@ -486,6 +485,19 @@ class ChartBuilder:
 
             # Égaliser aspect ratio
             ax.axis("equal")
+
+            # Transparence : signaler les parts non représentables exclues (≤ 0,
+            # NaN ou valeur absente) sinon le camembert prétend représenter 100 %
+            # des données alors qu'il en omet une partie.
+            if excluded_nonpos:
+                fig.text(
+                    0.5,
+                    0.01,
+                    f"{excluded_nonpos} catégorie(s) sans valeur affichable exclue(s)",
+                    ha="center",
+                    fontsize=8,
+                    color="gray",
+                )
 
             # Layout
             plt.tight_layout()

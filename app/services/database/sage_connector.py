@@ -211,6 +211,7 @@ def build_sage_connection_string(
     username: str,
     password: str,
     timeout: int,
+    connect_timeout: Optional[int] = None,
 ) -> str:
     """Assemble la conn-string ODBC pour Sage -- SOURCE UNIQUE.
 
@@ -260,6 +261,18 @@ def build_sage_connection_string(
             )
         trust_cert = "yes"
 
+    # ``Connection Timeout`` ODBC = timeout de LOGIN (établissement de la
+    # connexion), à NE PAS confondre avec le wall-clock d'exécution de requête
+    # (appliqué par ``query_executor``). Si ``connect_timeout`` est fourni, on
+    # l'utilise borné à ``timeout`` (inutile que le login dépasse le budget
+    # requête) ; sinon fallback ``timeout`` (comportement historique pour les
+    # callers qui ne le passent pas). Court → le circuit breaker Sage s'ouvre
+    # vite quand le serveur est injoignable au lieu de pendre (prod 2026-06-08).
+    login_timeout = max(
+        1,
+        int(timeout) if connect_timeout is None else min(int(connect_timeout), int(timeout)),
+    )
+
     return (
         f"DRIVER={{{driver}}};"
         f"SERVER={sanitize_odbc_value(f'{host},{port}')};"
@@ -268,7 +281,7 @@ def build_sage_connection_string(
         f"PWD={sanitize_odbc_value(password)};"
         f"Encrypt={encrypt_opt};"
         f"TrustServerCertificate={trust_cert};"
-        f"Connection Timeout={int(timeout)};"
+        f"Connection Timeout={login_timeout};"
         f"Lock Timeout=30;"
         f"MARS_Connection=Yes;"
     )
@@ -340,6 +353,7 @@ class SageConnector:
         username: str = None,
         password: str = None,
         timeout: int = None,
+        connect_timeout: int = None,
         max_rows: int = None,
     ):
         """
@@ -365,6 +379,13 @@ class SageConnector:
         self.username = username or config.sage.username
         self.password = password or config.sage.password
         self.timeout = timeout or config.sage.timeout
+        # Login timeout (court) — DISTINCT du wall-clock requête (self.timeout).
+        # Cf. SageConfig.connect_timeout / build_sage_connection_string : permet
+        # au circuit breaker de s'ouvrir vite quand Sage est injoignable au lieu
+        # de pendre 30 s par requête (incident prod 2026-06-08).
+        self.connect_timeout = (
+            connect_timeout if connect_timeout is not None else config.sage.connect_timeout
+        )
         # ``max_rows`` peut tre 0 valide (interdit par le check
         # constraint BDD mais defensif), donc on filtre explicitement
         # ``None`` plutt que de profiter du falsy.
@@ -425,6 +446,7 @@ class SageConnector:
             username=self.username,
             password=self.password,
             timeout=self.timeout,
+            connect_timeout=self.connect_timeout,
         )
 
     def _get_executor(self) -> ThreadPoolExecutor:
@@ -507,11 +529,18 @@ class SageConnector:
                     _cb_half_open = True
                     logger.info("Circuit breaker Sage: half-open, tentative de reconnexion")
 
+        # Login timeout (court) — borné < au wall-clock requête de query_executor
+        # pour que la connexion échoue AVANT l'annulation et ouvre le breaker
+        # (incident prod 2026-06-08). MÊME valeur pour le kwarg pyodbc, le
+        # ``Connection Timeout`` de la conn-string ET le wait_for asyncio ci-dessous.
+        login_timeout = max(1, min(self.connect_timeout, self.timeout))
+
         def _connect():
             try:
                 conn = pyodbc.connect(
                     self.connection_string,
-                    timeout=self.timeout,
+                    # Login timeout (court). PAS ``self.timeout`` (wall-clock requête).
+                    timeout=login_timeout,
                     autocommit=True,  # Read-only, pas besoin de transactions
                 )
                 # Vérifier la connexion
@@ -528,7 +557,18 @@ class SageConnector:
 
         try:
             loop = asyncio.get_running_loop()
-            self._connection = await loop.run_in_executor(self._get_executor(), _connect)
+            # Defense in depth (finding adversarial #1) : on borne le login au
+            # niveau asyncio EN PLUS du ``Connection Timeout`` ODBC. Si le driver
+            # ignorait son timeout et que le socket TCP pendait (firewall SYN-drop),
+            # ce wait_for coupe quand même à ``login_timeout`` → l'échec remonte en
+            # TimeoutError COMPTÉ par le breaker (cf. except plus bas), au lieu d'un
+            # hang qui ne l'ouvre jamais. Le thread _connect sous-jacent (non
+            # cancellable) reste vivant jusqu'au timeout TCP OS, mais le breaker
+            # ouvert évite d'en spawner d'autres (× N widgets dashboard).
+            self._connection = await asyncio.wait_for(
+                loop.run_in_executor(self._get_executor(), _connect),
+                timeout=login_timeout,
+            )
             self._connected = True
             # Connexion réussie : reset complet du circuit breaker
             with _cb_lock:
@@ -547,6 +587,35 @@ class SageConnector:
             # ce garde couvre tout chemin où le driver disparaîtrait entre le
             # pré-vol et pyodbc.connect (re-discovery dans la conn-string).
             raise
+        except asyncio.TimeoutError as e:
+            # Login timeout dépassé au niveau asyncio (defense in depth, finding
+            # adversarial #1). Échec de connexion RÉEL → incrémenter le breaker
+            # pour qu'il s'ouvre (sinon, si le TCP pend au-delà du ``Connection
+            # Timeout`` ODBC, le hang reviendrait sans jamais ouvrir le breaker).
+            # ⚠️ En Python 3.11+ ``asyncio.TimeoutError`` EST ``TimeoutError``
+            # (sous-classe d'``OSError``), donc cette clause DOIT précéder le
+            # ``except (..., OSError, ...)`` ci-dessous pour ne pas être masquée ;
+            # sur 3.10 c'est une classe distincte, d'où la clause explicite.
+            # NB : on ne catch PAS ``asyncio.CancelledError`` (annulation externe,
+            # ex. déconnexion navigateur) → pas de faux positif breaker.
+            with _cb_lock:
+                _cb_failure_count += 1
+                _cb_last_failure_time = _time.monotonic()
+                _cb_half_open = False
+                logger.error(
+                    "❌ Timeout de connexion Sage après %ss (%d/%d)",
+                    login_timeout,
+                    _cb_failure_count,
+                    _CB_MAX_FAILURES,
+                )
+            raise SageConnectionError(
+                f"[CONNEXION_IMPOSSIBLE] Délai de connexion au serveur SQL Server "
+                f"dépassé ({login_timeout}s). Si la base est joignable mais lente "
+                f"(LAN saturé, handshake TLS ancien sur un serveur d'époque), "
+                f"augmentez SAGE_DB_CONNECT_TIMEOUT ; sinon la base est injoignable "
+                f"(réseau/firewall). NE PAS reformuler la requête SQL — c'est un "
+                f"problème de connexion serveur."
+            ) from e
         except (pyodbc.Error, OSError, SageConnectionError) as e:
             # Échec : incrémenter le circuit breaker
             with _cb_lock:

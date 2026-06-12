@@ -109,7 +109,7 @@ async def plan_widget_v2(
         raise WidgetPipelineError("Requête SQL vide.")
 
     # ── 1. Exécute le SQL ─────────────────────────────────────────────
-    columns, rows, real_row_count = await _execute_sql(sql, user=user)
+    columns, rows, real_row_count, sample_truncated = await _execute_sql(sql, user=user)
     if not rows:
         raise WidgetPipelineError(
             "La requête n'a retourné aucune ligne — impossible de planifier "
@@ -126,6 +126,7 @@ async def plan_widget_v2(
     # ── 3. Profile déterministe (zéro LLM) ────────────────────────────
     profile = profile_columns(columns, rows)
     profile["real_row_count"] = real_row_count
+    profile["sample_truncated"] = sample_truncated
     roles = columns_by_role(profile)
 
     # ── 4. Construit le profile pour l'Analyst (proxy anonymise au call site)
@@ -238,7 +239,7 @@ async def plan_widgets_batch(
     if not isinstance(sql, str) or not sql.strip():
         raise WidgetPipelineError("Requête SQL vide.")
 
-    columns, rows, real_row_count = await _execute_sql(sql, user=user)
+    columns, rows, real_row_count, sample_truncated = await _execute_sql(sql, user=user)
     if not rows:
         raise WidgetPipelineError(
             "La requête n'a retourné aucune ligne — impossible de planifier "
@@ -251,6 +252,7 @@ async def plan_widgets_batch(
 
     profile = profile_columns(columns, rows)
     profile["real_row_count"] = real_row_count
+    profile["sample_truncated"] = sample_truncated
     roles = columns_by_role(profile)
     profile_for_llm = _build_profile_for_llm(profile, columns, rows)
 
@@ -542,8 +544,20 @@ async def _restore_spec_from_db(spec: Any, cm: Any) -> None:
 # ------------------------------------------------------------------
 
 
-async def _execute_sql(sql: str, *, user: Any = None) -> tuple[list[str], list[list[Any]], int]:
-    """Exécute le SQL via QueryExecutor avec cap peek. Retourne (cols, rows, row_count).
+async def _execute_sql(
+    sql: str, *, user: Any = None
+) -> tuple[list[str], list[list[Any]], int, bool]:
+    """Exécute le SQL via QueryExecutor avec cap peek.
+
+    Retourne ``(cols, rows, row_count, sample_truncated)``.
+
+    ``sample_truncated`` (flag AUTORITATIF du connector, basé sur le cap
+    EFFECTIF ``min(_PEEK_MAX_ROWS, DatabaseConnection.max_rows)``) vaut True
+    quand la requête réelle a PLUS de lignes que le peek : ``row_count`` est
+    alors la taille de l'échantillon, PAS le total de la requête. #50 — sans
+    ce signal, l'Analyst/Composer LLM croit que la table fait ``row_count``
+    lignes et choisit une mauvaise intent / affirme des totaux portant sur
+    l'échantillon comme s'ils étaient globaux.
 
     ``user`` : objet ORM User pour activation RLS data_access. Sans user,
     l'enforcer logue ``RLS skip`` et la requête passe sans filtrage
@@ -570,9 +584,10 @@ async def _execute_sql(sql: str, *, user: Any = None) -> tuple[list[str], list[l
     rows = [[drow.get(col) for col in columns] for drow in dict_rows]
     # QueryResult.row_count reflète ce qui a été ramené (≤ max_rows). On n'a
     # pas accès au count total sans un second COUNT(*) — on reporte ce qu'on
-    # a, le Designer comprend que c'est un peek.
+    # a + le flag truncated pour que le LLM sache que c'est un échantillon.
     real_row_count = getattr(qr, "row_count", len(rows)) or len(rows)
-    return columns, rows, real_row_count
+    sample_truncated = bool(getattr(qr, "truncated", False))
+    return columns, rows, real_row_count, sample_truncated
 
 
 def _build_profile_for_llm(
@@ -597,12 +612,38 @@ def _build_profile_for_llm(
         for row in rows[:sample_size]
     ]
 
-    return {
+    payload: dict[str, Any] = {
         "row_count": profile.get("row_count"),
         "real_row_count": profile.get("real_row_count"),
         "columns": [dict(c) for c in profile.get("columns", [])],
         "sample": sample_dicts,
     }
+    # #50 (2026-06-10) — quand le peek a été tronqué au cap (_PEEK_MAX_ROWS),
+    # row_count/real_row_count = taille de l'ÉCHANTILLON, PAS le total réel de
+    # la requête. Ce dict est sérialisé tel quel dans le prompt Analyst
+    # (analyst.py:87) ET Composer : sans signal, le LLM croit que la table
+    # fait N lignes (200) → mauvaise intent (ex. detail_table « tout afficher »
+    # sur une table en réalité énorme) et totaux/superlatifs portant sur
+    # l'échantillon présentés comme globaux. On annonce explicitement le sample.
+    if profile.get("sample_truncated"):
+        # Revue adv. #50 — sinon le nombre 200 apparaît sous 3 noms
+        # (row_count, real_row_count, sample_size) et seul total_row_count est
+        # null : un LLM faible peut ancrer sur 200 comme total. On retire les
+        # 2 noms trompeurs (« real_row_count » ment quand c'est un échantillon)
+        # et on ne laisse qu'UN compteur honnête (sample_size) + le total null.
+        payload.pop("row_count", None)
+        payload.pop("real_row_count", None)
+        payload["is_sample"] = True
+        payload["sample_size"] = profile.get("real_row_count")
+        payload["total_row_count"] = None  # inconnu sans COUNT(*) séparé
+        payload["sample_note"] = (
+            "⚠ ÉCHANTILLON : sample_size = nombre de lignes LUES (premières "
+            "lignes seulement), PAS le total réel de la requête (total_row_count "
+            "inconnu, SUPÉRIEUR). Choisis l'intent sur la STRUCTURE des colonnes, "
+            "pas sur ce nombre. N'affirme aucun total/somme/moyenne/max/"
+            "classement comme global."
+        )
+    return payload
 
 
 def _trim_for_designer(transformed: dict[str, Any]) -> dict[str, Any]:
@@ -620,23 +661,42 @@ def _trim_for_designer(transformed: dict[str, Any]) -> dict[str, Any]:
             "columns": transformed.get("columns"),
             "rows": rows[:15],
             "row_count": len(rows),
+            # #18f (verdict #51, 2026-06-10) — le designer LLM rédige un
+            # « insight » (classement, max…) depuis cet échantillon : sans
+            # flag explicite, il affirme des superlatifs FAUX (le vrai max
+            # peut être dans les lignes 16+), affichés tels quels au pied
+            # du widget.
+            "rows_truncated": len(rows) > 15,
         }
     if t == "chart":
         labels = transformed.get("labels") or []
         datasets = transformed.get("datasets") or []
+        # Revue adv. lot 3 — sans cap sur le NOMBRE de datasets, un pivot
+        # SQL large (100 colonnes métriques) bypasse toute la réduction du
+        # designer → prompt non borné. 20 séries suffisent largement à
+        # choisir un type de visuel.
         trimmed_datasets = [
             {
                 "label": ds.get("label"),
                 "data": (ds.get("data") or [])[:20],
             }
-            for ds in datasets
+            for ds in datasets[:20]
         ]
-        return {
+        out_chart: dict[str, Any] = {
             "type": "chart",
             "labels": labels[:20],
             "datasets": trimmed_datasets,
             "label_count": len(labels),
+            "labels_truncated": len(labels) > 20,
+            "datasets_truncated": len(datasets) > 20,
+            "dataset_count": len(datasets),
         }
+        # #48 — PRÉSERVER le marqueur de catégories droppées (agg non additive) :
+        # sinon ce rebuild le mange et le designer ne sait pas que le chart est
+        # partiel (insight superlatif faux). Canal consommé par designer._is_partial.
+        if transformed.get("truncated_categories"):
+            out_chart["truncated_categories"] = transformed["truncated_categories"]
+        return out_chart
     return transformed
 
 

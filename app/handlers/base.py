@@ -805,6 +805,16 @@ class BaseHandler(tornado.web.RequestHandler):
 
         ns["pricing_currency_code"] = PRICING_CURRENCY_CODE
         ns["pricing_currency_symbol"] = PRICING_CURRENCY_SYMBOL
+        # Affichage daté FRONTEND : émettre l'instant en ISO HORODATÉ (offset
+        # +00:00) dans les attrs `<time datetime="…">` pour que le JS
+        # (local-datetime.js / KomptiaFormat) le reconvertisse vers le fuseau du
+        # visiteur SANS mal-parse (un ISO naïf est lu en heure navigateur = +Nh).
+        # SSoT = clock.iso_utc : gère naïf→UTC ET aware→garde l'offset (jamais de
+        # double « +00:00 »). Remplace les `{{ x.isoformat() }}`/`…+00:00` manuels.
+        # Import local (cohérent avec constants_ai ci-dessus) : évite tout cycle.
+        from app.core import clock
+
+        ns["iso_utc"] = clock.iso_utc
         return ns
 
     def _extract_error_message(self, kwargs: dict[str, Any]) -> str:
@@ -818,7 +828,23 @@ class BaseHandler(tornado.web.RequestHandler):
             reason = getattr(exception, "reason", None)
             if reason:
                 return str(reason)
-            # Exception non-HTTP : log complet côté serveur, message neutre.
+            # Tornado lève des HTTPError « nues » sans ``log_message`` ni
+            # ``reason`` : 405 (méthode non autorisée, via
+            # ``_unimplemented_method``), 404 de routing, etc. Ce sont des
+            # erreurs HTTP ATTENDUES (mauvaise méthode/route côté client), PAS
+            # des exceptions internes — on NE log donc PAS de stacktrace ERROR
+            # ici. Le bloc ``status_code >= 500`` de ``write_error`` couvre déjà
+            # les vraies 500, et l'access-log Tornado trace déjà le 4xx. On
+            # renvoie la reason-phrase HTTP standard du statut.
+            if isinstance(exception, tornado.web.HTTPError):
+                from http.client import responses
+
+                return responses.get(
+                    getattr(exception, "status_code", 0), _Messages.INTERNAL_ERROR
+                )
+            # Exception VRAIMENT non-HTTP (ValueError, KeyError… ayant fui un
+            # handler et dégénéré en 500) : stacktrace complète côté serveur,
+            # message client neutre.
             logger.error(
                 "Exception non-HTTP dans write_error",
                 exc_info=exc_info,

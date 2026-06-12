@@ -95,7 +95,6 @@ from app.models.ai_performance import AIPerformanceLog, QueryStatus, SchemaSync
 from app.models.concept_glossary import ConceptGlossary
 from app.models.training_data import TrainingData, TrainingDataType
 from app.models.value_mapping import ValueMapping
-from app.models.value_mapping_archive import ValueMappingArchive
 from app.models.inferred_foreign_key import (
     INFERRED_FK_KINDS,
     KIND_NAMING_AND_VALUE,
@@ -224,7 +223,6 @@ __all__ = (
     "TrainingData",
     "TrainingDataType",
     "ValueMapping",
-    "ValueMappingArchive",
     "INFERRED_FK_KINDS",
     "KIND_NAMING_AND_VALUE",
     "KIND_NAMING_PATTERN",

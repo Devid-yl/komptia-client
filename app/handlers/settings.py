@@ -54,12 +54,15 @@ Garanties senior appliquées (OWASP Top 10 2025 + API Sec Top 10 2023 + ASVS v5)
    octets, pas 100 comme historiquement) pour coller à la norme SMTP ;
    un attaquant qui teste 256 chars reçoit 400 cohérent avec le serveur
    de mail aval.
-6. **V6.2.5 Password strength** — longueur ``[`` :data:`_PASSWORD_MIN_LEN`
-   ``,`` :data:`_PASSWORD_MAX_LEN` ``]`` octets UTF-8.
-   :data:`_PASSWORD_MAX_LEN` = 128 couvre la limite de troncature bcrypt
-   (72 octets + marge Unicode). Un refus de mot de passe « trivial »
-   (liste noire locale :data:`_TRIVIAL_PASSWORDS`) bloque les 20
-   classiques — sans dépendance externe payante (haveibeenpwned).
+6. **V6.2.5 Password strength** — longueur min :data:`_PASSWORD_MIN_LEN`
+   caractères. La borne HAUTE qui compte pour la sécurité est en OCTETS :
+   :data:`~app.core.constants_auth.PASSWORD_MAX_BYTES` (72) — au-delà, bcrypt
+   ignore les octets, donc on REJETTE (cf. :func:`password_exceeds_bcrypt_limit`).
+   ⚠️ :data:`_PASSWORD_MAX_LEN` (128 caractères) n'est qu'un garde-fou grossier
+   complémentaire ; il NE « couvre » PAS la limite bcrypt — 128 chars ASCII =
+   128 octets > 72. Un refus de mot de passe « trivial » (liste noire locale
+   :data:`_TRIVIAL_PASSWORDS`) bloque les 20 classiques — sans dépendance
+   externe payante (haveibeenpwned).
 7. **CWE-209 — Error Message Containing Sensitive Information** — aucune
    ``str(exc)`` ou ``repr(exc)`` dans les réponses : tous les messages
    clients sont dans :class:`_Messages` (FR, tons cohérents). Les traces
@@ -85,6 +88,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants import THEME_MODES
+from app.core.constants_auth import PASSWORD_MAX_BYTES, password_exceeds_bcrypt_limit
 from app.core.database import get_session
 from app.handlers.base import SESSION_COOKIE_NAME, BaseHandler, authenticated
 from app.handlers.help_docs import available_guides_for_user
@@ -171,10 +175,14 @@ _EMAIL_MAX_LEN: Final[int] = 254
 #: invalider les comptes existants — la règle peut évoluer (EPIC transverse).
 _PASSWORD_MIN_LEN: Final[int] = 8
 
-#: Longueur max d'un mot de passe. bcrypt tronque à 72 octets UTF-8 : deux
-#: mots de passe distincts >72 octets peuvent hasher identiquement. 128
-#: caractères UTF-8 = toujours sous la limite même avec un emoji 4 octets /
-#: caractère. Au-delà : 400 net, pas de faille de collision silencieuse.
+#: Borne haute *grossière* en CARACTÈRES (sanité / anti-body géant). La borne
+#: de **correction bcrypt** est distincte et exprimée en OCTETS :
+#: :data:`~app.core.constants_auth.PASSWORD_MAX_BYTES` (72), vérifiée par
+#: :func:`password_exceeds_bcrypt_limit` dans :func:`_validate_password_input`.
+#: ⚠️ NE PAS croire que « 128 chars < 72 octets » : 128 chars ASCII = 128 octets
+#: > 72 — c'est justement le bug que le check octets ferme. Les deux coexistent :
+#: le check octets (strict) attrape tout >72 o, ce cap chars reste un garde-fou
+#: lisible en complément.
 _PASSWORD_MAX_LEN: Final[int] = 128
 
 #: Liste noire minimaliste de mots de passe triviaux (V6.2.8 ASVS v5). Ne
@@ -294,6 +302,10 @@ class _Messages:
     )
     PASSWORD_TOO_LONG: Final[str] = (
         f"Le nouveau mot de passe ne peut dépasser {_PASSWORD_MAX_LEN} caractères."
+    )
+    PASSWORD_TOO_MANY_BYTES: Final[str] = (
+        f"Le nouveau mot de passe ne peut pas dépasser {PASSWORD_MAX_BYTES} octets "
+        "(limite de l'algorithme de hachage)."
     )
     PASSWORD_TOO_TRIVIAL: Final[str] = (
         "Ce mot de passe est trop courant, choisissez-en un plus original."
@@ -596,6 +608,12 @@ def _validate_password_input(
         return None
     if len(new_pw) > _PASSWORD_MAX_LEN:
         _http_error(handler, 400, _Messages.PASSWORD_TOO_LONG)
+        return None
+    # Borne de correction bcrypt (octets, pas caractères) : au-delà de 72 o, les
+    # octets sont ignorés par l'algo — on rejette plutôt que de tronquer en
+    # silence (cf. app.core.constants_auth.PASSWORD_MAX_BYTES, SSoT).
+    if password_exceeds_bcrypt_limit(new_pw):
+        _http_error(handler, 400, _Messages.PASSWORD_TOO_MANY_BYTES)
         return None
     if new_pw.casefold() in _TRIVIAL_PASSWORDS:
         _http_error(handler, 400, _Messages.PASSWORD_TOO_TRIVIAL)
@@ -1320,12 +1338,13 @@ class SettingsIrisConsentAPIHandler(BaseHandler):
 
 
 class SettingsBootstrapAPIHandler(BaseHandler):
-    """``GET /api/settings/bootstrap`` — agrégateur lecture-only des 4 endpoints.
+    """``GET /api/settings/bootstrap`` — agrégateur lecture-only du boot /settings.
 
     Bug 2026-05-26 (Agent 1 brainstorm S-14 MOYEN) : la page ``/settings``
-    déclenche 4 ``fetch`` séquentiels au boot (``profile``, ``appearance``,
-    ``company``, ``iris-consent``). 4 RTT + 4 sessions BDD = 200ms+ visible
-    en 3G/WiFi instable. Cet endpoint les concatène en 1 RTT + 1 session.
+    déclenche plusieurs ``fetch`` séquentiels au boot (``profile``, ``appearance``,
+    ``company``, ``iris-consent``, ``user-memory``). N RTT + N sessions BDD =
+    200ms+ visible en 3G/WiFi instable. Cet endpoint les concatène en 1 RTT + 1
+    session. ``user_memory`` est gratuit (colonne ``User.iris_memory`` déjà chargée).
 
     Politique de sécurité :
     - Auth : ``@authenticated``. Les 4 endpoints individuels restent
@@ -1354,21 +1373,30 @@ class SettingsBootstrapAPIHandler(BaseHandler):
             except Exception:
                 display_name = ""
 
+            # Sur EXCEPTION de lecture (≠ pref absente), le bloc vaut ``None`` : le
+            # front distingue ainsi « pref par défaut » de « lecture échouée » et
+            # bascule sur son fallback individuel (qui a sa propre logique :
+            # localStorage scopé pour le thème, taxonomie d'erreur, etc.). Servir
+            # un défaut silencieux écraserait le vrai choix (= données fausses).
+            appearance_block = None
             try:
                 pref_theme = await _get_pref(session, user.id, PREF_THEME_MODE)
                 theme = pref_theme.value if pref_theme else _DEFAULT_THEME_MODE
                 if theme not in _THEME_MODE_VALUES:
                     theme = _DEFAULT_THEME_MODE
+                appearance_block = {"theme_mode": theme}
             except Exception:
-                theme = _DEFAULT_THEME_MODE
+                appearance_block = None
 
+            iris_consent_block = None
             try:
                 pref_iris = await _get_pref(session, user.id, PREF_IRIS_DATA_READ_CONSENT)
                 iris_value = pref_iris.value if pref_iris else _DEFAULT_IRIS_CONSENT
                 if iris_value not in _IRIS_CONSENT_VALUES:
                     iris_value = _DEFAULT_IRIS_CONSENT
+                iris_consent_block = {"iris_data_read_consent": iris_value}
             except Exception:
-                iris_value = _DEFAULT_IRIS_CONSENT
+                iris_consent_block = None
 
             company_block = None
             if user_is_admin:
@@ -1387,12 +1415,30 @@ class SettingsBootstrapAPIHandler(BaseHandler):
                 except Exception:
                     company_block = None
 
+            # user_memory : GRATUIT — ``db_user.iris_memory`` est une colonne déjà
+            # chargée (0 requête en plus). Sur exception → ``None`` (PAS un défaut
+            # ``max_chars:0`` qui bloquerait le textarea à maxLength=0 côté front)
+            # → le front bascule sur son fallback ``/api/iris/user-memory``.
+            user_memory_block = None
+            try:
+                from app.services.ai.iris_user_memory import IRIS_USER_MEMORY_MAX_CHARS
+
+                _mem = db_user.iris_memory or ""
+                user_memory_block = {
+                    "memory": _mem,
+                    "char_count": len(_mem),
+                    "max_chars": IRIS_USER_MEMORY_MAX_CHARS,
+                }
+            except Exception:
+                user_memory_block = None
+
         self.write_json(
             {
                 "success": True,
                 "profile": _serialize_profile(db_user, display_name),
-                "appearance": {"theme_mode": theme},
-                "iris_consent": {"iris_data_read_consent": iris_value},
+                "appearance": appearance_block,
+                "iris_consent": iris_consent_block,
                 "company": company_block,
+                "user_memory": user_memory_block,
             }
         )

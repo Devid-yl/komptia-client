@@ -3,7 +3,7 @@
 Surface HTTP
 ------------
 * ``GET /help/guides/<key>``  — téléchargement (ou affichage ``?inline=true``)
-  authentifié d'un guide PDF. ``<key>`` ∈ {user, expert, admin}. Hors ``/api/``
+  authentifié d'un guide PDF. ``<key>`` ∈ {user, admin}. Hors ``/api/``
   volontairement : liens cliqués en navigation top-level → une erreur rend
   ``error.html`` / redirige vers ``/login`` plutôt qu'un JSON brut.
 
@@ -32,11 +32,12 @@ prod via ``.dockerignore``/``Dockerfile``) — il ne vit PAS dans le volume de
 données runtime, donc reste disponible pour un nouveau client sans aucune
 génération côté serveur.
 
-Mapping rôle → guide (décision D2, à confirmer par David — cf. tâche #13)
--------------------------------------------------------------------------
-* ``user`` + ``expert`` → tout utilisateur authentifié (le guide expert est
-  du *contenu* avancé, pas un rôle d'accès : Komptia n'a que 2 rôles,
-  ``admin`` et ``user`` — cf. :class:`app.models.user.UserRole`).
+Mapping rôle → guide (2026-06-05 : fusion user + expert)
+--------------------------------------------------------
+* ``user`` → tout utilisateur authentifié. Inclut désormais le contenu avancé
+  (ex-« guide expert ») : « expert » était du *contenu*, pas un rôle d'accès —
+  Komptia n'a que 2 rôles, ``admin`` et ``user`` (cf.
+  :class:`app.models.user.UserRole`).
 * ``admin`` → admins uniquement (appliqué côté serveur, pas seulement masqué
   dans l'UI).
 """
@@ -89,21 +90,11 @@ HELP_GUIDES: Final[tuple[HelpGuide, ...]] = (
         title="Guide utilisateur",
         description=(
             "Prise en main pas-à-pas : interface, Iris, exploration des données, "
-            "automatisations, tableaux de bord, paramètres."
+            "automatisations, tableaux de bord, paramètres — et usage avancé "
+            "(grille experte, construction de données, DAG avancés, webhooks)."
         ),
         admin_only=False,
         download_name="Komptia - Guide utilisateur.pdf",
-    ),
-    HelpGuide(
-        key="expert",
-        filename="komptia_guide_expert.pdf",
-        title="Guide expert",
-        description=(
-            "Maîtrise avancée : tirer le maximum d'Iris, grille experte, "
-            "construction de données, DAG avancés, webhooks."
-        ),
-        admin_only=False,
-        download_name="Komptia - Guide expert.pdf",
     ),
     HelpGuide(
         key="admin",

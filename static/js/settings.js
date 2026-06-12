@@ -110,7 +110,11 @@
         set('pf-last-login', formatDate(d.last_login));
     }
 
-    function loadProfile() {
+    function loadProfile(prefetched) {
+        if (prefetched !== undefined) {
+            fillProfile(prefetched || {});
+            return;
+        }
         return fetchJson('/api/settings/profile').then(function (res) {
             if (handleAuthError(res)) return;
             if (!res.ok) {
@@ -337,7 +341,13 @@
         });
     }
 
-    function loadAppearance() {
+    function loadAppearance(prefetched) {
+        if (prefetched !== undefined) {
+            var pm = (prefetched && VALID_THEMES[prefetched.theme_mode])
+                ? prefetched.theme_mode : 'system';
+            selectTheme(pm, false);
+            return;
+        }
         return fetchJson('/api/settings/appearance').then(function (res) {
             if (handleAuthError(res)) return;
             var mode = 'system';
@@ -368,6 +378,64 @@
 
     // ── Bootstrap ──────────────────────────────────────────────────────
 
+    // Promesse PARTAGÉE du bundle /api/settings/bootstrap (profile + appearance
+    // + company + iris_consent + user_memory en 1 RTT / 1 session). Le guard
+    // ``window.__komptiaSettingsBootstrap`` dédoublonne quel que soit l'ordre de
+    // chargement : settings.js ET iris-user-memory.js consomment la MÊME
+    // promesse → 1 seul fetch. Forme résolue normalisée ``{ok, status, data}``
+    // (cohérente avec ``fetchJson``), indépendante du module appelant.
+    function getSettingsBootstrap() {
+        if (!window.__komptiaSettingsBootstrap) {
+            window.__komptiaSettingsBootstrap = fetch('/api/settings/bootstrap', {
+                method: 'GET',
+                credentials: 'same-origin',
+                headers: { 'Accept': 'application/json' },
+            }).then(function (r) {
+                return r.json().then(
+                    function (d) { return { ok: r.ok, status: r.status, data: d }; },
+                    function () { return { ok: false, status: r.status, data: null }; }
+                );
+            }).catch(function () {
+                return { ok: false, status: 0, data: null };
+            }).then(function (res) {
+                // Ne PAS mémoriser un échec : libère le guard pour un retry
+                // ultérieur (sinon 1 glitch réseau = perte perf permanente).
+                if (!res || !res.ok) window.__komptiaSettingsBootstrap = null;
+                return res;
+            });
+        }
+        return window.__komptiaSettingsBootstrap;
+    }
+
+    // Charge les 4 sections en 1 appel. Fallback sur les loaders individuels si
+    // le bootstrap échoue (les endpoints individuels restent disponibles).
+    function loadBootstrap() {
+        return getSettingsBootstrap().then(function (res) {
+            if (handleAuthError(res)) return;
+            if (!res.ok || !res.data || res.data.success !== true) {
+                loadProfile();
+                loadAppearance();
+                loadCompany();
+                loadIrisConsent();
+                return;
+            }
+            // Par bloc : prefetch si présent, sinon fallback individuel. Le backend
+            // met un bloc à ``null`` quand SA lecture a échoué → on relit cet
+            // endpoint (qui a sa propre logique : localStorage thème, taxonomie
+            // d'erreur…) au lieu d'appliquer une valeur défaut silencieuse.
+            var d = res.data;
+            if (d.profile) { loadProfile(d.profile); } else { loadProfile(); }
+            if (d.appearance) { loadAppearance(d.appearance); } else { loadAppearance(); }
+            if (d.company) { loadCompany(d.company); } else { loadCompany(); }
+            if (d.iris_consent) { loadIrisConsent(d.iris_consent); } else { loadIrisConsent(); }
+        }).catch(function () {
+            loadProfile();
+            loadAppearance();
+            loadCompany();
+            loadIrisConsent();
+        });
+    }
+
     function init() {
         attachSystemThemeListenerOnce();
         wireProfileForm();
@@ -375,10 +443,8 @@
         wireAppearance();
         wireCompanyForm();
         wireIrisConsent();
-        loadProfile();
-        loadAppearance();
-        loadCompany();
-        loadIrisConsent();
+        wireOnboardingReset();
+        loadBootstrap();
     }
 
     // ── Confidentialité Iris : pref de consentement lecture résultats SQL ─
@@ -411,10 +477,18 @@
         }
     }
 
-    function loadIrisConsent() {
+    function loadIrisConsent(prefetched) {
         var container = document.getElementById('iris-consent-options');
         if (!container) return;
         var msg = document.getElementById('iris-consent-msg');
+        if (prefetched !== undefined) {
+            var iv = prefetched && prefetched.iris_data_read_consent;
+            if (_IRIS_CONSENT_VALUES.indexOf(iv) === -1) iv = 'ask';
+            _persistedIrisConsent = iv;
+            _updateIrisConsentSelection(iv);
+            if (msg) msg.textContent = '';
+            return;
+        }
         return fetchJson('/api/settings/iris-consent').then(function (res) {
             if (handleAuthError(res)) return;
             // ``fetchJson`` enveloppe la réponse dans ``{ok, status, data}``.
@@ -540,11 +614,21 @@
 
     // ── Mon entreprise (admin only — section absente du DOM si non-admin)
 
-    function loadCompany() {
+    function loadCompany(prefetched) {
         var form = document.getElementById('form-company');
         if (!form) return; // Section absente (user non-admin)
         var input = document.getElementById('cp-company-name');
         var msg = document.getElementById('cp-msg');
+        if (prefetched !== undefined) {
+            var cd = prefetched || {};
+            if (input) {
+                input.value = (typeof cd.company_name === 'string') ? cd.company_name : '';
+                if (typeof cd.placeholder === 'string' && cd.placeholder) {
+                    input.placeholder = cd.placeholder;
+                }
+            }
+            return;
+        }
         fetchJson('/api/settings/company').then(function (res) {
             if (handleAuthError(res)) return;
             if (!res.ok) {
@@ -596,6 +680,98 @@
                 if (m && msg) msg.textContent = m;
             }).finally(function () {
                 if (btn) btn.disabled = false;
+            });
+        });
+    }
+
+    // ── Aide : réactiver les tours d'onboarding ────────────────────────
+
+    function wireOnboardingReset() {
+        var btn = document.getElementById('onb-reset-btn');
+        if (!btn) return; // carte absente (template non à jour) → no-op gracieux
+        var msg = document.getElementById('onb-reset-msg');
+
+        btn.addEventListener('click', function () {
+            // Anti double-action (doctrine Komptia — cf. iris-consent BLOCKING #1) :
+            // garde + désactivation IMMÉDIATE, AVANT l'ouverture de la confirmation.
+            // Sans ça, le bouton reste actif pendant que le modal appConfirm est
+            // ouvert → un 2e déclenchement (double-tap, Enter répété) ouvrirait un
+            // 2e modal. On ré-active si l'utilisateur annule.
+            if (btn.disabled) return;
+            btn.disabled = true;
+
+            // Confirmation stylée Komptia (appConfirm de base.html, Promise).
+            // Fallback Promise.resolve(true) si le helper global n'est pas chargé
+            // (dégradation gracieuse, jamais de blocage).
+            var ask = (typeof window.appConfirm === 'function')
+                ? window.appConfirm(
+                    'Les tours guidés réapparaîtront à votre prochaine visite de chaque page. Continuer ?',
+                    'Réactiver les tours d\'aide')
+                : Promise.resolve(true);
+
+            ask.then(function (ok) {
+                if (!ok) { btn.disabled = false; return; } // annulé → ré-active
+                if (msg) msg.textContent = 'Réinitialisation…';
+                btn.setAttribute('aria-busy', 'true');
+
+                fetchJson('/api/onboarding/reset', { method: 'POST' }).then(function (res) {
+                    btn.disabled = false;
+                    btn.removeAttribute('aria-busy');
+                    if (handleAuthError(res)) return;
+
+                    // Anti faux-succès silencieux (axe 5 / consequences Q5) : un 200
+                    // avec un body non conforme (proxy, réponse mal routée, JSON
+                    // illisible → ``data:{}``) ne doit PAS être affiché comme
+                    // réussite. Le handler renvoie TOUJOURS un ``deleted_count``
+                    // entier → son absence = réponse anormale, traitée comme erreur.
+                    var count = (res.data && typeof res.data.deleted_count === 'number')
+                        ? res.data.deleted_count
+                        : null;
+
+                    if (!res.ok || count === null) {
+                        // Taxonomie 4-cas Komptia (axe 5).
+                        var m;
+                        if (res.status >= 500) {
+                            m = 'Erreur serveur. Réessaie dans un instant ou clique sur « Signaler » en bas de page.';
+                        } else if (res.status === 429) {
+                            m = errorMessage(res, 'Trop de requêtes. Patiente quelques secondes.');
+                        } else if (!res.ok) {
+                            m = errorMessage(res, 'Impossible de réactiver les tours.');
+                        } else {
+                            // 200 mais payload inattendu (pas de deleted_count).
+                            m = 'Réponse inattendue du serveur. Réessaie ou clique sur « Signaler ».';
+                        }
+                        if (msg) msg.textContent = m;
+                        toastErr(m);
+                        return;
+                    }
+
+                    // Serveur OK (source de vérité) → purge le miroir localStorage
+                    // + invalide le cache mémoire. Le SSoT du préfixe vit dans
+                    // onboarding-tour.js (resetAll).
+                    if (window.KomptiaOnboarding
+                        && typeof window.KomptiaOnboarding.resetAll === 'function') {
+                        try { window.KomptiaOnboarding.resetAll(); } catch (e) { /* ignore */ }
+                    }
+
+                    // Message honnête selon ce qui a réellement été réinitialisé
+                    // (0 = l'user n'avait encore vu aucun tour).
+                    if (count > 0) {
+                        if (msg) msg.textContent = 'Tours réactivés. Ils réapparaîtront à votre prochaine visite.';
+                        toastOk('Tours d\'aide réactivés');
+                    } else {
+                        if (msg) msg.textContent = 'Vos tours guidés sont déjà actifs.';
+                        toastOk('Tours d\'aide déjà actifs');
+                    }
+                }).catch(function (err) {
+                    btn.disabled = false;
+                    btn.removeAttribute('aria-busy');
+                    var m = networkErrorMessage(err, 'Erreur réseau. Réessaye dans un instant.');
+                    if (m) {
+                        if (msg) msg.textContent = m;
+                        toastErr(m);
+                    }
+                });
             });
         });
     }

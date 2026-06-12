@@ -78,6 +78,19 @@ try:
 except (TypeError, ValueError):
     MAX_GLOBAL_CONCURRENT_PREVIEWS = 3
 
+# PREV-3 — délai MAX d'attente d'un créneau du sémaphore global avant de rendre
+# un message d'erreur clair (au lieu d'un « Démarrage… » figé indéfiniment si un
+# aperçu en cours est hung). Généreux : un aperçu normal libère son créneau bien
+# avant (timeouts SQL/report). Env-configurable.
+try:
+    PREVIEW_QUEUE_TIMEOUT_SECONDS: float = float(
+        _os_for_env.environ.get("KOMPTIA_PREVIEW_QUEUE_TIMEOUT_S", "240")
+    )
+    if PREVIEW_QUEUE_TIMEOUT_SECONDS < 1:
+        PREVIEW_QUEUE_TIMEOUT_SECONDS = 240.0
+except (TypeError, ValueError):
+    PREVIEW_QUEUE_TIMEOUT_SECONDS = 240.0
+
 # A7-M16 — Cap de previews CONCURRENTS PAR USER (isolation cross-user, axe 18).
 # Le cap global protège Sage mais ne garantit PAS la fairness : un seul user
 # ouvrant N aperçus monopolisait tous les slots globaux. On borne par user
@@ -615,10 +628,34 @@ class StepPreviewService:
         try:
             # Sémaphore global : borne la charge concurrente sur Sage. Acquis
             # AVANT toute query SQL, libéré après tout le pipeline (cascade
-            # incluse). Si saturé, on attend (l'event de progression rassure
-            # l'utilisateur). Pas de timeout d'acquisition pour ne pas casser
-            # l'UX en cas de pic temporaire.
-            async with _get_global_semaphore():
+            # incluse).
+            _sem = _get_global_semaphore()
+            # PREV-3 — si saturé, AVERTIR (« en file d'attente ») au lieu d'un
+            # « Démarrage… » figé, ET borner l'attente : sinon un aperçu hung
+            # bloquerait les suivants indéfiniment sans aucun message.
+            if _sem.locked():
+                try:
+                    await on_progress(
+                        step_id,
+                        "queued",
+                        "En file d'attente : trop d'aperçus en cours. "
+                        "Démarrage dès qu'un créneau se libère…",
+                    )
+                except Exception:  # noqa: BLE001 — progression best-effort
+                    pass
+            _acquired = False
+            try:
+                try:
+                    await asyncio.wait_for(
+                        _sem.acquire(), timeout=PREVIEW_QUEUE_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise PreviewError(
+                        "Trop d'aperçus sont en cours sur le serveur. "
+                        "Réessayez dans quelques instants.",
+                        category="rate_limited",
+                    ) from exc
+                _acquired = True
                 res = await self._preview_step_inner(
                     user_id=user_id,
                     automation_id=automation_id,
@@ -627,6 +664,9 @@ class StepPreviewService:
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                 )
+            finally:
+                if _acquired:
+                    _sem.release()
         finally:
             # Décrément + retrait de la clé à 0 (borne le dict). Dans le finally
             # → décrémente sur TOUT chemin (succès, PreviewError, Sage down,
@@ -1083,10 +1123,17 @@ class StepPreviewService:
 
             await on_progress(step.id, "calling_llm", "Appel LLM (copilot)…")
             try:
-                wb = await format_workbook_for_automation(
-                    input_workbook,
-                    instruction,
-                    user_id=automation.user_id,
+                # PREV-1 — borne l'appel LLM de formatage : sinon spinner figé
+                # plusieurs minutes si le LLM est lent/boucle. Le TimeoutError
+                # remonte au wrapper externe (_preview_step) → PreviewTimeoutError
+                # « délai dépassé, réduisez la portée ».
+                wb = await asyncio.wait_for(
+                    format_workbook_for_automation(
+                        input_workbook,
+                        instruction,
+                        user_id=automation.user_id,
+                    ),
+                    timeout=executor.STEP_TIMEOUT_FORMAT,
                 )
             except CopilotAutomationError as exc:
                 # Match par ``code`` (typed) — robuste face à une
@@ -1111,15 +1158,35 @@ class StepPreviewService:
                 # cet id). Sentinel négatif → on remplace le nom du
                 # fichier produit par un nom "preview_..." après coup
                 # (move_to_preview_tmp).
-                out_path_str = await executor._generate_llm_report(
-                    automation,
-                    -1,
-                    tabs=tabs,
-                    user_prompt=(cfg.get("prompt") or "").strip() or None,
-                    user_title_hint=(cfg.get("title") or "").strip() or None,
+                # PREV-1 — borne la génération PDF/LLM : sinon spinner figé.
+                # T8 — ``_generate_llm_report`` retourne ``(Path, warnings)`` ;
+                # en aperçu les warnings de matérialisation ne sont pas surfacés
+                # (l'aperçu a son propre canal de troncature) → unpack pour ne
+                # pas traiter le tuple comme un chemin.
+                out_path_str, _preview_report_warnings = await asyncio.wait_for(
+                    executor._generate_llm_report(
+                        automation,
+                        -1,
+                        tabs=tabs,
+                        user_prompt=(cfg.get("prompt") or "").strip() or None,
+                        user_title_hint=(cfg.get("title") or "").strip() or None,
+                        # PREV-2 — borne la re-matérialisation SQL au cap APERÇU :
+                        # sinon le rapport ré-exécute le SQL jusqu'à 100k lignes/
+                        # onglet sur Sage alors que l'aperçu n'a besoin que de
+                        # ~``max_rows_eff`` lignes.
+                        max_rows=max_rows_eff,
+                    ),
+                    timeout=executor.STEP_TIMEOUT_REPORT,
                 )
             except (KeyboardInterrupt, SystemExit):
                 raise
+            except asyncio.TimeoutError as exc:
+                # Explicite ICI : le ``except Exception`` ci-dessous masquerait
+                # le TimeoutError en PreviewLLMError « impossible » (trompeur).
+                raise PreviewTimeoutError(
+                    f"Étape « {step.name} » (report) : génération > "
+                    f"{executor.STEP_TIMEOUT_REPORT}s. Réduisez la portée puis réessayez."
+                ) from exc
             except Exception as exc:  # noqa: BLE001
                 raise PreviewLLMError(f"Génération du rapport impossible : {_short(exc)}") from exc
             tmp_path = _move_to_preview_tmp(
@@ -1149,13 +1216,20 @@ class StepPreviewService:
                 )
             await on_progress(step.id, "exporting", f"Export {output_format.upper()}…")
             preview_hint = (cfg.get("filename") or "").strip() or f"preview_step{step.id}"
-            out_path_str = await executor._generate_workbook_export(
+            # #18b (2026-06-10) — contrat tuple (path, warnings) : les warnings
+            # de troncature remontent dans le panneau d'aperçu (l'utilisateur
+            # voit AVANT d'activer que son export serait amputé).
+            out_path_str, preview_export_warnings = await executor._generate_workbook_export(
                 automation,
                 -1,
                 tabs=selected_tabs,
                 output_format=output_format,
                 filename_hint=preview_hint,
             )
+            if preview_export_warnings:
+                extras["warnings"] = list(
+                    (extras.get("warnings") or [])
+                ) + list(preview_export_warnings)
             ext_map = {".xlsx": ".xlsx", ".csv": ".csv", ".zip": ".zip"}
             src_path = Path(out_path_str)
             ext = ext_map.get(src_path.suffix.lower(), src_path.suffix or ".bin")
@@ -1210,7 +1284,10 @@ class StepPreviewService:
             if no_explicit and not any(resolved.values()):
                 resolved["to"] = list(automation.recipients or [])
             subject = cfg.get("subject") or f"Rapport — {automation.name}"
-            body = cfg.get("body") or ""
+            # MEME coercition que l'executor (branche email DAG) : un body
+            # whitespace-only doit etre montre vide en preview puisque le
+            # send strippera et retombera sur le fallback objet-en-contenu.
+            body = str(cfg.get("body") or "").strip()
             strategy = cfg.get("delivery_strategy") or "single_email_all_recipients"
             if strategy not in VALID_DELIVERY_STRATEGIES:
                 raise PreviewValidationError(
@@ -1448,7 +1525,11 @@ class StepPreviewService:
             )
         except (SQLAlchemyError, OSError) as exc:
             raise _SageUnavailable("BDD source indisponible. Réessayez dans un instant.") from exc
-        return [dict(zip(qr.columns, row)) for row in qr.rows], bool(qr.truncated)
+        # V12 (2026-06-10) — SSoT ``QueryResult.to_dicts()`` (sage_connector),
+        # partagée avec executor._execute_query → preview et run réel normalisent
+        # IDENTIQUEMENT (dédup des colonnes homonymes incluse). Avant, le zip
+        # inline divergeait de l'executor et perdait les colonnes de même nom.
+        return qr.to_dicts(), bool(qr.truncated)
 
 
 class _SageUnavailable(Exception):

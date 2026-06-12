@@ -56,6 +56,7 @@ from app.services.anonymization import api_service as anon_api
 from app.services.anonymization import audit as anon_audit_module
 from app.services.anonymization import extract as anon_terms
 from app.services.anonymization import repository as anon_repo
+from app.services.anonymization.locks import acquire_user_anon_lock
 from app.utils.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -261,8 +262,12 @@ class AnonymizationTermsAPIHandler(BaseHandler):
                 state = await anon_repo.get_detailed_state_for_user(session, user_id)
             else:
                 state = await anon_repo.get_state_for_user(session, user_id)
+            # Jeton de révision pour le verrou optimiste du PUT (fix lost
+            # update 2026-06-10) — le client le renvoie en
+            # ``expected_revision`` ; mismatch ⇒ 409 STATE_REVISION_MISMATCH.
+            revision = await anon_repo.get_state_revision(session, user_id)
         _set_no_store_headers(self)
-        self.write_json({"anonymization_state": state})
+        self.write_json({"anonymization_state": state, "revision": revision})
 
     @authenticated
     @require_role(UserRole.ADMIN, UserRole.USER)
@@ -393,6 +398,46 @@ class AnonymizationTermsAPIHandler(BaseHandler):
         # ``MassDeleteRefused`` → 409 actionnable côté UI.
         confirm_mass_delete = bool(body.get("confirm_mass_delete", False))
 
+        # **Périmètre de suppression** (fix 2026-06-10, bug vécu en prod) :
+        # le panneau iris-grid charge le GET NON-détaillé (filtré — les
+        # désactivés+confirmés en sont exclus depuis le fix perf 2026-06-09)
+        # puis PUT son état en replace. Sans déclaration de périmètre, les
+        # ~85k termes invisibles du client étaient comptés comme suppressions
+        # → 409 MASS_DELETE_REFUSED systématique (gros dico) ou purge
+        # silencieuse (dico sous les seuils). Contrat : le client qui a
+        # chargé l'état COMPLET (``?detailed=1``, ex. /data/privacy) déclare
+        # ``state_scope: "full"`` ; tout le reste (défaut FAIL-CLOSED) ne
+        # peut supprimer que les termes du périmètre actif qu'il a vus.
+        # ``state_scope == "full"`` est une DÉCLARATION client non vérifiée
+        # serveur — acceptable (verdict tâche #25) car : (1) le périmètre ne
+        # porte que sur les termes DU user authentifié, un client menteur
+        # n'obtient rien de plus que ce que /data/privacy (?detailed=1) lui
+        # permet déjà légitimement ; (2) la garde mass-delete ci-dessus reste
+        # active quel que soit le scope (>1000 ET >50% ⇒ 409 sans
+        # confirmation explicite) ; (3) le défaut reste FAIL-CLOSED pour
+        # tous les clients qui ne le déclarent pas.
+        delete_scope = (
+            anon_repo.DELETE_SCOPE_FULL
+            if body.get("state_scope") == "full"
+            else anon_repo.DELETE_SCOPE_ACTIVE_STATE
+        )
+
+        # **Verrou optimiste** (fix lost update 2026-06-10) : le client
+        # renvoie la ``revision`` reçue au GET ; si l'état a changé
+        # entre-temps (autre onglet, /data/privacy, scan de classeur), le
+        # replace-state écraserait silencieusement ces modifications →
+        # refus 409 STATE_REVISION_MISMATCH, le client re-fetch. Optionnel
+        # (None = legacy last-writer-wins) pour compat clients non migrés.
+        expected_revision = body.get("expected_revision")
+        if expected_revision is not None and not isinstance(expected_revision, str):
+            expected_revision = None
+        # Cap défensif (eXamine 2026-06-10) : le jeton réel fait < 60 chars —
+        # une string géante ne sert qu'à polluer logs/mémoire. Sur-longueur =
+        # jeton forcément invalide → on le garde tel quel serait inutile,
+        # on le tronque à une valeur qui mismatch proprement.
+        if expected_revision is not None and len(expected_revision) > 128:
+            expected_revision = expected_revision[:128]
+
         # **Write-then-read dans la même session** (fix review 2026-04-23) :
         # deux sessions consécutives ouvraient une fenêtre où un autre PUT
         # ou le cleanup job pouvait s'insérer entre le write et le read.
@@ -400,15 +445,53 @@ class AnonymizationTermsAPIHandler(BaseHandler):
         # propre write. Une seule session garantit la cohérence en lecture
         # immédiate après commit.
         try:
-            async with self.db_session() as session:
-                stats = await anon_repo.replace_state(
-                    session,
-                    user_id,
-                    state,
-                    confirm_mass_delete=confirm_mass_delete,
-                )
-                await session.flush()
-                normalized = await anon_repo.get_state_for_user(session, user_id)
+            # **Lock per-user AUTOUR de la transaction ENTIÈRE, commit inclus**
+            # (eXamine 2026-06-10 BLOQUANT) : le check de révision dans
+            # replace_state tourne sous ce lock, mais le COMMIT arrive à la
+            # sortie de db_session — s'il était hors lock, un writer
+            # concurrent lisait l'ancienne révision (WAL snapshot isolation),
+            # matchait son jeton périmé et écrasait quand même : le verrou
+            # optimiste était une fausse garantie. En tenant le lock jusqu'au
+            # commit, check+write+commit sont atomiques vis-à-vis des autres
+            # PUT du même user. L'acquire interne de replace_state est
+            # réentrant (ContextVar, cf. locks.py) → no-op ici.
+            async with acquire_user_anon_lock(user_id):
+                async with self.db_session() as session:
+                    stats = await anon_repo.replace_state(
+                        session,
+                        user_id,
+                        state,
+                        confirm_mass_delete=confirm_mass_delete,
+                        delete_scope=delete_scope,
+                        expected_revision=expected_revision,
+                    )
+                    await session.flush()
+                    normalized = await anon_repo.get_state_for_user(session, user_id)
+                    # Nouvelle révision post-write : le client l'adopte pour son
+                    # prochain PUT (sinon il 409-erait sur sa propre écriture).
+                    new_revision = await anon_repo.get_state_revision(session, user_id)
+        except anon_repo.StaleStateRefused as exc:
+            logger.info(
+                "anonymization PUT user=%s: révision périmée (client=%s, bdd=%s) "
+                "— réponse 409 STATE_REVISION_MISMATCH.",
+                user_id,
+                exc.expected,
+                exc.current,
+            )
+            self.write_json(
+                {
+                    "error": (
+                        "Vos termes ont été modifiés entre-temps (autre onglet, "
+                        "page Confidentialité ou scan de classeur). Rien n'a été "
+                        "enregistré — rechargez la liste puis réappliquez vos "
+                        "modifications."
+                    ),
+                    "error_code": "STATE_REVISION_MISMATCH",
+                    "current_revision": exc.current,
+                },
+                409,
+            )
+            return
         except anon_repo.MassDeleteRefused as exc:
             logger.warning(
                 "anonymization PUT user=%s: mass-delete refusé "
@@ -449,6 +532,9 @@ class AnonymizationTermsAPIHandler(BaseHandler):
             "success": True,
             "anonymization_state": normalized,
             "stats": stats,
+            # Révision post-write : le client l'adopte pour son prochain
+            # ``expected_revision`` (sans ça il 409-erait sur sa propre écriture).
+            "revision": new_revision,
         }
         # Inclure ``state_errors`` UNIQUEMENT si la sanitization a strippé
         # des termes — pas de clé vide en response normale. Le frontend
@@ -1132,7 +1218,13 @@ class AnonymizationImprovePseudoAPIHandler(BaseHandler):
                 # pour que le frontend cesse d'afficher « Terminé » à tort et
                 # invite l'user à relancer (anti données-fausses silencieuses).
                 "skipped_unprocessed": len(result.unprocessed),
-                "status": "ok",
+                # Propage le VRAI statut du chunk (ok/timeout/error/not_configured)
+                # au lieu d'un « ok » en dur : le frontend en a besoin pour afficher
+                # la vraie cause des termes non traités (timeout vs rejet
+                # anti-hallucination) — cf. improve-pseudos.js. Avant ce fix, le
+                # frontend affichait « budget du modèle local atteint » dans tous
+                # les cas, ce qui était trompeur (le statut réel était écrasé).
+                "status": result.status,
                 "duration_ms": duration_ms,
             }
         )

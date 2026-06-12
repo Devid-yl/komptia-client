@@ -683,7 +683,14 @@ _INSTRUCTION_VAGUE = (
 
 _INSTRUCTION_NOT_VAGUE = (
     "La question semble suffisamment concrète. Appelle run_pipeline avec "
-    "la question d'origine pour validation et génération SQL."
+    "la question d'origine pour validation et génération SQL. "
+    "OPTION (à TON jugement, pas obligatoire) : si l'utilisateur cherche "
+    "d'abord à comprendre ou VALIDER le mapping (quelles tables/colonnes) "
+    "AVANT de générer le SQL, tu peux passer run_pipeline(..., "
+    "stop_after_phase='1.5') pour t'arrêter au blueprint (tables + jointures), "
+    "ou '3' pour les fact sheets — présente alors le résultat comme une "
+    "HYPOTHÈSE à confirmer, puis pipeline_resume pour finir vers le SQL. "
+    "Sinon, run complet par défaut."
 )
 
 # Flags structurés exposés pour les callers (tests, agents). Les chaînes
@@ -691,6 +698,13 @@ _INSTRUCTION_NOT_VAGUE = (
 # que les tests doivent vérifier (anti-coupling à l'i18n).
 ACTION_PRESENT_AXES = "present_axes"
 ACTION_RUN_PIPELINE = "run_pipeline"
+# Mode « preview » : run_pipeline avec ``stop_after_phase`` (arrêt à une phase
+# intermédiaire pour rendre un blueprint/factsheets au lieu du SQL final).
+# C'est un SOUS-MODE de run_pipeline décidé par Iris au moment de l'appel (le
+# param du tool, T13) — PAS un routage déterministe par mots-clés (anti-pattern
+# « listes restrictives »). Exposé ici comme action reconnue (tests/doc). Cf.
+# docs/design/iris_stop_at_phase.md (T14).
+ACTION_RUN_PIPELINE_PREVIEW = "run_pipeline_preview"
 
 
 def format_exploration_response(
@@ -730,6 +744,7 @@ def format_exploration_response(
 __all__ = [
     "ACTION_PRESENT_AXES",
     "ACTION_RUN_PIPELINE",
+    "ACTION_RUN_PIPELINE_PREVIEW",
     "ExplorationAxis",
     "MAX_AXES",
     "MIN_AXES",

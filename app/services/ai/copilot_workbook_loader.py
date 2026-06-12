@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -111,6 +112,23 @@ def _coerce_number_or_str(value: Any) -> Tuple[Any, bool]:
         if value != value or value in (float("inf"), float("-inf")):
             return value, False
         return value, True
+    if isinstance(value, Decimal):
+        # Decimal = colonnes MONEY/NUMERIC/DECIMAL SQL Server (pyodbc).
+        # LATENT aujourd'hui : le copilot charge des classeurs .afz.json
+        # JSON-sérialisés (donc float/str, jamais Decimal natif). MAIS sans
+        # cette branche, si un jour des rows natives (to_dicts) arrivaient ici
+        # (cf. #133 : tabs construits côté serveur), la cellule MESURE serait
+        # classée non-numérique (is_num=False) → droppée de sheet_content →
+        # somme/count copilot FAUSSE silencieusement. Même classe que
+        # #139/#147/#148. On convertit au float au passage de la frontière
+        # (le reste du pipeline + JSON restent purement float).
+        try:
+            f = float(value)
+        except (ValueError, OverflowError):
+            return value, False
+        if f != f or f in (float("inf"), float("-inf")):
+            return value, False
+        return f, True
     if not isinstance(value, str):
         return value, False
     s = value.strip()

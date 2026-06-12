@@ -51,4 +51,38 @@
 {% block scripts %}
 <script src="/static/js/automation-templates-gallery.js"
         nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding automations_templates_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'automations_templates_v1',
+                title: 'Galerie de modèles',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Démarrer sans partir de zéro',
+                        text: 'Chaque carte est une automatisation toute prête pour un besoin courant. Le titre et la description vous disent ce qu\'elle fait, et les pastilles de catégorie (Démarrage, Surveillance, Avancé) vous aident à repérer celle qui correspond à votre cas.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Comparer d\'un coup d\'œil',
+                        text: 'Sous chaque modèle, vous voyez le nombre d\'étapes, le nombre de liens entre elles et le niveau de difficulté (Facile, Moyen, Avancé). Pratique pour choisir un modèle simple pour débuter ou un modèle plus complet si vous êtes à l\'aise.'
+                    },
+                    {
+                        icon: 'rocket',
+                        title: 'Utiliser un modèle',
+                        text: 'Le bouton « Utiliser ce template » crée aussitôt une copie modifiable et vous emmène dans l\'éditeur. Rien n\'est activé tout seul : vous restez libre d\'adapter chaque étape avant de lancer l\'automatisation. Le bouton « Retour » vous ramène à la liste de vos automatisations.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
 {% end %}

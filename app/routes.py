@@ -116,6 +116,8 @@ from app.handlers.iris import (
     IrisUploadHandler,
     IrisUsageStatsAPIHandler,
     IrisUserMemoryAPIHandler,
+    IrisConversationOlderEventsAPIHandler,
+    IrisModelContextWindowAPIHandler,
     IrisWelcomeSuggestionsAPIHandler,
     IrisWidgetConversationAPIHandler,
 )
@@ -204,6 +206,7 @@ from app.handlers.datastore import (
     ContextFilesAPIHandler,
 )
 from app.handlers.ai_admin import (
+    AIModelsPageHandler,
     AIPerformanceDashboardHandler,
     AITrainingPageHandler,
     AIStatsAPIHandler,
@@ -218,6 +221,7 @@ from app.handlers.ai_admin import (
     LlmModelRegistryLitellmSyncHandler,
     LlmModelOverrideHandler,
     LocalLlmStatusHandler,
+    LocalLlmDetectHandler,
     LocalLlmPullHandler,
     LocalLlmDeleteHandler,
     LocalLlmInstallStatusHandler,
@@ -242,6 +246,8 @@ from app.handlers.dashboard_builder import (
     DashboardWidgetAPIHandler,
     DashboardWidgetLLMAPIHandler,
     DashboardWidgetDetailAPIHandler,
+    DashboardWidgetExtraTabsAPIHandler,
+    DashboardWidgetWorkbookAPIHandler,
     DashboardWidgetReorderAPIHandler,
     DashboardCoherenceAPIHandler,
     DashboardDataAPIHandler,
@@ -250,8 +256,6 @@ from app.handlers.dashboard_builder import (
     DashboardFilterDetailAPIHandler,
     DashboardFilterOptionsAPIHandler,
     DashboardFilterReorderAPIHandler,
-    DashboardScheduleAPIHandler,
-    DashboardSendNowAPIHandler,
     DashboardTemplatesAPIHandler,
     DashboardTemplateCreateAPIHandler,
     DashboardSaveAsTemplateAPIHandler,
@@ -273,6 +277,7 @@ from app.handlers.webhooks import (
 from app.handlers.ai_config import (
     AIConfigPageHandler,
     AIConfigAPIHandler,
+    AIModelsRefreshHandler,
     AIConfigResetHandler,
     AIConfigExportHandler,
     AIConfigImportHandler,
@@ -293,6 +298,7 @@ from app.handlers.settings import (
 from app.handlers.help_docs import HelpGuideDownloadHandler
 from app.handlers.onboarding import (
     OnboardingResetHandler,
+    OnboardingSelfResetHandler,
     OnboardingStateHandler,
     OnboardingTourCompleteHandler,
     OnboardingTourSkipHandler,
@@ -349,6 +355,10 @@ def get_routes() -> list:
         # Task #43c (cycle #33) — monitoring usage modes legacy vs éphémère
         # pour préparer la décision #43d/#43e (suppression handler legacy).
         (r"/api/admin/iris-mode-usage", IrisModeUsageStatsHandler),
+        # Context window du modèle actif (bug 2026-06-02 — cache stale).
+        # Endpoint dynamique LIVE, jamais en cache statique. Utilisé par
+        # l'indicateur iris.js pour afficher la vraie fenêtre du modèle courant.
+        (r"/api/iris/model-context-window", IrisModelContextWindowAPIHandler),
         # Suggestions d'accueil dynamiques (task #11). SSOT = même service
         # que la page /iris (sync_svc.generate_welcome_suggestions).
         (r"/api/iris/welcome-suggestions", IrisWelcomeSuggestionsAPIHandler),
@@ -357,6 +367,11 @@ def get_routes() -> list:
         # pas de SSR donc il appelle cet endpoint au boot / à la première
         # ouverture pour récupérer son historique persisté (source=widget).
         (r"/api/iris/widget/conversation", IrisWidgetConversationAPIHandler),
+        # IRIS-events-loadmore (#54) — pagination arrière de l'historique events.
+        (
+            r"/api/iris/conversation/([0-9]+)/older-events",
+            IrisConversationOlderEventsAPIHandler,
+        ),
         (r"/api/iris/result-modify", ResultModifyHandler),
         (r"/api/iris/result-cancel", CopilotCancelHandler),
         (r"/api/iris/cell-suggest", CellSuggestHandler),
@@ -451,6 +466,11 @@ def get_routes() -> list:
         (r"/api/onboarding/tour/step", OnboardingTourStepHandler),
         (r"/api/onboarding/tour/complete", OnboardingTourCompleteHandler),
         (r"/api/onboarding/tour/skip", OnboardingTourSkipHandler),
+        # Self-service : l'utilisateur réactive SES propres tours guidés
+        # (bouton « Réactiver les tours » dans /settings → section Aide).
+        # Owner-scope strict (current_user.id) — distinct de l'utilitaire
+        # admin /api/admin/onboarding/reset qui prend un user_id cible.
+        (r"/api/onboarding/reset", OnboardingSelfResetHandler),
         # ── Administration ──
         (r"/admin", AdminHandler),
         (r"/admin/performance", PerformanceStatsHandler),
@@ -464,6 +484,9 @@ def get_routes() -> list:
         (r"/admin/ai-performance", AIPerformanceDashboardHandler),
         (r"/admin/ai-training", AITrainingPageHandler),
         (r"/admin/ai-config", AIConfigPageHandler),
+        # Registre des modèles LLM — page promise par le contrat « LLM
+        # dynamique » (liens depuis /admin/ai-performance + messages runtime).
+        (r"/admin/ai-models", AIModelsPageHandler),
         # ── Accès aux données (RLS par utilisateur) ──
         (r"/admin/data-access", DataAccessPageHandler),
         (r"/api/admin/data-access/users", DataAccessUsersAPIHandler),
@@ -524,6 +547,12 @@ def get_routes() -> list:
         (r"/api/ai/schema-sync/history", AISchemaSyncAPIHandler),
         # Autocomplete des noms de tables pour l'UI admin business_context
         (r"/api/ai/schema/tables", AISchemaTablesAPIHandler),
+        # Refresh = découverte (sync_from_provider) + enrichissement (LiteLLM)
+        # en 1 passe. Déclenché par « Tester » dans /admin/ai-config pour que
+        # les modèles de la dropdown atterrissent dans llm_models avec leur
+        # vraie fenêtre. Placé AVANT /api/ai/models (ancrage $ Tornado, mais
+        # clarté). Cf. bug « 200K peu importe le modèle ».
+        (r"/api/ai/models/refresh", AIModelsRefreshHandler),
         (r"/api/ai/models", AIModelsAPIHandler),
         # Registre dynamique BDD-backed (Phase 2 refonte) — listing, sync,
         # override admin. ``AIModelsAPIHandler`` (au-dessus) reste l'API
@@ -543,8 +572,18 @@ def get_routes() -> list:
         # après un page refresh en plein milieu d'une sync — l'event bus
         # n'a pas de replay).
         (r"/api/system/sync-status", SystemSyncStatusHandler),
-        (r"/api/admin/llm/models/([A-Za-z0-9_.\-]+)", LlmModelOverrideHandler),
+        # ``([^/]+)`` (et pas une classe restrictive) : les ids de modèles
+        # OpenAI-compat contiennent couramment ``/`` et ``:`` (``mistralai/
+        # Mixtral-8x7B``, ``phi3:mini``). Le frontend les envoie percent-encodés
+        # (``%2F``/``%3A``) — une classe ``[A-Za-z0-9_.\-]`` ne matchait pas le
+        # ``%`` et rendait ces modèles INÉDITABLES (PATCH 404 silencieux,
+        # revue adversariale page ai-models 2026-06-10). Tornado décode le
+        # groupe capturé avant de le passer au handler. Les littéraux
+        # ``sync``/``sync-litellm`` restent captés par leurs routes dédiées
+        # déclarées AVANT (ordre Tornado).
+        (r"/api/admin/llm/models/([^/]+)", LlmModelOverrideHandler),
         (r"/api/admin/llm-local/status", LocalLlmStatusHandler),
+        (r"/api/admin/llm-local/detect", LocalLlmDetectHandler),
         (r"/api/admin/llm-local/pull", LocalLlmPullHandler),
         (r"/api/admin/llm-local/delete", LocalLlmDeleteHandler),
         (r"/api/admin/llm-local/install-status", LocalLlmInstallStatusHandler),
@@ -583,14 +622,20 @@ def get_routes() -> list:
         (r"/api/dashboards/([0-9]+)/widgets/llm", DashboardWidgetLLMAPIHandler),
         (r"/api/dashboards/([0-9]+)/widgets/reorder", DashboardWidgetReorderAPIHandler),
         (r"/api/dashboards/([0-9]+)/widgets/([0-9]+)", DashboardWidgetDetailAPIHandler),
+        (
+            r"/api/dashboards/([0-9]+)/widgets/([0-9]+)/extra-tabs",
+            DashboardWidgetExtraTabsAPIHandler,
+        ),
+        (
+            r"/api/dashboards/([0-9]+)/widgets/([0-9]+)/workbook",
+            DashboardWidgetWorkbookAPIHandler,
+        ),
         (r"/api/dashboards/([0-9]+)/filters/options", DashboardFilterOptionsAPIHandler),
         (r"/api/dashboards/([0-9]+)/filters/reorder", DashboardFilterReorderAPIHandler),
         (r"/api/dashboards/([0-9]+)/filters/([0-9]+)", DashboardFilterDetailAPIHandler),
         (r"/api/dashboards/([0-9]+)/filters", DashboardFilterAPIHandler),
         (r"/api/dashboards/([0-9]+)/coherence", DashboardCoherenceAPIHandler),
         (r"/api/dashboards/([0-9]+)/data", DashboardDataAPIHandler),
-        (r"/api/dashboards/([0-9]+)/schedule", DashboardScheduleAPIHandler),
-        (r"/api/dashboards/([0-9]+)/send-now", DashboardSendNowAPIHandler),
         # ── Users (admin) ──
         (r"/api/users", UsersAPIHandler),
         # Bulk avant le suffix ``/<id>`` : sinon Tornado matche "bulk" comme

@@ -334,6 +334,34 @@ def _build_audit_payload(
     else:
         attachment_names = _extract_attachment_names(attachments)
 
+    # #52 — annoter les pièces SKIPPÉES (taille/symlink/introuvable/erreur)
+    # remontées par ``_send_email_sync``. Sans ça, ``/email-history`` présente
+    # comme « jointe » un fichier qui n'a JAMAIS été envoyé (audit menteur).
+    skipped = (send_result or {}).get("skipped_attachments") if send_result else None
+    if skipped:
+        skipped_by_name = {
+            str(s.get("name")): str(s.get("reason"))
+            for s in skipped
+            if isinstance(s, dict) and s.get("name")
+        }
+        if skipped_by_name:
+            annotated: List[str] = []
+            matched: set = set()
+            for nm in attachment_names:
+                if nm in skipped_by_name:
+                    annotated.append(f"{nm} (NON jointe : {skipped_by_name[nm]})")
+                    matched.add(nm)
+                else:
+                    annotated.append(nm)
+            # #52 review (Moyen) — un skip dont le nom ne matche AUCUN
+            # attachment_name (cas où audit_attachment_names = libellé
+            # d'affichage ≠ filename réel) ne doit PAS être perdu : on l'ajoute
+            # comme entrée d'audit dédiée plutôt que de le droper en silence.
+            for nm, reason in skipped_by_name.items():
+                if nm not in matched:
+                    annotated.append(f"{nm} (NON jointe : {reason})")
+            attachment_names = annotated[:_AUDIT_ATTACHMENT_COUNT_MAX]
+
     return {
         "to_list": to_list,
         "cc_list": cc_list,
@@ -802,8 +830,11 @@ class SMTPClient:
             reply_to=reply_to,
             custom_headers=custom_headers,
         )
+        # #52 — récupérer les pièces SKIPPÉES pour les remonter au caller +
+        # audit (sinon promesse non tenue silencieuse : mail parti sans le fichier).
+        skipped_attachments: List[Dict[str, str]] = []
         if attachments:
-            self._add_attachments(msg, attachments)
+            skipped_attachments = self._add_attachments(msg, attachments)
 
         # Tenter l'envoi avec retry
         for attempt in range(1, self.max_retries + 1):
@@ -828,6 +859,7 @@ class SMTPClient:
                         "recipients": to_list,
                         "message_id": message_id,
                         "refused_recipients": [],
+                        "skipped_attachments": skipped_attachments,
                     }
 
                 # Cas 2 et 3 : refus partiel ou total. RCPT refused n'est pas un transient
@@ -845,6 +877,7 @@ class SMTPClient:
                         "message": "Tous les destinataires ont été refusés par le serveur SMTP",
                         "recipients": to_list,
                         "refused_recipients": refused_list,
+                        "skipped_attachments": skipped_attachments,
                     }
 
                 # Cas 2 : refus partiel — message_id existe (au moins 1 destinataire OK)
@@ -864,6 +897,7 @@ class SMTPClient:
                     "recipients": to_list,
                     "message_id": message_id,
                     "refused_recipients": refused_list,
+                    "skipped_attachments": skipped_attachments,
                 }
 
             except (smtplib.SMTPException, OSError):
@@ -883,6 +917,7 @@ class SMTPClient:
             "message": f"Échec après {self.max_retries} tentatives",
             "recipients": to_list,
             "refused_recipients": [],
+            "skipped_attachments": skipped_attachments,
             "error": "L'envoi a échoué après plusieurs tentatives. Vérifiez la configuration SMTP.",
         }
 
@@ -939,8 +974,19 @@ class SMTPClient:
 
         return msg
 
-    def _add_attachments(self, msg: MIMEMultipart, attachments: List[Union[str, Path, Dict]]):
-        """Ajoute les pièces jointes au message."""
+    def _add_attachments(
+        self, msg: MIMEMultipart, attachments: List[Union[str, Path, Dict]]
+    ) -> List[Dict[str, str]]:
+        """Ajoute les pièces jointes au message.
+
+        #52 — Retourne la liste des pièces SKIPPÉES ``[{"name", "reason"}]``
+        (symlink, hors-sandbox, introuvable, trop volumineuse, erreur lecture).
+        Avant, un skip n'était qu'un ``logger.warning`` : l'envoi renvoyait
+        ``success=True`` et ``/email-history`` affichait la pièce comme jointe
+        alors qu'elle n'a JAMAIS quitté la machine (promesse non tenue
+        silencieuse). L'appelant propage cette liste au dict de retour + audit.
+        """
+        skipped: List[Dict[str, str]] = []
         # Garde agrégat anti-OOM : on borne le TOTAL des pièces AVANT d'en lire
         # une seule en mémoire. ``stat().st_size`` uniquement (zéro lecture de
         # contenu). On échoue tout le build si la somme dépasse le cap — un
@@ -971,15 +1017,29 @@ class SMTPClient:
 
         for attachment in attachments:
             try:
-                # Extraire infos du fichier
-                if isinstance(attachment, dict):
-                    filepath = Path(attachment["path"])
-                    filename = attachment.get("filename", filepath.name)
-                    content_type = attachment.get("content_type")
-                else:
-                    filepath = Path(attachment)
-                    filename = filepath.name
-                    content_type = None
+                # Extraire infos du fichier. #52 review (Moyen) : un dict sans
+                # "path" (ou un type inattendu) levait un KeyError/TypeError NON
+                # capturé par l'except (OSError, ValueError) ci-dessous → crash
+                # de TOUT l'envoi. On skippe GRACIEUSEMENT (cohérent avec la
+                # pré-passe anti-OOM l.993) et on le SIGNALE.
+                try:
+                    if isinstance(attachment, dict):
+                        filepath = Path(attachment["path"])
+                        filename = attachment.get("filename", filepath.name)
+                        content_type = attachment.get("content_type")
+                    else:
+                        filepath = Path(attachment)
+                        filename = filepath.name
+                        content_type = None
+                except (KeyError, TypeError):
+                    logger.warning("Pièce jointe malformée ignorée: %r", attachment)
+                    skipped.append(
+                        {
+                            "name": str(attachment)[:_AUDIT_ATTACHMENT_NAME_MAX],
+                            "reason": "entrée malformée (path manquant)",
+                        }
+                    )
+                    continue
 
                 # Prédicat de skip UNIQUE (cf. _attachment_skip_reason) :
                 # symlink / '..' / hors-sandbox (defense-in-depth axe 8 :
@@ -989,6 +1049,9 @@ class SMTPClient:
                 _skip_reason, _ = _attachment_skip_reason(filepath)
                 if _skip_reason is not None:
                     logger.warning("Pièce jointe ignorée (%s): %s", _skip_reason, filepath)
+                    skipped.append(
+                        {"name": str(filename)[:_AUDIT_ATTACHMENT_NAME_MAX], "reason": _skip_reason}
+                    )
                     continue
 
                 with open(filepath, "rb") as f:
@@ -1014,6 +1077,28 @@ class SMTPClient:
 
             except (OSError, ValueError) as e:
                 logger.error("Erreur ajout pièce jointe %s: %s", attachment, e)
+                # La pièce n'a pas pu être lue/attachée → la signaler aussi
+                # (sinon même angle mort que le skip-reason). Nom dérivé
+                # défensivement (``filename`` peut ne pas être défini si l'échec
+                # est survenu avant son assignation).
+                try:
+                    _nm = (
+                        attachment.get("filename")
+                        if isinstance(attachment, dict)
+                        else None
+                    ) or Path(
+                        attachment["path"] if isinstance(attachment, dict) else attachment
+                    ).name
+                except Exception:
+                    _nm = str(attachment)
+                skipped.append(
+                    {
+                        "name": str(_nm)[:_AUDIT_ATTACHMENT_NAME_MAX],
+                        "reason": f"erreur lecture ({type(e).__name__})",
+                    }
+                )
+
+        return skipped
 
     def _send_via_smtp(
         self, msg: MIMEMultipart, recipients: List[str]

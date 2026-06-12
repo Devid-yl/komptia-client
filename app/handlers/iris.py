@@ -47,7 +47,7 @@ from urllib.parse import urlparse
 
 import tornado.web
 import tornado.websocket
-from sqlalchemy import delete, desc, select, update
+from sqlalchemy import delete, desc, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import config
@@ -176,6 +176,16 @@ _RATE_LIMIT_MESSAGES: Final[int] = _int_env("IRIS_WS_RATE_LIMIT_MESSAGES", 20, m
 #: Ajustable via env ``IRIS_WS_RATE_LIMIT_WINDOW_S`` (default 60, clamp [1, 86400]).
 _RATE_LIMIT_WINDOW: Final[int] = _int_env("IRIS_WS_RATE_LIMIT_WINDOW_S", 60, min_=1, max_=86400)
 
+#: Actions WS soumises au rate-limit GÉNÉRAL (anti-spam LLM) : uniquement celles
+#: qui déclenchent un NOUVEAU tour agent (``_run_agent``). Les réponses qui
+#: RÉSOLVENT un await serveur (consent, pipeline ask_user) en sont exclues — les
+#: rate-limiter figerait le run en attente de la réponse (deadlock silencieux,
+#: audit IRIS-ratelimit). ``cancel``/``ping`` sont court-circuités encore en
+#: amont. Le consent garde en plus son limiteur dédié anti-spam.
+_RATE_LIMITED_WS_ACTIONS: Final[frozenset] = frozenset(
+    {"send_message", "clarification_response"}
+)
+
 #: Timeout per-event sur ``async for event in agent.run(...)``. Sans
 #: timeout, un LLM hung ou un appel SQL Sage qui ne renvoie jamais tient
 #: la WS du user et le lock conversation indéfiniment. 300 s couvre les
@@ -195,6 +205,98 @@ _AGENT_EVENT_TIMEOUT_SECONDS: Final[float] = _float_env(
 _AGENT_RUN_TOTAL_TIMEOUT_SECONDS: Final[float] = _float_env(
     "IRIS_AGENT_TOTAL_TIMEOUT_S", 1800.0, min_=30.0, max_=86400.0
 )
+
+#: R2 (L0O0/L7O2) — Cap d'attente sur l'acquisition du LOCK CONVERSATION dans
+#: ``_run_agent``. Le lock sérialise les runs d'une même conv (anti-race C2-followup
+#: sur ``max_turn``) et reste tenu TOUTE la durée d'un run (jusqu'au wall-clock cap
+#: 1800 s). Sans borne sur l'``acquire``, un 2e onglet (même conv) restait bloqué sur
+#: ``__aenter__`` indéfiniment (spinner trompeur, aucun feedback). On borne l'attente :
+#: timeout → message « conversation occupée ailleurs » + abandon propre. La
+#: ``CancelledError`` du timeout frappe ``lock.acquire()`` AVANT l'enregistrement →
+#: waiter retiré proprement, JAMAIS de lock orphelin (cf. agent_service.conversation_lock).
+#: Ajustable via env ``IRIS_CONV_LOCK_ACQUIRE_TIMEOUT_S`` (default 30, clamp [1, 300]).
+_CONV_LOCK_ACQUIRE_TIMEOUT_SECONDS: Final[float] = _float_env(
+    "IRIS_CONV_LOCK_ACQUIRE_TIMEOUT_S", 30.0, min_=1.0, max_=300.0
+)
+
+#: Cap d'attente sur le lock d'écriture ``User.iris_memory`` (endpoints PUT/DELETE
+#: ``/api/iris/user-memory``). Ce lock est PARTAGÉ avec la fusion fin-de-run de
+#: l'agent (``IrisAgent.user_iris_memory_lock``) pour éviter qu'une édition manuelle
+#: soit silencieusement écrasée par une fusion concourante (lost-update). La fusion
+#: peut tenir le lock le temps d'un appel LLM → on borne l'attente du endpoint pour
+#: ne pas pendre l'utilisateur ; timeout → 503 « réessayez » (fail-safe, JAMAIS de
+#: lost-update). Env ``IRIS_USERMEM_LOCK_ACQUIRE_TIMEOUT_S`` (default 35, clamp [1, 120]).
+_USERMEM_LOCK_ACQUIRE_TIMEOUT_SECONDS: Final[float] = _float_env(
+    "IRIS_USERMEM_LOCK_ACQUIRE_TIMEOUT_S", 35.0, min_=1.0, max_=120.0
+)
+
+#: R3.1 (L7O1) — Fenêtre de GRÂCE après fermeture WS avant de tuer le run agent.
+#: Un blip transitoire (sommeil laptop, throttle onglet en arrière-plan, micro-
+#: coupure réseau) ferme la WS → ``on_close``. Sans grâce, le run EN VOL est annulé
+#: immédiatement et l'utilisateur doit tout relancer (un rapport multi-SQL peut
+#: représenter des minutes de travail + des appels LLM coûteux). On DIFFÈRE
+#: l'annulation : si l'user reconnecte dans la fenêtre, le run survit. Les events
+#: restent persistés en BDD AVANT l'envoi WS (cf. ``_run_agent``), donc le nouveau
+#: socket recharge l'historique. De toute façon borné par le wall-clock cap
+#: (``_AGENT_RUN_TOTAL_TIMEOUT_SECONDS``). Mettre à 0 désactive la grâce (= annulation
+#: immédiate, comportement historique). Ajustable via ``IRIS_RECONNECT_GRACE_S``
+#: (default 8, clamp [0, 120]).
+_RECONNECT_GRACE_SECONDS: Final[float] = _float_env(
+    "IRIS_RECONNECT_GRACE_S", 8.0, min_=0.0, max_=120.0
+)
+
+#: R3.1 — Registre des annulations de run DIFFÉRÉES (grace reconnect), clé = user_id.
+#: Valeur = ``(TimerHandle, cancel_event)`` — on stocke le ``cancel_event`` ciblé pour
+#: que CHAQUE consommateur vérifie l'IDENTITÉ avant d'agir (le ``_run_agent.finally``
+#: ne désarme QUE le timer qui vise SON propre event, pas celui d'un autre run/onglet
+#: du même user). ``on_close`` y dépose le timer ; ``open`` le ``pop`` + ``cancel``
+#: quand le MÊME user reconnecte ; le ``finally`` du run le désarme à la complétion
+#: (sinon un timer survit au run et pourrait fire tard — inoffensif car il vise l'event
+#: du handler MORT, mais on nettoie quand même : hygiène + robustesse à un futur
+#: refactor de cycle de vie handler). Clé user_id car le socket reconnecté ne connaît
+#: que son user à ``open()`` (le conv_id n'arrive qu'au 1er message) → pas de fuite
+#: cross-user (axe 18, on ne touche QUE l'entrée du user courant). Limite assumée :
+#: multi-onglets/convs ≠ d'un même user = grossier (1 seul slot/​user ; un run peut
+#: tourner non-observé jusqu'au wall-clock cap ; borné, pas un bug de correction).
+_pending_reconnect_cancels: dict[int, tuple[asyncio.TimerHandle, asyncio.Event]] = {}
+
+
+def _fire_deferred_cancel(user_id: int, cancel_event: asyncio.Event) -> None:
+    """R3.1 — Callback du grace timer : le user n'a PAS reconnecté à temps → annule le
+    run. Retire l'entrée du registre SI elle vise toujours CE ``cancel_event`` (un timer
+    annulé ne fire pas, donc en pratique c'est le nôtre — mais on vérifie l'identité par
+    défense), puis ``set`` le ``cancel_event`` (l'agent le verra à son prochain checkpoint
+    cancel). Exécuté sur le thread de l'event loop (callback ``call_later``) → pas de
+    préemption, pas de lock requis."""
+    entry = _pending_reconnect_cancels.get(user_id)
+    if entry is not None and entry[1] is cancel_event:
+        _pending_reconnect_cancels.pop(user_id, None)
+    cancel_event.set()
+
+
+#: Events qui ATTENDENT une réponse de l'utilisateur (consentement lecture des
+#: résultats, clarification, question posée par la pipeline). Après un tel
+#: event, le prochain event agent peut légitimement tarder le temps que l'user
+#: réponde — on ne lui applique PAS le per-event timeout (sinon le run est tué à
+#: 300 s avec « reformulez en plus simple », alors que l'user remplissait le
+#: panneau de consentement ; cf. audit UX PIPE-2). Le wall-clock cap + les
+#: timeouts backend de chaque gate restent les vraies bornes.
+_INTERACTIVE_EVENT_TYPES: Final[frozenset] = frozenset(
+    {"data_read_consent_request", "clarification", "pipeline_ask_user"}
+)
+
+#: Cap d'events de conversation chargés au RENDER de /iris. Sur une conversation
+#: très utilisée (jamais effacée), charger TOUS les events fait grossir le HTML
+#: inline et le navigateur les rejoue tous → page de plus en plus lente
+#: (audit IRIS-events). On ne rend que les N PLUS RÉCENTS ; le reste reste en
+#: BDD (« charger l'historique plus ancien » = amélioration future). Env-
+#: configurable + clampé pour ne jamais crasher sur une valeur invalide.
+try:
+    _IRIS_RENDER_EVENTS_CAP: Final[int] = max(
+        50, min(5000, int(os.environ.get("KOMPTIA_IRIS_RENDER_EVENTS_CAP", "500")))
+    )
+except (ValueError, TypeError):
+    _IRIS_RENDER_EVENTS_CAP = 500
 
 #: Timeout sur ``agent_gen.aclose()`` lui-même. Si l'agent est bloqué
 #: dans un ``await provider.stream(...)`` sans checkpoint cancel, le
@@ -305,6 +407,85 @@ _ALLOWED_FEEDBACKS: Final[frozenset[str]] = frozenset({"positive", "adjust", "ne
 #: zéro chemin absolu hardcodé, portable par déploiement.
 _UPLOAD_DIR: Final[Path] = config.data_dir / "uploads"
 
+#: E4 (L1O1) part 2 — quota disque CUMULÉ par utilisateur sur ``_UPLOAD_DIR``.
+#: Le rate-limit (part 1) borne la FRÉQUENCE des uploads (30/min × cap), pas le
+#: TOTAL accumulé : sur la fenêtre TTL (``cleanup_iris_uploads`` 30j), un seul user
+#: pouvait remplir le disque (30/min × 50 Mo = 90 Go/h). Le quota est COUPLÉ au cap
+#: upload admin (SSoT ``get_max_upload_size_bytes``) via ``_resolve_user_upload_quota``
+#: = ``max(plancher, cap_upload × multiple)`` : si l'admin relève le cap, le quota
+#: suit (pas de faux rejet). Multiple configurable par env ; plancher pour que les
+#: petits caps tolèrent quand même une accumulation raisonnable.
+_IRIS_UPLOAD_USER_QUOTA_MULTIPLE: Final[int] = _int_env(
+    "IRIS_UPLOAD_USER_QUOTA_MULTIPLE", 50, min_=2, max_=100000
+)
+_IRIS_UPLOAD_USER_QUOTA_FLOOR_BYTES: Final[int] = 500 * 1024 * 1024
+
+
+def _resolve_user_upload_quota(upload_cap_bytes: int) -> int:
+    """Quota disque cumulé par user = ``max(plancher, cap_upload × multiple)``.
+
+    Couple le quota au cap upload admin (un déploiement acceptant de gros uploads
+    tolère mécaniquement un plus gros cumul → pas de faux rejet quand l'admin relève
+    le cap). Tolère un cap corrompu (None/0/négatif → plancher seul)."""
+    try:
+        scaled = int(upload_cap_bytes) * _IRIS_UPLOAD_USER_QUOTA_MULTIPLE
+    except (TypeError, ValueError):
+        scaled = 0
+    return max(_IRIS_UPLOAD_USER_QUOTA_FLOOR_BYTES, scaled)
+
+
+def _user_upload_dir_usage_bytes(user_dir: Path) -> int:
+    """Somme des tailles des fichiers d'UPLOAD (``{uuid}.ext``) d'un user
+    (octets cumulés on-disk).
+
+    PURE/sync → à appeler via ``asyncio.to_thread`` (I/O disque, pattern E1, pour
+    ne pas geler l'event loop).
+
+    Périmètre du compte (review E4-part2) :
+    - **Exclut les sidecars de bookkeeping** (``.dedup.json`` / ``.dedup.lock``) :
+      ce sont des octets que l'app gère et que l'user ne peut PAS supprimer via
+      ``upload/cancel`` (qui n'unlink que ``{file_id}.*``) → les compter ferait un
+      faux rejet near-quota sur des octets non-contrôlables. Le quota mesure ce que
+      l'user peut purger : ses fichiers importés.
+    - **Ignore les symlinks** : ``is_file()`` les suit (taille de la cible →
+      sur/sous-compte) ; l'app ne crée JAMAIS de symlink ici, donc les exclure
+      n'affecte aucun usage légitime, et neutralise un symlink→gros-fichier forgé.
+    - **Scan PLAT** (pas de récursion) : l'unique writer (``IrisUploadHandler.post``)
+      écrit des fichiers plats ``{uuid}.ext`` directement sous ``user_dir`` — pas de
+      sous-dossier. ⚠️ INVARIANT : si un futur writer introduit un sous-dossier, ce
+      compte le sous-évaluerait (gate défait silencieusement) → rendre récursif ici.
+
+    Fail-safe (ne JAMAIS lever — le caller décide) :
+    - dossier user absent (premier upload) → 0 ;
+    - fichier supprimé entre ``iterdir`` et ``stat`` (race cleanup/TTL) → ignoré ;
+    - FS globalement inaccessible (OSError) → 0 (fail-OPEN : on ne bloque pas un
+      upload légitime sur un hoquet FS transitoire ; le DoS reste borné par le
+      rate-limit, et une écriture sur disque vraiment plein lèvera son propre
+      OSError → 500 géré). Loggé en WARNING pour que l'admin voie la dégradation."""
+    total = 0
+    try:
+        for entry in user_dir.iterdir():
+            name = entry.name
+            if name.startswith(".dedup"):
+                continue  # sidecar de bookkeeping, hors quota user
+            try:
+                if entry.is_file() and not entry.is_symlink():
+                    total += entry.stat().st_size
+            except OSError:
+                continue  # fichier disparu entre iterdir et stat → ignore
+    except (FileNotFoundError, NotADirectoryError):
+        return 0  # dossier user pas encore créé
+    except OSError as exc:
+        # FS inaccessible → fail-open (cf. docstring) ; visible pour l'admin.
+        logger.warning(
+            "Quota upload : usage disque illisible (fail-open) user_dir=%s : %s",
+            user_dir,
+            exc,
+        )
+        return 0
+    return total
+
+
 #: Codes de fermeture WebSocket (RFC 6455 section 7.4.2, range applicatif
 #: 4000-4999). On centralise pour que les clients puissent reconnaître un
 #: code précis sans introspection de la raison textuelle.
@@ -329,6 +510,10 @@ class _Messages:
     AGENT_RUNNING: Final[str] = (
         "L'agent est déjà en cours d'exécution. Attendez la fin ou arrêtez-le d'abord."
     )
+    CONV_BUSY_OTHER_TAB: Final[str] = (
+        "Cette conversation est déjà traitée par l'agent dans une autre fenêtre ou "
+        "onglet. Attendez la fin de ce traitement, puis réessayez."
+    )
     MESSAGE_EMPTY: Final[str] = "Le message ne peut pas être vide."
     SESSION_EXPIRED: Final[str] = (
         "Votre session a expiré ou votre compte a été désactivé. " "Veuillez vous reconnecter."
@@ -352,6 +537,14 @@ class _Messages:
     FEEDBACK_JSON_INVALID: Final[str] = "JSON invalide."
     NO_FILE: Final[str] = "Aucun fichier envoyé."
     PATH_INVALID: Final[str] = "Chemin de fichier invalide."
+    PARSE_FAILED_GENERIC: Final[str] = (
+        "Le fichier n'a pas pu être analysé. Vérifiez son format (CSV/Excel/JSON) "
+        "et réessayez, ou signalez le problème."
+    )
+    UPLOAD_QUOTA_EXCEEDED: Final[str] = (
+        "Espace de stockage saturé : ce fichier dépasserait votre quota d'uploads. "
+        "Supprimez des fichiers déjà importés ou contactez l'administrateur."
+    )
     DISK_FULL: Final[str] = "Espace disque insuffisant pour sauvegarder le fichier."
     DISK_DENIED: Final[str] = (
         "Permission refusée pour écrire le fichier. Contactez l'administrateur."
@@ -774,6 +967,95 @@ async def _scrub_tool_input_for_user(tool_input: Mapping[str, Any], user: Any) -
     return scrubbed
 
 
+#: Clés d'event dont la VALEUR string est un NOM (table/colonne/SQL/texte libre)
+#: susceptible de contenir un terme *denied* → à scrubber. Volontairement CIBLÉ
+#: (pas un scrub de tous les strings) : les events ``tool_result`` ne sont PAS
+#: strippés par le persister et portent des DONNÉES sous d'autres clés
+#: (``values``, ``cells``, ``resolved``, scalaires…). Scrubber ces valeurs
+#: corromprait une donnée métier qui vaudrait par hasard un nom denied =
+#: « donnée fausse silencieuse » (consequences.md Q5), pire qu'une fuite de
+#: nom dans le propre replay de l'user. On ne touche donc QUE les porteurs de
+#: noms. ``columns`` (liste de noms d'en-têtes) est traité à part.
+_EVENT_NAME_STRING_KEYS: Final[frozenset] = frozenset(
+    {
+        "sql",
+        "query",
+        "text",
+        "description",
+        "message",
+        "question",
+        "title",
+        "summary",
+        "table",
+        "table_name",
+        "label",
+    }
+)
+
+
+async def _scrub_event_payload(value: Any, user: Any) -> Any:
+    """Scrub CIBLÉ (P0 #124) des NOMS dans un payload d'event de replay.
+
+    Récurse dans les dict/list imbriqués (pour atteindre ``sql_data.sql`` /
+    ``result.sql_data.columns``…) mais ne scrub QUE :
+    - les strings sous une clé de :data:`_EVENT_NAME_STRING_KEYS` ;
+    - les éléments string d'une liste ``columns`` (noms d'en-têtes).
+
+    Toute autre valeur (cellules de ``rows``, ``values``/``cells``/scalaires de
+    données, nombres, booléens) est laissée INTACTE — voir la note sur
+    :data:`_EVENT_NAME_STRING_KEYS`. Cohérent avec ``_render_tool_message`` qui
+    ne scrub pas non plus les données de résultat.
+    """
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k == "columns" and isinstance(v, list):
+                out[k] = [await _scrub(c, user) if isinstance(c, str) else c for c in v]
+            elif k in _EVENT_NAME_STRING_KEYS and isinstance(v, str):
+                out[k] = await _scrub(v, user)
+            elif isinstance(v, (Mapping, list)):
+                out[k] = await _scrub_event_payload(v, user)
+            else:
+                out[k] = v
+        return out
+    if isinstance(value, list):
+        return [await _scrub_event_payload(v, user) for v in value]
+    return value
+
+
+async def _scrub_events_for_user(
+    events: list[dict[str, Any]], user: Any
+) -> list[dict[str, Any]]:
+    """Scrub PII des payloads d'events de replay AVANT envoi au navigateur.
+
+    **P0 (#124) — fermeture de l'asymétrie** : le chemin ``messages`` est déjà
+    scrubé (``_render_tool_message``/``_render_user_or_assistant``), mais les
+    ``conversation_events`` étaient renvoyés BRUTS (SSR ``/iris`` + endpoint
+    ``older-events``). Le persister ne strippe que les ``rows`` — pas les noms.
+    Sans ce passage, un nom de table/colonne *denied* (durci a posteriori dans
+    ``/data-privacy``) fuit au replay.
+
+    ``payload`` est une string JSON (le front fait ``JSON.parse``) → on parse,
+    on scrub les strings (hors ``rows``), on re-sérialise. No-op pour user None
+    / admin / sans restrictions (``_scrub`` court-circuite ; caches view+rules
+    TTL 60s → pas d'explosion BDD même sur ``_IRIS_RENDER_EVENTS_CAP`` events).
+    """
+    if user is None or not events:
+        return events
+    scrubbed_events: list[dict[str, Any]] = []
+    for ev in events:
+        raw = ev.get("payload")
+        parsed = _safe_json_loads(raw) if isinstance(raw, str) else None
+        if not isinstance(parsed, (dict, list)):
+            scrubbed_events.append(ev)
+            continue
+        scrubbed_payload = await _scrub_event_payload(parsed, user)
+        new_ev = dict(ev)
+        new_ev["payload"] = json.dumps(scrubbed_payload, ensure_ascii=False)
+        scrubbed_events.append(new_ev)
+    return scrubbed_events
+
+
 async def _render_tool_message(msg: ConversationMessage, user: Any) -> dict[str, Any]:
     """Sérialise un message ``TOOL`` pour le template (icon/label/description).
 
@@ -867,6 +1149,12 @@ async def _render_user_or_assistant(msg: ConversationMessage, user: Any) -> dict
 
     rendered: dict[str, Any] = {"role": msg.role.value, "content": content}
     if msg.role == MessageRole.ASSISTANT:
+        # D4 (L1O2) — id stable du message → le front peut cibler CE message
+        # précis pour le feedback (chaque tour a sa propre row 👍/👎 au replay).
+        # Sans id, le feedback retombe sur « dernier message par created_at » →
+        # un 👍 sur un tour ancien entraînait la mauvaise paire Q/SQL (donnée
+        # fausse silencieuse, consequences.md Q5).
+        rendered["id"] = msg.id
         if msg.feedback:
             rendered["feedback"] = msg.feedback
         if msg.turn_events:
@@ -910,6 +1198,12 @@ _LOAD_CONVERSATION_TIMEOUT_S: Final[float] = 5.0
 # TOUT au refresh (latence + mémoire non bornées). Le contexte AGENT est chargé
 # séparément (couche D1) → borner l'AFFICHAGE n'ampute pas la mémoire agent.
 _CONVERSATION_REPLAY_LIMIT: Final[int] = 200
+
+#: Seuil d'AVERTISSEMENT « conversation longue » exposé au front (IRIS_CONFIG).
+#: Dérivé DYNAMIQUEMENT du cap de replay (80 %) — pas un magic number : si le
+#: cap change, l'alerte suit. Au-delà du cap, l'historique se recharge tronqué
+#: au refresh ; on prévient l'utilisateur AVANT pour qu'il puisse effacer.
+_CONVERSATION_WARN_THRESHOLD: Final[int] = max(1, int(_CONVERSATION_REPLAY_LIMIT * 0.8))
 
 
 async def _load_active_conversation(user: User, source: str) -> tuple[
@@ -1138,10 +1432,53 @@ _iris_consent_ws_rate_limiter: Final[RateLimiter] = RateLimiter()
 _IRIS_CONSENT_WS_RATE_MAX: Final[int] = 5
 _IRIS_CONSENT_WS_RATE_WINDOW_S: Final[int] = 60
 
+#: IRIS-events-loadmore (#54, revue adversariale) — rate-limit du GET
+#: older-events : protège la BDD (``min(seq)`` + tail scan) d'un spam (user
+#: légitime au scroll rapide OU compte compromis). 60/min suffit largement pour
+#: un usage humain (un clic « charger plus ancien » par seconde au pire).
+_older_events_rate_limiter: Final[RateLimiter] = RateLimiter()
+_OLDER_EVENTS_RATE_MAX: Final[int] = 60
+_OLDER_EVENTS_RATE_WINDOW_S: Final[int] = 60
+
+#: Rate-limit des mutateurs HTTP Iris (clear / feedback / user-memory PUT+DELETE /
+#: upload). Clé par (endpoint, user) → un compte authentifié ne peut pas marteler
+#: ces écritures (DoS BDD : hard-delete cascade, UPDATE users, SELECT dernier
+#: message ; DoS disque + event-loop pour l'upload : sha256/write_bytes/flock sync).
+#: Confirmé live par la sonde ``mutator_no_ratelimit`` (scripts/iris_flow_probe.py).
+#: 30/min/endpoint suffit largement pour un usage humain (chaque action est un
+#: clic délibéré). Ajustable par env pour les tests/exploitation.
+_iris_mutator_rate_limiter: Final[RateLimiter] = RateLimiter()
+_IRIS_MUTATOR_RATE_MAX: Final[int] = _int_env("IRIS_MUTATOR_RATE_LIMIT", 30, min_=1, max_=10000)
+_IRIS_MUTATOR_RATE_WINDOW_S: Final[int] = _int_env(
+    "IRIS_MUTATOR_RATE_WINDOW_S", 60, min_=1, max_=86400
+)
+
+
+def _enforce_iris_mutator_rate_limit(handler: "BaseHandler", endpoint: str, user_id: int) -> bool:
+    """Applique le rate-limit mutateur Iris (clé ``iris_mutator:<endpoint>:<user>``).
+
+    Source unique pour les endpoints mutateurs (clear/feedback/user-memory/upload),
+    alignée sur le pattern ``_older_events_rate_limiter``. Émet 429 et retourne
+    ``False`` si dépassé ; ``True`` sinon (le caller continue). Chaque ``endpoint``
+    a son propre bucket (clé distincte) → un flood d'upload ne bloque pas le clear.
+    """
+    if not _iris_mutator_rate_limiter.check(
+        f"iris_mutator:{endpoint}:{user_id}",
+        _IRIS_MUTATOR_RATE_MAX,
+        _IRIS_MUTATOR_RATE_WINDOW_S,
+    ):
+        handler.write_json(
+            {"success": False, "error": "Trop de requêtes. Réessayez dans un instant."},
+            status=429,
+        )
+        return False
+    return True
+
 
 def _reset_ws_rate_limiter() -> None:
     """Helper exclusivement utilisé par les tests pour réinitialiser le state."""
     _ws_rate_limiter._requests.clear()  # type: ignore[attr-defined]
+    _iris_mutator_rate_limiter._requests.clear()  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -1188,7 +1525,15 @@ class IrisPageHandler(BaseHandler):
             )
 
             try:
-                conversation_events = await get_events_for_conversation(conversation_id)
+                # IRIS-events — borne le rendu aux N events les plus récents
+                # (sinon une conversation très utilisée ralentit /iris à chaque
+                # refresh : HTML inline géant + rejeu navigateur de tout).
+                conversation_events = await get_events_for_conversation(
+                    conversation_id, limit=_IRIS_RENDER_EVENTS_CAP
+                )
+                # P0 (#124) — scrub PII des payloads d'events AVANT injection
+                # HTML (parité avec le chemin messages déjà scrubé).
+                conversation_events = await _scrub_events_for_user(conversation_events, user)
             except SQLAlchemyError as exc:
                 logger.warning(
                     "Erreur chargement conversation_events (conv=%s): %s",
@@ -1203,6 +1548,7 @@ class IrisPageHandler(BaseHandler):
         # capacité (sinon une rehydratation aberrante ferait apparaître un
         # bar saturé sans raison utile au user).
         cw = snapshot.get("context_window")
+        cw_verified = bool(snapshot.get("context_window_verified"))
         if cw and history_token_estimate > cw:
             history_token_estimate = cw
         model_display = snapshot.get("model_display") or "IA"
@@ -1227,16 +1573,68 @@ class IrisPageHandler(BaseHandler):
 
         upload_config = _upload_config_for_template(await get_max_upload_size_bytes())
 
+        # Coût LLM cumulé de la conversation réhydratée → initialise la puce
+        # discrète /iris au chargement (le live la rafraîchit ensuite via l'event
+        # ``done``). MÊME wrapper SSoT que l'agent (``get_conversation_cost_usd_for_ui``)
+        # : le ``created_after`` interne garantit que le compteur repart de 0 après
+        # « Effacer la conversation ». ``user.id`` isole le coût au compte courant.
+        # Fail-soft : un échec de lecture ne doit pas casser le rendu de /iris.
+        initial_conversation_cost_usd = 0.0
+        initial_conversation_cost_partial = False
+        try:
+            from app.services.ai.llm_call_tracker import (
+                get_conversation_cost_usd_for_ui,
+            )
+
+            (
+                initial_conversation_cost_usd,
+                initial_conversation_cost_partial,
+            ) = await get_conversation_cost_usd_for_ui(conversation_id, user_id=user.id)
+        except Exception as exc:  # noqa: BLE001 — observabilité non-bloquante
+            logger.warning(
+                "Lecture coût initial conversation /iris échouée (conv=%s): %s",
+                conversation_id,
+                exc,
+            )
+
+        # Compteur de messages (dénormalisé) pour l'avertissement front « conv
+        # longue ». Le trim le resynchronise ; une légère dérive n'affecte qu'un
+        # seuil d'alerte (jamais un calcul critique). Fallback : longueur rendue.
+        conv_message_count = len(conversation_messages or [])
+        if conversation_id is not None:
+            try:
+                async with get_session() as session:
+                    _mc = (
+                        await session.execute(
+                            select(Conversation.message_count).where(
+                                Conversation.id == conversation_id
+                            )
+                        )
+                    ).scalar()
+                if _mc is not None:
+                    conv_message_count = int(_mc)
+            except Exception as exc:  # noqa: BLE001 — non bloquant
+                logger.warning(
+                    "Lecture message_count /iris échouée (conv=%s): %s",
+                    conversation_id,
+                    exc,
+                )
+
         self.render(
             "iris.html",
             user=user,
             conversation_id=conversation_id,
+            conversation_message_count=conv_message_count,
+            conversation_warn_threshold=_CONVERSATION_WARN_THRESHOLD,
             conversation_messages=_json_for_template(conversation_messages),
             conversation_events=_json_for_template(conversation_events),
             model_display=model_display,
             model_name=snapshot.get("model_name"),
             context_window=cw,
+            context_window_verified=cw_verified,
             initial_context_tokens=history_token_estimate,
+            initial_conversation_cost_usd=initial_conversation_cost_usd,
+            initial_conversation_cost_partial=initial_conversation_cost_partial,
             welcome_suggestions=_json_for_template(welcome_suggestions),
             llm_ready=llm_ready,
             llm_setup_hint=llm_setup_hint,
@@ -1446,6 +1844,16 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
         # repris de ``app/main.py:_ServerLifecycle._background_tasks``.
         # Cf. mémoire ``feedback_asyncio_create_task_strong_ref.md``.
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # R3.1 — Reconnect : annule une éventuelle annulation de run DIFFÉRÉE pour ce
+        # user (un blip avait fermé le socket précédent ; le run a survécu, ses events
+        # sont persistés en BDD). Best-effort, clé user_id (cf. _pending_reconnect_cancels).
+        _prior_grace = _pending_reconnect_cancels.pop(user.id, None)
+        if _prior_grace is not None:
+            _prior_grace[0].cancel()
+            logger.info(
+                "Reconnect WS user_id=%s : annulation différée supprimée, run préservé",
+                user.id,
+            )
         logger.info(
             "WebSocket Iris ouvert: user_id=%s, ip=%s",
             user.id,
@@ -1455,13 +1863,52 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
     def on_close(self) -> None:
         user_id = getattr(getattr(self, "current_user", None), "id", "?")
         cancel_event = getattr(self, "_cancel_event", None)
+        agent_task = getattr(self, "_agent_task", None)
+        run_active = agent_task is not None and not agent_task.done()
         if cancel_event is not None:
-            cancel_event.set()
+            if run_active and isinstance(user_id, int) and _RECONNECT_GRACE_SECONDS > 0:
+                # R3.1 — Run EN VOL fermé par un blip : DIFFÉRER l'annulation pour
+                # laisser une fenêtre de reconnexion. Si l'user revient, ``open()``
+                # annule ce timer et le run survit (events persistés en BDD AVANT
+                # l'envoi WS → le nouveau socket recharge l'historique).
+                self._schedule_deferred_cancel(user_id, cancel_event)
+            else:
+                # Pas de run actif, grâce désactivée (env=0), ou user non identifié →
+                # annulation IMMÉDIATE (comportement historique, inoffensif).
+                cancel_event.set()
         logger.info(
-            "WebSocket Iris fermé: user_id=%s, code=%s, reason=%s",
+            "WebSocket Iris fermé: user_id=%s, code=%s, reason=%s, run_active=%s",
             user_id,
             self.close_code,
             self.close_reason,
+            run_active,
+        )
+
+    def _schedule_deferred_cancel(self, user_id: int, cancel_event: asyncio.Event) -> None:
+        """R3.1 — Programme l'annulation du run après ``_RECONNECT_GRACE_SECONDS``.
+
+        Stocke ``(TimerHandle, cancel_event)`` dans le registre cross-handler (clé
+        user_id) ; ``open()`` l'annule si le user reconnecte à temps. Remplace toute
+        grâce déjà en attente pour ce user (le close le plus récent gagne — son
+        ``cancel_event`` est le bon). ``get_running_loop`` (API correcte vs.
+        ``get_event_loop`` déprécié py3.12) → fallback ``set`` immédiat si appelé hors
+        loop (défensif, ne devrait pas arriver dans ``on_close`` Tornado)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cancel_event.set()
+            return
+        prior = _pending_reconnect_cancels.pop(user_id, None)
+        if prior is not None:
+            prior[0].cancel()
+        _pending_reconnect_cancels[user_id] = (
+            loop.call_later(
+                _RECONNECT_GRACE_SECONDS,
+                _fire_deferred_cancel,
+                user_id,
+                cancel_event,
+            ),
+            cancel_event,
         )
 
     def _spawn_background(self, coro: Any) -> asyncio.Task[Any]:
@@ -1543,7 +1990,15 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
         if action == "ping":
             return
 
-        if self._check_rate_limit():
+        # IRIS-ratelimit — le rate-limit GÉNÉRAL (anti-spam LLM) ne gate que les
+        # actions qui déclenchent un NOUVEAU tour agent (cf.
+        # ``_RATE_LIMITED_WS_ACTIONS``). Les réponses qui RÉSOLVENT un await
+        # serveur (data_read_consent_response, pipeline_ask_user_response) en
+        # sont EXEMPTÉES : les rate-limiter figerait le run/pipeline en attente
+        # de la réponse → deadlock silencieux. Le consent garde son limiteur
+        # dédié plus bas ; ask_user résout un Future borné (réponse tardive =
+        # no-op + event « expired »).
+        if action in _RATE_LIMITED_WS_ACTIONS and self._check_rate_limit():
             self._spawn_background(self._send_error(_Messages.RATE_LIMITED))
             return
 
@@ -1595,7 +2050,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
             exc,
             exc_info=exc,
         )
-        self._spawn_background(self._send_error(_Messages.INTERNAL_ERROR))
+        self._spawn_background(self._send_error(_Messages.INTERNAL_ERROR, reportable=True))
 
     # ------------------------------------------------------------------
     # Action handlers
@@ -1719,10 +2174,29 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
         # à chaque réponse de clarification).
         source = _coerce_source(payload.get("source") or getattr(self, "_last_source", None))
 
+        # R1 (L0O1) — Mode du PAYLOAD en priorité (le front connaît le mode courant ;
+        # un reconnect WS re-``open()`` le socket et RESET ``_last_mode`` à execution,
+        # mais NE recharge PAS la page → le toggle front reste juste). Fallback sur
+        # ``_last_mode`` mémorisé (parité avec ``source`` ci-dessus + clients legacy).
+        # Sans ça, un reconnect entre la demande de clarification et la réponse
+        # relançait l'agent en mode EXECUTION (outils à EFFETS DE BORD) même quand
+        # l'user était en EXPLICATION (lecture seule) → changement SILENCIEUX de
+        # comportement. On re-mémorise pour les réponses suivantes sur ce socket.
+        mode_raw = payload.get("mode")
+        # ``isinstance`` AVANT ``in`` : un ``mode`` non-string forgé (dict/list non
+        # hashable) lèverait ``TypeError`` sur ``in frozenset`` → ici on retombe
+        # proprement sur ``_last_mode`` (parité avec le cas string invalide).
+        mode = (
+            mode_raw
+            if isinstance(mode_raw, str) and mode_raw in _ALLOWED_MODES
+            else getattr(self, "_last_mode", _DEFAULT_MODE)
+        )
+        self._last_mode = mode
+
         await self._run_agent(
             message=response,
             conversation_id=conversation_id,
-            mode=getattr(self, "_last_mode", _DEFAULT_MODE),
+            mode=mode,
             file_id=None,
             role=None,
             source=source,
@@ -1788,7 +2262,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
         # adversarial review CRITICAL #7 mai 2026).
         user = self.current_user
         if user is None:
-            await self._send_error(_Messages.INTERNAL_ERROR)
+            await self._send_error(_Messages.INTERNAL_ERROR, reportable=True)
             return
         try:
             # SSOT du helper : ``conversation_lifecycle`` (cf. l'autre call-site
@@ -1887,7 +2361,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                 resolve_consent,
             )
 
-            resolve_consent(
+            _resolved = resolve_consent(
                 user.id,
                 conversation_id,
                 ConsentResponse(
@@ -1896,6 +2370,23 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                     dont_ask_again=dont_ask_again,
                 ),
             )
+            if not _resolved and not abandoned:
+                # PIPE consent-modal — l'user a répondu (Autoriser/Non) mais la
+                # demande n'était PLUS en attente (timeout serveur déjà passé,
+                # ou déjà résolue ailleurs). On le signale au client pour qu'il
+                # ferme le modal + affiche « expiré », au lieu d'un clic mort.
+                try:
+                    await self._safe_write(
+                        json.dumps(
+                            {
+                                "type": "data_read_consent_expired",
+                                "conversation_id": conversation_id,
+                            },
+                            default=_json_safe_default,
+                        )
+                    )
+                except Exception:  # noqa: BLE001 — best-effort
+                    pass
         except Exception as exc:  # noqa: BLE001 — defense-in-depth
             logger.error(
                 "data_read_consent_response: resolve_consent crashed " "(conv=%s) : %s",
@@ -1903,7 +2394,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                 exc,
                 exc_info=exc,
             )
-            await self._send_error(_Messages.INTERNAL_ERROR)
+            await self._send_error(_Messages.INTERNAL_ERROR, reportable=True)
 
     # Cap longueur réponse user → AskUserBridge (2 KB, idem
     # ``iris_pipeline_ws.IrisPipelineWebSocketHandler._ASK_RESPONSE_MAX_CHARS``).
@@ -1957,7 +2448,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
 
         user = self.current_user
         if user is None:
-            await self._send_error(_Messages.INTERNAL_ERROR)
+            await self._send_error(_Messages.INTERNAL_ERROR, reportable=True)
             return
 
         try:
@@ -1972,7 +2463,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                 ask_id,
                 exc,
             )
-            await self._send_error(_Messages.INTERNAL_ERROR)
+            await self._send_error(_Messages.INTERNAL_ERROR, reportable=True)
             return
 
         if runner is None:
@@ -2001,7 +2492,7 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                 ask_id,
                 exc,
             )
-            await self._send_error(_Messages.INTERNAL_ERROR)
+            await self._send_error(_Messages.INTERNAL_ERROR, reportable=True)
             return
 
         if not ok:
@@ -2015,6 +2506,22 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                 run_id,
                 ask_id,
             )
+            # PIPE ask_user-stale — signaler au client que la réponse n'a PAS
+            # été prise en compte (la pipeline a déjà continué), pour marquer la
+            # carte « expirée » au lieu de la laisser « répondu » (trompeur).
+            try:
+                await self._safe_write(
+                    json.dumps(
+                        {
+                            "type": "pipeline_ask_user_expired",
+                            "run_id": run_id,
+                            "ask_id": ask_id,
+                        },
+                        default=_json_safe_default,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
 
     async def _run_agent(
         self,
@@ -2134,8 +2641,29 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
         # lock orphelin jusqu'au prochain restart.
         _conv_lock_cm = None
         if _resolved_conv_id is not None:
-            _conv_lock_cm = agent.conversation_lock(_resolved_conv_id)
-            await _conv_lock_cm.__aenter__()
+            _cm = agent.conversation_lock(_resolved_conv_id)
+            # R2 (L0O0/L7O2) — acquire BORNÉ : un 2e onglet sur la même conv ne
+            # bloque plus indéfiniment sur ``__aenter__`` (spinner trompeur jusqu'au
+            # wall-clock cap 1800 s, sans feedback). Sur timeout, la ``CancelledError``
+            # de ``wait_for`` frappe ``lock.acquire()`` AVANT l'enregistrement du lock
+            # → waiter retiré, PAS de lock orphelin. On ne pose ``_conv_lock_cm``
+            # qu'APRÈS succès (sinon le cleanup tenterait un ``__aexit__`` sur un lock
+            # non tenu). Message clair + abandon propre (l'user réessaie).
+            try:
+                await asyncio.wait_for(
+                    _cm.__aenter__(), timeout=_CONV_LOCK_ACQUIRE_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "Run abandonné : lock conversation %s occupé > %.0fs (autre "
+                    "onglet/run en cours) user=%s",
+                    _resolved_conv_id,
+                    _CONV_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+                    scope_user_id,
+                )
+                await self._send_error(_Messages.CONV_BUSY_OTHER_TAB)
+                return
+            _conv_lock_cm = _cm
 
         _persister: Optional[SequentialEventPersister] = None
         if _resolved_conv_id is not None:
@@ -2245,12 +2773,21 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                 # helper qu'à la finalisation event-loop (potentiellement
                 # secondes/minutes plus tard) — leak transitoire en
                 # multi-user.
+                #
+                # R3.1 — ``_socket_dead`` : passe à ``True`` quand une écriture WS
+                # échoue (socket fermé par un blip). On ARRÊTE alors d'écrire mais on
+                # CONTINUE de consommer + persister le run (events déjà en BDD), pour
+                # qu'un reconnect dans la fenêtre de grâce retrouve un run vivant. Sans
+                # ça, la 1re écriture post-close propageait ``WebSocketClosedError`` et
+                # tuait le run, rendant la grâce inutile.
+                _socket_dead = False
                 try:
                     async with _ctxlib.aclosing(
                         drain_agent_events(
                             _agent_gen,
                             per_event_timeout_s=_AGENT_EVENT_TIMEOUT_SECONDS,
                             total_timeout_s=_AGENT_RUN_TOTAL_TIMEOUT_SECONDS,
+                            interactive_event_types=_INTERACTIVE_EVENT_TYPES,
                         )
                     ) as _drained:
                         async for event in _drained:
@@ -2300,7 +2837,27 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
                                     )
                                     continue
 
-                            await self._safe_write(json.dumps(event, default=_json_safe_default))
+                            # R3.1 — Si le socket est déjà mort, on saute l'écriture
+                            # (l'event est persisté ci-dessus → reload au reconnect).
+                            if _socket_dead:
+                                continue
+                            try:
+                                await self._safe_write(
+                                    json.dumps(event, default=_json_safe_default)
+                                )
+                            except tornado.websocket.WebSocketClosedError:
+                                # Blip/close pendant le run : NE PAS propager (sinon le
+                                # run meurt). On marque le socket mort et on CONTINUE —
+                                # le run ira à complétion OU sera annulé par le grace
+                                # timer (``on_close`` → ``_schedule_deferred_cancel``) si
+                                # l'user ne reconnecte pas. Cf. R3.1 / R3.2 (re-attach live).
+                                _socket_dead = True
+                                logger.info(
+                                    "WS fermée pendant le run (user=%s conv=%s) — run "
+                                    "préservé (grâce reconnect), events persistés en BDD",
+                                    scope_user_id,
+                                    _resolved_conv_id,
+                                )
                 except AgentEventTimeout as _timeout_exc:
                     logger.warning(
                         "Agent.run event timeout après %.0fs " "(user_id=%s conv=%s)",
@@ -2343,6 +2900,19 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
             # catégorise + sanitize PII via sanitize_sql_for_client.
             await self._send_error(await _classify_agent_error_for_user(exc, self.current_user))
         finally:
+            # R3.1 (review adversariale Critique) — DÉSARMER le grace timer de CE run
+            # à sa complétion. Sans ça, un ``on_close`` survenu PENDANT le run laisse un
+            # timer pending qui fire après la fin du run : inoffensif aujourd'hui (il
+            # vise le ``cancel_event`` du handler MORT, jamais partagé avec un nouveau
+            # handler — ``open()`` recrée un Event neuf), mais on nettoie quand même par
+            # hygiène + robustesse à un futur refactor de cycle de vie. On ne touche que
+            # le timer qui vise NOTRE ``cancel_event`` (vérif identité) → ne désarme pas
+            # la grâce d'un autre onglet/run du même user.
+            if isinstance(scope_user_id, int):
+                _grace = _pending_reconnect_cancels.get(scope_user_id)
+                if _grace is not None and _grace[1] is self._cancel_event:
+                    _grace[0].cancel()
+                    _pending_reconnect_cancels.pop(scope_user_id, None)
             # Reset ``_cancel_event`` (adversarial CRIT #1) — sans ce
             # reset, après un timeout serveur le ``_cancel_event`` reste
             # en état ``set``. Les actions WS suivantes du même user qui
@@ -2415,10 +2985,20 @@ class IrisWebSocketHandler(tornado.websocket.WebSocketHandler):
         else:
             await self.write_message(payload)
 
-    async def _send_error(self, message: str) -> None:
-        """Envoie un événement ``{"type": "error", ...}`` — swallow sur WS fermée."""
+    async def _send_error(self, message: str, reportable: bool = False) -> None:
+        """Envoie un événement ``{"type": "error", ...}`` — swallow sur WS fermée.
+
+        IRIS-3 — ``reportable=True`` pour les erreurs 5xx/internes (crash agent,
+        exception serveur) → le frontend affiche un bouton « Signaler » inline
+        (réutilise la SSoT ``window.komptiaReportFeedback``). Les erreurs
+        métier/4xx (rate-limit, message vide, validation) restent
+        ``reportable=False`` (l'user peut les corriger lui-même, pas de ticket
+        support — cohérent doctrine axe 5).
+        """
         try:
-            await self._safe_write(json.dumps({"type": "error", "message": message}))
+            await self._safe_write(
+                json.dumps({"type": "error", "message": message, "reportable": reportable})
+            )
         except tornado.websocket.WebSocketClosedError:
             pass
 
@@ -2653,8 +3233,12 @@ def _format_stats_payload_to_text(stats: Mapping[str, Any], filename: str) -> st
                 if isinstance(tv, Mapping):
                     val = tv.get("value", "?")
                     cnt = tv.get("count", 0)
-                    # Tronque les valeurs longues (anti-saturation)
-                    val_str = str(val)[:40]
+                    # Tronque les valeurs longues (anti-saturation) — avec
+                    # ellipse (#18f) : sans elle, le LLM prend une valeur
+                    # coupée pour la valeur exacte (filtres = faux).
+                    val_str = str(val)
+                    if len(val_str) > 40:
+                        val_str = val_str[:40] + "…"
                     tops_formatted.append(f"{val_str}×{cnt}")
             if tops_formatted:
                 line += " — top: " + ", ".join(tops_formatted)
@@ -2767,6 +3351,9 @@ class IrisClearAPIHandler(BaseHandler):
         user = self.current_user
         assert user is not None
 
+        if not _enforce_iris_mutator_rate_limit(self, "clear", user.id):
+            return
+
         # Parse body — best-effort, défaut "page" (cohérent avec le client
         # historique qui n'envoyait rien et était toujours la page).
         body_raw = self.request.body or b""
@@ -2802,6 +3389,8 @@ class IrisClearAPIHandler(BaseHandler):
                 {"success": False, "error": _Messages.CLEAR_FAILED},
                 status=500,
             )
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2889,6 +3478,259 @@ class IrisWidgetConversationAPIHandler(BaseHandler):
         )
 
 
+async def _load_sql_rows_by_uid(
+    conversation_id: int, result_uids: set[str]
+) -> dict[str, list[Any]]:
+    """Charge les ``rows`` (cellules de données) des résultats SQL d'une conversation,
+    indexées par ``result_uid`` — C1.4a.
+
+    Les rows vivent dans ``tool_result._restore_data`` des messages ``execute_sql``
+    (déjà cappées ``_RESTORE_ROWS_CAP`` à la persistance). On les retrouve par
+    ``result_uid`` (clé stable C1.2 : token 12-hex unique par run) via un LIKE BORNÉ
+    aux uids demandés (≤ nb d'events ``sql_results`` d'une page) → on NE charge PAS
+    toute la conversation. ``.like()`` utilise des paramètres liés (pas d'injection ;
+    les uids sont de toute façon des tokens hex). Fail-safe : ``{}`` sur timeout/
+    erreur → la grille reste vide (= comportement actuel, JAMAIS de données fausses).
+    """
+    if not result_uids:
+        return {}
+    out: dict[str, list[Any]] = {}
+    try:
+        async with get_session() as session:
+            result = await asyncio.wait_for(
+                session.execute(
+                    select(ConversationMessage.tool_result)
+                    .where(
+                        ConversationMessage.conversation_id == conversation_id,
+                        ConversationMessage.role == MessageRole.TOOL,
+                        ConversationMessage.tool_name == "execute_sql",
+                        or_(
+                            *[
+                                ConversationMessage.tool_result.like(f"%{u}%")
+                                for u in result_uids
+                            ]
+                        ),
+                    )
+                    # Déterminisme (review C1.4a) : si deux messages partageaient le
+                    # MÊME result_uid (ne devrait jamais arriver — token unique/run),
+                    # le dernier (id le plus grand = plus récent) gagne, de façon
+                    # STABLE. Les deux porteraient les données du même run de toute
+                    # façon (jamais de croisement cross-run, garanti par le filtre uid).
+                    .order_by(ConversationMessage.id)
+                ),
+                timeout=_LOAD_CONVERSATION_TIMEOUT_S,
+            )
+            for (tool_result_json,) in result.all():
+                parsed = _safe_json_loads(tool_result_json)
+                if not isinstance(parsed, Mapping):
+                    continue
+                restore = parsed.get("_restore_data")
+                if not isinstance(restore, Mapping):
+                    continue
+                uid = restore.get("result_uid")
+                # Filtre STRICT sur le set demandé : le LIKE peut matcher un message
+                # dont le _restore_data porte un AUTRE uid (substring), on ne garde
+                # QUE l'appariement exact (jamais de données croisées, Q5).
+                if not isinstance(uid, str) or uid not in result_uids:
+                    continue
+                rows = restore.get("rows")
+                if isinstance(rows, list):
+                    out[uid] = rows
+    except (asyncio.TimeoutError, SQLAlchemyError) as exc:
+        logger.warning(
+            "older-events: chargement rows par uid échoué conv=%s: %s",
+            conversation_id,
+            exc,
+        )
+        return {}
+    return out
+
+
+async def _reinject_sql_rows_into_older_events(
+    events: list[dict[str, Any]], conversation_id: int
+) -> list[dict[str, Any]]:
+    """Ré-injecte les ``rows`` SQL dans les events ``sql_results`` STRIPPÉS d'une page
+    ``/older-events`` (C1.4a).
+
+    Les events persistés ont leurs rows strippées (économie BD) ; au « charger plus
+    ancien » (au-delà du cap replay 200 → sans les messages porteurs côté client), la
+    grille s'affichait VIDE. On apparie par ``result_uid`` (clé stable C1.2) et on
+    ré-injecte ``rows`` DANS le payload de l'event. À appeler APRÈS
+    ``_scrub_events_for_user`` : les rows sont des CELLULES DE DONNÉES, jamais
+    scrubbées (parité SSR — seuls les NOMS le sont). ``handleWebSocketEvent`` (front)
+    rend ``event.rows`` → zéro changement frontend. Fail-safe : event inchangé si pas
+    d'appariement (grille vide = comportement actuel)."""
+    targets: list[tuple[int, dict[str, Any], str]] = []
+    uids: set[str] = set()
+    for idx, ev in enumerate(events):
+        payload_str = ev.get("payload")
+        if not isinstance(payload_str, str) or not payload_str:
+            continue
+        payload = _safe_json_loads(payload_str)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "sql_results" and payload.get("_rows_stripped"):
+            uid = payload.get("result_uid")
+            if isinstance(uid, str) and uid:
+                targets.append((idx, payload, uid))
+                uids.add(uid)
+    if not uids:
+        return events
+    rows_by_uid = await _load_sql_rows_by_uid(conversation_id, uids)
+    if not rows_by_uid:
+        return events
+    for idx, payload, uid in targets:
+        rows = rows_by_uid.get(uid)
+        if isinstance(rows, list):
+            payload["rows"] = rows
+            # Les rows ne sont plus strippées → retirer le marqueur (cohérence).
+            payload.pop("_rows_stripped", None)
+            # ``ensure_ascii=False`` : parité avec le scrub/persister (les cellules
+            # accentuées ne sont pas échappées \uXXXX → pas d'inflation de payload).
+            events[idx] = {**events[idx], "payload": json.dumps(payload, ensure_ascii=False)}
+    return events
+
+
+class IrisConversationOlderEventsAPIHandler(BaseHandler):
+    """``GET /api/iris/conversation/<id>/older-events`` — pagination ARRIÈRE des
+    events d'une conversation (IRIS-events-loadmore #54).
+
+    La page ``/iris`` ne rend au load que les ``_IRIS_RENDER_EVENTS_CAP`` (500)
+    events les plus récents (audit IRIS-events #13). Cet endpoint sert le bouton
+    « Charger l'historique plus ancien » : il renvoie le BLOC des ``limit`` events
+    juste AVANT ``before_seq`` (le ``seq`` du plus ancien event actuellement
+    affiché côté client), trié chronologiquement (ASC).
+
+    Query params :
+        - ``before_seq`` (REQUIS, >0) : seq du plus ancien event rendu côté client.
+        - ``limit`` (def 50, clamp [1, 200]) : taille de page.
+
+    Sécurité : ``@authenticated`` + ownership STRICTE
+    (``assert_conversation_owned_by_user`` — un user ne lit QUE ses conversations ;
+    fail-close 404 anti-leak d'existence, AVANT toute lecture). GET → pas de XSRF.
+
+    Réponse :
+        ``{"success": true, "events": [{seq, turn_index, event_type, payload,
+        created_at}, ...], "has_more_older": bool}``
+    """
+
+    _DEFAULT_LIMIT = 50
+    _MAX_LIMIT = 200
+
+    @authenticated
+    async def get(self, conversation_id: str) -> None:
+        user = self.current_user
+        if user is None:
+            self.write_json({"success": False, "error": "Non authentifié."}, status=401)
+            return
+
+        try:
+            conv_id = int(conversation_id)
+        except (TypeError, ValueError):
+            self.write_json({"success": False, "error": "conversation_id invalide."}, status=400)
+            return
+
+        # ``before_seq`` REQUIS et > 0 : sans lui on retournerait TOUT l'historique
+        # (perf risk sur conv ancienne) → fail-close 400.
+        try:
+            before_seq = int(self.get_argument("before_seq", ""))
+        except (TypeError, ValueError):
+            self.write_json(
+                {"success": False, "error": "before_seq requis (entier > 0)."}, status=400
+            )
+            return
+        if before_seq <= 0:
+            self.write_json({"success": False, "error": "before_seq doit être > 0."}, status=400)
+            return
+
+        try:
+            limit = int(self.get_argument("limit", str(self._DEFAULT_LIMIT)))
+        except (TypeError, ValueError):
+            limit = self._DEFAULT_LIMIT
+        limit = max(1, min(self._MAX_LIMIT, limit))
+
+        # IRIS-events-loadmore (#54, revue adversariale) — rate-limit AVANT la
+        # lecture BDD (anti-DoS : ownership query + min(seq) + tail scan). Clé
+        # par user → un compte ne peut pas saturer la BDD en bouclant l'endpoint.
+        if not _older_events_rate_limiter.check(
+            f"older_events:{user.id}",
+            _OLDER_EVENTS_RATE_MAX,
+            _OLDER_EVENTS_RATE_WINDOW_S,
+        ):
+            self.write_json(
+                {"success": False, "error": "Trop de requêtes. Réessayez dans un instant."},
+                status=429,
+            )
+            return
+
+        from app.services.ai.conversation_lifecycle import (
+            assert_conversation_owned_by_user,
+        )
+
+        # Ownership STRICTE AVANT toute lecture (anti-IDOR ; fail-close 404
+        # anti-leak d'existence : même réponse qu'une conv inexistante).
+        owned = await assert_conversation_owned_by_user(conv_id, user.id)
+        if not owned:
+            self.write_json(
+                {"success": False, "error": "Conversation introuvable ou non autorisée."},
+                status=404,
+            )
+            return
+
+        from app.services.ai.conversation_event_persister import (
+            get_events_for_conversation,
+            get_min_seq_for_conversation,
+        )
+
+        try:
+            events = await get_events_for_conversation(conv_id, before_seq=before_seq, limit=limit)
+            min_seq = await get_min_seq_for_conversation(conv_id)
+        except Exception:  # noqa: BLE001 — best-effort lecture
+            logger.error(
+                "older-events: lecture échouée (conv=%s before_seq=%s)",
+                conv_id,
+                before_seq,
+                exc_info=True,
+            )
+            self.write_json(
+                {"success": False, "error": "Erreur de lecture de l'historique."},
+                status=500,
+            )
+            return
+
+        # has_more_older : il reste de l'historique plus ancien SSI le plus ancien
+        # event RETOURNÉ a un seq > au min GLOBAL (les seq peuvent avoir des trous
+        # → comparer au min réel, PAS à 1). Aucun event retourné → plus rien.
+        has_more_older = bool(events) and events[0]["seq"] > min_seq
+
+        # Anti-bfcache + anti-CDN (même doctrine que les autres endpoints conv).
+        self.set_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+        self.set_header("Pragma", "no-cache")
+        self.set_header("Vary", "Cookie")
+
+        # P0 (#124) — scrub PII des payloads d'events AVANT envoi (parité SSR /
+        # messages). ``has_more_older`` est dérivé du seq AVANT scrub (inchangé).
+        events = await _scrub_events_for_user(events, user)
+        # C1.4a (L4O0) — ré-injecte les rows des grilles ``sql_results`` strippées :
+        # au « charger plus ancien », ces events (au-delà du cap replay 200, donc sans
+        # les messages porteurs côté client) s'affichaient VIDES. Apparié par
+        # ``result_uid`` (clé stable C1.2), APRÈS le scrub (rows = données, non
+        # scrubbées). Fail-safe : grille vide si pas d'appariement (jamais de données
+        # croisées). ``conv_id`` ownership déjà vérifié plus haut (anti-IDOR).
+        # Fail-safe défense en profondeur : une erreur imprévue de ré-injection ne
+        # doit JAMAIS 500-er l'endpoint — on retombe sur les events non ré-injectés
+        # (grilles vides = comportement d'avant le fix, jamais de données fausses).
+        try:
+            events = await _reinject_sql_rows_into_older_events(events, conv_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "older-events: ré-injection rows échouée (non-bloquant) conv=%s",
+                conv_id,
+                exc_info=True,
+            )
+        self.write_json({"success": True, "events": events, "has_more_older": has_more_older})
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Mémoire Iris user-scoped — 2026-05-22 (parité ``copilot_memory``)
 # ──────────────────────────────────────────────────────────────────────
@@ -2923,6 +3765,43 @@ class IrisUserMemoryAPIHandler(BaseHandler):
             )
             return None
         return user
+
+    async def _acquire_memory_lock_or_503(self, user_id: int):
+        """Acquiert (borné) le lock d'écriture ``iris_memory`` PARTAGÉ avec la fusion
+        fin-de-run de l'agent (anti lost-update : une fusion concourante ne peut plus
+        écraser silencieusement l'édition manuelle). Retourne le lock TENU (à
+        ``release()`` par le caller) ou ``None`` (un 503 a déjà été écrit).
+
+        Acquire borné via ``wait_for`` : si la fusion agent tient le lock le temps
+        d'un appel LLM, on ne pend pas l'utilisateur. Orphan-safe : la
+        ``CancelledError`` du timeout frappe ``lock.acquire()`` (cancellation-safe
+        Python 3.12) → jamais de lock orphelin ; on ne release QUE sur succès."""
+        lock = get_iris_agent().user_iris_memory_lock(user_id)
+        try:
+            await asyncio.wait_for(
+                lock.acquire(), timeout=_USERMEM_LOCK_ACQUIRE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                "usermem lock occupé > %.0fs (fusion agent en cours ?) user=%d",
+                _USERMEM_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+                user_id,
+            )
+            # 409 Conflict (pas 503) : c'est une CONTENTION attendue (l'agent réécrit la
+            # mémoire), pas une panne serveur — cohérent avec le pattern existant
+            # ``version_conflict`` (automation-canvas). ``code`` permet au front de
+            # distinguer une vraie indispo d'un simple « réessayez ».
+            self.write_json(
+                {
+                    "success": False,
+                    "code": "memory_busy",
+                    "error": "Mémoire en cours de mise à jour par l'agent, "
+                    "réessayez dans un instant.",
+                },
+                status=409,
+            )
+            return None
+        return lock
 
     @authenticated
     async def get(self) -> None:
@@ -2966,6 +3845,8 @@ class IrisUserMemoryAPIHandler(BaseHandler):
         user = self._require_user()
         if user is None:
             return
+        if not _enforce_iris_mutator_rate_limit(self, "usermem_put", user.id):
+            return
         from app.services.ai.iris_user_memory import (
             IRIS_USER_MEMORY_MAX_CHARS,
             sanitize_iris_user_memory,
@@ -3006,26 +3887,35 @@ class IrisUserMemoryAPIHandler(BaseHandler):
             cleaned = sanitize_iris_user_memory(raw_memory)
             # Une mémoire vide après sanitize équivaut à un reset → on
             # accepte (alignement DELETE comportement).
-            async with get_session() as session:
-                stmt = select(User).where(User.id == user.id)
-                result = await session.execute(stmt)
-                u_row = result.scalar_one_or_none()
-                if u_row is None:
-                    self.write_json(
-                        {"success": False, "error": "Utilisateur introuvable."},
-                        status=404,
-                    )
-                    return
-                u_row.iris_memory = cleaned or None
-                await session.commit()
-            self.write_json(
-                {
-                    "success": True,
-                    "memory": cleaned,
-                    "char_count": len(cleaned),
-                    "max_chars": IRIS_USER_MEMORY_MAX_CHARS,
-                }
-            )
+            # Lost-update guard : on sérialise l'écriture avec la fusion fin-de-run
+            # de l'agent via le lock PARTAGÉ (sinon une fusion concourante écraserait
+            # silencieusement cette édition manuelle). Acquire borné → 503 si occupé.
+            _mem_lock = await self._acquire_memory_lock_or_503(user.id)
+            if _mem_lock is None:
+                return
+            try:
+                async with get_session() as session:
+                    stmt = select(User).where(User.id == user.id)
+                    result = await session.execute(stmt)
+                    u_row = result.scalar_one_or_none()
+                    if u_row is None:
+                        self.write_json(
+                            {"success": False, "error": "Utilisateur introuvable."},
+                            status=404,
+                        )
+                        return
+                    u_row.iris_memory = cleaned or None
+                    await session.commit()
+                self.write_json(
+                    {
+                        "success": True,
+                        "memory": cleaned,
+                        "char_count": len(cleaned),
+                        "max_chars": IRIS_USER_MEMORY_MAX_CHARS,
+                    }
+                )
+            finally:
+                _mem_lock.release()
         except SQLAlchemyError as exc:
             logger.error("Écriture user_memory échouée: %s", exc, exc_info=True)
             self.write_json(
@@ -3038,21 +3928,32 @@ class IrisUserMemoryAPIHandler(BaseHandler):
         user = self._require_user()
         if user is None:
             return
+        if not _enforce_iris_mutator_rate_limit(self, "usermem_delete", user.id):
+            return
         try:
-            async with get_session() as session:
-                stmt = select(User).where(User.id == user.id)
-                result = await session.execute(stmt)
-                u_row = result.scalar_one_or_none()
-                if u_row is None:
-                    self.write_json(
-                        {"success": False, "error": "Utilisateur introuvable."},
-                        status=404,
-                    )
-                    return
-                u_row.iris_memory = None
-                await session.commit()
-            logger.info("user_memory reset par user=%d", user.id)
-            self.write_json({"success": True, "memory": "", "char_count": 0})
+            # Lost-update guard (cf. PUT) : reset sérialisé avec la fusion fin-de-run
+            # via le lock PARTAGÉ — sinon une fusion concourante pourrait ré-écrire la
+            # mémoire juste après le reset (l'user croit avoir tout oublié, mais non).
+            _mem_lock = await self._acquire_memory_lock_or_503(user.id)
+            if _mem_lock is None:
+                return
+            try:
+                async with get_session() as session:
+                    stmt = select(User).where(User.id == user.id)
+                    result = await session.execute(stmt)
+                    u_row = result.scalar_one_or_none()
+                    if u_row is None:
+                        self.write_json(
+                            {"success": False, "error": "Utilisateur introuvable."},
+                            status=404,
+                        )
+                        return
+                    u_row.iris_memory = None
+                    await session.commit()
+                logger.info("user_memory reset par user=%d", user.id)
+                self.write_json({"success": True, "memory": "", "char_count": 0})
+            finally:
+                _mem_lock.release()
         except SQLAlchemyError as exc:
             logger.error("Reset user_memory échoué: %s", exc, exc_info=True)
             self.write_json(
@@ -3077,6 +3978,17 @@ class IrisFeedbackAPIHandler(BaseHandler):
 
         feedback = body.get("feedback")
         conversation_id = _coerce_optional_int(body.get("conversation_id"))
+        # D4 (L1O2) — message_id OPTIONNEL : si fourni, le feedback cible CE
+        # message (validé : doit appartenir à la conv + rôle assistant). Absent
+        # → fallback « dernier message assistant » (legacy + cas live/auto-feedback,
+        # où le dernier message EST le bon).
+        # Durcissement (review adversariale) : on rejette ``bool`` (``True`` est un
+        # int-subclass → ``int(True)==1`` ciblerait le message #1) et les id < 1 →
+        # ces inputs douteux retombent sur le fallback dernier message (fail-closed).
+        _raw_message_id = body.get("message_id")
+        message_id = None if isinstance(_raw_message_id, bool) else _coerce_optional_int(_raw_message_id)
+        if message_id is not None and message_id < 1:
+            message_id = None
         if conversation_id is None or feedback not in _ALLOWED_FEEDBACKS:
             self.write_json(
                 {"success": False, "error": _Messages.FEEDBACK_INVALID},
@@ -3087,11 +3999,15 @@ class IrisFeedbackAPIHandler(BaseHandler):
         user = self.current_user
         assert user is not None
 
+        if not _enforce_iris_mutator_rate_limit(self, "feedback", user.id):
+            return
+
         try:
             last_msg = await self._store_feedback(
                 conversation_id=conversation_id,
                 feedback=str(feedback),
                 user_id=user.id,
+                message_id=message_id,
             )
         except SQLAlchemyError as exc:
             logger.error("Erreur feedback: %s", exc, exc_info=True)
@@ -3119,7 +4035,7 @@ class IrisFeedbackAPIHandler(BaseHandler):
             # un 👍 de non-admin part en attente d'approbation (axe 14 + promesse
             # onboarding /admin/ai-training). ``user`` est garanti non-None ici.
             await knowledge.learn_from_conversation_feedback(
-                conversation_id, str(feedback), is_admin=user.is_admin
+                conversation_id, str(feedback), is_admin=user.is_admin, message_id=message_id
             )
         except Exception as learn_exc:  # noqa: BLE001 — best-effort enrichment
             logger.warning("Learning from feedback failed: %s", learn_exc)
@@ -3132,10 +4048,19 @@ class IrisFeedbackAPIHandler(BaseHandler):
         conversation_id: int,
         feedback: str,
         user_id: int,
+        message_id: Optional[int] = None,
     ) -> Optional[ConversationMessage]:
-        """Met à jour le feedback du dernier message assistant. Écrit la réponse
+        """Met à jour le feedback d'un message assistant. Écrit la réponse
         d'erreur directement sur le handler si conversation / message introuvable ;
         retourne le message persisté sinon.
+
+        D4 (L1O2) — ``message_id`` OPTIONNEL : si fourni, cible CE message précis
+        (validé : doit appartenir à ``conversation_id`` ET être un message
+        assistant) ; si l'id est invalide/absent de la conv → **404 fail-closed**
+        (jamais de fallback silencieux sur le dernier message = la donnée fausse
+        qu'on corrige). Si ``message_id`` est None → fallback historique « dernier
+        message assistant par ``created_at`` » (cas live/auto-feedback/legacy où
+        le dernier message EST le bon).
         """
         async with get_session() as session:
             # Defense-in-depth : ownership + is_active + agent_role. Sans le
@@ -3159,15 +4084,29 @@ class IrisFeedbackAPIHandler(BaseHandler):
                 )
                 return None
 
-            result = await session.execute(
-                select(ConversationMessage)
-                .where(
+            if message_id is not None:
+                # Ciblage explicite : le message DOIT appartenir à cette conv
+                # (déjà prouvée owned + Iris ci-dessus) ET être un message
+                # assistant. Un id d'une autre conv / d'un message user / d'un
+                # tool → introuvable → 404 (fail-closed, pas de fallback).
+                stmt = select(ConversationMessage).where(
+                    ConversationMessage.id == message_id,
                     ConversationMessage.conversation_id == conversation_id,
                     ConversationMessage.role == MessageRole.ASSISTANT,
                 )
-                .order_by(desc(ConversationMessage.created_at))
-                .limit(1)
-            )
+            else:
+                # Fallback historique : dernier message assistant de la conv.
+                stmt = (
+                    select(ConversationMessage)
+                    .where(
+                        ConversationMessage.conversation_id == conversation_id,
+                        ConversationMessage.role == MessageRole.ASSISTANT,
+                    )
+                    .order_by(desc(ConversationMessage.created_at))
+                    .limit(1)
+                )
+
+            result = await session.execute(stmt)
             msg = result.scalar_one_or_none()
             if msg is None:
                 self.write_json(
@@ -3240,6 +4179,44 @@ class IrisWelcomeSuggestionsAPIHandler(BaseHandler):
         # middleware pose déjà no-store sur /api/* ; on ne le ré-écrase plus.
         self.set_header("Cache-Control", "no-store")
         self.write_json({"suggestions": sanitized})
+
+
+class IrisModelContextWindowAPIHandler(BaseHandler):
+    """GET ``/api/iris/model-context-window`` — contexte window LIVE du modèle
+    actif, tiré directement depuis ``ai_config.primary_model``.
+
+    **Pourquoi cet endpoint existe** : l'indicateur context-window sur /iris
+    affichait une valeur périmée (bug 2026-06-02 — cache stale de
+    LlmModelRegistry). Cet endpoint garantit une réponse fraîche, dynamique,
+    jamais en cache local.
+
+    **Résolution dynamique** :
+    1. Lire ``ai_config.primary_model`` actuel (BDD live)
+    2. Appliquer ``get_context_window_for_model(model)`` qui lui-même
+       - essaie le registre BDD en priorité
+       - fallback sur les constantes static
+       - jamais une valeur en cache périmée
+    3. Retourner le tuple (model_name, context_window) pour que l'indicateur
+       JS puisse se synchroniser en temps réel.
+
+    **Format de réponse** :
+    ```json
+    {
+      "model_name": "claude-opus-4-8-20250507",
+      "context_window": 200000,
+      "configured": true
+    }
+    ```
+
+    Si aucun modèle n'est configuré → ``configured=false``, autres champs à
+    null. Jamais levée, toujours un JSON cohérent (fail-soft).
+    """
+
+    @authenticated
+    async def get(self) -> None:
+        snapshot = await resolve_active_window_snapshot()
+        self.set_header("Cache-Control", "no-store")
+        self.write_json(snapshot)
 
 
 class IrisUsageStatsAPIHandler(BaseHandler):
@@ -3468,6 +4445,99 @@ class IrisModeUsageStatsHandler(BaseHandler):
         self.write_json(out)
 
 
+#: E2 (L1O4) part 2 — plafond de taille DÉCOMPRESSÉE d'un .xlsx avant parse pandas.
+#: Un .xlsx est une archive ZIP : un fichier compressé ≤ cap upload peut se
+#: décompresser en plusieurs Go (zip-bomb) → OOM serveur au parse openpyxl/pandas
+#: (qui charge tout en RAM). Le plafond est COUPLÉ au cap upload (résolu runtime,
+#: admin-configurable, cf. ``get_max_upload_size_bytes``) via
+#: ``_resolve_parse_decompressed_cap`` : ``max(plancher, cap_upload × ratio)``.
+#: Un classeur dense LÉGITIME décompresse ~5-20× ; une bombe 100-1000×. Ratio 25
+#: par défaut → laisse passer le légitime (évite les faux rejets sur de vrais gros
+#: classeurs, cf. review), bloque les bombes. Plancher pour que les petits caps
+#: upload tolèrent quand même un classeur normal. Ratio configurable via env.
+_PARSE_DECOMPRESS_RATIO: Final[int] = _int_env(
+    "IRIS_PARSE_DECOMPRESS_RATIO", 25, min_=2, max_=2000
+)
+_PARSE_DECOMPRESS_FLOOR_BYTES: Final[int] = 300 * 1024 * 1024
+
+
+def _resolve_parse_decompressed_cap(upload_cap_bytes: int) -> int:
+    """Plafond décompressé anti-bombe = ``max(plancher, cap_upload × ratio)``.
+
+    Couple le cap au cap upload admin : un déploiement qui accepte de gros uploads
+    attend mécaniquement de gros décompressés → pas de faux rejet quand l'admin
+    relève le cap upload (le découplage était le risque #1 de la review)."""
+    try:
+        scaled = int(upload_cap_bytes) * _PARSE_DECOMPRESS_RATIO
+    except (TypeError, ValueError):
+        scaled = 0
+    return max(_PARSE_DECOMPRESS_FLOOR_BYTES, scaled)
+
+
+def _assert_archive_within_decompressed_cap(path: Path, max_bytes: int) -> None:
+    """Refuse une archive ZIP (.xlsx) dont le contenu décompressé dépasse
+    ``max_bytes`` — anti zip-bomb AU NIVEAU ZIP (E2 part 2).
+
+    Robuste : on STREAME chaque membre par chunks et on compte les octets RÉELS
+    décompressés (pas la taille annoncée dans le central directory, qu'une archive
+    forgée peut falsifier), avec abandon précoce dès le dépassement → la mémoire
+    pendant le contrôle reste bornée (un chunk + un compteur), même face à une bombe.
+
+    Gate sur ``ZipFile(path)`` — le MÊME test d'admission qu'openpyxl (qui ouvre
+    aussi via ``ZipFile``) — et NON ``is_zipfile`` : si openpyxl peut l'ouvrir comme
+    .xlsx, la garde l'a vue (pas de bypass par divergence de détection) ; si
+    ``ZipFile`` échoue (.xls OLE, .csv, corrompu), openpyxl échouera aussi → no-op
+    (pandas lèvera une erreur de parse propre ; ces formats ne sont pas compressés
+    de façon amplifiante, le cap upload borne déjà leur RAM).
+
+    ⚠️ Périmètre : couvre la bombe au niveau ZIP, PAS une bombe au niveau XML
+    (entity-expansion / billion-laughs DANS un membre, qu'openpyxl/lxml pourrait
+    amplifier après cette garde) — défense XML = suivi séparé.
+    """
+    import zipfile
+    import zlib
+
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        return
+    total = 0
+    chunk_size = 1024 * 1024
+    # Erreurs de décompression d'UN membre (méthode non supportée, CRC en fin de
+    # flux, membre chiffré, données tronquées). On NE bloque PAS sur notre
+    # incapacité à mesurer ce membre : openpyxl/pandas utilise le MÊME décodeur
+    # ``zipfile`` → ce que notre streamer ne sait pas lire, openpyxl ne le saura
+    # pas non plus (il lèvera sa propre erreur de parse, gérée en amont). On
+    # ``continue`` (pas ``return``) → les AUTRES membres restent vérifiés : une
+    # bombe deflate cachée après un membre illisible est toujours attrapée.
+    # ``RuntimeError`` (dépassement RÉEL du cap, ci-dessous) est ABSENT de cette
+    # liste → il se propage : fail-closed sur la bombe, fail-open sur l'illisible.
+    _member_decode_errors = (
+        zipfile.BadZipFile,
+        OSError,
+        zlib.error,
+        NotImplementedError,
+        EOFError,
+    )
+    with zf:
+        for info in zf.infolist():
+            try:
+                with zf.open(info) as member:
+                    while True:
+                        chunk = member.read(chunk_size)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise RuntimeError(
+                                "Fichier trop volumineux une fois décompressé "
+                                f"(> {max_bytes // (1024 * 1024)} Mo). Réduis le "
+                                "classeur ou contacte l'administrateur."
+                            )
+            except _member_decode_errors:
+                continue
+
+
 class IrisParseAttachmentHandler(BaseHandler):
     """POST ``/api/iris/parse-attachment`` — parse un fichier uploadé via
     pandas et retourne ``tabs/columns/rows`` pour affichage en grille
@@ -3549,6 +4619,14 @@ class IrisParseAttachmentHandler(BaseHandler):
             logger.warning("parse-attachment refusé : current_user ou user.id manquant")
             self.write_json({"success": False, "error": "Authentication requise"}, status=401)
             return
+        # E2 (L1O4) part 1 — rate-limit le parse (SSoT `_enforce_iris_mutator_rate_limit`,
+        # bucket "parse_attachment" dédié). Sans ça, un client pouvait marteler le
+        # re-parsing pandas d'un file_id déjà uploadé → CPU/RAM non bornés via
+        # l'executor (l'upload est rate-limité depuis E4, mais PAS le re-parse). Le
+        # parse charge tout le fichier en RAM avant le cap d'aperçu (1000×50) → un
+        # flood de parses de gros fichiers = DoS mémoire. Fail-fast avant le scan disque.
+        if not _enforce_iris_mutator_rate_limit(self, "parse_attachment", user_id):
+            return
         user_dir = _UPLOAD_DIR / str(user_id)
 
         # Cherche le fichier (extension peut varier : csv, xlsx, xls, json, txt)
@@ -3573,18 +4651,50 @@ class IrisParseAttachmentHandler(BaseHandler):
             return
 
         ext = target.suffix.lower().lstrip(".")
+        # E2 part 2 — plafond décompressé anti zip-bomb, COUPLÉ au cap upload admin
+        # (SSoT `get_max_upload_size_bytes`) via `_resolve_parse_decompressed_cap`.
+        # Résolu ici (event loop) puis passé à l'executor : pas d'I/O config dans le thread.
+        from app.services.ai.config_service import get_max_upload_size_bytes
+
+        _upload_cap = await get_max_upload_size_bytes()
+        _decompressed_cap = _resolve_parse_decompressed_cap(_upload_cap)
         try:
-            tabs = await self._parse_file_to_tabs(target, ext)
-        except Exception as exc:
+            tabs = await self._parse_file_to_tabs(target, ext, _decompressed_cap)
+        except RuntimeError as exc:
+            # L1O6 — les ``RuntimeError`` de ``_parse_sync`` sont des messages CURÉS
+            # (encoding testé, format non supporté, fichier trop volumineux…),
+            # auteur-contrôlés et SANS chemin/stack → on les renvoie (utile au
+            # diagnostic). Défense en profondeur au cas où un futur message
+            # embarquerait un path serveur :
+            #   1) remplacement LITTÉRAL du préfixe connu ``_UPLOAD_DIR`` (robuste aux
+            #      ESPACES — le data_dir de ce déploiement peut en contenir, ce que le
+            #      redacteur regex ne couvre que jusqu'au 1er espace) ;
+            #   2) puis ``redact_filesystem_paths`` (SSoT S8) pour les autres paths
+            #      absolus. Ordre important : littéral d'abord (sinon le regex coupe le
+            #      préfixe au 1er espace et le littéral ne matche plus).
+            from app.services.data_access.error_messages import redact_filesystem_paths
+
+            raw = str(exc).strip().replace(str(_UPLOAD_DIR), "[chemin]")
+            safe = redact_filesystem_paths(raw) or _Messages.PARSE_FAILED_GENERIC
             logger.warning(
-                "parse-attachment échec file_id=%s ext=%s: %s",
+                "parse-attachment échec curé file_id=%s ext=%s: %s", file_id, ext, exc
+            )
+            self.write_json({"success": False, "error": safe}, status=400)
+            return
+        except Exception as exc:
+            # L1O6 — exception INATTENDUE (pandas interne, OSError avec chemin tmp,
+            # MemoryError…) : NE JAMAIS echoer ``str(exc)`` au client (fuite path/
+            # stack/détail interne). Message GÉNÉRIQUE ; le raw reste EN LOG serveur
+            # pour l'admin (doctrine S6a/S6b — jamais le brut au navigateur).
+            logger.warning(
+                "parse-attachment échec inattendu file_id=%s ext=%s: %s",
                 file_id,
                 ext,
                 exc,
                 exc_info=True,
             )
             self.write_json(
-                {"success": False, "error": f"Parsing échoué : {exc}"},
+                {"success": False, "error": _Messages.PARSE_FAILED_GENERIC},
                 status=400,
             )
             return
@@ -3604,15 +4714,24 @@ class IrisParseAttachmentHandler(BaseHandler):
             }
         )
 
-    async def _parse_file_to_tabs(self, path: Path, ext: str) -> list[dict[str, Any]]:
+    async def _parse_file_to_tabs(
+        self, path: Path, ext: str, decompressed_cap: int
+    ) -> list[dict[str, Any]]:
         """Parse pandas dans un executor pour ne pas bloquer l'event loop
-        sur les gros fichiers. Pandas n'est PAS async-friendly nativement."""
+        sur les gros fichiers. Pandas n'est PAS async-friendly nativement.
+
+        ``decompressed_cap`` borne la taille décompressée d'un .xlsx (anti zip-bomb,
+        E2 part 2) — résolu côté ``post`` à partir du cap upload admin."""
         import asyncio
 
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._parse_sync, path, ext)
+        return await loop.run_in_executor(
+            None, self._parse_sync, path, ext, decompressed_cap
+        )
 
-    def _parse_sync(self, path: Path, ext: str) -> list[dict[str, Any]]:
+    def _parse_sync(
+        self, path: Path, ext: str, decompressed_cap: int
+    ) -> list[dict[str, Any]]:
         import io  # noqa: F401 — peut servir pour bytes IO
 
         try:
@@ -3642,6 +4761,11 @@ class IrisParseAttachmentHandler(BaseHandler):
             return [self._df_to_tab(path.stem, df)]
 
         if ext in ("xlsx", "xls"):
+            # E2 part 2 — garde anti zip-bomb AVANT le parse (un .xlsx ≤ cap upload
+            # peut se décompresser en plusieurs Go → OOM). No-op pour .xls (non-zip).
+            # ``decompressed_cap`` est résolu en amont (post → _resolve_parse_decompressed_cap)
+            # à partir du cap upload admin : couplage volontaire (cf. review).
+            _assert_archive_within_decompressed_cap(path, decompressed_cap)
             sheets = pd.read_excel(path, sheet_name=None)
             result = []
             for name, df in sheets.items():
@@ -3694,6 +4818,10 @@ class IrisParseAttachmentHandler(BaseHandler):
             "columns": columns,
             "rows": rows,
             "row_count": total_rows,
+            # Total RÉEL de colonnes (≠ len(columns) si truncated_cols) —
+            # permet au front d'afficher « 50 colonnes sur N » au lieu d'une
+            # troncation silencieuse (doctrine Q5).
+            "column_count": total_cols,
             "truncated_rows": truncated_rows,
             "truncated_cols": truncated_cols,
         }
@@ -3826,6 +4954,17 @@ class IrisUploadHandler(BaseHandler):
                 status=410,  # HTTP 410 Gone — la ressource n'est plus disponible
             )
             return
+        # E4 (L1O1) — rate-limit l'upload via la SSoT ``_enforce_iris_mutator_rate_limit``
+        # (même limiter per-endpoint/user que clear/feedback/usermem). Sans ça, un
+        # client pouvait flooder l'écriture disque (croissance non bornée /uploads/)
+        # ET bloquer l'event loop (I/O disque sync : hachage + écriture + verrou)
+        # sans aucune borne. Bucket "upload" dédié → n'interfère pas avec les autres.
+        # ``current_user`` garanti non-None (@authenticated), même invariant que les
+        # autres mutateurs. Fail-fast AVANT toute lecture/validation du fichier.
+        user = self.current_user
+        assert user is not None
+        if not _enforce_iris_mutator_rate_limit(self, "upload", user.id):
+            return
         if "file" not in self.request.files:
             self.write_json({"success": False, "error": _Messages.NO_FILE}, status=400)
             return
@@ -3845,8 +4984,7 @@ class IrisUploadHandler(BaseHandler):
             return
 
         ext_key = os.path.splitext(filename.lower())[1][1:]  # "csv", "xlsx", ...
-        user = self.current_user
-        assert user is not None
+        # ``user`` déjà résolu + non-None en tête de post() (rate-limit E4).
 
         user_dir = _UPLOAD_DIR / str(user.id)
 
@@ -3865,15 +5003,31 @@ class IrisUploadHandler(BaseHandler):
         # encore présent (résistant aux cleanups manuels), on REUSE
         # le file_id existant — aucune écriture disque, aucun nouveau
         # file_id. Le client reçoit le file_id partagé.
-        body_sha256 = hashlib.sha256(body).hexdigest()
-        existing_file_id, existing_ext = _dedup_lookup(user_dir, body_sha256)
+        # E1 (L1O3) — l'I/O disque sync + le hash CPU d'un gros body bloquaient
+        # l'event loop (donc TOUS les users) le temps de l'upload. On déporte ces
+        # opérations bloquantes vers un thread (pattern identique à pipeline_runner).
+        # Le hash est CPU-bound sur ``body`` (≤ max_upload), le lookup fait du
+        # fcntl.flock + lecture JSON. ``hexdigest()`` reste sur le loop (trivial).
+        body_sha256 = (await asyncio.to_thread(hashlib.sha256, body)).hexdigest()
+        existing_file_id, existing_ext = await asyncio.to_thread(
+            _dedup_lookup, user_dir, body_sha256
+        )
+        # Fenêtre TOCTOU lookup→record ACCEPTÉE (review E1) : deux uploads
+        # concurrents du MÊME body par le MÊME user peuvent tous deux rater ce
+        # lookup et écrire 2 fichiers UUID distincts → 1 orphelin (octets
+        # identiques, jamais de corruption d'index ni de donnée fausse ; l'index
+        # `_dedup_record` reste sérialisé par flock, et le TTL `cleanup_iris_uploads`
+        # récupère l'orphelin). ⚠️ NE PAS « corriger » en tenant le lock dedup sur
+        # tout l'upload : ça re-bloquerait l'event loop que E1 vient de libérer.
         if existing_file_id is not None and existing_ext is not None:
             existing_safe_filename = f"{existing_file_id}.{existing_ext}"
             existing_path = user_dir / existing_safe_filename
             # Defense in depth — vérifier que le fichier référencé
             # existe encore (un cleanup manuel ou TTL futur pourrait
-            # avoir supprimé le fichier sans nettoyer l'index).
-            if existing_path.is_file() and _is_within_dir(existing_path, _UPLOAD_DIR):
+            # avoir supprimé le fichier sans nettoyer l'index). Stat disque
+            # déportée hors loop (E1).
+            _existing_is_file = await asyncio.to_thread(existing_path.is_file)
+            if _existing_is_file and _is_within_dir(existing_path, _UPLOAD_DIR):
                 file_type = "csv" if existing_ext == "csv" else existing_ext
                 logger.info(
                     "Fichier dédupliqué : file_id=%s réutilisé pour "
@@ -3898,6 +5052,36 @@ class IrisUploadHandler(BaseHandler):
             # Sinon : l'index pointe vers un fichier disparu → on
             # créera un nouveau (et l'index sera mis à jour ci-dessous).
 
+        # E4 (L1O1) part 2 — quota disque CUMULÉ par user. Le rate-limit (part 1)
+        # borne la fréquence, PAS le total accumulé sur la fenêtre TTL → un user
+        # pouvait remplir le disque. On REFUSE si (usage courant + ce body) dépasse
+        # le quota (couplé au cap upload admin). Placé APRÈS le dédup : un re-upload
+        # dédupliqué (return ci-dessus) n'écrit RIEN sur disque → jamais compté ni
+        # bloqué ; seul un NOUVEAU fichier est soumis au quota. Le calcul d'usage est
+        # déporté hors event loop (I/O disque, pattern E1). TOCTOU acceptée (comme le
+        # dédup) : N uploads concurrents lisent l'usage AVANT que l'un d'eux écrive →
+        # dépassement borné par (in-flight concurrents) × cap (lui-même borné par le
+        # rate-limit 30/min), jamais de corruption. Le 413 (4xx) est DÉLIBÉRÉ vs 507
+        # (5xx) : limite user actionnable (supprimer des fichiers), pas une panne
+        # serveur → ne pollue pas la télémétrie d'erreurs 5xx ; un retry avec un body
+        # plus petit PEUT légitimement passer sous le quota.
+        _user_quota = _resolve_user_upload_quota(max_upload)
+        _current_usage = await asyncio.to_thread(_user_upload_dir_usage_bytes, user_dir)
+        if _current_usage + len(body) > _user_quota:
+            logger.warning(
+                "Upload refusé (quota disque user dépassé) user_id=%d : "
+                "usage=%d + body=%d > quota=%d",
+                user.id,
+                _current_usage,
+                len(body),
+                _user_quota,
+            )
+            self.write_json(
+                {"success": False, "error": _Messages.UPLOAD_QUOTA_EXCEEDED},
+                status=413,
+            )
+            return
+
         file_id = str(uuid.uuid4())
         safe_filename = f"{file_id}.{ext_key}"
         file_path = user_dir / safe_filename
@@ -3911,9 +5095,12 @@ class IrisUploadHandler(BaseHandler):
             self.write_json({"success": False, "error": _Messages.PATH_INVALID}, status=400)
             return
 
-        user_dir.mkdir(parents=True, exist_ok=True)
         try:
-            file_path.write_bytes(body)
+            # E1 — mkdir + write_bytes (gros body) déportés hors loop. mkdir entre
+            # désormais dans le try (avant : hors try → une OSError mkdir, ex. disque
+            # plein/permission, remontait non gérée en 500 générique Tornado).
+            await asyncio.to_thread(user_dir.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(file_path.write_bytes, body)
         except OSError as exc:
             logger.error("Erreur sauvegarde upload user_id=%s: %s", user.id, exc, exc_info=True)
             self.write_json(
@@ -3930,7 +5117,8 @@ class IrisUploadHandler(BaseHandler):
         # uploade le même fichier, il ne sera pas dédupliqué (mais
         # aucune corruption).
         try:
-            _dedup_record(user_dir, body_sha256, file_id, ext_key)
+            # E1 — read-modify-write + fcntl.flock déportés hors loop.
+            await asyncio.to_thread(_dedup_record, user_dir, body_sha256, file_id, ext_key)
         except Exception as dedup_err:
             logger.warning(
                 "Échec enregistrement dédup user_id=%d sha256=%s: %s",

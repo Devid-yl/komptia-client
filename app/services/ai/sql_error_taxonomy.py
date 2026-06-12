@@ -240,7 +240,12 @@ _CORRECTION_PROMPTS: dict[str, str] = {
     ),
     "timeout_or_resource": (
         "La requête est trop lourde ou le serveur ne répond pas. Simplifie :\n"
-        "1. Ajoute TOP 100 si absent\n"
+        "1. Ajoute TOP 100 si absent — ⚠ c'est un échantillon de DIAGNOSTIC : si "
+        "tu ajoutes (ou gardes) un TOP pour contourner le timeout, tu DOIS dire "
+        "EXPLICITEMENT à l'utilisateur que le résultat affiché est limité aux N "
+        "premières lignes (PARTIEL, pas exhaustif) et lui proposer de relancer "
+        "sans limite une fois la cause du timeout corrigée. Ne présente JAMAIS "
+        "un résultat tronqué par TOP comme s'il était complet.\n"
         "2. Réduis le nombre de JOINs\n"
         "3. Utilise des filtres WHERE restrictifs (date, dossier)\n"
         "4. Évite les sous-requêtes corrélées — utilise des CTEs\n"

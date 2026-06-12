@@ -36,11 +36,15 @@ import logging
 import unicodedata
 from typing import Callable, List, Optional, Set, Tuple
 
-from sqlalchemy import create_engine, select, delete, update
+from sqlalchemy import select, delete, update
 from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.core.database import get_db_url
+
+# get_db_url ré-exposé (et passé explicitement à make_sync_engine) pour rester
+# monkeypatchable par les tests (qui redirigent la BDD via patch de
+# ``cleanup_job.get_db_url``).
+from app.core.database import get_db_url, make_sync_engine
 from app.models.anonymization_term import AnonymizationTerm
 
 logger = logging.getLogger(__name__)
@@ -53,8 +57,8 @@ logger = logging.getLogger(__name__)
 TokenProvider = Callable[[int], Set[str]]
 
 
-def _scan_classeurs_for_user(user_id: int) -> Tuple[Set[str], Set[str]]:
-    """Scanne UNE FOIS le datastore d'un user, retourne ``(tokens, refs)``.
+def _scan_classeurs_for_user(user_id: int) -> Tuple[Set[str], Set[str], bool]:
+    """Scanne UNE FOIS le datastore d'un user, retourne ``(tokens, refs, complete)``.
 
     Factorisé du précédent ``_classeur_token_provider`` pour permettre au
     job cleanup de récupérer EN PLUS la liste des ``classeur_refs`` (noms
@@ -62,17 +66,25 @@ def _scan_classeurs_for_user(user_id: int) -> Tuple[Set[str], Set[str]]:
     le job a besoin des refs pour purger les origines orphelines dans
     ``AnonymizationTerm.origins``.
 
-    Silencieux sur les classeurs mal formés (log debug, pas fatal) — un
-    classeur corrompu ne doit pas bloquer le cleanup des autres.
+    **``complete`` (anti-perte RGPD silencieuse)** : ``False`` dès qu'un
+    classeur PRÉSENT sur disque n'a pas pu être lu (ex : trop volumineux à
+    décompresser une fois > quota admin, ou corrompu). Dans ce cas le scan
+    est INCOMPLET : on ne connaît pas les tokens de ce fichier, donc le
+    caller (job cleanup) DOIT s'abstenir de purger (sinon les termes de ce
+    fichier seraient supprimés comme « orphelins » alors qu'ils vivent
+    toujours sur disque — fuite/perte de données confidentielles). Un échec
+    ponctuel diffère la purge d'un cycle (auto-résolu : si le fichier est
+    vraiment supprimé, il n'est plus listé au cycle suivant → ``complete``).
 
     **Ne lit QUE des fichiers** — ne touche PAS la BDD.
 
     Returns:
-        Tuple ``(tokens, classeur_refs)`` :
+        Tuple ``(tokens, classeur_refs, complete)`` :
 
-        - ``tokens`` : union des tokens détectés dans tous les classeurs.
-        - ``classeur_refs`` : noms de fichiers (basenames) des classeurs
-          présents sur disque. Vide ⇔ datastore vide / inaccessible.
+        - ``tokens`` : union des tokens détectés dans tous les classeurs LUS.
+        - ``classeur_refs`` : noms de fichiers (basenames) des classeurs LUS.
+        - ``complete`` : ``True`` ssi TOUS les classeurs listés ont été lus
+          avec succès. ``False`` ⇒ purge à éviter (scan partiel).
     """
     from pathlib import Path
 
@@ -92,11 +104,17 @@ def _scan_classeurs_for_user(user_id: int) -> Tuple[Set[str], Set[str]]:
 
     user_dir = _user_dir(user_id)
     if not user_dir.exists():
-        return set(), set()
+        # Datastore vide/inaccessible = rien à scanner = scan COMPLET (aucun
+        # fichier illisible) → la purge peut procéder normalement.
+        return set(), set(), True
 
-    classeurs = list_classeurs_sync(user_dir)
+    # include_hidden : les classeurs internes des widgets grille (``.widgets/``)
+    # contiennent aussi des tokens — les ignorer ferait purger leurs termes
+    # comme orphelins (perte silencieuse de pseudonymisation).
+    classeurs = list_classeurs_sync(user_dir, include_hidden=True)
     active_tokens: Set[str] = set()
     active_refs: Set[str] = set()
+    scan_complete = True  # passe à False si un classeur PRÉSENT est illisible
     for meta in classeurs:
         fname = meta.get("filename") if isinstance(meta, dict) else None
         if not fname:
@@ -126,20 +144,33 @@ def _scan_classeurs_for_user(user_id: int) -> Tuple[Set[str], Set[str]]:
             tabs = raw.get("tabs") if isinstance(raw, dict) else None
             if isinstance(tabs, list):
                 active_tokens |= extract_terms(tabs)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            # Classeur corrompu ou illisible : skip pour tokens uniquement.
-            # NB : si on a déjà ajouté `fname` à `active_refs` avant le
-            # raise (cas .open() OK mais json.load échoue), on le garde
-            # — il est vivant côté disque. Si le raise vient de .open()
-            # (FileNotFoundError, race entre list et open), `active_refs`
-            # n'aura pas été incrémenté pour ce fichier — comportement OK.
+        except FileNotFoundError:
+            # Fichier listé mais disparu entre list et open (race avec une
+            # suppression) : il est GENUINEMENT parti → ses termes peuvent
+            # légitimement être purgés. N'invalide PAS la complétude du scan.
             logger.debug(
-                "cleanup_unused_anonymization_terms: classeur %s ignoré (%s)",
+                "cleanup: classeur %s disparu pendant le scan (race delete), skip",
                 fname,
-                exc,
+            )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            # Classeur PRÉSENT mais illisible (trop volumineux à décompresser
+            # > quota, gzip corrompu, JSON invalide). On ne connaît PAS ses
+            # tokens → le scan est INCOMPLET. ``scan_complete=False`` fait que
+            # le job s'abstient de purger ce user ce cycle : sinon les termes
+            # de CE classeur (toujours vivant sur disque) seraient supprimés
+            # comme orphelins = perte silencieuse de données confidentielles
+            # (RGPD). WARNING (≠ debug) pour que l'admin voie un classeur
+            # durablement illisible (ex : quota à relever).
+            scan_complete = False
+            logger.warning(
+                "cleanup: classeur %s PRÉSENT mais illisible (%s) — scan marqué "
+                "incomplet, purge des termes différée pour user=%s (anti-perte RGPD)",
+                fname,
+                f"{type(exc).__name__}: {exc}",
+                user_id,
             )
 
-    return active_tokens, active_refs
+    return active_tokens, active_refs, scan_complete
 
 
 def _classeur_token_provider(user_id: int) -> Set[str]:
@@ -149,7 +180,7 @@ def _classeur_token_provider(user_id: int) -> Set[str]:
     Le job cleanup interne préfère :func:`_scan_classeurs_for_user` qui
     retourne aussi les refs pour la purge orphan-origins (task #24).
     """
-    tokens, _refs = _scan_classeurs_for_user(user_id)
+    tokens, _refs, _complete = _scan_classeurs_for_user(user_id)
     return tokens
 
 
@@ -186,7 +217,7 @@ def _dashboard_token_provider(user_id: int) -> Set[str]:
         extract_dashboard_terms_with_origin,
     )
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     tokens: Set[str] = set()
     try:
         with Session(engine) as session:
@@ -296,7 +327,7 @@ def _automation_token_provider(user_id: int) -> Set[str]:
         extract_automation_terms_with_origin,
     )
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     tokens: Set[str] = set()
     try:
         with Session(engine) as session:
@@ -371,7 +402,7 @@ def _iris_messages_token_provider(user_id: int) -> Set[str]:
         scrub_pyodbc_technical,
     )
 
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     tokens: Set[str] = set()
     try:
         with Session(engine) as session:
@@ -757,13 +788,16 @@ def _purge_orphan_origins_for_user(
     ).all()
 
     # task #29 — Comparaison case-insensitive Unicode-aware via NFKC
-    # casefold (cohérent avec ``_canonical_key`` sur les termes). Pourquoi :
-    # un classeur stocké en BDD avec la casse "Bilan.afz.json" mais
-    # renommé sur disque (via FS ou via l'app) en "bilan.afz.json"
-    # apparaîtrait orphelin sur Linux Docker (case-sensitive FS) alors
-    # qu'il est légitime. macOS APFS est case-insensitive par défaut →
-    # divergence silencieuse entre dev (Mac) et prod (Docker Linux).
+    # casefold. Pourquoi : un classeur stocké en BDD avec la casse
+    # "Bilan.afz.json" mais renommé sur disque (via FS ou via l'app) en
+    # "bilan.afz.json" apparaîtrait orphelin sur Linux Docker (case-sensitive
+    # FS) alors qu'il est légitime. macOS APFS est case-insensitive par défaut
+    # → divergence silencieuse entre dev (Mac) et prod (Docker Linux).
     # Pré-calcul une fois ; le casefold est ~O(n_chars) donc trivial.
+    # NB : volontairement accent-SENSIBLE ici (≠ ``_canonical_key`` sur les
+    # *termes*, devenu accent-insensible le 2026-06-09) — ce sont des NOMS DE
+    # FICHIERS : fusionner "café.afz.json" et "cafe.afz.json" provoquerait une
+    # fausse détection d'orphelin (deux fichiers distincts sur le FS).
     active_normalized = {
         unicodedata.normalize("NFKC", ref).casefold()
         for ref in active_classeur_refs
@@ -1147,9 +1181,10 @@ def cleanup_unused_anonymization_terms_job() -> None:
     empêcher le cleanup des autres. Le log niveau ``error`` émet un
     snapshot exception pour investigation sans exposer de PII.
     """
-    engine = create_engine(get_db_url())
+    engine = make_sync_engine(get_db_url())
     total_deleted = 0
     users_scanned = 0
+    users_skipped_incomplete = 0  # scan classeur partiel → purge différée (anti-perte RGPD)
     try:
         # Première session courte : juste pour lister les user_ids.
         with Session(engine) as session:
@@ -1168,8 +1203,12 @@ def cleanup_unused_anonymization_terms_job() -> None:
                 # effective via ``_active_tokens_for_user`` — pas de purge
                 # orphan dans ce cas (pas de refs fiables disponibles).
                 classeur_refs: Set[str] = set()
+                # ``scan_complete`` : si un classeur présent est illisible, le
+                # scan est partiel → on s'abstient de purger ce user (anti-perte
+                # RGPD). True par défaut pour le chemin sans scan classeur direct.
+                scan_complete = True
                 if _classeur_token_provider in DEFAULT_TOKEN_PROVIDERS:
-                    tokens, classeur_refs = _scan_classeurs_for_user(int(uid))
+                    tokens, classeur_refs, scan_complete = _scan_classeurs_for_user(int(uid))
                     extra_providers = [
                         p for p in DEFAULT_TOKEN_PROVIDERS if p is not _classeur_token_provider
                     ]
@@ -1190,6 +1229,23 @@ def cleanup_unused_anonymization_terms_job() -> None:
                     # le ``except Exception`` du for loop → user skip
                     # (garde anti mass-purge préservée).
                     tokens = _active_tokens_for_user(int(uid))
+
+                if not scan_complete:
+                    # Scan classeur INCOMPLET (un fichier présent illisible) :
+                    # on connaît un sous-ensemble seulement des tokens/refs actifs.
+                    # Purger maintenant supprimerait les termes du fichier illisible
+                    # comme orphelins = perte RGPD silencieuse. On DIFFÈRE toutes
+                    # les purges basées sur tokens/refs pour ce user ce cycle.
+                    # (Le purge d'audit, indépendant et borné par l'âge, n'est PAS
+                    # concerné — mais par simplicité et prudence on skip tout le
+                    # bloc de purge ; l'audit sera purgé au prochain cycle complet.)
+                    logger.warning(
+                        "cleanup user=%s: scan classeur incomplet (fichier illisible) "
+                        "→ purge différée ce cycle (anti-perte RGPD)",
+                        uid,
+                    )
+                    users_skipped_incomplete += 1
+                    continue
                 with Session(engine) as session_u:
                     deleted = _delete_missing_for_user(session_u, int(uid), tokens)
                     purged = _purge_orphan_origins_for_user(session_u, int(uid), classeur_refs)
@@ -1234,7 +1290,8 @@ def cleanup_unused_anonymization_terms_job() -> None:
         engine.dispose()
 
     logger.info(
-        "cleanup_unused_anonymization_terms_job done: users=%d deleted=%d",
+        "cleanup_unused_anonymization_terms_job done: users=%d deleted=%d skipped_incomplete=%d",
         users_scanned,
         total_deleted,
+        users_skipped_incomplete,
     )

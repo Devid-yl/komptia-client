@@ -380,7 +380,11 @@ async def _rehash_if_needed(user_id: int, current_hash: str, plaintext: str) -> 
     if not hasher.needs_rehash(current_hash):
         return
     try:
-        new_hash = hasher.hash_password(plaintext)
+        # ``allow_truncate=True`` : ``plaintext`` vient d'un login RÉUSSI, donc
+        # un mot de passe legacy >72 octets (créé sous bcrypt 4.x) a déjà été
+        # accepté via la troncature au verify. Le re-hacher sans tronquer
+        # lèverait PasswordTooLongError ; on tronque pour rester cohérent.
+        new_hash = hasher.hash_password(plaintext, allow_truncate=True)
         async with get_session() as db:
             result = await db.execute(
                 update(User)

@@ -17,10 +17,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import create_engine, event
-
 from app.core import clock
-from app.core.database import get_db_url, setup_encryption
+from app.core.database import make_sync_engine
 from app.services.backup.db_backup import (
     BackupEncryptionError,
     copy_to_offsite,
@@ -61,10 +59,9 @@ def run_backup_job() -> Optional[Path]:
     # Chiffrement attendu ssi une clé est configurée (même critère que l'app).
     expect_encrypted = bool(config.database.encryption_key)
 
-    engine = create_engine(get_db_url())
-    # Réutilise le hook clé canonique : 1er hook sur connexion neuve. En prod
-    # SQLCipher → PRAGMA key posé → VACUUM INTO hérite de la clé. Sans clé → no-op.
-    event.listen(engine, "connect", setup_encryption)
+    # make_sync_engine pose PRAGMA key (SQLCipher) sur chaque connexion → le
+    # VACUUM INTO hérite de la clé. Sans clé configurée → no-op (base claire).
+    engine = make_sync_engine()
     try:
         raw = engine.raw_connection()
         try:

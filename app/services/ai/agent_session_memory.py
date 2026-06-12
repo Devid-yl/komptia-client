@@ -88,6 +88,14 @@ MEMORY_NOTHING_SENTINEL: str = "(rien à retenir)"
 #: Nombre max de SQL réussis pris en compte dans l'input (les plus récents).
 MAX_SUCCESSFUL_SQL_IN_INPUT: int = 5
 
+#: Caps des INPUTS passés au LLM résumeur. #73 — la coupe était MUETTE : le
+#: résumeur prenait un texte amputé en pleine phrase pour la préférence
+#: COMPLÈTE de l'utilisateur et la persistait dans ``User.iris_memory`` (biais
+#: durable cross-session). Désormais la coupe est SIGNALÉE (cf.
+#: :func:`_truncate_memory_input`).
+MEMORY_INPUT_QUESTION_MAX_CHARS: int = 500
+MEMORY_INPUT_DISCOVERIES_MAX_CHARS: int = 1500
+
 #: Préfixes markdown directifs à stripper en début de ligne — empêche
 #: qu'une mémoire passe pour une section système au run suivant.
 _MD_PREFIX_RE: re.Pattern[str] = re.compile(r"(?m)^\s*(##+|---+|\*\*+)\s*")
@@ -158,6 +166,43 @@ def _is_nothing_to_remember(text: Optional[str]) -> bool:
     return _norm(text) == _norm(MEMORY_NOTHING_SENTINEL)
 
 
+def _truncate_memory_input(text: str, limit: int, *, label: str) -> str:
+    """Tronque un INPUT du résumeur en SIGNALANT la coupe (#73).
+
+    L'ancienne coupe ``text[:N]`` était MUETTE : le résumeur prenait un texte
+    amputé en pleine phrase pour la préférence COMPLÈTE de l'utilisateur et la
+    persistait telle quelle dans ``User.iris_memory`` → biais durable
+    cross-session (l'inverse de l'OUTPUT, qui lui ajoute déjà « … »). On ajoute
+    un marqueur explicite avec le total réel pour que le résumeur sache que
+    l'input est partiel et ne fabrique pas une préférence définitive.
+
+    ⚠️ Ordre confidentialité (#73-bis, FIXÉ 2026-06-10) : cette coupe s'exécute
+    désormais sur des INPUTS DÉJÀ ANONYMISÉS — ``generate_session_memory``
+    anonymise les inputs bruts (``anonymize_for_llm`` sur le dict
+    {question, discoveries, sqls, corrections}) AVANT d'appeler
+    ``build_memory_input``. Donc couper ici ne touche qu'un token (``§…§`` /
+    ``[EMAIL_N]``), jamais une valeur brute → pas de fuite de préfixe de
+    pseudonyme. (Le seul résidu : un token coupé en bord ne sera pas restauré
+    par ``restore_fn`` → over-anonymisation = mémoire dégradée sur ce champ,
+    jamais une fuite. Fail-safe.)
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    logger.warning(
+        "Mémoire session : %s tronqué %d→%d chars en entrée du résumeur",
+        label,
+        len(text),
+        limit,
+    )
+    return (
+        f"{text[:limit].rstrip()} "
+        f"[⚠ {label} tronqué à {limit} caractères sur {len(text)} — texte "
+        "INCOMPLET, ne déduis aucune préférence définitive sur la partie "
+        "manquante]"
+    )
+
+
 def build_memory_input(
     user_question: str,
     discoveries: Optional[str],
@@ -187,10 +232,16 @@ def build_memory_input(
 
     discoveries_section = ""
     if discoveries:
-        discoveries_section = f"\nCahier de découvertes en cours :\n{discoveries.strip()[:1500]}\n"
+        _disc = _truncate_memory_input(
+            discoveries, MEMORY_INPUT_DISCOVERIES_MAX_CHARS, label="cahier de découvertes"
+        )
+        discoveries_section = f"\nCahier de découvertes en cours :\n{_disc}\n"
 
+    _question = _truncate_memory_input(
+        user_question, MEMORY_INPUT_QUESTION_MAX_CHARS, label="question utilisateur"
+    )
     return (
-        f"Question initiale de l'utilisateur :\n{user_question.strip()[:500]}\n"
+        f"Question initiale de l'utilisateur :\n{_question}\n"
         f"{discoveries_section}"
         f"{sqls_section}"
         f"{corrections_section}"
@@ -283,24 +334,38 @@ async def generate_session_memory(
             model_kind=ModelKind.UTILITY,
             retry=RetryPolicy.STANDARD,
         )
+        # #73-bis (confidentialité) — anonymiser les INPUTS BRUTS en UN SEUL
+        # appel proxy (mapping unique partagé cross-champs — un seul §…§ /
+        # [EMAIL_N] par payload ; PAS de partage d'instance cross-user) AVANT
+        # que ``build_memory_input`` ne les TRONQUE (question 500 / discoveries
+        # 1500). Sinon la coupe d'une valeur BRUTE en plein milieu d'un
+        # pseudonyme configuré → le terme ne matche plus le pattern (qui exige
+        # le terme COMPLET) → préfixe RÉEL en clair au résumeur. Sur des champs
+        # DÉJÀ anonymisés, la coupe ne touche qu'un token (§…§) → pas de fuite.
+        # ``terminal_kind`` (statut enum) n'est pas sensible → laissé en clair.
+        # ``user_id`` peut être ``None`` (appel système) — la couche PII regex
+        # reste active. Le résumé est dé-anonymisé (restore_fn) pour que la BDD
+        # ``conversation_messages.summary`` contienne du cleartext.
+        _anon_inputs, restore_fn = await anonymize_for_llm(
+            user_id,
+            {
+                "question": user_question,
+                "discoveries": discoveries or "",
+                "sqls": list(successful_sqls),
+                "corrections": list(user_corrections),
+            },
+            "IRIS_CHAT",
+        )
         prompt = build_memory_input(
-            user_question,
-            discoveries,
-            successful_sqls,
-            user_corrections,
+            _anon_inputs.get("question") or "",
+            _anon_inputs.get("discoveries") or None,
+            _anon_inputs.get("sqls") or [],
+            _anon_inputs.get("corrections") or [],
             terminal_kind,
         )
 
-        # Proxy d'anonymisation single source of truth. ``user_id`` peut
-        # être ``None`` (appel système) — la couche PII regex
-        # (EMAIL/SIRET/IBAN/etc.) reste active même sans pseudonymizer
-        # user-scoped. Le résumé final est dé-anonymisé pour que la BDD
-        # ``conversation_messages.summary`` contienne du cleartext lisible
-        # par le futur agent qui reprendra une conv similaire.
-        prompt_anon, restore_fn = await anonymize_for_llm(user_id, prompt, "IRIS_CHAT")
-
         request = LLMRequest(
-            prompt=prompt_anon,
+            prompt=prompt,  # DÉJÀ anonymisé (inputs anonymisés ci-dessus)
             system=(
                 get_confidentiality_prompt("IRIS_CHAT") + "\n\n" + build_memory_system_prompt()
             ),

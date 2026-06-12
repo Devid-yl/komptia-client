@@ -362,6 +362,33 @@
                 <p class="text-sm text-gray-500 dark:text-gray-400">Aucun guide n'est disponible pour le moment.</p>
                 {% end %}
             </div>
+            {# ── Réactiver les tours guidés (self-service, tous les users) ──
+               Intégré DANS la carte « Guides d'utilisation » (même rubrique Aide,
+               demande David 2026-06-09) — rangée séparée par un trait, pas de
+               carte distincte. Bouton → POST /api/onboarding/reset (owner-scope
+               strict : agit sur le user courant uniquement). Le JS (settings.js →
+               wireOnboardingReset) confirme via appConfirm, appelle l'endpoint,
+               puis purge le miroir localStorage via KomptiaOnboarding.resetAll().
+               N'affecte QUE les tours par-utilisateur ; la checklist de setup
+               admin (tenant-wide) reste intacte. #}
+            <div class="p-5 border-t border-gray-100 dark:border-gray-800">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div class="min-w-0">
+                        <div class="text-sm font-medium text-gray-900 dark:text-gray-100 flex items-center gap-1.5">
+                            Tours d'aide guidés
+                            {# info-icon = « i » CLIQUABLE (info-tooltip.js, .info-icon + data-info) — pas de hover-only (axe 4). #}
+                            <button type="button" class="info-icon"
+                                    aria-label="À quoi servent les tours d'aide ?"
+                                    data-info="Komptia affiche un court tour guidé la première fois que vous visitez une page (Iris, Datastore, Tableaux de bord, Automatisations, pages d'administration…). « Réactiver » les remet à zéro : ils réapparaîtront à votre prochaine visite de chaque page. N'affecte que votre compte."></button>
+                        </div>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Revoir les tours guidés affichés lors de votre première visite de chaque page.</p>
+                    </div>
+                    <div class="flex items-center gap-3 flex-shrink-0">
+                        <span id="onb-reset-msg" class="text-xs text-gray-500 dark:text-gray-400" role="status" aria-live="polite"></span>
+                        <button type="button" id="onb-reset-btn" class="btn btn-secondary text-sm">Réactiver les tours</button>
+                    </div>
+                </div>
+            </div>
         </div>
     </section>
 
@@ -375,4 +402,43 @@
    les IDs DOM utilisés par le JS), les navigateurs servaient l'ancienne
    version cachée et le bouton Enregistrer restait figé en `disabled`. #}
 <script src="{{ static_url('js/privacy/iris-user-memory.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding settings_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'settings_v1',
+                title: 'Vos paramètres Komptia',
+                steps: [
+                    {
+                        icon: 'sparkle',
+                        title: 'Votre espace personnel',
+                        text: 'Cette page rassemble tout ce qui vous est propre : votre profil, votre mot de passe, le thème de l\'interface et vos préférences avec Iris. Chaque réglage n\'affecte que votre compte, sauf le nom d\'entreprise qui est réservé aux administrateurs.'
+                    },
+                    {
+                        icon: 'zap',
+                        title: 'Apparence et profil',
+                        text: 'Dans « Apparence », choisissez le mode Clair, Sombre ou Système (qui suit votre appareil) : le changement s\'applique aussitôt. Plus haut, mettez à jour votre nom d\'affichage et votre adresse email, puis cliquez sur « Enregistrer ».'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Mot de passe et confidentialité Iris',
+                        text: 'La carte « Mot de passe » sécurise votre compte : un changement déconnecte vos autres appareils. Juste en dessous, « Confidentialité Iris » décide si Iris peut lire les résultats de vos requêtes SQL. Rassurez-vous : les anonymisations automatiques et vos termes confidentiels s\'appliquent toujours, quel que soit votre choix.'
+                    },
+                    {
+                        icon: 'chart',
+                        title: 'Votre mémoire Iris',
+                        text: 'Iris construit une petite mémoire factuelle privée à partir de vos conversations (vos préférences, votre contexte) pour vous répondre plus justement. Vous la consultez ici, vous pouvez l\'éditer ou la vider à tout moment, et elle n\'est jamais partagée avec les autres utilisateurs.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
 {% end %}

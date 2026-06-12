@@ -24,6 +24,10 @@ Options :
     --max-qa-loops N           # max Q/A loops par concept (filter+curate)
     --only-phase PHASE         # exécute UNE phase (1.1-1.2 / 1.2.5 / 1.2.6 /
                                #   1.3-1.4 / 1.5 / 2 / 3 / 4), lit run.json amont
+    --stop-after-phase PHASE   # exécute de la 1re phase JUSQU'À PHASE incluse
+                               #   puis stop (run partiel « preview » : blueprint
+                               #   1.5 / factsheets 3, pas de SQL final). Exclusif
+                               #   avec --only-phase et --resume.
     --resume                   # reprend après dernière phase complétée dans run.json
     --no-clean                 # ne wipe pas run.json avant le run
     --db PATH                  # BDD source (défaut data/sage_copy.db)
@@ -123,12 +127,89 @@ DEFAULT_DB_PATH = Path(
 # Alias backward-compat pour les callers historiques. À supprimer en même
 # temps que le mirror SQLite (cf. TODO ci-dessus, avant prod).
 SAGE_DB = DEFAULT_DB_PATH
-KOMPTIA_DB = ROOT / "data" / "komptia.db"
+# KOMPTIA_DB honore ``KOMPTIA_DB_PATH`` — MÊME contrat que ``app/config.py``
+# (``config.database.path``) et que ``seed_value_mapping_from_sage._resolve_komptia_db``.
+# Sans ça, sous un chemin custom (E2E, déploiement non-défaut), le keying SQLCipher
+# comparerait un KOMPTIA_DB figé à un ``config.database.path`` divergent → BDD locale
+# NON keyée (« file is not a database ») OU lecture de la mauvaise base.
+KOMPTIA_DB = Path(os.environ.get("KOMPTIA_DB_PATH") or str(ROOT / "data" / "komptia.db"))
 OUT_DIR = ROOT / "outputs"
 RUN_JSON = OUT_DIR / "run.json"
 RUN_SQL = OUT_DIR / "run.sql"
 RUN_MD = OUT_DIR / "run.md"
 DEBUG_TRACES_DIR = OUT_DIR / "_debug_traces"
+
+
+# Référence brute du connecteur DBAPI, capturée AVANT toute réécriture des
+# call-sites en ``_connect_sqlite``. Sert d'unique point d'appel réel au
+# connecteur DBAPI DE CE MODULE (évite la récursion infinie : tous les autres
+# call-sites ``connect(`` de pipeline.py ont été réécrits en ``_connect_sqlite(``).
+_raw_sqlite_connect = sqlite3.connect
+
+
+def _sqlite_target_is_local_db(target: "str | Path", db_path: "str | Path") -> bool:
+    """``True`` si ``target`` désigne le MÊME fichier que ``db_path``.
+
+    ``target`` peut être un chemin nu (``str(KOMPTIA_DB)``) OU une URI SQLite
+    (``file:/abs/path?mode=ro``) — les deux formes coexistent dans ce module.
+    On normalise (retrait du préfixe ``file:`` et du query-string ``?...``) puis
+    on compare les chemins résolus. Générique : aucun nom de fichier hardcodé.
+    """
+    s = str(target)
+    if s.startswith("file:"):
+        s = s[len("file:") :]
+    s = s.split("?", 1)[0]
+    try:
+        return Path(s).resolve() == Path(db_path).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _connect_sqlite(target: "str | Path", **kwargs: Any) -> "sqlite3.Connection":
+    """``sqlite3.connect`` + ``PRAGMA key`` SQLCipher SI ``target`` est la BDD
+    LOCALE chiffrée (``config.database.path``).
+
+    Pourquoi : en prod la BDD locale (``data/komptia.db``) est chiffrée
+    SQLCipher. Un ``sqlite3.connect`` brut sans clé la voit « file is not a
+    database » dès la 1re requête (le binding fait de ``sqlite3`` un
+    ``sqlcipher3`` process-wide, mais la clé doit être posée PAR CONNEXION).
+    Le miroir Sage (``data/sage_copy.db``, ``--db``) n'est JAMAIS chiffré → on
+    NE le keye pas (sinon « file is not a database » à l'envers).
+
+    No-op strict en mode clair (pas de ``SQLCIPHER_KEY``) → dev/CLI standalone
+    inchangés. DRY : réutilise ``setup_encryption`` (SSoT du keying) — pas de
+    ``PRAGMA key`` dupliqué ici. Un échec de keying (clé posée mais moteur
+    non-SQLCipher) se PROPAGE volontairement (fail-closed, cohérent avec le boot).
+
+    Fail-CLOSED si ``app`` est inimportable (standalone hors repo) ALORS que le
+    chiffrement est explicitement demandé (``SQLCIPHER_KEY`` posée) ET que la cible
+    EST la BDD locale : renvoyer une connexion NON keyée sur une base chiffrée =
+    lecture/écriture EN CLAIR silencieuse. On refuse plutôt que de dégrader.
+    """
+    conn = _raw_sqlite_connect(target, **kwargs)
+    try:
+        from app.config import config as _cfg
+        from app.core.database import setup_encryption as _setup_enc
+    except ImportError:
+        # app indisponible : on ne peut PAS poser la clé. Fail-closed si le
+        # chiffrement est demandé sur la BDD locale (cf. KOMPTIA_DB, env-aware) ;
+        # sinon (mode clair OU cible Sage non chiffrée) on dégrade au legacy.
+        if os.getenv("SQLCIPHER_KEY", "").strip() and _sqlite_target_is_local_db(
+            target, KOMPTIA_DB
+        ):
+            conn.close()
+            raise RuntimeError(
+                "SQLCIPHER_KEY définie mais app.core.database inimportable — refus "
+                "du fallback NON chiffré sur la BDD locale (fail-closed)."
+            )
+        return conn  # base supposée claire (mode clair, ou cible Sage)
+    if _cfg.database.encryption_key and _sqlite_target_is_local_db(target, _cfg.database.path):
+        try:
+            _setup_enc(conn, None)  # pose le PRAGMA key AVANT toute requête
+        except Exception:
+            conn.close()  # ne pas fuiter le FD si le keying échoue (fail-closed)
+            raise
+    return conn
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +285,45 @@ _pipeline_cancel_event: _contextvars.ContextVar[asyncio.Event | None] = _context
 _pipeline_user_id: _contextvars.ContextVar[int | None] = _contextvars.ContextVar(
     "_pipeline_user_id", default=None
 )
+# L3O2 — objet User du run (chargé une fois au démarrage), nécessaire au RLS
+# row-level des probes Phase-3 (``enforce_for_executor`` lit ``user.id``/``role``).
+# ``None`` = run CLI/système sans user → pas d'enforcement.
+_pipeline_user: _contextvars.ContextVar[object | None] = _contextvars.ContextVar(
+    "_pipeline_user", default=None
+)
+
+
+async def _enforce_pipeline_probe_rls(sql: str) -> str:
+    """Applique le RLS row-level data_access sur une probe Phase-3 AVANT exécution
+    sur Sage (L3O2).
+
+    Les probes exécutent du SQL écrit par le LLM via le connecteur Sage brut ;
+    sans ce passage, un user RESTREINT lit des lignes/colonnes interdites (canal
+    latéral de cardinalité). SSoT = :func:`enforce_for_executor` (idem
+    ``execute_count``/``query_executor``/``check_join_compatibility``).
+
+    - User absent (run CLI/système) → SQL inchangé (pas de RLS, cf. SYSTEM_USER).
+    - User sans restriction / admin sans règle (la majorité) → NO-OP (SQL inchangé).
+    - User restreint → filtres de lignes injectés, OU ``DataAccessDeniedError``
+      levée FAIL-CLOSED (jamais de SQL non filtrée renvoyée). Le caller skip la
+      probe proprement.
+    """
+    user = _pipeline_user.get()
+    if user is None:
+        return sql
+    from app.services.data_access.enforcer import enforce_for_executor
+
+    return await enforce_for_executor(sql, user, source="pipeline_phase3_probe")
+# Conversation Iris à laquelle attribuer les appels LLM de CE run (même rationale
+# per-task que ``_pipeline_user_id``). Sans ça, ``call_llm`` poserait
+# ``llm_call_context(caller=...)`` avec ``conversation_id=None`` → les
+# ``AIPerformanceLog`` de la pipeline (le chemin analytique LE PLUS coûteux)
+# sortiraient avec ``conversation_id=NULL`` et NE seraient PAS comptés par la
+# puce coût /iris ni par ``get_conversation_cost_usd`` (sous-évaluation
+# silencieuse). ``str`` car ``AIPerformanceLog.conversation_id`` est ``String(64)``.
+_pipeline_conversation_id: _contextvars.ContextVar[str | None] = _contextvars.ContextVar(
+    "_pipeline_conversation_id", default=None
+)
 
 
 def _check_cancel_or_raise() -> None:
@@ -255,7 +375,7 @@ def _read_ai_config_value(key: str) -> str | None:
     """Lit une clé brute depuis `ai_config`. Retourne None si absente."""
     if not KOMPTIA_DB.exists():
         raise SystemExit(f"❌ {KOMPTIA_DB} introuvable")
-    conn = sqlite3.connect(str(KOMPTIA_DB))
+    conn = _connect_sqlite(str(KOMPTIA_DB))
     try:
         row = conn.execute(
             "SELECT value FROM ai_config WHERE key = ?",
@@ -590,7 +710,7 @@ async def call_llm(
         try:
             from app.services.ai.llm_providers import LLMRequest
 
-            with llm_call_context(caller=caller):
+            with llm_call_context(caller=caller, conversation_id=_pipeline_conversation_id.get()):
                 resp = await manager.generate(
                     LLMRequest(
                         prompt=user,
@@ -612,7 +732,7 @@ async def call_llm(
     from app.services.ai.llm_providers import AnthropicProvider, LLMRequest
 
     provider = AnthropicProvider(api_key=api_key)
-    with llm_call_context(caller=caller):
+    with llm_call_context(caller=caller, conversation_id=_pipeline_conversation_id.get()):
         resp = await provider.generate(
             LLMRequest(
                 prompt=user,
@@ -743,6 +863,15 @@ class PipelineState:
     # Final (le SQL réellement exécutable — vient de Phase 4)
     final_sql: str | None = None
 
+    # Raison terminale du run — mécanisme UNIQUE de signalisation (design D2,
+    # docs/design/iris_stop_at_phase.md). Posé EXPLICITEMENT au point d'arrêt
+    # par ``_run_pipeline_inner``, JAMAIS inféré depuis les attrs None
+    # (``last_completed_phase`` est positionnel → clean-stop / crash / cancel
+    # seraient indiscernables = données fausses silencieuses, CRIT-B).
+    # Valeurs : "stopped_clean" | "completed" | "failed" | "cancelled".
+    # None = run encore en cours / jamais terminé.
+    terminal_reason: str | None = None
+
     # Telemetry
     phase_durations: dict[str, float] = field(default_factory=dict)
 
@@ -803,6 +932,75 @@ PHASES_ORDER: tuple[tuple[str, str, str], ...] = (
     ("3", "factsheets", "Phase 3 — Concept Fact Sheets (probes par concept)"),
     ("4", "sql_final", "Phase 4 — SQL Composer (final)"),
 )
+
+
+def _phase_index(phase_id: str) -> int | None:
+    """Index d'une phase dans ``PHASES_ORDER``, ou ``None`` si inconnue."""
+    for i, (pid, _attr, _label) in enumerate(PHASES_ORDER):
+        if pid == phase_id:
+            return i
+    return None
+
+
+def _build_phases_to_run(
+    *,
+    only_phase: str | None,
+    stop_after_phase: str | None,
+    resume: bool,
+    state: "PipelineState",
+) -> list[tuple[str, str, str]]:
+    """Construit la liste ordonnée des phases à exécuter (helper UNIQUE — D1/D3).
+
+    Sémantique (docs/design/iris_stop_at_phase.md) :
+
+    - ``only_phase`` : exécute UNE seule phase (CLI/dev ; lit run.json amont).
+    - ``stop_after_phase`` : exécute de la 1re phase JUSQU'À cette phase
+      INCLUSE, puis stop (run partiel « preview » Iris — blueprint/factsheets).
+    - ``resume`` : reprend après la dernière phase complétée du run.json.
+    - aucun : run complet du début à la fin.
+
+    Fail-closed (D8) : valeur inconnue (après strip) ou combinaison
+    incompatible → ``SystemExit`` avec la liste des valides. JAMAIS de
+    full-run silencieux sur une entrée non vide mais invalide.
+    """
+    # Normalisation tolérante (whitespace/typo). Une valeur vide après strip
+    # = absence de contrainte (None) ; une valeur non vide mais inconnue lève.
+    only_phase = (only_phase or "").strip() or None
+    stop_after_phase = (stop_after_phase or "").strip() or None
+    valid = ", ".join(pid for pid, _, _ in PHASES_ORDER)
+
+    # Conflits explicites — fail-fast (D8)
+    if stop_after_phase and only_phase:
+        raise SystemExit("❌ stop_after_phase et only_phase sont mutuellement exclusifs.")
+    if stop_after_phase and resume:
+        raise SystemExit("❌ stop_after_phase et resume sont mutuellement exclusifs.")
+
+    if only_phase is not None:
+        idx = _phase_index(only_phase)
+        if idx is None:
+            raise SystemExit(f"❌ Phase inconnue : {only_phase!r}. Valides : {valid}")
+        return [PHASES_ORDER[idx]]
+
+    if stop_after_phase is not None:
+        idx = _phase_index(stop_after_phase)
+        if idx is None:
+            raise SystemExit(
+                f"❌ stop_after_phase inconnue : {stop_after_phase!r}. Valides : {valid}"
+            )
+        return list(PHASES_ORDER[: idx + 1])
+
+    if resume:
+        last = state.last_completed_phase()
+        if last is None:
+            return list(PHASES_ORDER)
+        idx = _phase_index(last)
+        if idx is None:  # défensif : ``last`` vient de PHASES_ORDER
+            return list(PHASES_ORDER)
+        tail = list(PHASES_ORDER[idx + 1 :])
+        print(f"→ Resume après phase {last} — reprend à {tail[0][0] if tail else '(rien)'}")
+        return tail
+
+    return list(PHASES_ORDER)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3610,7 +3808,7 @@ def phase_2_5_concept_resolution(
     if candidate_tables:
         out.append(f"Filtre tables candidates : {len(candidate_tables)} tables")
 
-    con = sqlite3.connect(f"file:{komptia_db}?mode=ro", uri=True)
+    con = _connect_sqlite(f"file:{komptia_db}?mode=ro", uri=True)
     try:
         resolution: dict[str, dict] = {}
         n_resolved = 0
@@ -3826,11 +4024,61 @@ _IR_VALID_AGGS: tuple[str, ...] = (
 )
 
 
+def _p4_resolve_target_compat_level() -> Optional[int]:
+    """Compatibility level du SQL Server connecté (ex. 100, 110, 150) ou ``None``.
+
+    Lu depuis le SSoT (libellé de version peuplé au schema sync), via
+    ``parse_compat_level_from_label(get_sql_server_version_label_sync())``. Fail-open :
+    ``None`` si non résolu (aucun sync, test isolé, libellé générique) → l'appelant
+    NE dégrade PAS à l'aveugle. Généricité : aucune valeur hardcodée, tout vient du
+    serveur réellement connecté.
+    """
+    try:
+        from app.services.database.db_config_service import (
+            get_sql_server_version_label_sync,
+            parse_compat_level_from_label,
+        )
+
+        return parse_compat_level_from_label(get_sql_server_version_label_sync())
+    except Exception:
+        return None
+
+
+def _p4_string_agg_within_group_min_compat() -> int:
+    """Compat-level minimum pour ``STRING_AGG ... WITHIN GROUP`` — SSoT db_config_service.
+
+    Réutilise ``_CAPABILITY_MIN_COMPAT["STRING_AGG_WITHIN_GROUP"]`` (= 140 = SQL Server
+    2017) au lieu de dupliquer un nombre magique (il existe déjà 2 copies de « 140 »
+    dans la codebase : db_config_service + deja_vu_prefetch). Fallback 140 si l'import
+    échoue.
+    """
+    try:
+        from app.services.database.db_config_service import _CAPABILITY_MIN_COMPAT
+
+        return int(_CAPABILITY_MIN_COMPAT["STRING_AGG_WITHIN_GROUP"])
+    except Exception:
+        return 140
+
+
+def _p4_within_group_supported() -> bool:
+    """Le serveur cible supporte-t-il ``STRING_AGG ... WITHIN GROUP`` (compat ≥ 140) ?
+
+    Résolu au CALL-SITE (pas dans le renderer, qui reste pur/déterministe). Fail-CLOSED :
+    compat inconnu (None) → ``False`` — on n'émet pas une clause non confirmée sur un
+    renderer terminal dont le SQL s'exécute sans recours aval (cf. contrat documenté
+    ``get_sql_server_version_label`` ; sinon erreur SQL Server 10757 en compat < 140).
+    """
+    compat = _p4_resolve_target_compat_level()
+    return compat is not None and compat >= _p4_string_agg_within_group_min_compat()
+
+
 def _ir_render_string_agg(
     inner_expr: str,
     item: dict,
     concept_resolution: dict,
     table_alias: dict,
+    within_group_supported: bool = True,
+    string_agg_sink: "Optional[list]" = None,
 ) -> str:
     """Compose un ``STRING_AGG(DISTINCT col, sep) WITHIN GROUP (ORDER BY ...)``
     valide T-SQL à partir d'un select item IR.
@@ -3904,10 +4152,28 @@ def _ir_render_string_agg(
         # T-SQL exige un ORDER BY dans WITHIN GROUP — sans, syntax error.
         order_by_sql = inner_expr
 
-    return (
-        f"STRING_AGG({distinct_kw}{inner_expr}, '{sep_escaped}') "
-        f"WITHIN GROUP (ORDER BY {order_by_sql})"
+    # Dédup RÉELLE : `STRING_AGG(DISTINCT ...)` n'existe pas en T-SQL — sqlglot strip
+    # le DISTINCT silencieusement (→ doublons côté SQL Server). Quand un sink est fourni
+    # ET que la dédup est demandée, on enregistre les métadonnées pour que `ir_to_sql`
+    # réécrive ce select-item en sous-requête corrélée DISTINCT (post-pass, qui a accès
+    # au FROM/joins/WHERE/GROUP). L'alias + l'index de clause sont posés par le caller.
+    # Le return ci-dessous reste INCHANGÉ (forme legacy) : utilisé pour HAVING et quand
+    # aucun sink n'est fourni → les tests primitive existants restent verts.
+    if string_agg_sink is not None and distinct:
+        string_agg_sink.append(
+            {
+                "inner_expr": inner_expr,
+                "separator": separator,
+                "within_group_supported": within_group_supported,
+            }
+        )
+    # `WITHIN GROUP` n'est émis QUE si le caller confirme le support (compat ≥ 140).
+    # Décision prise EN AMONT au call-site via _p4_within_group_supported → renderer PUR
+    # et déterministe (défaut True = legacy). En compat < 140 la clause est omise.
+    within_group = (
+        f" WITHIN GROUP (ORDER BY {order_by_sql})" if within_group_supported else ""
     )
+    return f"STRING_AGG({distinct_kw}{inner_expr}, '{sep_escaped}'){within_group}"
 
 
 def _ir_render_partition_by_set(
@@ -4944,6 +5210,7 @@ def _ir_render_select_item(
     table_alias: dict[str, str],
     select_alias_to_expr: dict[str, str],
     fk_lookup: dict[str, list[dict]] | None = None,
+    string_agg_sink: "Optional[list]" = None,
 ) -> tuple[str, str]:
     """Rend un item de SELECT en ``(alias_or_None, expression_sql)``.
 
@@ -4993,7 +5260,12 @@ def _ir_render_select_item(
             return alias, f"COUNT({case_expr})"
         if agg == "string_agg":
             return alias, _ir_render_string_agg(
-                case_expr, item, concept_resolution, table_alias
+                case_expr,
+                item,
+                concept_resolution,
+                table_alias,
+                within_group_supported=_p4_within_group_supported(),
+                string_agg_sink=string_agg_sink,
             )
         return alias, f"{agg.upper()}({case_expr})"
     if "case_when" in item:
@@ -5016,7 +5288,12 @@ def _ir_render_select_item(
         # Émet T-SQL STRING_AGG(DISTINCT col, sep) WITHIN GROUP (ORDER BY ...)
         if agg == "string_agg":
             return alias, _ir_render_string_agg(
-                case_sql, item, concept_resolution, table_alias
+                case_sql,
+                item,
+                concept_resolution,
+                table_alias,
+                within_group_supported=_p4_within_group_supported(),
+                string_agg_sink=string_agg_sink,
             )
         return alias, f"{agg.upper()}({case_sql})"
     if "derivation" in item:
@@ -5086,7 +5363,12 @@ def _ir_render_select_item(
         # Task #100 (2026-05-22) — string_agg avec filtres CASE WHEN
         if agg == "string_agg":
             return alias, _ir_render_string_agg(
-                case_expr, item, concept_resolution, table_alias
+                case_expr,
+                item,
+                concept_resolution,
+                table_alias,
+                within_group_supported=_p4_within_group_supported(),
+                string_agg_sink=string_agg_sink,
             )
         return alias, f"{agg.upper()}({case_expr})"
     # Pas de filtre conditionnel.
@@ -5097,7 +5379,12 @@ def _ir_render_select_item(
     # Task #100 (2026-05-22) — string_agg simple (sans CASE filter)
     if agg == "string_agg":
         return alias, _ir_render_string_agg(
-            qualified, item, concept_resolution, table_alias
+            qualified,
+            item,
+            concept_resolution,
+            table_alias,
+            within_group_supported=_p4_within_group_supported(),
+            string_agg_sink=string_agg_sink,
         )
     return alias, f"{agg.upper()}({qualified})"
 
@@ -5760,6 +6047,7 @@ def _ir_assemble_select_sqlglot(
     order_by_clauses: list[str],
     limit: int | None,
     having_clauses: list[str] | None = None,
+    distinct: bool = False,
     dialect: str = "tsql",
 ) -> str:
     """T11 — Compose le SQL final via sqlglot AST.
@@ -5841,6 +6129,10 @@ def _ir_assemble_select_sqlglot(
         select_exprs.append(items[0])
 
     sel = exp.Select(expressions=select_exprs).from_(from_expr)
+    if distinct:
+        # SELECT DISTINCT — utilisé par la dérivée de dédup string_agg
+        # (_ir_build_string_agg_dedup_subquery).
+        sel = sel.distinct()
 
     # 3. JOINs — construire chaque exp.Join manuellement (V1 = LEFT JOIN ON eq)
     for j in join_chain:
@@ -5931,6 +6223,81 @@ def _ir_assemble_select_sqlglot(
     dialect_norm = (dialect or "").lower()
     render_dialect = "komptia_tsql" if dialect_norm == "tsql" else dialect_norm
     return sel.sql(dialect=render_dialect, pretty=False) + ";"
+
+
+def _ir_build_string_agg_dedup_subquery(
+    *,
+    alias: str,
+    inner_expr: str,
+    separator: str,
+    within_group_supported: bool,
+    from_table: str,
+    from_alias: str,
+    join_chain: list[dict],
+    where_clauses: list[str],
+    group_by_clauses: list[str],
+    table_alias: dict,
+) -> str:
+    """Réécrit un select-item ``string_agg`` (dédup demandée) en sous-requête scalaire
+    CORRÉLÉE — pour que la déduplication soit RÉELLEMENT appliquée.
+
+    Pourquoi : ``STRING_AGG(DISTINCT x, sep)`` n'existe pas en T-SQL ; sqlglot strip le
+    ``DISTINCT`` silencieusement (→ doublons côté SQL Server ; le miroir SQLite, lui,
+    garde ``GROUP_CONCAT(DISTINCT)`` → asymétrie trompeuse). On dédup EN AMONT via une
+    dérivée ``SELECT DISTINCT`` puis on agrège : correct ET transpile proprement dans
+    les deux dialectes (T-SQL ``STRING_AGG`` / SQLite ``GROUP_CONCAT``), et compose avec
+    des agrégats mixtes (sous-requête scalaire dans le SELECT, sans effet sur le grain
+    du GROUP BY externe).
+
+    Forme générée — la dérivée isole ses propres alias, donc la corrélation
+    ``sa.gkN = <ref GROUP BY externe>`` référence bien le scope EXTERNE (pas de
+    ré-aliasing) ::
+
+        (SELECT STRING_AGG(sa.val, 'sep') [WITHIN GROUP (ORDER BY sa.val)]
+         FROM (SELECT DISTINCT <gb0> AS gk0, ..., <inner_expr> AS val
+               FROM <from> <joins> WHERE <where>) sa
+         WHERE sa.gk0 = <gb0> AND ... AND sa.val IS NOT NULL) AS [alias]
+
+    Sans GROUP BY externe : pas de corrélation (agrège toutes les valeurs distinctes).
+    ``within_group_supported`` (gate compat A2) conditionne le WITHIN GROUP interne.
+    Générique : aucun nom de table/colonne hardcodé — tout vient des composants résolus.
+    """
+    sep_escaped = separator.replace("'", "''")
+    # Dérivée : SELECT DISTINCT <cols de groupe AS gkN>, <inner_expr> AS val FROM ...
+    # `sa` / `gk*` / `val` sont des alias internes RÉSERVÉS, isolés dans la dérivée
+    # (pas de collision possible avec un identifiant réel quoté `[...]`).
+    inner_select = [f"{gb} AS gk{i}" for i, gb in enumerate(group_by_clauses)]
+    inner_select.append(f"{inner_expr} AS val")
+    inner_sql = _ir_assemble_select_sqlglot(
+        from_table=from_table,
+        from_alias=from_alias,
+        select_clauses=inner_select,
+        join_chain=join_chain,
+        table_alias=table_alias,
+        where_clauses=where_clauses,
+        group_by_clauses=[],
+        order_by_clauses=[],
+        limit=None,
+        distinct=True,
+        dialect="tsql",
+    )
+    inner_sql = inner_sql.rstrip().rstrip(";").rstrip()  # retire le ';' terminal
+    # Corrélation sur chaque colonne de GROUP BY externe + skip des NULL (comme STRING_AGG).
+    # Corrélation NULL-safe : `=` ne matche pas une clé de groupe NULL (ex. LEFT-JOIN
+    # miss), alors qu'un vrai STRING_AGG agrégerait ce groupe NULL → on ajoute la branche
+    # IS NULL/IS NULL (cf. revue adversariale — Moyen). Puis skip des valeurs NULL.
+    corr = [
+        f"(sa.gk{i} = {gb} OR (sa.gk{i} IS NULL AND {gb} IS NULL))"
+        for i, gb in enumerate(group_by_clauses)
+    ]
+    corr.append("sa.val IS NOT NULL")
+    where_corr = " AND ".join(corr)
+    within_group = " WITHIN GROUP (ORDER BY sa.val)" if within_group_supported else ""
+    subq = (
+        f"(SELECT STRING_AGG(sa.val, '{sep_escaped}'){within_group} "
+        f"FROM ({inner_sql}) sa WHERE {where_corr})"
+    )
+    return f"{subq} AS {_ir_quote_sql_identifier(alias)}"
 
 
 def ir_to_sql(
@@ -6072,14 +6439,25 @@ def ir_to_sql(
     # Render SELECT items + collect derivations dépendances.
     select_alias_to_expr: dict[str, str] = {}
     select_clauses: list[str] = []
+    # Collecteur de dédup string_agg : rempli par _ir_render_string_agg (via
+    # _ir_render_select_item) pour les items string_agg-avec-distinct. Réécrits en
+    # post-pass plus bas (une fois FROM/joins/WHERE/GROUP construits).
+    string_agg_dedup_sink: list[dict] = []
     for item in ir["select"]:
+        _sink_before = len(string_agg_dedup_sink)
         alias, expr = _ir_render_select_item(
             item,
             concept_resolution,
             table_alias,
             select_alias_to_expr,
             fk_lookup=fk_lookup,
+            string_agg_sink=string_agg_dedup_sink,
         )
+        if len(string_agg_dedup_sink) > _sink_before:
+            # Cet item a produit un string_agg dédup → mémoriser alias + index de clause
+            # (l'index de la clause qu'on s'apprête à append) pour la réécriture post-pass.
+            string_agg_dedup_sink[-1]["alias"] = alias
+            string_agg_dedup_sink[-1]["clause_index"] = len(select_clauses)
         select_alias_to_expr[alias] = expr
         select_clauses.append(f"{expr} AS {_ir_quote_sql_identifier(alias)}")
 
@@ -6161,6 +6539,16 @@ def ir_to_sql(
         if ar not in select_alias_to_expr:
             raise IRValidationError(
                 f"having_filters alias_ref '{ar}' inexistant après render select"
+            )
+        # Garde fail-closed : un HAVING sur un string_agg qui SERA réécrit en sous-requête
+        # corrélée déduppée (cas groupé) filtrerait l'ANCIENNE forme STRING_AGG (DISTINCT
+        # strippé → liste différente de celle affichée) → données incohérentes. On refuse
+        # plutôt que de produire un résultat faux silencieux (cf. revue adversariale).
+        if group_by_clauses and any(_s.get("alias") == ar for _s in string_agg_dedup_sink):
+            raise IRValidationError(
+                f"having_filters sur '{ar}' : filtrer un string_agg dédupliqué via HAVING "
+                f"n'est pas supporté (le SELECT est réécrit en sous-requête corrélée). "
+                f"Retirer ce HAVING ou filtrer en amont."
             )
         agg_expr = select_alias_to_expr[ar]
         op = hf["op"]
@@ -6254,6 +6642,33 @@ def ir_to_sql(
     raw_limit = ir.get("limit")
     if isinstance(raw_limit, int) and raw_limit > 0:
         limit_val = raw_limit
+
+    # Post-pass dédup string_agg : un item string_agg-avec-distinct a rendu un
+    # `STRING_AGG(DISTINCT ...)` dont le DISTINCT est strippé par sqlglot (→ doublons
+    # silencieux côté SQL Server). On le réécrit ICI — maintenant que FROM/joins/WHERE/
+    # GROUP sont construits — en sous-requête scalaire corrélée déduppée (correct +
+    # dual-dialect : T-SQL STRING_AGG / SQLite GROUP_CONCAT).
+    for _sa in string_agg_dedup_sink:
+        if not group_by_clauses:
+            # Cas NON groupé : un STRING_AGG sans GROUP BY fait de la requête externe un
+            # agrégat 1-ligne. Le réécrire en sous-requête scalaire la transformerait en
+            # N lignes (explosion). On GARDE donc la forme in-place pour ce cas (rare) —
+            # la dédup n'y est pas appliquée (le DISTINCT reste strippé), mais sans
+            # régression de cardinalité. Le cas GROUPÉ (le courant) reste corrigé.
+            # (cf. revue adversariale — Critique #1.)
+            continue
+        select_clauses[_sa["clause_index"]] = _ir_build_string_agg_dedup_subquery(
+            alias=_sa["alias"],
+            inner_expr=_sa["inner_expr"],
+            separator=_sa["separator"],
+            within_group_supported=_sa["within_group_supported"],
+            from_table=from_table,
+            from_alias=table_alias[from_table],
+            join_chain=join_chain_emitted,
+            where_clauses=where_clauses,
+            group_by_clauses=group_by_clauses,
+            table_alias=table_alias,
+        )
 
     return _ir_assemble_select_sqlglot(
         from_table=from_table,
@@ -10227,7 +10642,7 @@ def get_fk_lookup_from_db_with_views(
     if not db_path.exists():
         return fk
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:
         return fk
     try:
@@ -10290,9 +10705,12 @@ def get_fk_lookup_from_db(db_path: Path) -> dict[str, list[dict]]:
     Generic : marche sur n'importe quelle SQLite mirror avec PRAGMA support.
     """
     if not db_path.exists():
-        return {}
+        # Mirror absent (prod Docker) → graphe FK depuis komptia.db
+        # (inferred_foreign_keys + view-mined). Bénéficie aussi à
+        # get_fk_lookup_from_db_with_views (early-return) et au fast-path.
+        return _training_data_fk_lookup(KOMPTIA_DB)
     fk_lookup: dict[str, list[dict]] = {}
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         # Liste les tables.
         tables = [
@@ -10468,7 +10886,7 @@ def _list_db_entities(
         raise RuntimeError(f"❌ {db_path} introuvable")
     tables: list[tuple[str, int | None]] = []
     views: list[str] = []
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         for name, kind in conn.execute(
             "SELECT name, type FROM sqlite_master "
@@ -10497,7 +10915,7 @@ def _list_training_data_views(komptia_db: Path) -> list[str]:
     """
     if not komptia_db.exists():
         return []
-    conn = sqlite3.connect(f"file:{komptia_db}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{komptia_db}?mode=ro", uri=True)
     try:
         rows = conn.execute(
             "SELECT DISTINCT table_name FROM training_data "
@@ -10508,6 +10926,252 @@ def _list_training_data_views(komptia_db: Path) -> list[str]:
     finally:
         conn.close()
     return sorted({r[0] for r in rows if r[0]})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fallback schéma/FK depuis komptia.db training_data — quand le mirror dev
+# ``sage_copy.db`` est ABSENT (Docker : data/ exclu de l'image + volume
+# nommé vide ; cf. docs/design/pipeline_mirror_decouple_2026_06_09.md).
+# La prod alimente déjà ces sources programmatiquement via schema_sync
+# (0 appel LLM) : lignes DDL (colonnes), table ``inferred_foreign_keys``
+# (FK value-containment + naming) et patterns ``join_pattern:*`` (view-mined).
+# Aucun nom de table/colonne hardcodé — tout est lu depuis training_data.
+# ─────────────────────────────────────────────────────────────────────
+
+# Pas de cache module-level pour ces helpers : le parse DDL (quelques
+# centaines de lignes) est bon marché vs un run pipeline, et un cache keyé sur
+# le mtime de komptia.db (BDD locale très active, WAL) grossirait sans borne
+# (RGH-1) ET servirait des données périmées entre 2 checkpoints WAL (RGH-2).
+# On relit à chaque appel → toujours frais, mémoire O(1).
+
+# Premiers mots de ligne DDL qui ne sont PAS des colonnes (contraintes).
+_DDL_NON_COLUMN_KW = {
+    "constraint",
+    "primary",
+    "foreign",
+    "unique",
+    "check",
+    "key",
+    "index",
+    "with",
+}
+_DDL_COL_NAME_RE = re.compile(r'^\s*(?:\[([^\]]+)\]|"([^"]+)"|`([^`]+)`|([A-Za-z_@#][\w@#$]*))')
+
+
+def _split_top_level_commas(s: str) -> list[str]:
+    """Découpe ``s`` sur les virgules de niveau 0 (hors parenthèses) → ne casse
+    pas un type ``DECIMAL(18,2)``. Sert au parse DDL colonne-par-colonne."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _columns_from_ddl(ddl: str) -> set[str]:
+    """Extrait les noms de colonnes (lowercase) d'un ``CREATE TABLE`` généré par
+    ``schema_sync`` (``    <col> <type> <NULL|NOT NULL>,`` ; cf.
+    ``_generate_ddl_from_info_schema`` / ``_generate_ddl``).
+
+    Robuste :
+    - retire le commentaire ``-- ...`` de chaque ligne PUIS découpe sur les
+      virgules de top-niveau → gère 1-colonne/ligne ET plusieurs colonnes par
+      ligne / corps sur une seule ligne, sans casser ``DECIMAL(18,2)`` ;
+    - accepte identifiant nu OU délimité (``[Key]`` / ``"Index"`` / `` `x` ``) ;
+    - le filtre mot-clé (CONSTRAINT/PRIMARY/FOREIGN/...) ne s'applique qu'aux
+      identifiants NUS : une colonne délimitée ``[Key]`` est TOUJOURS une
+      colonne (T-SQL autorise les mots réservés ainsi), jamais une contrainte
+      (toujours nue). Sans cette distinction, une vraie colonne nommée
+      ``Key``/``Index``/``Check`` serait silencieusement perdue (revue DI-1/RGH-3).
+
+    Best-effort — une colonne ratée = pas de pré-validation pour elle, l'oracle
+    live (probes SQL Server) reste l'autorité. Generic : aucun nom hardcodé.
+    """
+    start = ddl.find("(")
+    end = ddl.rfind(")")
+    if start == -1 or end == -1 or end <= start:
+        return set()
+    body = ddl[start + 1 : end]
+    cols: set[str] = set()
+    for raw in body.splitlines():
+        # Retire le commentaire de ligne AVANT le découpage virgules.
+        line = raw.split("--", 1)[0]
+        for seg in _split_top_level_commas(line):
+            seg = seg.strip()
+            if not seg:
+                continue
+            m = _DDL_COL_NAME_RE.match(seg)
+            if not m:
+                continue
+            delimited = m.group(1) or m.group(2) or m.group(3)
+            bare = m.group(4)
+            if bare is not None and bare.lower() in _DDL_NON_COLUMN_KW:
+                # Un identifiant NU mot-clé n'est une CONTRAINTE (à ignorer) que
+                # s'il en a la FORME : ``CONSTRAINT ...`` / ``PRIMARY|FOREIGN KEY
+                # ...`` (toujours suivis de ``KEY``), ou ``MOTCLÉ ( ... )``
+                # standalone (UNIQUE/CHECK/KEY/INDEX/WITH). Une vraie COLONNE
+                # nommée comme un mot-clé (``Key nvarchar(50) NULL``) est suivie
+                # d'un TYPE, pas d'une ``(`` → on la GARDE (revue DI-1). Les DDL
+                # prod (_generate_ddl_from_info_schema) n'ont d'ailleurs aucune
+                # ligne de contrainte ; ce filtre ne sert que le path YAML/admin.
+                rest = seg[m.end() :].lstrip()
+                if bare.lower() in {"constraint", "primary", "foreign"} or rest.startswith("("):
+                    continue
+            name = delimited if delimited is not None else bare
+            if name:
+                cols.add(name.lower())
+    return cols
+
+
+def _training_data_entities(
+    komptia_db: Path,
+) -> tuple[list[tuple[str, int | None]], list[str]]:
+    """``(tables, vues)`` depuis ``komptia.db`` training_data — fallback prod de
+    ``_list_db_entities`` quand le mirror est absent.
+
+    Tables = ``DISTINCT table_name`` des lignes DDL actives (même requête que
+    ``schema_loader``). ``row_count`` = ``None`` (training_data ne porte pas de
+    COUNT → ``_format_tables_block`` rend ``(?)`` ; le LLM filtre par pertinence
+    logique, pas par taille). Vues = ``_list_training_data_views``.
+    """
+    views = _list_training_data_views(komptia_db)
+    if not komptia_db.exists():
+        return [], views
+    tables: list[tuple[str, int | None]] = []
+    try:
+        conn = _connect_sqlite(f"file:{komptia_db}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SEC)
+    except sqlite3.Error:
+        return [], views
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT table_name FROM training_data "
+            "WHERE data_type IN ('DDL', 'ddl') AND is_active = 1 "
+            "AND table_name IS NOT NULL ORDER BY table_name"
+        ).fetchall()
+        tables = [(r[0], None) for r in rows if r[0]]
+    except sqlite3.Error:
+        tables = []
+    finally:
+        conn.close()
+    return tables, views
+
+
+def _list_entities_with_fallback(
+    db_path: Path, komptia_db: Path
+) -> tuple[list[tuple[str, int | None]], list[str]]:
+    """``_list_db_entities`` si le mirror existe (dev), sinon fallback
+    training_data (prod). Loggue toujours la source — jamais ``([], [])`` muet
+    (le caller doit pouvoir constater l'absence des deux sources)."""
+    if db_path.exists():
+        return _list_db_entities(db_path)
+    tables, views = _training_data_entities(komptia_db)
+    if not tables and not views:
+        print(
+            f"⚠️  Aucune source d'entités : mirror {db_path.name} absent ET "
+            f"training_data ({komptia_db.name}) vide/illisible. Phase 1.2.5 "
+            f"tourne sans liste d'entités.",
+            flush=True,
+        )
+    else:
+        print(
+            f"ℹ️  Mirror {db_path.name} absent → entités depuis training_data "
+            f"({len(tables)} tables, {len(views)} vues).",
+            flush=True,
+        )
+    return tables, views
+
+
+def _training_data_schema_map(komptia_db: Path) -> dict[str, set[str]]:
+    """``{table_lower: {col_lower}}`` depuis le DDL de training_data — fallback
+    prod de ``get_sqlite_schema``. Best-effort (parse DDL). Les vues sont
+    ajoutées avec un set vide : elles EXISTENT (pas de faux ``unknown_table``)
+    mais sans validation colonne — l'oracle live backstop."""
+    if not komptia_db.exists():
+        return {}
+    schema: dict[str, set[str]] = {}
+    try:
+        conn = _connect_sqlite(f"file:{komptia_db}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SEC)
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT table_name, content FROM training_data "
+            "WHERE data_type IN ('DDL', 'ddl') AND is_active = 1 "
+            "AND table_name IS NOT NULL AND content IS NOT NULL"
+        ).fetchall()
+        for tname, content in rows:
+            if not tname:
+                continue
+            schema[str(tname).lower()] = _columns_from_ddl(content or "")
+    except sqlite3.Error:
+        schema = {}
+    finally:
+        conn.close()
+    for v in _list_training_data_views(komptia_db):
+        schema.setdefault(v.lower(), set())
+    return schema
+
+
+def _training_data_fk_lookup(komptia_db: Path) -> dict[str, list[dict]]:
+    """``{table: [{to_table, from_col, to_col}]}`` depuis komptia.db (FK
+    ``inferred_foreign_keys`` + view-mined) — fallback prod de
+    ``get_fk_lookup_from_db``. Single-direction child→parent (parité avec
+    PRAGMA foreign_key_list du mirror : ``inferred`` est source⊆target =
+    enfant→parent).
+
+    Les arêtes view-mined ont des colonnes ON potentiellement mal assignées
+    (alias non résolus, cf. revue DI-3) → on NE les laisse PAS redéfinir une
+    paire déjà couverte par une FK inférée (colonnes fiables) ; elles ne
+    comblent que les paires que l'inférence n'a pas trouvées. Non caché
+    (cf. note RGH-1/RGH-2 plus haut)."""
+    if not komptia_db.exists():
+        return {}
+    inferred = extract_fk_inferred_persistent(komptia_db)
+    view_mined = extract_join_patterns_from_komptia(komptia_db)
+    inferred_pairs: set[tuple[str, str]] = set()
+    for e in inferred:
+        src = (e.get("source") or "").lower()
+        tgt = (e.get("target") or "").lower()
+        if src and tgt:
+            inferred_pairs.add(tuple(sorted((src, tgt))))
+    fk: dict[str, list[dict]] = {}
+    seen: set[tuple] = set()
+
+    def _add(e: dict) -> None:
+        src = e.get("source") or ""
+        tgt = e.get("target") or ""
+        sc = e.get("src_col") or ""
+        tc = e.get("tgt_col") or ""
+        if not src or not tgt:
+            return
+        kk = (src, sc, tgt, tc)
+        if kk in seen:
+            return
+        seen.add(kk)
+        fk.setdefault(src, []).append({"to_table": tgt, "from_col": sc, "to_col": tc})
+
+    for e in inferred:
+        _add(e)
+    for e in view_mined:
+        src = (e.get("source") or "").lower()
+        tgt = (e.get("target") or "").lower()
+        if src and tgt and tuple(sorted((src, tgt))) in inferred_pairs:
+            continue  # paire déjà couverte par une FK inférée fiable (colonnes sûres)
+        _add(e)
+    return fk
 
 
 def _format_tables_block(tables: list[tuple[str, int | None]]) -> str:
@@ -10967,7 +11631,7 @@ async def phase_1_2_5_filter(
     """
     from app.services.ai import user_qa_session as qa_session
 
-    tables, views = _list_db_entities(db_path)
+    tables, views = _list_entities_with_fallback(db_path, KOMPTIA_DB)
     real_tables = {n for n, _ in tables}
     real_views = set(views)
 
@@ -12837,9 +13501,15 @@ def get_sqlite_schema(db_path: Path) -> dict[str, set[str]]:
 
     Utilisé pour valider les requêtes diagnostiques avant exécution
     (refuser celles qui référencent des colonnes inventées).
+
+    Mirror absent (prod Docker) → fallback DDL training_data (best-effort) :
+    restaure la pré-validation colonnes. Reste backstoppé par l'oracle live
+    (probes exécutées sur le vrai SQL Server). Cf. design pipeline_mirror_decouple.
     """
+    if not db_path.exists():
+        return _training_data_schema_map(KOMPTIA_DB)
     schema: dict[str, set[str]] = {}
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SEC)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SEC)
     try:
         for name, kind in conn.execute(
             "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
@@ -12993,6 +13663,16 @@ def validate_sql_columns_against_schema(
             if resolved_table not in schema:
                 continue
 
+            # Set de colonnes VIDE = colonnes inconnues pour cette entité
+            # (ex: vues du fallback training_data prod, dont les colonnes ne
+            # sont pas parsées). On NE PEUT PAS valider → skip (fail-open pour
+            # cette entité, comme le cas "table absente" ci-dessus). Sans ça,
+            # `col not in set()` est TOUJOURS vrai → faux unknown_column sur
+            # CHAQUE colonne de la vue → probe rejetée à tort (revue DI-2 ;
+            # l'oracle live reste l'autorité).
+            if not schema[resolved_table]:
+                continue
+
             # Dédup par (table, col) — éviter de reporter 5x la même colonne.
             sig = (resolved_table, col_name)
             if sig in seen_signatures:
@@ -13032,7 +13712,7 @@ def execute_sqlite(
     rows: list[tuple] = []
     columns: list[str] = []
     err: str | None = None
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SEC)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SEC)
     _register_tsql_udfs(conn)
     try:
         cur = conn.execute(sql)
@@ -13056,7 +13736,7 @@ def get_table_schema(db_path: Path, table_name: str) -> dict | None:
     """
     if not db_path.exists():
         return None
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         row = conn.execute(
             "SELECT type, sql FROM sqlite_master WHERE name=? LIMIT 1",
@@ -13296,7 +13976,7 @@ def _build_runtime_context_block() -> str:
         "vendredi", "samedi", "dimanche",
     )[now.weekday()]
     quarter = (now.month - 1) // 3 + 1
-    return (
+    temporal = (
         "# Contexte temporel d'exécution\n\n"
         f"- Date courante : **{now.strftime('%Y-%m-%d')}** ({weekday_fr})\n"
         f"- Heure locale : {now.strftime('%H:%M')}\n"
@@ -13306,6 +13986,51 @@ def _build_runtime_context_block() -> str:
         "Utilise ces valeurs pour interpréter les références temporelles "
         "relatives de la requête utilisateur (« ce mois », « l'année "
         "dernière », « le trimestre en cours », « hier », etc.).\n"
+    )
+    # On N'AJOUTE PAS le bloc « serveur cible » ici : _build_runtime_context_block
+    # alimente AUSSI le composer IR (dialect-agnostic par doctrine — cf. son call-site
+    # « PAS de dialect T-SQL ici ») et les factsheets. Le bloc compat est injecté
+    # UNIQUEMENT au call-site qui écrit du T-SQL natif (phase_4_compose_sql), via
+    # _build_target_server_block().
+    return temporal
+
+
+def _build_target_server_block() -> str:
+    """Bloc user-prompt : version moteur + niveau de compatibilité du SQL Server cible.
+
+    Injecté dans le user prompt (via ``_build_runtime_context_block``) → per-run, ne
+    casse pas le cache du system prompt. Permet aux phases qui composent du SQL de
+    générer du T-SQL valide pour le compatibility level RÉEL et d'éviter les
+    constructions refusées en deçà d'un seuil (ex. ``STRING_AGG ... WITHIN GROUP``
+    exige compat ≥ 110 → sinon erreur 42000 à l'exécution).
+
+    Source = SSoT ``get_sql_server_version_label_sync()`` (peuplé au schema sync ;
+    le libellé embarque la compat, ex. « SQL Server 2019 (compatibilité 130 = syntaxe
+    SQL Server 2016) »). Fail-open : libellé absent (aucun sync / test isolé) ou
+    générique « SQL Server » → bloc OMIS (on n'affirme rien de faux ; le guide T-SQL
+    statique reste le filet). Généricité : aucune version/compat hardcodée — tout vient
+    du serveur réellement connecté.
+    """
+    try:
+        from app.services.database.db_config_service import (
+            get_sql_server_version_label_sync,
+        )
+
+        label = (get_sql_server_version_label_sync() or "").strip()
+    except Exception:
+        label = ""
+    if not label or label.lower() == "sql server":
+        return ""
+    return (
+        "\n# Serveur SQL cible\n\n"
+        f"- Version / compatibilité : **{label}**\n"
+        "\n"
+        "Génère du T-SQL valide pour CE niveau de compatibilité, même si le moteur "
+        "est plus récent. Si le libellé indique « (compatibilité NNN = syntaxe SQL "
+        "Server AAAA) », n'utilise QUE des fonctions disponibles dans SQL Server AAAA "
+        "ou antérieur. Exemple : `STRING_AGG` et `... WITHIN GROUP` exigent SQL Server "
+        "2017 (compat 140) — en deçà, concatène avec `STUFF((... FOR XML PATH('')))` "
+        "(ordonné, compat-safe) plutôt que STRING_AGG.\n"
     )
 
 
@@ -14736,7 +15461,9 @@ async def phase_3_concept_factsheets(
     _check_cancel_or_raise()
 
     # Exécute les probes pour chaque fiche en mode "ok"
-    schema_map = get_sqlite_schema(db_path) if db_path.exists() else {}
+    # get_sqlite_schema gère lui-même le fallback training_data si le mirror
+    # est absent (prod Docker) — ne pas court-circuiter avec {} ici.
+    schema_map = get_sqlite_schema(db_path)
 
     # Si use_sage : ouvrir UN connecteur Sage pour toutes les probes (vs un par
     # probe = 100+ connexions). On exécute alors le T-SQL en natif (pas de
@@ -14888,6 +15615,29 @@ async def phase_3_concept_factsheets(
                         f"{', '.join(u['column'] for u in unknown_cols)})"
                     )
                     return
+
+            # L3O2 — RLS row-level data_access AVANT exécution. La probe exécute
+            # du SQL écrit par le LLM via le connecteur brut ; sans ce passage un
+            # user RESTREINT lit des lignes/colonnes interdites (canal de
+            # cardinalité). Fail-closed : si la probe touche une donnée interdite
+            # à l'user, on la skip proprement (pas d'exécution). No-op pour un
+            # user sans restriction / run CLI sans user.
+            from app.services.data_access.enforcer import (
+                DataAccessDeniedError as _DataAccessDeniedError,
+            )
+
+            try:
+                sql = await _enforce_pipeline_probe_rls(sql)
+            except _DataAccessDeniedError:
+                probe["executed"] = False
+                probe["error"] = "probe_denied_by_data_access"
+                probe["row_count"] = 0
+                factsheet_ref["probes"].append(probe)
+                await _log(
+                    f"  ⚠ [{concept_name}] {probe['id']} : probe refusée "
+                    f"(data_access — donnée interdite à l'utilisateur)"
+                )
+                return
 
             if sage_conn is not None:
                 # T-SQL natif sur SQL Server. asyncio.wait_for cap par probe.
@@ -15401,7 +16151,10 @@ async def phase_4_compose_sql(
     p4_qa_block_inline = (p4_qa_block + "\n\n") if p4_qa_block else ""
 
     user_prompt = COMPOSE_SQL_USER_TEMPLATE.format(
-        runtime_context=_build_runtime_context_block(),
+        # Compose natif = SEUL chemin où le LLM écrit du T-SQL directement → on lui
+        # injecte ici (et pas dans le composer IR dialect-agnostic) la version/compat
+        # cible via _build_target_server_block().
+        runtime_context=_build_runtime_context_block() + _build_target_server_block(),
         user_query=query,
         session_qa_block=p4_qa_block_inline,
         explicit_values_block=explicit_values_block,
@@ -15518,6 +16271,7 @@ async def run_pipeline(
     query: str,
     *,
     only_phase: str | None = None,
+    stop_after_phase: str | None = None,
     resume: bool = False,
     no_clean: bool = False,
     block_all_views: bool = False,
@@ -15536,6 +16290,7 @@ async def run_pipeline(
     progress_callback: "Callable[[str, str, dict | None], Awaitable[None]] | None" = None,
     additional_context: str | None = None,
     user_id: int | None = None,
+    conversation_id: str | None = None,
 ) -> PipelineState:
     """Orchestre les 8 phases en fonction des flags.
 
@@ -15581,10 +16336,49 @@ async def run_pipeline(
     # Pose l'identité du run en ContextVar (même rationale que cancel_event :
     # les phases profondes lisent user_id sans changer toutes les signatures).
     user_token = _pipeline_user_id.set(user_id)
+    # L3O2 — charge l'objet User UNE fois (id + role) pour le RLS row-level des
+    # probes Phase-3 (cf. ``_enforce_pipeline_probe_rls``). 1 requête/run, cachée
+    # ensuite par les caches view/rules de l'enforcer. Fail-open sur échec de
+    # chargement (DB blip / user supprimé) : RLS skip sur ce run — pas de
+    # régression (état pré-fix = aucun RLS sur les probes) ; log pour traçage.
+    _pipeline_user_obj: object | None = None
+    if user_id is not None:
+        try:
+            from app.core.database import get_session as _get_session
+            from app.models.user import User as _User
+
+            async with _get_session() as _user_sess:
+                _pipeline_user_obj = await _user_sess.get(_User, user_id)
+        except Exception:  # noqa: BLE001 — best-effort, fail-open + log
+            logger.warning(
+                "pipeline: chargement User(%s) pour RLS probes échoué — RLS skip ce run",
+                user_id,
+                exc_info=True,
+            )
+            _pipeline_user_obj = None
+    pipeline_user_token = _pipeline_user.set(_pipeline_user_obj)
+    # Attribue les appels LLM de la pipeline à la conversation Iris (puce coût
+    # /iris + get_conversation_cost_usd). Reset en finally comme user_id.
+    conv_token = _pipeline_conversation_id.set(conversation_id)
+    # Isole la session Q/A PAR RUN (ContextVar) sur l'output_dir du run :
+    # (a) supprime le partage/clobber cross-user du fichier de session (réponses
+    # = noms métier confidentiels) sous concurrence multi-user in-process — deux
+    # run_pipeline concurrents (users différents) sont des asyncio.Task distinctes
+    # qui voient chacune leur propre valeur ; (b) la session vit dans l'output_dir
+    # PER-RUN, donc sous le volume au runtime (persistée proprement car isolée).
+    # PAS de reset (≠ cancel_event/user_id) : pipeline_runner lit la session
+    # APRÈS run_pipeline (même tâche) pour le récap final — un reset rendrait
+    # cette lecture sur le défaut. Aucun leak : chaque run est sa propre
+    # asyncio.Task (contexte copié à create_task), et run_pipeline re-set au
+    # début de chaque run → une valeur héritée serait de toute façon écrasée.
+    from app.services.ai import user_qa_session as _qa_session
+
+    _qa_session.set_session_file(paths.output_dir / "user_qa_session.json")
     try:
         return await _run_pipeline_inner(
             query=query,
             only_phase=only_phase,
+            stop_after_phase=stop_after_phase,
             resume=resume,
             no_clean=no_clean,
             block_all_views=block_all_views,
@@ -15606,12 +16400,15 @@ async def run_pipeline(
     finally:
         _pipeline_cancel_event.reset(cancel_token)
         _pipeline_user_id.reset(user_token)
+        _pipeline_user.reset(pipeline_user_token)
+        _pipeline_conversation_id.reset(conv_token)
 
 
 async def _run_pipeline_inner(
     *,
     query: str,
     only_phase: str | None,
+    stop_after_phase: str | None,
     resume: bool,
     no_clean: bool,
     block_all_views: bool,
@@ -15680,26 +16477,15 @@ async def _run_pipeline_inner(
     api_key = get_api_key()
     model_id = get_configured_model()
 
-    # Liste des phases à exécuter
-    if only_phase:
-        phases_to_run = [
-            (pid, attr, label) for pid, attr, label in PHASES_ORDER if pid == only_phase
-        ]
-        if not phases_to_run:
-            valid = ", ".join(p[0] for p in PHASES_ORDER)
-            raise SystemExit(f"❌ Phase inconnue : {only_phase}. Valides : {valid}")
-    elif resume:
-        last = state.last_completed_phase()
-        if last is None:
-            phases_to_run = list(PHASES_ORDER)
-        else:
-            idx = next(i for i, (pid, _, _) in enumerate(PHASES_ORDER) if pid == last)
-            phases_to_run = list(PHASES_ORDER[idx + 1 :])
-            print(
-                f"→ Resume après phase {last} — reprend à {phases_to_run[0][0] if phases_to_run else '(rien)'}"
-            )
-    else:
-        phases_to_run = list(PHASES_ORDER)
+    # Liste des phases à exécuter (helper UNIQUE — design D1/D3,
+    # docs/design/iris_stop_at_phase.md). Gère only_phase / stop_after_phase /
+    # resume / run complet + fail-closed sur conflit ou phase inconnue.
+    phases_to_run = _build_phases_to_run(
+        only_phase=only_phase,
+        stop_after_phase=stop_after_phase,
+        resume=resume,
+        state=state,
+    )
 
     # Boucle d'exécution
     for phase_id, attr, label in phases_to_run:
@@ -15708,6 +16494,7 @@ async def _run_pipeline_inner(
         # déjà fini, on sort avant la suivante).
         if cancel_event is not None and cancel_event.is_set():
             print(f"\n⚠ Pipeline annulée avant {label} (cancel_event set)", flush=True)
+            state.terminal_reason = "cancelled"  # D2 — PAS un arrêt propre
             state.save(paths.run_json)
             raise asyncio.CancelledError(f"pipeline cancelled before phase {phase_id}")
 
@@ -15747,10 +16534,12 @@ async def _run_pipeline_inner(
                     await progress_callback(phase_id, "failed", {"error_message": str(e)})
                 except Exception:  # noqa: BLE001
                     pass
+            state.terminal_reason = "failed"  # D2 — arrêt anormal, pas une hypothèse valide
             state.save(paths.run_json)
             return state
         except asyncio.CancelledError:
             # Propagé depuis une phase qui a vu le cancel_event
+            state.terminal_reason = "cancelled"  # D2
             state.save(paths.run_json)
             raise
         except Exception as exc:  # noqa: BLE001
@@ -15762,6 +16551,15 @@ async def _run_pipeline_inner(
                     await progress_callback(phase_id, "failed", {"error_message": str(exc)})
                 except Exception:  # noqa: BLE001
                     pass
+            # D2/CRIT-B — persiste l'échec dans run.json pour que le resume
+            # (T15) refuse un run non-clean et que la carte affiche un état
+            # d'erreur (jamais une hypothèse trompeuse). Best-effort : ne
+            # jamais masquer l'exception d'origine.
+            state.terminal_reason = "failed"
+            try:
+                state.save(paths.run_json)
+            except Exception:  # noqa: BLE001
+                pass
             raise
 
         dur = time.time() - t0
@@ -15783,6 +16581,17 @@ async def _run_pipeline_inner(
                     "progress_callback(complete) raised — pipeline continues"
                 )
 
+    # terminal_reason (D2) — déterminé par le CONTRÔLE DE FLUX, pas inféré
+    # depuis les attrs (anti CRIT-B). La boucle a fini SANS exception : si la
+    # dernière phase exécutée est la dernière de PHASES_ORDER → run complet
+    # (completed) ; sinon arrêt intermédiaire propre (stopped_clean).
+    # phases_to_run vide (resume sur run déjà complet) → on ne touche à rien.
+    if phases_to_run:
+        _last_ran = phases_to_run[-1][0]
+        state.terminal_reason = (
+            "completed" if _last_ran == PHASES_ORDER[-1][0] else "stopped_clean"
+        )
+
     # SQL final → run.sql (humain) — priorité Phase 5 → Phase 3
     if state.sql_final and state.sql_final.get("sql"):
         state.final_sql = state.sql_final["sql"]
@@ -15793,6 +16602,21 @@ async def _run_pipeline_inner(
         except ValueError:
             # output_dir hors de ROOT (test ou conteneur monté ailleurs)
             print(f"\n→ SQL final écrit : {paths.run_sql}")
+    elif getattr(state, "terminal_reason", None) == "completed":
+        # FIX (hunt it.49, BF7) : un run flaggé « completed » SANS ``final_sql`` est un
+        # échec SILENCIEUX. Cas legacy déprécié : ``_extract_sql_from_llm_response`` peut
+        # renvoyer "" → ``state.sql_final = {"sql": ""}`` (falsy) → la garde ci-dessus ne
+        # set jamais ``final_sql`` → ``run.sql`` JAMAIS écrit et AUCUNE erreur levée. On
+        # rend l'anomalie OBSERVABLE (WARNING) au lieu de laisser un run « réussi » sans
+        # artefact SQL inspectable. (On n'écrit PAS de fichier vide : ce ne serait pas un
+        # artefact valide ; on ne dégrade pas non plus terminal_reason — trop risqué pour
+        # un bord déprécié — la trace log suffit au diagnostic.)
+        logger.warning(
+            "Pipeline run 'completed' mais SANS SQL final (sql_final=%r) → %s NON écrit. "
+            "Probable extraction SQL vide (mode legacy déprécié).",
+            state.sql_final,
+            paths.run_sql.name,
+        )
 
     # Récap markdown lisible — concatène les trace_text de chaque phase
     # (équivalent monolithique des anciens fichiers extracted_terms.txt,
@@ -16507,6 +17331,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exécute UNE phase isolée (lit run.json pour les amont)",
     )
     p.add_argument(
+        "--stop-after-phase",
+        choices=valid_phases,
+        default=None,
+        help="Exécute de la 1re phase JUSQU'À cette phase INCLUSE puis stop "
+        "(run partiel : blueprint 1.5 / factsheets 3). Nécessite la query. "
+        "Exclusif avec --only-phase et --resume.",
+    )
+    p.add_argument(
         "--resume",
         action="store_true",
         help="Reprend après la dernière phase complétée dans run.json",
@@ -16599,6 +17431,7 @@ def main() -> int:
         run_pipeline(
             query,
             only_phase=args.only_phase,
+            stop_after_phase=args.stop_after_phase,
             resume=args.resume,
             no_clean=args.no_clean,
             block_all_views=args.block_all_views,
@@ -17075,9 +17908,17 @@ def extract_fk_explicit(db_path: Path) -> list[dict]:
     """Extract declared FK via SQLite PRAGMA foreign_key_list.
 
     Returns a list of {source, src_col, target, tgt_col, kind='explicit'}.
+
+    Mirror absent (prod Docker) → ``[]`` : les FK déclarées vivent dans le
+    mirror SQLite dev ; en prod le graphe FK est porté par komptia.db
+    (``inferred_foreign_keys`` + view-mined). Cohérent avec les jumelles
+    ``extract_fk_inferred_persistent`` / ``extract_join_patterns_from_komptia``
+    qui gardent déjà ``not db_path.exists()``.
     """
+    if not db_path.exists():
+        return []
     fks: list[dict] = []
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
         for tbl in tables:
@@ -17114,8 +17955,14 @@ def extract_fk_implicit(db_path: Path) -> list[dict]:
     """Detect implicit FK via Sage-style naming convention.
 
     Returns a list of {source, src_col, target, tgt_col, kind='implicit', evidence}.
+
+    Mirror absent (prod Docker) → ``[]`` : la convention de nommage est
+    rejouée par ``schema_sync`` dans ``inferred_foreign_keys`` (naming + value,
+    conf≥0.85), source FK de la prod. Cf. design pipeline_mirror_decouple.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    if not db_path.exists():
+        return []
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         # Build prefix → table mapping (case-insensitive)
         # A table has a "prefix" if it has a column ^<prefix>NoEnreg$ (its PK).
@@ -17210,7 +18057,7 @@ def extract_join_patterns_from_komptia(db_path: Path) -> list[dict]:
         return []
     edges: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
             "SELECT category, content FROM training_data "
@@ -17283,7 +18130,7 @@ def extract_fk_inferred_persistent(db_path: Path) -> list[dict]:
         return []
     edges: list[dict] = []
     seen: set[tuple[str, str, str, str]] = set()
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         # ``inferred_foreign_keys`` peut ne pas exister sur une BDD ancienne ;
         # sqlite_master nous renseigne sans risquer OperationalError au SELECT.
@@ -17342,7 +18189,14 @@ def extract_view_dependencies(db_path: Path) -> dict[str, set[str]]:
     clauses — works for any SQL Server view migrated to SQLite. Identifiers may
     appear with optional schema prefix (`dbo.`), with brackets `[name]`, or
     quoted `"name"` — we normalize.
+
+    Mirror absent (prod Docker) → ``{}`` : les CREATE VIEW DDL vivent dans le
+    mirror SQLite dev. Sans garde, ``_connect_sqlite(mode=ro)`` planterait sur
+    le fichier inexistant (appelé par ``_p15_main_legacy``). En prod la
+    centralité-vue n'est pas calculée — non bloquant (revue crash-completeness).
     """
+    if not db_path.exists():
+        return {}
     # Regex: capture identifiers after FROM or JOIN keywords (case-insensitive,
     # word-boundary). Skips subquery markers.
     ref_re = re.compile(
@@ -17353,7 +18207,7 @@ def extract_view_dependencies(db_path: Path) -> dict[str, set[str]]:
     )
 
     deps: dict[str, set[str]] = {}
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = _connect_sqlite(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE type='view' AND sql IS NOT NULL"
@@ -18539,8 +19393,17 @@ def _p15_main_legacy():
         print("❌ Input file has no lines")
         return 1
     if not DB.exists():
-        print(f"❌ Database missing: {DB}")
-        return 1
+        # Mirror dev ``sage_copy.db`` absent (prod Docker) : on NE bail PAS
+        # (sinon phase_1_5_scoring_fk lève RuntimeError → pipeline mort, revue
+        # crash-completeness). Les FK explicit/implicit (lues du mirror)
+        # tombent à [] via leurs gardes ; le graphe FK est porté par komptia.db
+        # (view-mined + inferred_foreign_keys) ; extract_view_dependencies est
+        # gardé de même. Cf. docs/design/pipeline_mirror_decouple_2026_06_09.md.
+        print(
+            f"ℹ️  Mirror {DB.name} absent → Phase 1.5 : FK depuis komptia.db "
+            f"uniquement (view-mined + inferred).",
+            flush=True,
+        )
 
     print("Parsing user query...")
     query = _p15_parse_user_query(lines)
@@ -18930,6 +19793,11 @@ def _p15_main_legacy():
     print(f"  Lines:  {len(annex_out):>10,}")
     print(f"  Bytes:  {len(annex_text.encode('utf-8')):>10,}")
     try:
+        # tiktoken : dépendance OPTIONNELLE volontairement NON déclarée dans
+        # requirements.txt — elle ne sert QU'à cette stat d'affichage (print,
+        # non load-bearing : aucun budget/troncature n'en dépend). Fallback
+        # propre ci-dessous si absente. NE PAS l'ajouter comme dépendance pour
+        # « corriger » ce warning (poids image inutile pour une métrique debug).
         import tiktoken
 
         enc = tiktoken.get_encoding("cl100k_base")

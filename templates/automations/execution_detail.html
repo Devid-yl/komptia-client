@@ -55,7 +55,7 @@
                 <p class="text-xs text-gray-500 mb-0.5 dark:text-gray-400">D&eacute;but</p>
                 <p class="text-sm font-medium text-gray-900 dark:text-gray-100">
                     {% if execution.started_at %}
-                    <time datetime="{{ execution.started_at.isoformat() }}+00:00"
+                    <time datetime="{{ iso_utc(execution.started_at) }}"
                           data-fmt-local="datetime">{{ execution.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC</time>
                     {% else %}-{% end %}
                 </p>
@@ -64,7 +64,7 @@
                 <p class="text-xs text-gray-500 mb-0.5 dark:text-gray-400">Fin</p>
                 <p class="text-sm font-medium text-gray-900 dark:text-gray-100">
                     {% if execution.finished_at %}
-                    {{ execution.finished_at.strftime('%d/%m/%Y %H:%M:%S') }}
+                    <time datetime="{{ iso_utc(execution.finished_at) }}" data-fmt-local="datetime">{{ execution.finished_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC</time>
                     {% else %}-{% end %}
                 </p>
             </div>
@@ -344,7 +344,7 @@
                             {% end %}
                             {% if step.started_at %}
                             <time class="text-gray-400 dark:text-gray-500"
-                                  datetime="{{ step.started_at.isoformat() }}+00:00"
+                                  datetime="{{ iso_utc(step.started_at) }}"
                                   data-fmt-local="time"
                                   title="{{ step.started_at.strftime('%d/%m/%Y %H:%M:%S') }} UTC">{{ step.started_at.strftime('%H:%M:%S') }} UTC</time>
                             {% end %}
@@ -404,4 +404,43 @@
 <script src="/static/vendor/drawflow/drawflow.min.js" nonce="{{ handler.csp_nonce }}"></script>
 <script src="/static/js/automation-canvas.js" nonce="{{ handler.csp_nonce }}"></script>
 {% end %}
+<script nonce="{{ handler.csp_nonce }}">
+    /* Onboarding automations_execution_detail_v1 — tour de 1re visite.
+       onboarding-tour.js est chargé en amont par base.html (avant le
+       bloc scripts), donc window.KomptiaOnboarding est défini ici.
+       Anti-cascade (1 modal/session) + persistance serveur+localStorage
+       gérés par le composant. Best-effort : un échec n'impacte pas la page. */
+    (function () {
+        if (!window.KomptiaOnboarding ||
+            typeof window.KomptiaOnboarding.start !== 'function') return;
+        try {
+            window.KomptiaOnboarding.start({
+                key: 'automations_execution_detail_v1',
+                title: 'Comprendre une exécution',
+                steps: [
+                    {
+                        icon: 'chart',
+                        title: 'Le bilan de cette exécution',
+                        text: 'En haut, le bandeau résume tout : le statut (Réussi, Partiel, Échec…), l\'heure de début et de fin, la durée et le nombre de lignes produites. Si l\'exécution a échoué, un encadré rouge affiche le message d\'erreur précis pour vous aider à comprendre ce qui a bloqué.'
+                    },
+                    {
+                        icon: 'sparkle',
+                        title: 'Voir le déroulé étape par étape',
+                        text: 'Quand l\'automatisation enchaîne plusieurs étapes, deux vues sont disponibles via les onglets « DAG » et « Timeline ». Le schéma DAG montre le flux complet : cliquez sur une étape pour ouvrir son détail à droite (durée, lignes entrantes/sortantes, erreurs). La Timeline affiche la même chose en liste chronologique.'
+                    },
+                    {
+                        icon: 'shield',
+                        title: 'Comprendre les décisions d\'Iris',
+                        text: 'Si une étape laisse l\'agent Iris décider, le panneau « Décisions Iris » explique pourquoi : l\'instruction reçue, le résumé de sa décision et les variables qu\'il a renseignées. Vous gardez ainsi la main sur ce que l\'IA a fait, en toute transparence.'
+                    },
+                    {
+                        icon: 'rocket',
+                        title: 'Relancer ou télécharger le résultat',
+                        text: 'Le bouton « Relancer » rejoue cette exécution avec les données actuelles (un message vous prévient s\'il s\'agit d\'un nouveau passage et non d\'une reproduction). Si un fichier a été produit, l\'encadré vert « Fichier généré » vous permet de le télécharger directement.'
+                    }
+                ]
+            });
+        } catch (e) { /* Best-effort — tour facultatif. */ }
+    })();
+</script>
 {% end %}

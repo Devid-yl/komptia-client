@@ -9,7 +9,7 @@ from typing import Optional
 from sqlalchemy import DateTime, Integer, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.clock import ensure_utc
+from app.core.clock import ensure_utc, iso_utc
 from app.core.database import Base
 
 # ``ensure_utc`` vit désormais dans ``app.core.clock`` (source de vérité unique
@@ -26,9 +26,12 @@ def iso_or_none(dt: Optional[datetime]) -> Optional[str]:
     éviter la duplication ``ensure_utc(x).isoformat() if x else None`` — qui
     apparaît une trentaine de fois dans le projet (cf. ``user_preference``,
     ``user_onboarding_progress``, etc.).
+
+    Délègue à ``clock.iso_utc`` (SOURCE DE VÉRITÉ UNIQUE de l'émission d'un
+    instant en ISO horodaté) : ``iso_or_none`` n'est qu'un alias ergonomique
+    pour les ``to_dict()`` de modèles — une SEULE implémentation existe.
     """
-    aware = ensure_utc(dt)
-    return aware.isoformat() if aware else None
+    return iso_utc(dt)
 
 
 class TimestampMixin:

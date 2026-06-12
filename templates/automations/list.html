@@ -164,7 +164,7 @@
                     <i class="bi bi-box-arrow-up-right"></i> {{ auto.output_summary }}
                 </span>
                 {% end %}
-                <span>Creee {{ auto.created_at.strftime('%d/%m/%Y') }}</span>
+                <span>Creee <time datetime="{{ iso_utc(auto.created_at) }}" data-fmt-local="date">{{ auto.created_at.strftime('%d/%m/%Y') }}</time></span>
             </div>
 
             <!-- Stats (gauche) + Actions (droite) sur la meme ligne pour
@@ -205,7 +205,7 @@
                     {% if item.get('next_run_time') %}
                     <div>
                         <span class="text-gray-500 dark:text-gray-400">Prochaine</span>
-                        <span class="font-medium text-gray-900 ml-1 dark:text-gray-100">{{ item['next_run_time'].strftime('%d/%m %Hh%M') }}</span>
+                        <span class="font-medium text-gray-900 ml-1 dark:text-gray-100"><time datetime="{{ iso_utc(item['next_run_time']) }}" data-fmt-local="short">{{ item['next_run_time'].strftime('%d/%m %Hh%M') }}</time></span>
                     </div>
                     {% end %}
                 </div>
@@ -225,21 +225,8 @@
         {% end %}
     </div>
 
-    <!-- Pagination -->
-    {% if total_pages > 1 %}
-    <div class="flex items-center justify-center gap-1 mt-6">
-        {% if page > 1 %}
-        <a href="/automations?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}" class="btn btn-secondary">Precedent</a>
-        {% end %}
-        {% for p in range(1, total_pages + 1) %}
-        <a href="/automations?page={{ p }}{% if status_filter %}&status={{ status_filter }}{% end %}" 
-           class="px-3 py-1.5 text-sm rounded {% if p == page %}bg-gray-900 text-white dark:bg-gray-100 dark:text-gray-900{% else %}border border-gray-300 hover:bg-gray-50 dark:text-gray-300 dark:hover:bg-gray-800{% end %} dark:border-gray-700">{{ p }}</a>
-        {% end %}
-        {% if page < total_pages %}
-        <a href="/automations?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% end %}" class="btn btn-secondary">Suivant</a>
-        {% end %}
-    </div>
-    {% end %}
+    {# Pagination unifiée (UIModule, cf. app/ui_modules.py) #}
+    {% module Pagination(page=page, total_pages=total_pages) %}
 
     {% else %}
     <div class="card px-4 py-16 text-center">
@@ -250,6 +237,16 @@
             <path stroke-linecap="round" stroke-linejoin="round" d="M7 6h6a2 2 0 012 2v8a2 2 0 01-2 2H7"/>
             <path stroke-linecap="round" stroke-linejoin="round" d="M15 12h2"/>
         </svg>
+        {# AUTO-4 — distinguer « filtre vide » de « aucune automatisation ». Sans
+           ça, un user QUI A des automatisations mais filtre sur Actives/Inactives
+           voyait l'onboarding « créez votre première » et croyait avoir tout perdu. #}
+        {% if status_filter %}
+        <h3 class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200">Aucune automatisation ne correspond à ce filtre</h3>
+        <p class="text-sm text-gray-500 mb-4 dark:text-gray-400 max-w-md mx-auto">Le filtre « {{ "Actives" if status_filter == "active" else "Inactives" }} » ne retourne aucun résultat. Vos automatisations sont peut-être dans l'autre état.</p>
+        <div class="flex justify-center items-center gap-3 flex-wrap">
+            <a href="/automations" class="btn btn-primary">Réinitialiser le filtre</a>
+        </div>
+        {% else %}
         <h3 class="text-base font-semibold text-gray-800 mb-1 dark:text-gray-200">Aucune automatisation pour l'instant</h3>
         <p class="text-sm text-gray-500 mb-1 dark:text-gray-400 max-w-md mx-auto">Une automatisation extrait vos données, les met en forme, génère un rapport et l'envoie par email — sur planification ou déclencheur.</p>
         <p class="text-xs text-gray-400 mb-4 dark:text-gray-500">Quatre maillons configurables : source, format, rapport, envoi.</p>
@@ -261,6 +258,7 @@
             </form>
             <a href="/automations/templates" class="text-sm text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Voir un exemple →</a>
         </div>
+        {% end %}
     </div>
     {% end %}
 
@@ -309,10 +307,27 @@ async function toggleAutomation(id, active, checkbox) {
             headers: { 'X-Xsrftoken': getCookie('_xsrf'), 'Content-Type': 'application/json' },
             body: JSON.stringify({ target: active })
         });
-        var data = await res.json();
+        // AUTO-5 — komptiaReadJson : robuste aux pages d'erreur HTML (429/500/502
+        // nginx) → pas de « Unexpected token < ». ``res.status`` reste lisible.
+        var parsed = await komptiaReadJson(res);
+        var data = parsed.data || {};
         if (data.success) {
-            showToast('Automatisation ' + (active ? 'activee' : 'desactivee'), 'success');
-            setTimeout(function() { location.reload(); }, 600);
+            // AUTO-2 — l'activation a réussi en BDD mais si le scheduler n'a PAS
+            // inscrit le job (data.scheduled === false / data.warning), on NE
+            // ment PAS avec un toast vert : l'automatisation ne se déclenchera
+            // jamais. On affiche le warning serveur (actionnable « désactivez
+            // puis réactivez ») en évidence + on laisse le temps de le lire.
+            var _schedFailed = active && (data.scheduled === false || !!data.warning);
+            if (_schedFailed) {
+                showToast(
+                    data.warning
+                    || 'Automatisation activée mais NON planifiée — désactivez puis réactivez.',
+                    'error'
+                );
+            } else {
+                showToast('Automatisation ' + (active ? 'activee' : 'desactivee'), 'success');
+            }
+            setTimeout(function() { location.reload(); }, _schedFailed ? 3000 : 600);
             return;
         }
         // A7-M2 : 409 = un autre onglet a déjà mis l'auto dans cet état. On
@@ -341,7 +356,7 @@ async function toggleAutomation(id, active, checkbox) {
                 }
             );
         } else {
-            showToast(data.error || 'Activation refusée', 'error');
+            showToast(data.error || parsed.error || 'Activation refusée', 'error');
         }
     } catch (err) {
         checkbox.disabled = false;
@@ -353,22 +368,29 @@ async function toggleAutomation(id, active, checkbox) {
 async function executeAutomation(id, btn) {
     if (!(await appConfirm('Lancer l\'exécution maintenant ?'))) return;
     btn.disabled = true;
-    btn.textContent = 'En cours...';
+    // AUTO-6 — innerHTML (PAS textContent) pour PRÉSERVER l'icône ▶ : textContent
+    // écrasait l'icône, et le restore catch ré-affichait « Executer » sans elle.
+    // HTML statique → aucun risque XSS ; bi-play-fill déjà sur le bouton.
+    btn.innerHTML = '<i class="bi bi-play-fill" aria-hidden="true"></i> En cours...';
     try {
         var res = await fetch('/automations/' + id + '/execute', { method: 'POST', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
-        var data = await res.json();
+        // AUTO-5 — komptiaReadJson ne throw JAMAIS sur une page d'erreur HTML
+        // (429/500/502 nginx) → message clair au lieu de « Unexpected token < ».
+        var parsed = await komptiaReadJson(res);
+        var data = parsed.data || {};
         if (data.success) { showToast('Execution lancee', 'success'); setTimeout(function() { location.reload(); }, 1500); }
-        else throw new Error(data.error);
-    } catch (err) { btn.disabled = false; btn.textContent = 'Executer'; showToast('Erreur: ' + err.message, 'error'); }
+        else throw new Error(data.error || parsed.error || 'Erreur inconnue');
+    } catch (err) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-play-fill" aria-hidden="true"></i> Executer'; showToast('Erreur: ' + err.message, 'error'); }
 }
 
 async function deleteAutomation(id, name) {
     if (!(await appConfirm('Supprimer l\'automatisation "' + name + '" ?'))) return;
     try {
         var res = await fetch('/automations/' + id, { method: 'DELETE', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
-        var data = await res.json();
+        var parsed = await komptiaReadJson(res);  // AUTO-5 — robuste aux pages HTML d'erreur
+        var data = parsed.data || {};
         if (data.success) { showToast('Supprimee', 'success'); setTimeout(function() { location.reload(); }, 600); }
-        else throw new Error(data.error);
+        else throw new Error(data.error || parsed.error || 'Erreur inconnue');
     } catch (err) { showToast('Erreur: ' + err.message, 'error'); }
 }
 
@@ -376,15 +398,19 @@ async function duplicateAutomation(id) {
     if (!(await appConfirm('Dupliquer cette automatisation ?'))) return;
     try {
         var res = await fetch('/automations/' + id + '/duplicate', { method: 'POST', headers: { 'X-Xsrftoken': getCookie('_xsrf') } });
-        var data = await res.json();
+        var parsed = await komptiaReadJson(res);  // AUTO-5 — robuste aux pages HTML d'erreur
+        var data = parsed.data || {};
         if (data.success) { showToast('Dupliquee', 'success'); setTimeout(function() { location.reload(); }, 600); }
-        else throw new Error(data.error);
+        else throw new Error(data.error || parsed.error || 'Erreur inconnue');
     } catch (err) { showToast('Erreur: ' + err.message, 'error'); }
 }
 
 // ── Live Execution Monitor ──
 var _monitorInterval = null;
 var _previousRunning = {};
+// ENGINE-3-ux (#49) — execution_id déjà signalés « en attente email » : évite de
+// re-toaster à chaque poll (3s) tant que le run reste suspendu.
+var _previousWaiting = {};
 
 // Real-review #7 cycle 23 : escapeHtml local. Avant, le code référençait
 // une `escapeHtml` qui n'était définie que dans automation-canvas.js (qui
@@ -429,9 +455,14 @@ function renderRunningExecution(ex) {
             '<div class="min-w-0 flex-1">' +
                 '<div class="flex items-center gap-2">' +
                     '<span class="text-sm font-medium text-gray-900 truncate dark:text-gray-100">' + escapeHtml(ex.automation_name) + '</span>' +
-                    (ex.is_workflow
-                        ? '<span class="text-xs text-gray-400 dark:text-gray-500">' + ex.completed_steps + '/' + ex.total_steps + ' étapes</span>'
-                        : '<span class="text-xs text-gray-400 dark:text-gray-500">En cours</span>') +
+                    // ENGINE-3-ux (#49) — un run suspendu sur email_wait_response :
+                    // badge explicite (ambre, ⏸) au lieu de « En cours », pour que
+                    // l'user sache qu'il attend une réponse par email (≠ planté).
+                    (ex.status === 'waiting'
+                        ? '<span class="text-xs text-amber-600 dark:text-amber-400"><i class="bi bi-pause-circle"></i> En attente d\'une réponse par email</span>'
+                        : ex.is_workflow
+                            ? '<span class="text-xs text-gray-400 dark:text-gray-500">' + ex.completed_steps + '/' + ex.total_steps + ' étapes</span>'
+                            : '<span class="text-xs text-gray-400 dark:text-gray-500">En cours</span>') +
                 '</div>' +
                 stepInfo + progressBar +
             '</div>' +
@@ -441,6 +472,26 @@ function renderRunningExecution(ex) {
             '</div>' +
         '</div>' +
     '</div>';
+}
+
+// AUTO-3 — notifie la fin d'une exécution avec son VRAI statut (succès / échec /
+// annulé / partiel). ``statusMap`` vient de ``data.recently_finished``. Évite le
+// « terminée » vert systématique qui faisait passer un échec pour un succès.
+function notifyExecutionFinished(id, name, statusMap) {
+    var st = statusMap && statusMap[id];
+    if (st === 'success') {
+        showToast('Exécution terminée : ' + name, 'success');
+    } else if (st === 'failed') {
+        showToast('Exécution ÉCHOUÉE : ' + name + ' — voir l\'historique', 'error');
+    } else if (st === 'partial') {
+        showToast('Exécution partielle : ' + name + ' — certaines étapes ont échoué', 'warning');
+    } else if (st === 'cancelled') {
+        showToast('Exécution annulée : ' + name, 'info');
+    } else {
+        // Statut inconnu (fini hors fenêtre récente / course de poll) : NEUTRE.
+        // Ne JAMAIS prétendre un succès non confirmé.
+        showToast('Exécution terminée : ' + name, 'info');
+    }
 }
 
 async function pollRunningExecutions() {
@@ -457,6 +508,13 @@ async function pollRunningExecutions() {
         if (!res.ok) return;
         var data = await res.json();
         if (!data.success) return;
+
+        // AUTO-3 — map execution_id → vrai statut final pour les notifications
+        // de fin (au lieu d'un « terminée » vert systématique).
+        var _finishedStatusMap = {};
+        (data.recently_finished || []).forEach(function(ex) {
+            _finishedStatusMap[ex.execution_id] = ex.status;
+        });
 
         var monitor = document.getElementById('running-monitor');
         var list = document.getElementById('running-list');
@@ -477,12 +535,26 @@ async function pollRunningExecutions() {
             data.running.forEach(function(ex) { currentIds[ex.execution_id] = true; });
             Object.keys(_previousRunning).forEach(function(id) {
                 if (!currentIds[id]) {
-                    showToast('Execution terminee: ' + _previousRunning[id], 'success');
+                    notifyExecutionFinished(id, _previousRunning[id], _finishedStatusMap);
                 }
             });
             _previousRunning = {};
             data.running.forEach(function(ex) {
                 _previousRunning[ex.execution_id] = ex.automation_name;
+            });
+
+            // ENGINE-3-ux (#49) — toast one-time à la transition d'un run vers
+            // « en attente d'une réponse par email » (running→waiting). Le badge
+            // du moniteur reste affiché tant qu'il est suspendu ; on alerte une
+            // seule fois pour que l'user pense à répondre au mail.
+            data.running.forEach(function(ex) {
+                if (ex.status === 'waiting' && !_previousWaiting[ex.execution_id]) {
+                    showToast('« ' + ex.automation_name + ' » est en attente d\'une réponse par email.', 'info');
+                }
+            });
+            _previousWaiting = {};
+            data.running.forEach(function(ex) {
+                if (ex.status === 'waiting') _previousWaiting[ex.execution_id] = true;
             });
 
             // Poll faster when executions are running
@@ -494,7 +566,7 @@ async function pollRunningExecutions() {
         } else {
             // Check for just-finished executions
             Object.keys(_previousRunning).forEach(function(id) {
-                showToast('Execution terminee: ' + _previousRunning[id], 'success');
+                notifyExecutionFinished(id, _previousRunning[id], _finishedStatusMap);
             });
             _previousRunning = {};
 
@@ -784,7 +856,10 @@ async function submitImport() {
             headers: { 'X-Xsrftoken': getCookie('_xsrf') },
             body: formData,
         });
-        var data = await res.json();
+        // AUTO-5 — komptiaReadJson : un import qui dépasse la limite proxy (413)
+        // ou tombe sur un 429/502 HTML ne doit pas crasher en « Unexpected token < ».
+        var parsed = await komptiaReadJson(res);
+        var data = parsed.data || {};
         if (data.success) {
             closeImportModal();
             var msg = 'Automatisation importee';
@@ -792,7 +867,7 @@ async function submitImport() {
             showToast(msg, 'success');
             setTimeout(function() { location.reload(); }, 800);
         } else {
-            showToast(data.error || 'Erreur lors de l\'import', 'error');
+            showToast(data.error || parsed.error || 'Erreur lors de l\'import', 'error');
             submitBtn.disabled = false;
             submitBtn.textContent = 'Importer';
         }

@@ -6,7 +6,8 @@ Lance la sync à intervalles réguliers selon la configuration.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -15,6 +16,86 @@ from app.services.ai.config_service import get_ai_config_service, AIConfigKey
 from app.services.ai.schema_sync import get_sync_service
 
 logger = logging.getLogger(__name__)
+
+#: Intervalle minimum par défaut (h) si la config est absente/corrompue.
+_DEFAULT_INTERVAL_HOURS = 24.0
+
+
+def _parse_hhmm(value: str) -> Optional[tuple[int, int]]:
+    """Parse ``"HH:MM"`` → ``(h, m)`` validés, sinon ``None``."""
+    try:
+        hh_str, mm_str = value.split(":", 1)
+        h, m = int(hh_str), int(mm_str)
+    except (ValueError, AttributeError):
+        return None
+    if 0 <= h <= 23 and 0 <= m <= 59:
+        return h, m
+    return None
+
+
+def _compute_due(
+    *,
+    enabled: bool,
+    now_utc: datetime,
+    now_local: datetime,
+    last_sync_utc: Optional[datetime],
+    interval_hours: float,
+    start_time_str: str,
+) -> bool:
+    """Décide si une sync est due. **Fonction PURE** (aucune I/O) → testable seule.
+
+    Deux modes (calqués sur ``systemd`` ``OnCalendar``/``OnUnitActiveSec``) :
+
+    * **Calendrier** (``start_time`` = ``HH:MM`` valide) : due dès que la dernière
+      sync est ANTÉRIEURE au dernier créneau mural dû. Le créneau est ancré sur
+      l'horloge murale **locale serveur** → **pas de dérive** ; si l'app était
+      down à l'heure prévue, la sync se **rattrape** au prochain réveil ; jamais
+      2× pour un même créneau (une fois ``last_sync >= slot``, plus due jusqu'au
+      créneau suivant). ``interval_hours`` recule le seuil de
+      ``max(0, interval-24)`` h → 24h ⇒ quotidien, 48h ⇒ tous les 2 jours, etc.
+    * **Intervalle** (``start_time`` vide/invalide) : legacy — due dès que
+      ``now >= last_sync + interval_hours`` (pas d'heure fixe).
+
+    ``last_sync_utc=None`` ⇒ premier run (True). ``enabled=False`` ⇒ False.
+
+    Les comparaisons mêlent aware-UTC (``last_sync_utc``, ``now_utc``) et
+    aware-local (créneau dérivé de ``now_local``) : Python compare des **instants
+    absolus**, le résultat est donc correct quel que soit le fuseau.
+
+    DST (best-effort) : le créneau est construit via ``now_local.replace(hour, …)``.
+    Sur un fuseau à heure d'été, si le créneau tombe dans l'heure « sautée » du
+    passage été (inexistante) ou « doublée » du retour, l'instant absolu peut être
+    décalé d'~1h ce jour-là (pas de double-run ni de skip de jour — juste la
+    fenêtre de décision décalée). Sans objet pour ``America/Guadeloupe`` (UTC−4
+    constant, pas de DST). Acceptable pour une sync schéma quotidienne.
+    """
+    if not enabled:
+        return False
+    if last_sync_utc is None:
+        return True
+
+    # Garde anti-config-corrompue : NaN/inf (ou ≤0) → défaut. Sans `isfinite`,
+    # un `inf` passerait (`inf > 0` True) puis ferait lever `OverflowError` au
+    # `last_sync_utc + timedelta(hours=inf)` ci-dessous.
+    interval = (
+        interval_hours
+        if (interval_hours and math.isfinite(interval_hours) and interval_hours > 0)
+        else _DEFAULT_INTERVAL_HOURS
+    )
+
+    parsed = _parse_hhmm((start_time_str or "").strip())
+    if parsed is None:
+        # Mode intervalle (legacy) : espacement pur depuis la dernière sync.
+        return now_utc >= last_sync_utc + timedelta(hours=interval)
+
+    # Mode calendrier : dernier créneau mural <= maintenant (heure locale).
+    target_h, target_m = parsed
+    slot_local = now_local.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
+    if slot_local > now_local:
+        slot_local -= timedelta(days=1)
+    # Seuil multi-jours : 24h ⇒ slot ; 48h ⇒ slot-24h ; etc.
+    threshold = slot_local - timedelta(hours=max(0.0, interval - 24.0))
+    return last_sync_utc < threshold
 
 
 class SchemaSyncScheduler:
@@ -30,78 +111,93 @@ class SchemaSyncScheduler:
         self._check_interval = 3600  # Vérifier toutes les heures
 
     async def _should_sync(self) -> bool:
-        """Vérifie si une sync est nécessaire.
+        """Vérifie si une sync est nécessaire (décision pure → :func:`_compute_due`).
 
-        Logique :
-        - SCHEMA_SYNC_ENABLED off → False
-        - Pas de last_sync → True (premier run après boot ou reset)
-        - Intervalle non écoulé → False
-        - Intervalle écoulé ET start_time vide → True (comportement legacy)
-        - Intervalle écoulé ET start_time défini (HH:MM) → True UNIQUEMENT
-          si l'heure locale serveur courante est dans la fenêtre [HH:MM, HH:MM+tick).
-          Permet à l'admin de fixer "tous les jours à 3h du matin" sans bruit
-          en heures de bureau.
+        Récupère la config et la dernière sync, puis délègue la DÉCISION à la
+        fonction pure :func:`_compute_due` (deux modes : calendrier avec
+        rattrapage / intervalle legacy — cf. sa docstring).
+
+        Source de « dernière sync » = :meth:`_resolve_last_sync` (table
+        ``schema_syncs`` + repli clé config) : ainsi les syncs MANUELLES (qui
+        n'écrivent pas toujours la clé config) repoussent bien le planning, et un
+        run manqué (app down à l'heure prévue) est RATTRAPÉ au réveil au lieu
+        d'être sauté jusqu'au lendemain.
         """
         config = get_ai_config_service()
 
         enabled = await config.get(AIConfigKey.SCHEMA_SYNC_ENABLED, True)
         if not enabled:
+            # Court-circuit : inutile de lire la dernière sync (DB) si désactivé.
             return False
 
         interval_hours = await config.get(AIConfigKey.SCHEMA_SYNC_INTERVAL_HOURS, 24)
-        last_sync_str = await config.get(AIConfigKey.SCHEMA_SYNC_LAST_RUN)
         start_time_str = await config.get(AIConfigKey.SCHEMA_SYNC_START_TIME, "") or ""
 
-        if not last_sync_str:
-            return True
+        # Observabilité : start_time renseigné mais invalide → on bascule en mode
+        # intervalle (cf. _compute_due) ; on le signale pour que l'admin corrige.
+        if start_time_str.strip() and _parse_hhmm(start_time_str.strip()) is None:
+            logger.warning("schema_sync_start_time invalide (%r) → mode intervalle", start_time_str)
 
         try:
-            last_sync = datetime.fromisoformat(last_sync_str)
-            if last_sync.tzinfo is None:
-                last_sync = last_sync.replace(tzinfo=timezone.utc)
-            next_sync = last_sync + timedelta(hours=interval_hours)
-            interval_elapsed = clock.now() >= next_sync
-        except (ValueError, TypeError):
-            return True
+            interval = float(interval_hours)
+        except (TypeError, ValueError):
+            interval = _DEFAULT_INTERVAL_HOURS
 
-        if not interval_elapsed:
-            return False
+        last_sync_utc = await self._resolve_last_sync(config)
 
-        # Pas d'heure préférée → comportement actuel (sync au prochain tick).
-        start_time_str = start_time_str.strip()
-        if not start_time_str:
-            return True
+        return _compute_due(
+            enabled=bool(enabled),
+            now_utc=clock.now(),
+            now_local=clock.now_local(),
+            last_sync_utc=last_sync_utc,
+            interval_hours=interval,
+            start_time_str=start_time_str,
+        )
 
-        # Parse HH:MM (locale serveur). Format invalide → fallback comportement
-        # legacy (sync immédiat) plutôt que de bloquer indéfiniment.
+    async def _resolve_last_sync(self, config) -> Optional[datetime]:
+        """Dernière sync réussie = ``max(table schema_syncs, clé config)``, aware UTC.
+
+        La table ``schema_syncs`` est la SOURCE DE VÉRITÉ : toute sync y insère
+        une ligne, y compris les syncs **manuelles** (qui ne touchent pas
+        toujours la clé ``SCHEMA_SYNC_LAST_RUN``). Le repli sur la clé couvre le
+        cas où la table serait vide mais la clé présente (résilience). On prend le
+        ``max`` pour ne JAMAIS sous-estimer la dernière sync (sous-estimer ⇒
+        sur-déclenchement). ``None`` ⇒ aucune source exploitable ⇒ premier run.
+        """
+        candidates: list[datetime] = []
+
+        # 1. Table schema_syncs — inclut les syncs manuelles.
         try:
-            hh_str, mm_str = start_time_str.split(":", 1)
-            target_h = int(hh_str)
-            target_m = int(mm_str)
-            if not (0 <= target_h <= 23 and 0 <= target_m <= 59):
-                raise ValueError
-        except ValueError:
+            from app.services.ai.schema_freshness import get_freshness_checker
+
+            table_dt = clock.ensure_utc(await get_freshness_checker().get_last_sync_time())
+            if table_dt is not None:
+                candidates.append(table_dt)
+        except Exception:
             logger.warning(
-                "schema_sync_start_time invalide (%r), fallback comportement legacy",
-                start_time_str,
+                "Scheduler : échec lecture dernière sync (table schema_syncs)",
+                exc_info=True,
             )
-            return True
 
-        # Heure locale de la machine hôte via la source unique : `clock.now_local()`
-        # lit `config.server.timezone` (TZ machine résolue au boot) et retombe sur
-        # UTC si la résolution échoue. Remplace l'ancien
-        # `datetime.now(ZoneInfo(config.server.timezone))` + fallback `datetime.now()`
-        # naïf (qui suivait la TZ du process Python, pas celle voulue par l'admin).
-        now_local = clock.now_local()
-        target_minutes = target_h * 60 + target_m
-        now_minutes = now_local.hour * 60 + now_local.minute
-        # Fenêtre de tick (par défaut le scheduler tick 1×/h dans run() — voir
-        # ``check_interval_seconds``). On accepte ±30 min autour de l'heure
-        # cible pour rattraper si le tick a glissé. Si interval_hours < 1h,
-        # cette fenêtre s'élargirait artificiellement, donc on cap à 30 min.
-        diff = abs(now_minutes - target_minutes)
-        diff_circular = min(diff, 1440 - diff)  # diff sur cercle 24h
-        return diff_circular <= 30
+        # 2. Clé config (repli / compat ascendante).
+        cfg_str = None
+        try:
+            cfg_str = await config.get(AIConfigKey.SCHEMA_SYNC_LAST_RUN)
+        except Exception:
+            logger.warning("Scheduler : échec lecture SCHEMA_SYNC_LAST_RUN", exc_info=True)
+        if cfg_str:
+            try:
+                cfg_raw = str(cfg_str)
+                # Tolère un suffixe « Z » (cohérent avec clock.to_local) même si
+                # notre écriture (clock.now().isoformat()) produit « +00:00 ».
+                cfg_iso = cfg_raw[:-1] + "+00:00" if cfg_raw.endswith("Z") else cfg_raw
+                cfg_dt = clock.ensure_utc(datetime.fromisoformat(cfg_iso))
+                if cfg_dt is not None:
+                    candidates.append(cfg_dt)
+            except (ValueError, TypeError):
+                logger.warning("Scheduler : SCHEMA_SYNC_LAST_RUN illisible (%r)", cfg_str)
+
+        return max(candidates) if candidates else None
 
     async def _run_sync(self):
         """Exécute une synchronisation depuis la base Sage."""

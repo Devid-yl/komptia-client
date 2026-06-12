@@ -7,7 +7,7 @@
  *   - preview "5 prochaines executions" en debounce 300 ms via
  *     POST /api/automations/schedule/preview (dry-run, sans side-effect)
  *   - save via PUT /api/automations/:id/schedule (re-schedule live si actif)
- *   - heures stockees en TZ Europe/Paris cote serveur, affichees en TZ
+ *   - heures stockees en TZ serveur (dynamique), affichees en TZ
  *     navigateur via window.LocalDatetime.formatLocal
  *
  * Securite :
@@ -132,10 +132,19 @@
 
         if (mode === 'once') {
             const v = document.getElementById('komptia-sched-once-datetime').value;
-            // Le navigateur retourne "YYYY-MM-DDTHH:MM" — on l'envoie tel quel,
-            // backend.fromisoformat() l'accepte (datetime naive, interprete
-            // en TZ scheduler Europe/Paris au fire).
-            config.run_date = v;
+            // TZ-2 (#48) — l'input datetime-local retourne "YYYY-MM-DDTHH:MM"
+            // (NAÏF, heure NAVIGATEUR). On le convertit en UTC aware avant l'envoi
+            // (new Date(local).toISOString()) : l'heure de fire devient l'instant
+            // ABSOLU voulu par l'utilisateur, indépendamment du fuseau serveur.
+            // AVANT : envoyé naïf → le backend l'interprétait en TZ serveur → fire
+            // FAUX silencieux quand navigateur ≠ serveur. Re-affichage symétrique
+            // via _isoToDatetimeLocal (UTC → heure navigateur).
+            if (v) {
+                const d = new Date(v);
+                config.run_date = isNaN(d.getTime()) ? v : d.toISOString();
+            } else {
+                config.run_date = v;
+            }
         } else if (mode === 'daily') {
             const t = _parseTimeStr(document.getElementById('komptia-sched-daily-time').value);
             config.hour = t.hour;
@@ -267,7 +276,7 @@
         runs.forEach((iso) => {
             const li = document.createElement('li');
             // Format en heure locale via Date — le serveur renvoie ISO aware
-            // TZ Europe/Paris, le navigateur affiche dans la TZ de l'user.
+            // TZ serveur (dynamique), le navigateur affiche dans la TZ de l'user.
             const d = new Date(iso);
             if (isNaN(d.getTime())) {
                 li.textContent = iso;
@@ -332,9 +341,12 @@
                     ),
                     body: JSON.stringify(payload),
                 });
-                const data = await res.json();
+                // Lecture SÛRE : la frappe rapide du cron déclenche des POST
+                // en rafale → 429 nginx (HTML) possible ; ne pas planter dessus.
+                const _r = await window.komptiaReadJson(res);
+                const data = _r.data || {};
                 if (!res.ok || !data.success) {
-                    const msg = _extractErrorMsg(data, 'Configuration invalide.');
+                    const msg = _extractErrorMsg(data, _r.error || 'Configuration invalide.');
                     _renderPreview(null, msg);
                     _setSaveDisabled(true);
                     if (cronError && payload.schedule_type === 'cron') {
@@ -376,7 +388,11 @@
                 headers: _headers,
                 body: JSON.stringify(payload),
             });
-            const data = await res.json();
+            // Lecture SÛRE : ne plante pas sur le HTML d'une erreur passerelle
+            // (413/429/502/504). ``res.status``/``res.ok`` restent fiables pour
+            // la logique 409/!ok ci-dessous ; ``data`` = JSON parsé ou {}.
+            const _r = await window.komptiaReadJson(res);
+            const data = _r.data || {};
             // A7-M6 (adversarial #4/#6) — 409 = conflit optimiste (un autre
             // onglet a sauvé entre temps). On NE remplace PAS le formulaire :
             // écraser les edits non sauvés de l'user serait une perte SILENCIEUSE
@@ -399,7 +415,9 @@
                 return;
             }
             if (!res.ok || !data.success) {
-                const msg = _extractErrorMsg(data, 'Erreur lors de la sauvegarde');
+                // Message actionnable : priorité au message métier serveur,
+                // sinon celui dérivé du status par le helper (413/429/5xx).
+                const msg = _extractErrorMsg(data, _r.error || 'Erreur lors de la sauvegarde');
                 if (typeof window.showToast === 'function') {
                     window.showToast(msg, 'error');
                 } else {

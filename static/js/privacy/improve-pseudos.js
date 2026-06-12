@@ -425,6 +425,19 @@
             // Sans ce compteur, le recap affichait « Terminé » alors que ces
             // termes restaient au libellé générique (données fausses).
             var totalUnprocessed = 0;
+            // #97-fix — mémorise la VRAIE raison des termes non traités pour le
+            // recap final : un timeout LLM (modèle trop lent) doit afficher un
+            // message différent d'un rejet anti-hallucination. Sans ça, on
+            // affichait « budget du modèle local atteint » dans TOUS les cas (faux).
+            var sawTimeout = false;
+            // **LLM local indisponible (service éteint / non configuré)** :
+            // dès qu'un chunk remonte ``unreachable``/``not_configured``, tous
+            // les suivants échoueront pareil → on STOPPE et on affiche un
+            // message ACTIONNABLE, au lieu de mouliner puis prétendre
+            // « Terminé : 0/N » (le vrai bug : l'user ne savait pas qu'Ollama
+            // était simplement éteint — donnée fausse silencieuse).
+            var llmUnavailable = false;
+            var llmUnavailableMessage = '';
             $('improve-progress-bar').setAttribute('aria-valuenow', '0');
 
             // Modèle d'affichage : "Analyse de N termes via <model> | X/N traités, Y améliorés"
@@ -502,10 +515,22 @@
                     // À partir du 1er chunk reçu, bascule en progress déterminé.
                     _setProgressIndeterminate(false);
                     _renderStatus();
+                    // LLM local FONDAMENTALEMENT indisponible (éteint /
+                    // non configuré) → STOP immédiat : continuer ne ferait
+                    // qu'échouer chunk après chunk et finir sur un « Terminé »
+                    // mensonger. On mémorise le message serveur (actionnable)
+                    // pour le recap et on sort de la boucle.
+                    if (data.status === 'unreachable' || data.status === 'not_configured') {
+                        llmUnavailable = true;
+                        llmUnavailableMessage = data.message
+                            || 'Le LLM local est indisponible. Vérifie qu\'il est démarré, puis réessaie.';
+                        break;
+                    }
                     // Si le serveur renvoie un status != "ok" (timeout/error
                     // LLM), on continue avec les chunks suivants — best-effort.
                     // Le frontend log juste l'info pour observabilité.
                     if (data.status && data.status !== 'ok') {
+                        if (data.status === 'timeout') { sawTimeout = true; }
                         // eslint-disable-next-line no-console
                         console.warn('[improve-pseudo] chunk status=' + data.status,
                             data.message || '');
@@ -533,7 +558,17 @@
             // Bouton "Fermer" final (re-label de #modal-improve-cancel).
             $('modal-improve-cancel').textContent = 'Fermer';
             show($('modal-improve-cancel'));
-            if (processed >= tokens.length) {
+            if (llmUnavailable) {
+                // Message ACTIONNABLE explicite — JAMAIS « Terminé : 0/N » qui
+                // laissait croire que ça avait tourné. On dit clairement que le
+                // LLM local ne répond pas + quoi faire.
+                $('improve-progress-fill').style.width = '0%';
+                $('improve-status').textContent =
+                    llmUnavailableMessage
+                    + (totalUpdated > 0
+                        ? ' (' + totalUpdated + ' déjà amélioré(s) avant l\'arrêt.)'
+                        : '');
+            } else if (processed >= tokens.length) {
                 $('improve-progress-fill').style.width = '100%';
                 // #97 — si des termes n'ont PAS pu être traités (budget LLM
                 // local épuisé), ne PAS prétendre « Terminé » : la campagne est
@@ -547,7 +582,12 @@
                     (totalSkippedInvalid > 0 ? ', ' + totalSkippedInvalid + ' label(s) rejeté(s) (fallback sémantique)' : '') +
                     (totalSkippedNumeric > 0 ? ', ' + totalSkippedNumeric + ' numérique(s) ignoré(s) (aucune sémantique à améliorer)' : '') +
                     (totalSkippedStateChanged > 0 ? ', ' + totalSkippedStateChanged + ' modifié(s) en parallèle par un autre onglet' : '') +
-                    (totalUnprocessed > 0 ? ', ' + totalUnprocessed + ' non traité(s) (budget du modèle local atteint — relancez pour les compléter)' : '') +
+                    (totalUnprocessed > 0
+                        ? ', ' + totalUnprocessed + ' non traité(s) — ' +
+                          (sawTimeout
+                              ? 'le modèle local a été trop lent (timeout). Réessayez, ou choisissez un modèle plus rapide dans /admin/ai-config.'
+                              : 'le modèle local n\'a pas renvoyé de suggestion exploitable (rejetée par la sécurité anti-hallucination) — laissez le libellé actuel ou améliorez-le à la main.')
+                        : '') +
                     '.';
             }
             if (typeof deps.onComplete === 'function') {

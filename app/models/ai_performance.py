@@ -286,5 +286,9 @@ class SchemaSync(Base):
             "total_tables": self.total_tables,
             "total_columns": self.total_columns,
             "duration_seconds": self.duration_seconds,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            # ISO offset-aware (+00:00) : la colonne est relue NAÏVE depuis SQLite
+            # → un isoformat() brut serait mal-parsé par new Date() côté JS
+            # (<time data-fmt-local> de l'historique sync) = +Nh. clock.iso_utc
+            # gère naïf→UTC et None→None.
+            "created_at": clock.iso_utc(self.created_at),
         }

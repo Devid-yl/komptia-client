@@ -59,7 +59,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
-from typing import Any, Awaitable, Callable, Final, TypedDict
+import re
+from typing import Any, Awaitable, Callable, Dict, Final, TypedDict
 
 import tornado.ioloop
 import tornado.web
@@ -72,6 +73,12 @@ from app.utils.logger import get_logger
 from app.utils.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
+
+# Format accepté pour les run_id copilot (clé du progress store, jamais
+# interprété en SQL/chemin/HTML — defense-in-depth charset, tâche #25).
+# Couvre les deux générateurs frontend : ``crypto.randomUUID()``
+# (hex + tirets) et le fallback ``run_<base36>_<base36>``.
+_RUN_ID_RE: Final = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 # ── Constantes ────────────────────────────────────────────────────────────
@@ -304,6 +311,35 @@ def _classify_service_error(error_text: str) -> int:
     return 422
 
 
+#: Classification PRIMAIRE par ``error_kind`` machine-readable (fix
+#: 2026-06-11) : les retours d'erreur de ``run_copilot_agent`` portent un
+#: kind explicite — fini les décisions machine prises sur des substrings de
+#: messages français destinés aux humains (source du bug « cancel → 422 »
+#: et de l'incohérence 504/500 du fail-closed max_turns).
+#: ``_classify_service_error`` reste le fallback legacy pour les retours
+#: non encore tagués.
+_ERROR_KIND_TO_STATUS: Dict[str, int] = {
+    "overloaded": 503,
+    "rate_limit": 429,
+    "llm_truncated": 422,
+    "no_terminal": 422,
+    "abandon": 422,
+    "budget_exhausted": 504,
+    "internal": 500,
+}
+
+
+def _status_for_service_error(result: Dict[str, Any], error_text: str) -> int:
+    """Code HTTP d'un résultat d'erreur service — kind d'abord, legacy ensuite."""
+    kind = result.get("error_kind")
+    if isinstance(kind, str) and kind in _ERROR_KIND_TO_STATUS:
+        return _ERROR_KIND_TO_STATUS[kind]
+    if error_text == _Messages.INTERNAL_ERROR:
+        # Bug serveur (exception inattendue) — 500 pour les métriques 5xx.
+        return 500
+    return _classify_service_error(error_text)
+
+
 # ── Décorateur local d'autorisation ───────────────────────────────────────
 
 
@@ -369,8 +405,16 @@ def _parse_body_or_error(handler: BaseHandler) -> dict[str, Any] | None:
                 handler.write_json({"error": _Messages.BODY_TOO_LARGE}, 413)
                 return None
         except ValueError:
-            # Header malformé : laisser le parse JSON trancher.
+            # Header malformé : laisser la garde autoritative ci-dessous trancher.
             pass
+
+    # Garde AUTORITATIVE sur le body réellement reçu : ``Content-Length`` est
+    # absent en ``Transfer-Encoding: chunked`` → le pré-check ci-dessus est
+    # alors sauté et ``json.loads`` recevrait jusqu'à ``max_body_size`` (4 GiB).
+    # ``len`` sur bytes est O(1), sans copie.
+    if len(handler.request.body) > _BODY_MAX_BYTES:
+        handler.write_json({"error": _Messages.BODY_TOO_LARGE}, 413)
+        return None
 
     try:
         parsed = json.loads(handler.request.body)
@@ -484,7 +528,29 @@ class ResultModifyHandler(BaseHandler):
         if body is None:
             return
 
-        if not _copilot_rate_limiter.check(
+        # gap2 — l'auto-fill « ghost » (``is_auto_fill=True`` : one-shot
+        # ``modify_result``, 1 appel LLM léger) et le copilot EXPLICITE
+        # (``is_auto_fill=False`` : agent tool-loop ~40 appels, coûteux) ont des
+        # coûts TRÈS différents et NE doivent PAS partager le même bucket : sinon un
+        # auto-fill en rafale (ex. 50 cellules) épuise le quota copilot explicite de
+        # l'user (5/min) → l'action chère qu'on voulait protéger est bloquée par
+        # l'action légère (et inversement). On route le rate-limit PAR MODE, en
+        # réutilisant les SSoT déjà définies :
+        #   • explicite → ``_copilot_rate_limiter`` (5/min, cher) ;
+        #   • auto-fill → ``_suggest_rate_limiter`` (20/min, léger — la doc de
+        #     ``_SUGGEST_RATE_MAX`` dimensionne précisément l'auto-fill), clé
+        #     « autofill » DISTINCTE de l'endpoint /suggest (pas de nouvelle
+        #     interférence). ``is_auto_fill`` remonté AVANT le gate.
+        is_auto_fill = bool(body.get("is_auto_fill"))
+        if is_auto_fill:
+            if not _suggest_rate_limiter.check(
+                _rate_limit_key(self, "autofill"),
+                _SUGGEST_RATE_MAX,
+                _SUGGEST_RATE_WINDOW_S,
+            ):
+                self.write_json({"error": _Messages.RATE_LIMITED_SUGGEST}, 429)
+                return
+        elif not _copilot_rate_limiter.check(
             _rate_limit_key(self, "copilot"),
             _COPILOT_RATE_MAX,
             _COPILOT_RATE_WINDOW_S,
@@ -494,7 +560,6 @@ class ResultModifyHandler(BaseHandler):
 
         sql = _coerce_str(body.get("sql"))
         instruction_raw = body.get("instruction")
-        is_auto_fill = bool(body.get("is_auto_fill"))
 
         # Validation instruction : auto-fill peut être sans instruction
         # (le service devine depuis le contexte), sinon on exige un texte
@@ -542,7 +607,16 @@ class ResultModifyHandler(BaseHandler):
                     401,
                 )
                 return
-            loaded = load_workbook_for_copilot(user_id, workbook_path_raw.strip())
+            # **Hors event loop** (fix 2026-06-11, sweep Moyen confirmé) : la
+            # lecture + décompression gzip + parse JSON + conversion d'un
+            # gros .afz.json (plusieurs Mo, gzippé ~20×) est synchrone — la
+            # laisser dans la coroutine gelait tout Tornado le temps du load.
+            # La fonction est PURE (path scoped user → listes fraîches, aucun
+            # état partagé) → thread-safe. Pool par défaut adapté (IO court,
+            # même pattern que datastore.py).
+            loaded = await asyncio.to_thread(
+                load_workbook_for_copilot, user_id, workbook_path_raw.strip()
+            )
             if loaded is None:
                 self.write_json(
                     {
@@ -655,7 +729,7 @@ class ResultModifyHandler(BaseHandler):
         # le store de progress ne sera pas synchronisé (polling retournera
         # null, frontend affichera juste "Modification en cours…").
         run_id_raw = body.get("run_id")
-        if isinstance(run_id_raw, str) and 0 < len(run_id_raw) <= 128:
+        if isinstance(run_id_raw, str) and _RUN_ID_RE.match(run_id_raw):
             run_id = run_id_raw
         else:
             run_id = ""
@@ -679,6 +753,16 @@ class ResultModifyHandler(BaseHandler):
         # list[{r: int, c: int}] avec r,c >= 0.
         selected_cells: list[dict[str, int]] = []
         raw_selected = body.get("selected_cells")
+        # #18f (triage caps 2026-06-10) — au-delà de 200 cellules, la
+        # sélection est COUPÉE : sans log, le copilot transforme une partie
+        # de la sélection et l'utilisateur croit l'opération complète.
+        if isinstance(raw_selected, list) and len(raw_selected) > 200:
+            logger.warning(
+                "selected_cells tronquées : %d reçues, 200 transmises au "
+                "copilot — transformation potentiellement partielle",
+                len(raw_selected),
+                extra={"request_id": getattr(self, "request_id", "?")},
+            )
         if isinstance(raw_selected, list):
             for item in raw_selected[:200]:
                 if not isinstance(item, dict):
@@ -787,16 +871,21 @@ class ResultModifyHandler(BaseHandler):
             self.write_json(payload, 503)
             return
 
+        # **Cancel utilisateur → 200** (fix 2026-06-11) : ``{"type":
+        # "cancelled", "error": "Run annulé."}`` passait dans la
+        # classification d'erreur (le check ``error`` précédait le check
+        # ``type``) → 422 pour une annulation VOLONTAIRE, métriques 4xx
+        # polluées. L'UX front lisait déjà ``type`` en premier — seul le
+        # code HTTP était faux. Court-circuit AVANT la branche erreur.
+        if result.get("type") == "cancelled":
+            self.write_json(result, 200)
+            return
+
         error_text = result.get("error")
-        # Une string non vide → erreur métier classifiée.
+        # Une string non vide → erreur métier classifiée (kind machine-readable
+        # d'abord, substring legacy en fallback — cf. _status_for_service_error).
         if isinstance(error_text, str) and error_text:
-            # ``INTERNAL_ERROR`` n'est émis que lors d'une exception inattendue
-            # côté service (BDD locked, sandbox mort) — c'est un bug serveur,
-            # pas une erreur métier → 500 pour que les métriques 5xx le voient.
-            if error_text == _Messages.INTERNAL_ERROR:
-                status = 500
-            else:
-                status = _classify_service_error(error_text)
+            status = _status_for_service_error(result, error_text)
             self.write_json(result, status)
             return
 
@@ -857,10 +946,8 @@ class ResultModifyHandler(BaseHandler):
         """
         from app.services.ai.copilot_progress_store import (
             claim_run,
-            clear_progress,
+            finalize_run,
             register_task,
-            release_run,
-            unregister_task,
         )
 
         # IDEMPOTENCE : si un POST arrive avec un (user_id, run_id) déjà
@@ -893,7 +980,7 @@ class ResultModifyHandler(BaseHandler):
                     user_id,
                     run_id,
                 )
-                return {"error": _Messages.INTERNAL_ERROR}
+                return {"error": _Messages.INTERNAL_ERROR, "error_kind": "internal"}
             except asyncio.CancelledError:
                 # NB : depuis le fix adversarial, l'owner passe un dict
                 # `{type:cancelled}` via set_result, pas set_exception.
@@ -905,21 +992,22 @@ class ResultModifyHandler(BaseHandler):
                     "Idempotence : 1er appel a levé, propagation au doublon",
                     exc_info=True,
                 )
-                return {"error": _Messages.INTERNAL_ERROR}
+                return {"error": _Messages.INTERNAL_ERROR, "error_kind": "internal"}
 
         # Variables pour partage entre try et finally (résultat à
         # release_run pour les doublons en attente). Default sain en cas
         # de crash très précoce (avant l'assignation effective).
-        result_for_release: Any = {"error": _Messages.INTERNAL_ERROR}
+        result_for_release: Any = {"error": _Messages.INTERNAL_ERROR, "error_kind": "internal"}
+        registered_task: Any = None
         try:
             # Register le Task courant DANS le try pour que le finally
             # release_run s'exécute même si register_task lève. Sans ça,
             # un crash entre claim et register laissait les awaiters
             # bloqués 30min (TTL inflight).
             if run_id and user_id is not None:
-                current_task = asyncio.current_task()
-                if current_task is not None:
-                    await register_task(user_id, run_id, current_task)
+                registered_task = asyncio.current_task()
+                if registered_task is not None:
+                    await register_task(user_id, run_id, registered_task)
 
             result_for_release = await run_copilot_agent(
                 sql=sql,
@@ -956,56 +1044,45 @@ class ResultModifyHandler(BaseHandler):
                 "run_copilot_agent a crashé",
                 extra={"request_id": getattr(self, "request_id", "?")},
             )
-            result_for_release = {"error": _Messages.INTERNAL_ERROR}
+            result_for_release = {"error": _Messages.INTERNAL_ERROR, "error_kind": "internal"}
             return result_for_release
         finally:
-            # Release la Future inflight : les POSTs concurrents en attente
-            # reçoivent le résultat (jamais une exception, cf. fix adversarial
-            # — les awaiters propageraient CancelledError sur leur coro).
-            # Doit être avant les autres cleanups pour libérer rapidement.
+            # Cleanup de fin de run en UNE Task INDÉPENDANTE (fix
+            # 2026-06-11, tâche #14). L'ancien pattern (3 awaits shieldés
+            # successifs, chacun avec ``except CancelledError: raise``)
+            # avait un trou : une cancellation ré-entrante (2e clic Stop
+            # PENDANT le finally) levait au 1er await et SAUTAIT les
+            # cleanups suivants — la fuite ``_tasks``/``_store`` que les
+            # shields prétendaient empêcher. ``create_task`` détache la
+            # séquence de cleanup de NOTRE cancellation : elle va au bout
+            # dans tous les cas (release → unregister → clear, chaque
+            # étape isolée dans finalize_run). Le shield ne sert qu'à
+            # attendre poliment ; si on est re-cancellé, la Task continue
+            # en arrière-plan et la CancelledError se propage.
             if run_id and user_id is not None:
-                try:
-                    await asyncio.shield(
-                        release_run(
-                            user_id,
-                            run_id,
-                            result=result_for_release,
-                        )
+                cleanup_task = asyncio.create_task(
+                    finalize_run(
+                        user_id,
+                        run_id,
+                        result=result_for_release,
+                        task=registered_task,
                     )
+                )
+                # Consomme l'exception éventuelle de la Task détachée
+                # (review #14) : si on est re-cancellé pendant le shield,
+                # plus personne ne l'await — sans ce callback, une
+                # BaseException résiduelle deviendrait un warning asyncio
+                # « Task exception was never retrieved ».
+                cleanup_task.add_done_callback(
+                    lambda t: t.exception() if not t.cancelled() else None
+                )
+                try:
+                    await asyncio.shield(cleanup_task)
                 except asyncio.CancelledError:
-                    raise
+                    raise  # cleanup_task indépendante — elle finira seule
                 except Exception:
                     logger.debug(
-                        "release_run non critique a levé",
-                        exc_info=True,
-                    )
-            if run_id and user_id is not None:
-                # ``asyncio.shield`` protège les cleanups d'une cancellation
-                # ré-entrante : si l'utilisateur clique Stop PENDANT que ce
-                # finally s'exécute, sans shield le ``await`` lèverait
-                # CancelledError (qui hérite de BaseException et n'est pas
-                # rattrapé par ``except Exception``) → fuite mémoire dans
-                # ``_tasks`` + entrée orpheline dans ``_store``. Avec shield,
-                # les cleanups vont au bout puis la CancelledError est
-                # propagée APRÈS, ce que le caller asyncio gérera.
-                #
-                # Silent si déjà purgé : double-purge sans risque.
-                try:
-                    await asyncio.shield(unregister_task(user_id, run_id))
-                except asyncio.CancelledError:
-                    raise  # propage après cleanup réussi
-                except Exception:
-                    logger.debug(
-                        "unregister_task non critique a levé",
-                        exc_info=True,
-                    )
-                try:
-                    await asyncio.shield(clear_progress(user_id, run_id))
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.debug(
-                        "clear_progress non critique a levé",
+                        "finalize_run non critique a levé",
                         exc_info=True,
                     )
 
@@ -1040,7 +1117,7 @@ class ResultModifyHandler(BaseHandler):
                 "modify_result one-shot a crashé",
                 extra={"request_id": getattr(self, "request_id", "?")},
             )
-            return {"error": _Messages.INTERNAL_ERROR}
+            return {"error": _Messages.INTERNAL_ERROR, "error_kind": "internal"}
 
 
 # ── Handler : suggestions de remplissage de cellule ──────────────────────
@@ -1197,7 +1274,7 @@ class CopilotTaskProgressHandler(BaseHandler):
     @_copilot_authorized
     async def get(self) -> None:
         run_id = self.get_argument("run_id", default="")
-        if not isinstance(run_id, str) or not run_id or len(run_id) > 128:
+        if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
             # Fail-loud sur input mal formé ; mais le frontend n'est pas
             # censé envoyer un mauvais run_id sauf bug.
             self.write_json({"error": "run_id manquant ou invalide"}, 400)
@@ -1211,6 +1288,14 @@ class CopilotTaskProgressHandler(BaseHandler):
         # Scope user strict : (user_id, run_id) est la clé. Un user qui
         # devine le run_id d'un autre ne peut pas lire son plan — la clé
         # ne matche pas.
+        #
+        # Les deux lectures prennent le lock du store SÉPARÉMENT : entre les
+        # deux awaits, le run peut finir/expirer → paire plan/tool
+        # momentanément incohérente. Toléré par construction : les deux
+        # combinaisons (plan sans tool, tool sans plan — cf. branche
+        # ``plan is None`` plus bas) sont gérées, et le polling 1s du
+        # frontend s'auto-corrige au tick suivant (verdict tâche #25 :
+        # pas de snapshot atomique nécessaire).
         plan = await get_progress(self.current_user.id, run_id)
         raw_tool = await get_tool_in_use(self.current_user.id, run_id)
         tool_label = self._TOOL_LABELS.get(raw_tool) if raw_tool else None
@@ -1304,7 +1389,7 @@ class CopilotCancelHandler(BaseHandler):
             return
 
         run_id_raw = body.get("run_id")
-        if not isinstance(run_id_raw, str) or not run_id_raw or len(run_id_raw) > 128:
+        if not isinstance(run_id_raw, str) or not _RUN_ID_RE.match(run_id_raw):
             self.write_json({"error": "run_id manquant ou invalide"}, 400)
             return
 

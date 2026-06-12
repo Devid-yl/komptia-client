@@ -288,6 +288,14 @@
         chart: 'M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z',
         bell: 'M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0',
         rocket: 'M15.59 14.37a6 6 0 01-5.84 7.38v-4.8m5.84-2.58a14.98 14.98 0 006.16-12.12A14.98 14.98 0 009.631 8.41m5.96 5.96a14.926 14.926 0 01-5.841 2.58m-.119-8.54a6 6 0 00-7.381 5.84h4.8m2.581-5.84a14.927 14.927 0 00-2.58 5.84m2.699 2.7c-.103.021-.207.041-.311.06a15.09 15.09 0 01-2.448-2.448 14.9 14.9 0 01.06-.312m-2.24 2.39a4.493 4.493 0 00-1.757 4.306 4.493 4.493 0 004.306-1.758M16.5 9a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z',
+        // `zap` = Heroicons `bolt` (outline 24). Thème « action / étape rapide ».
+        // Référencé par 8 tours (automations, datastore, sync schéma, test connexion,
+        // SMTP, config IA, data-access) — avant cet ajout il retombait sur `sparkle`.
+        zap: 'M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z',
+        // `shield` = Heroicons `shield-check` (outline 24). Thème « sécurité / vérifier
+        // avant d'agir ». Référencé par 8 tours (rôles, modération, test avant activation,
+        // règles d'accès) — idem, retombait silencieusement sur `sparkle`.
+        shield: 'M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z',
     };
 
     function _buildIcon(name) {
@@ -369,6 +377,16 @@
      * doit être affiché.
      */
     function _renderTour(opts) {
+        // Garde SYNCHRONE anti-duplication (dernier rempart). ``_renderTour``
+        // construit et insère l'overlay de façon synchrone : si deux callbacks
+        // ``start().then()`` atteignent ce point dans la même file de
+        // micro-tâches (course que le flag ``_sessionTourShown`` couvre déjà,
+        // mais aussi tout ancien onboarding-tour.js servi par un serveur non
+        // redémarré, ou un double-appel exotique), le PREMIER insère l'overlay,
+        // le SECOND le voit ici et abandonne. Rend la double-modale
+        // structurellement impossible — bug « Bienvenue dans le composeur ×2 »
+        // signalé le 2026-06-10. Couplé au flag, c'est une défense à 2 niveaux.
+        if (document.querySelector('.komptia-onboard-overlay')) return;
         var steps = opts.steps;
         var index = 0;
         var lastFocused = document.activeElement;
@@ -628,5 +646,78 @@
         } catch (e) { /* ignore */ }
     }
 
-    window.KomptiaOnboarding = { start: start, reset: reset };
+    /**
+     * Réactive TOUS les tours guidés côté client.
+     *
+     * Utilisé par ``/settings`` (« Réactiver les tours ») APRÈS un reset
+     * serveur réussi (``POST /api/onboarding/reset``, qui supprime les lignes
+     * ``user_onboarding_progress`` du user). Cette fonction ne fait QUE la
+     * partie client :
+     *
+     *  1. Purge le miroir ``localStorage`` (toutes les clés préfixées
+     *     ``STORAGE_PREFIX``) — sinon le fallback offline (``_hasSeenTour``
+     *     quand la BDD est injoignable) continuerait de masquer les tours.
+     *  2. Invalide le cache d'état serveur en mémoire + la garde anti-cascade.
+     *     Komptia navigue en pleine page (pas de SPA) : un tour ne se déclenche
+     *     qu'au chargement d'une page via ``start()``. Cette invalidation
+     *     garantit donc que la PROCHAINE navigation re-fetch l'état (désormais
+     *     vide) et ré-affiche les tours — elle ne re-rend rien en place sur
+     *     /settings (qui n'a aucun tour). Le message UI le dit honnêtement
+     *     (« réapparaîtront à votre prochaine visite »).
+     *
+     * Le reset serveur reste la source de vérité : même si cette fonction
+     * n'est jamais appelée, la prochaine navigation re-fetch l'état vide et les
+     * tours réapparaissent. Elle évite juste de devoir purger le miroir local.
+     *
+     * @returns {number} nombre de clés ``localStorage`` retirées (debug/test).
+     */
+    function resetAll() {
+        var removed = 0;
+        try {
+            // Itère À REBOURS : ``removeItem`` décale les index restants, une
+            // boucle ascendante sauterait une clé sur deux.
+            for (var i = localStorage.length - 1; i >= 0; i--) {
+                var k = localStorage.key(i);
+                // Match de PRÉFIXE strict (``indexOf === 0``) : ne touche QUE
+                // ``komptia_onboarding_*``, jamais les autres clés Komptia
+                // (thème, brouillons Iris, drafts contacts…).
+                if (k && k.indexOf(STORAGE_PREFIX) === 0) {
+                    localStorage.removeItem(k);
+                    removed++;
+                }
+            }
+        } catch (e) { /* localStorage indisponible (mode privé strict) — no-op */ }
+        // Invalide le cache mémoire → prochain start() re-fetch l'état vide.
+        _serverState = null;
+        _serverStateLoaded = false;
+        _serverStatePromise = null;
+        _sessionTourShown = false;
+        return removed;
+    }
+
+    // ── Cohérence cross-onglets (axe 22) ──
+    // Si un AUTRE onglet réactive les tours (``resetAll`` → ``removeItem`` des
+    // clés ``komptia_onboarding_*``, ou un ``localStorage.clear()`` global), on
+    // invalide le cache d'état serveur en mémoire de CET onglet. Sa prochaine
+    // navigation (Komptia = full page nav) re-fetch alors l'état vide et
+    // ré-affiche les tours, au lieu de servir un cache stale qui les masquerait
+    // (incohérence BDD-vidée ↔ cache-onglet). On ne réagit qu'aux SUPPRESSIONS
+    // (``newValue === null``) : une écriture (``_markSeenLocal`` au cours d'un
+    // tour dans un autre onglet) ne doit PAS invalider.
+    try {
+        window.addEventListener('storage', function (ev) {
+            if (!ev) return;
+            var isOnboardingRemoval =
+                ev.newValue === null
+                && (ev.key === null  // localStorage.clear() global
+                    || (typeof ev.key === 'string' && ev.key.indexOf(STORAGE_PREFIX) === 0));
+            if (isOnboardingRemoval) {
+                _serverState = null;
+                _serverStateLoaded = false;
+                _serverStatePromise = null;
+            }
+        });
+    } catch (e) { /* addEventListener indispo — dégradation : reload requis ailleurs */ }
+
+    window.KomptiaOnboarding = { start: start, reset: reset, resetAll: resetAll };
 })();

@@ -46,6 +46,7 @@ import mimetypes
 import os
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Final, Optional
 from urllib.parse import quote
@@ -68,6 +69,7 @@ from app.services.storage_manager import (
     StorageManager,
     calculate_hash_from_bytes,
 )
+from app.utils.gzip_safe import gunzip_first_member
 from app.utils.http_streaming import stream_file_to_handler
 from app.utils.logger import get_logger
 from app.utils.rate_limiter import RateLimiter
@@ -140,16 +142,15 @@ MAX_PREVIEW_IMAGE_BYTES: Final[int] = 5 * 1024 * 1024
 #: parsing openpyxl. Pas besoin d'un cap row count distinct.
 MAX_PREVIEW_XLSX_ROWS: Final[int] = 1_000_000_000
 MAX_PREVIEW_XLSX_COLS: Final[int] = 200
-#: Cap décompression .afz.json au download — protection zip-bomb friendly.
-#: Un .afz.json légitime peut faire ratio gzip ~20×, donc 1 GB compressé →
-#: 20 GB décompressé. On cap à 4 GiB pour rester sous _HTTP_MAX_BODY_BYTES
-#: (Tornado ne peut pas répondre plus de toute façon).
-MAX_AFZ_DECOMPRESS_BYTES: Final[int] = 4 * 1024 * 1024 * 1024 - 1
-#: Cap PLUS SERRÉ pour le download anonymisé (F15 review adversariale) : ce
-#: chemin re-matérialise le JSON en mémoire (deepcopy d'anonymisation + json.dumps)
-#: → pic mémoire ≈ 3× la taille. Un .afz.json réel pèse <5 MiB, donc 256 MiB ne
-#: gêne aucun usage légitime tout en évitant un OOM mono-requête près du cap 4 GiB.
-MAX_AFZ_ANON_BYTES: Final[int] = 256 * 1024 * 1024
+#: ⚠️ Plus AUCUN cap de décompression .afz.json hardcodé ici. La SOURCE UNIQUE
+#: de toutes les limites de classeur (disque ET taille décompressée en RAM, sur
+#: TOUS les chemins : upload / download / download anonymisé / lecture) est le
+#: quota de stockage par user défini par l'admin (/admin/performance →
+#: STORAGE_QUOTA_PER_USER_BYTES), résolu au runtime via
+#: ``storage_manager.get_storage_quota_bytes()``. Un seul bouton, une seule
+#: responsabilité. ⚠️ Ce quota borne donc aussi le pic RAM de décompression :
+#: l'admin doit le dimensionner vs la RAM du conteneur (cf. docstring de
+#: ``get_storage_quota_bytes`` ; le défaut 500 Mio est sûr).
 #: Cap récursion ``DatastoreFoldersAPIHandler.scan_folders`` — défense
 #: contre symlink cycle et arborescence très profonde.
 MAX_FOLDER_DEPTH: Final[int] = 20
@@ -803,6 +804,25 @@ def validate_file_content(content: bytes, extension: str) -> bool:
     return False
 
 
+def _is_gzip_magic(data: bytes) -> bool:
+    """True si ``data`` commence par les magic bytes gzip (``0x1f 0x8b``)."""
+    return len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B
+
+
+#: Décompression gzip robuste = SINGLE SOURCE OF TRUTH (``app.utils.gzip_safe``).
+#: Ré-exportés ici pour les callers/tests historiques de ce module. Le client
+#: compresse le ``.afz.json`` côté navigateur (``CompressionStream``) pour
+#: réduire ~20× le payload réseau et passer sous ``client_max_body_size`` de
+#: nginx ; le serveur décompresse de façon transparente avant validation +
+#: stockage (re-gzip déterministe aval → ETag/quota inchangés).
+#:
+#: ``gunzip_first_member`` tolère les octets de queue (le fix du bug
+#: « classeur compressé trop volumineux ou illisible » : ``gzip.GzipFile``
+#: plantait sur le moindre octet résiduel APRÈS avoir tout décompressé) et
+#: borne la RAM (anti zip-bomb), tout en distinguant trop-gros vs corrompu.
+_gunzip_with_cap = gunzip_first_member  # alias rétrocompat (callers + tests)
+
+
 # ─── Page HTML ───────────────────────────────────────────────────
 
 
@@ -911,7 +931,18 @@ class DatastoreUploadAPIHandler(BaseHandler):
             total_size = sum(len(f["body"]) for f in files)
             can_upload, error_msg = await storage_mgr_quota.check_quota(user.id, total_size)
         if not can_upload:
-            return self.write_json({"success": False, "error": f"Quota dépassé : {error_msg}"}, 413)
+            # ``error_code`` machine-readable : permet au client de
+            # distinguer le quota app (JSON 413) de l'oversize passerelle
+            # nginx (HTML 413) et d'afficher l'UX quota dédiée. Cf.
+            # _saveToPathAsync (static/js/iris-grid.js).
+            return self.write_json(
+                {
+                    "success": False,
+                    "error": f"Quota dépassé : {error_msg}",
+                    "error_code": "QUOTA_EXCEEDED",
+                },
+                413,
+            )
 
         # Taille max PAR FICHIER = SSoT admin (/admin/performance), résolue au
         # runtime. Distincte (a) du quota cumulé vérifié ci-dessus et (b) du cap
@@ -922,6 +953,12 @@ class DatastoreUploadAPIHandler(BaseHandler):
         from app.services.ai.config_service import get_max_upload_size_bytes
 
         max_upload_bytes = await get_max_upload_size_bytes()
+
+        # NB : un .afz.json gzippé par le navigateur est stocké TEL QUEL (écriture
+        # disque directe, aucune décompression en RAM ici — cf. plus bas). La
+        # taille DISQUE reste bornée par ``max_upload_bytes`` (par fichier) + le
+        # quota de stockage admin (cumul, vérifié avant la boucle). Plus aucun cap
+        # de décompression à la sauvegarde.
 
         uploaded: list[dict] = []
         errors: list[str] = []
@@ -938,12 +975,36 @@ class DatastoreUploadAPIHandler(BaseHandler):
                 errors.append(f"{name}: {ext_error}")
                 continue
 
+            # Cap par fichier + quota (vérifié avant la boucle) portent sur la
+            # taille SUR LE FIL = taille disque (les .afz.json sont stockés
+            # gzippés). On les laisse sur ``f["body"]`` (compressé si le client
+            # a gzippé) — cohérent avec la convention « hash & quota = disque ».
             size_error = FileValidator.validate_size(len(f["body"]), max_upload_bytes)
             if size_error:
                 errors.append(f"{name}: {size_error}")
                 continue
 
-            if not validate_file_content(f["body"], ext):
+            # ── Sauvegarde = ÉCRITURE DISQUE DIRECTE (pas de décompression RAM) ──
+            # Un .afz.json gzippé par le navigateur (``CompressionStream``) est
+            # STOCKÉ TEL QUEL : on n'explose PAS son contenu en RAM pour le
+            # valider/re-compresser. Raisons :
+            #  • Sauvegarder un classeur est fondamentalement une écriture disque ;
+            #    le fichier compressé est petit (~Mo). Décompresser tout en RAM
+            #    (souvent des centaines de Mo) était un goulot artificiel qui
+            #    bloquait des classeurs pourtant largement stockables sur disque.
+            #  • L'autosave se déclenche souvent : re-décompresser à CHAQUE save
+            #    brûlerait du CPU pour rien.
+            # La taille DISQUE (octets compressés) reste bornée par le cap
+            # d'upload (vérifié ci-dessus) ET le quota de stockage admin (vérifié
+            # avant la boucle). La validité JSON est vérifiée à la LECTURE
+            # (``decode_afz_bytes`` → échec gracieux si corrompu), pas ici — c'est
+            # le fichier privé de l'utilisateur, jamais exécuté, juste re-parsé.
+            body = f["body"]
+            client_gzipped_afz = name.lower().endswith(".afz.json") and _is_gzip_magic(body)
+
+            if not client_gzipped_afz and not validate_file_content(body, ext):
+                # Validation de contenu pour TOUT le reste (uploads bruts : .json
+                # non gzippé d'un vieux navigateur, .xlsx, .csv, images, pdf…).
                 errors.append(
                     f"{name}: le contenu du fichier ne correspond pas à l'extension {ext}"
                 )
@@ -1003,31 +1064,32 @@ class DatastoreUploadAPIHandler(BaseHandler):
                     target = dest_dir / f"{stem}_{idx}{ext}"
                     idx += 1
 
-            body = f["body"]
             rel_path = str(target.relative_to(user_dir))
 
-            # Gzip transparent pour les classeurs .afz.json — ratio
-            # typique 5-20× (JSON répétitif compresse très bien).
-            # Convention "hash & quota = contenu DISQUE" :
-            #   - file_hash hashé sur body_to_write (= compressé pour .afz.json)
-            #   - file_size = len(body_to_write) (= compressé pour .afz.json)
-            # Garantit : ETag stable (If-Match check post-save retombe sur
-            # hash(disk) qui = hash(body_to_write) stocké), quota cohérent
-            # entre register_upload et sync_user_storage (deux sources
-            # reposent toutes deux sur f.stat().st_size = disk).
-            # Rétrocompat lecture : ``classeur/reader.py:_load_json_sync``
-            # détecte les magic bytes ``0x1f 0x8b`` et décompresse à
-            # la volée. Anciens .afz.json en clair continuent à marcher.
+            # Détermination des octets à écrire sur disque — convention
+            # "hash & quota = contenu DISQUE (compressé pour .afz.json)" :
+            #   • Classeur gzippé par le navigateur → on écrit ses octets gzip
+            #     TELS QUELS (aucune décompression / re-compression). C'est une
+            #     pure écriture disque. Le hash est déterministe : ``CompressionStream``
+            #     produit le MÊME gzip pour le même contenu (mtime fixe), donc
+            #     re-sauver un classeur identique redonne le même hash → If-Match
+            #     stable cross-onglet.
+            #   • .afz.json BRUT (vieux navigateur sans CompressionStream) → on
+            #     gzip côté serveur pour l'efficacité disque (offload thread :
+            #     CPU-bound, ne doit pas geler la boucle Tornado).
+            #   • Autre format (xlsx/csv/image/pdf) → écrit tel quel.
+            # Rétrocompat lecture : ``reader.decode_afz_bytes`` détecte le gzip et
+            # décompresse à la volée ; les anciens .afz.json en clair marchent.
             body_to_write = body
             target_name_lower = target.name.lower()
-            if target_name_lower.endswith(".afz.json"):
+            if target_name_lower.endswith(".afz.json") and not client_gzipped_afz:
                 import gzip as _gzip
 
-                # Niveau 6 = bon compromis ratio/vitesse (défaut gzip).
-                # mtime=0 → output déterministe pour le même input.
-                body_to_write = _gzip.compress(body, compresslevel=6, mtime=0)
+                body_to_write = await asyncio.to_thread(
+                    lambda: _gzip.compress(body, compresslevel=6, mtime=0)
+                )
                 logger.debug(
-                    "Gzip .afz.json %s : %d → %d bytes (%.1f%%)",
+                    "Gzip serveur .afz.json brut %s : %d → %d bytes (%.1f%%)",
                     target.name,
                     len(body),
                     len(body_to_write),
@@ -1036,11 +1098,12 @@ class DatastoreUploadAPIHandler(BaseHandler):
             file_size = len(body_to_write)
             file_hash = calculate_hash_from_bytes(body_to_write)
 
-            # Atomic write : écrit dans <target>.tmp puis os.replace()
-            # vers <target>. Si crash backend en plein write, le
-            # fichier original (s'il existe) reste intact. ``replace``
-            # est atomique sur la même partition (mv POSIX/Windows).
-            tmp_target = target.with_suffix(target.suffix + ".tmp")
+            # Atomic write : écrit dans un <target>.<token>.tmp UNIQUE puis
+            # os.replace() vers <target>. Si crash backend en plein write, le
+            # fichier original (s'il existe) reste intact. ``replace`` est
+            # atomique sur la même partition (mv POSIX/Windows). Le token unique
+            # (T9) évite la collision .tmp entre 2 uploads concurrents du même path.
+            tmp_target = _unique_tmp_path(target)
             try:
                 await asyncio.to_thread(tmp_target.write_bytes, body_to_write)
                 await asyncio.to_thread(os.replace, str(tmp_target), str(target))
@@ -1100,15 +1163,41 @@ class DatastoreUploadAPIHandler(BaseHandler):
                 },
             )
 
+        # **Anti-perte silencieuse (C1)** : ``success`` reflète qu'AU MOINS un
+        # fichier a réellement été persisté. Un batch où TOUT échoue
+        # (``uploaded == []`` mais ``errors`` non vide) doit renvoyer
+        # ``success:false`` — sinon le client (save classeur) marquerait le
+        # fichier "sauvé" alors que rien n'a été écrit. Status 200 conservé :
+        # la requête a été traitée (le détail est dans ``errors``), c'est un
+        # échec applicatif désambiguïsé par ``success`` + ``errors``.
         self.write_json(
             {
-                "success": True,
+                "success": bool(uploaded),
                 "uploaded": uploaded,
                 "errors": errors,
                 "message": f"{len(uploaded)} fichier(s) importé(s)"
                 + (f", {len(errors)} erreur(s)" if errors else ""),
             }
         )
+
+
+# ─── Écriture atomique : chemin .tmp unique par requête ─────────
+
+
+def _unique_tmp_path(target: Path) -> Path:
+    """Chemin ``.tmp`` UNIQUE par requête pour l'écriture atomique (T9).
+
+    Un ``.tmp`` DÉTERMINISTE (``<target>.tmp``) entre en collision quand deux
+    requêtes écrivent le MÊME ``target`` en parallèle (multi-onglets, autosave
+    keepalive + save normal, double-clic) : les ``write_bytes(.tmp)`` /
+    ``os.replace`` tournent dans le thread-pool et s'entrelacent → R1 peut
+    ``os.replace`` le contenu écrit par R2, puis R2 hit ``FileNotFoundError`` →
+    le disque contient R2 mais R1 reçoit un 200 + un hash qui NE correspond PAS
+    au disque (silent-wrong-data + 412 fantôme au prochain save). Un token
+    aléatoire isole chaque écriture. ``cleanup_orphan_tmp_files`` balaie toujours
+    les ``*.tmp`` orphelins (le nom finit par ``.tmp``).
+    """
+    return target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
 
 
 # ─── Cleanup orphelins : .tmp non remplacés ─────────────────────
@@ -1206,7 +1295,7 @@ class DatastoreMkdirAPIHandler(BaseHandler):
         except OSError as exc:
             logger.warning(
                 "Échec mkdir",
-                extra={"user_id": user.id, "name": folder_name, "error": str(exc)},
+                extra={"user_id": user.id, "folder_name": folder_name, "error": str(exc)},
             )
             return self.write_json(
                 {"success": False, "error": "Impossible de créer le dossier."}, 500
@@ -1623,16 +1712,15 @@ class DatastoreDownloadAPIHandler(BaseHandler):
 
         Seul le .afz.json (classeur ré-ouvrable) est concerné — un fichier
         binaire opaque (PDF, image…) ne peut pas être ré-anonymisé. Fail-closed
-        (422) si un terme configuré ne peut être appliqué. Respecte un cap mémoire
-        serré ``MAX_AFZ_ANON_BYTES`` (ce chemin re-matérialise le JSON → pic ~3×).
+        (422) si un terme configuré ne peut être appliqué. Borné par le quota de
+        stockage admin (SSoT) ; ce chemin re-matérialise le JSON (pic ~3×) donc
+        l'admin dimensionne le quota vs la RAM du conteneur.
 
         Note : les champs ``sql`` des onglets sont conservés. Le fichier reflète
         des valeurs anonymisées (instantané destiné au partage) ; une éventuelle
         ré-exécution SQL dans Iris repasserait sur les vraies données — ce n'est
         pas un original ré-importable garantissant l'anonymat au re-run.
         """
-        import gzip as _gzip
-
         if not target.name.lower().endswith(".afz.json"):
             return self.write_json(
                 {
@@ -1646,41 +1734,24 @@ class DatastoreDownloadAPIHandler(BaseHandler):
                 422,
             )
 
-        # Lecture du JSON (gzip-aware) avec cap mémoire — miroir du download
-        # normal (un .afz.json malicieux ne doit pas OOM le serveur).
+        # Lecture du JSON via le SSoT ``decode_afz_bytes`` : gzip transparent +
+        # tolérance aux octets de queue + borne de décompression = QUOTA admin
+        # (plus aucun cap hardcodé). Un .afz.json ne doit pas OOM le serveur ; le
+        # quota borne le pic RAM (ce chemin re-matérialise le JSON pour
+        # anonymisation → l'admin dimensionne le quota en conséquence).
+        from app.services.classeur.reader import decode_afz_bytes
+        from app.services.storage_manager import get_storage_quota_bytes
+
         try:
-            with open(target, "rb") as _f:
-                is_gz = _f.read(2) == b"\x1f\x8b"
-            if is_gz:
-                buffer: list[bytes] = []
-                total = 0
-                gz = await asyncio.to_thread(lambda: _gzip.open(str(target), "rb"))
-                try:
-                    while True:
-                        chunk = await asyncio.to_thread(gz.read, max(FILE_CHUNK_BYTES, 64 * 1024))
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > MAX_AFZ_ANON_BYTES:
-                            return self.write_json(
-                                {
-                                    "success": False,
-                                    "error": "Fichier décompressé trop volumineux",
-                                },
-                                413,
-                            )
-                        buffer.append(chunk)
-                finally:
-                    await asyncio.to_thread(gz.close)
-                raw = b"".join(buffer)
-            else:
-                if target.stat().st_size > MAX_AFZ_ANON_BYTES:
-                    return self.write_json(
-                        {"success": False, "error": "Fichier trop volumineux"}, 413
-                    )
-                raw = await asyncio.to_thread(target.read_bytes)
-            data = json.loads(raw.decode("utf-8"))
-        except (OSError, _gzip.BadGzipFile, UnicodeDecodeError, ValueError) as exc:
+            file_bytes = await asyncio.to_thread(target.read_bytes)
+            quota = await get_storage_quota_bytes()
+            data = await asyncio.to_thread(
+                decode_afz_bytes,
+                file_bytes,
+                source=target.name,
+                max_decompressed_bytes=quota,
+            )
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             logger.warning(
                 "datastore download anonymisé : lecture .afz.json échouée : %s",
                 exc,
@@ -1811,64 +1882,26 @@ class DatastoreDownloadAPIHandler(BaseHandler):
             )
 
         if is_gzipped_afz:
-            # DL-2 — Décompression chunk par chunk en mémoire AVANT le
-            # premier flush. Status 413 ne peut être posé qu'avant le
-            # flush initial (Tornado committe le status à la 1ère écriture
-            # sortante). On accumule donc en mémoire avec un cap cumulé ;
-            # si > MAX_AFZ_DECOMPRESS_BYTES, on refuse proprement 413 SANS
-            # avoir flushé un seul byte côté client. Coût : un fichier
-            # légitime de 500 MiB tient en RAM 500 MiB le temps du download
-            # — acceptable, et c'était déjà le cas avant le streaming
-            # tenté qui s'est révélé incompatible avec le set_status post-
-            # flush (régression détectée en review adversariale).
-            import gzip as _gzip
-
-            chunk_size = max(FILE_CHUNK_BYTES, 64 * 1024)
-            buffer: list[bytes] = []
-            total: int = 0
-            try:
-
-                def _open() -> Any:
-                    return _gzip.open(str(target), "rb")
-
-                gz = await asyncio.to_thread(_open)
-                try:
-                    while True:
-                        chunk = await asyncio.to_thread(gz.read, chunk_size)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > MAX_AFZ_DECOMPRESS_BYTES:
-                            logger.warning(
-                                "Refus download .afz.json zip-bomb (cap dépassé)",
-                                extra={
-                                    "user_id": user.id,
-                                    "name": target.name,
-                                    "read_so_far": total,
-                                    "cap": MAX_AFZ_DECOMPRESS_BYTES,
-                                },
-                            )
-                            # Aucun flush effectué — set_status fonctionne.
-                            return self.write_json(
-                                {
-                                    "success": False,
-                                    "error": "Fichier décompressé trop volumineux",
-                                },
-                                413,
-                            )
-                        buffer.append(chunk)
-                finally:
-                    await asyncio.to_thread(gz.close)
-            except (OSError, _gzip.BadGzipFile) as exc:
-                logger.warning(
-                    "Decompression .afz.json échouée : %s", exc, extra={"user_id": user.id}
-                )
-                return self.write_json({"success": False, "error": "Fichier corrompu"}, 500)
-
-            # Cap respecté → on peut maintenant écrire en sécurité.
+            # ── Ouverture/téléchargement = LECTURE DISQUE DIRECTE ────────────
+            # Symétrique au fix de sauvegarde : on NE décompresse PAS le
+            # .afz.json en RAM côté serveur. On streame les octets gzip STOCKÉS
+            # TELS QUELS avec ``Content-Encoding: gzip`` ; le navigateur les
+            # décompresse NATIVEMENT (le ``fetch`` de « ouvrir le classeur » via
+            # ``r.json()`` ET le téléchargement disque décodent l'encoding de
+            # façon transparente — résultat identique à l'ancien comportement
+            # « JSON décompressé », mais sans aucun pic mémoire serveur).
+            #
+            # Conséquences :
+            #  • Plus de buffer de 600 Mio en RAM avant le flush → plus d'OOM ni
+            #    de 413 quota à l'ouverture : un classeur s'ouvre quelle que soit
+            #    sa taille décompressée (tant qu'il tient côté navigateur).
+            #  • Octets transmis = taille COMPRESSÉE (~Mo) → réseau léger.
+            #  • Le navigateur reste seul juge de sa propre RAM au parse JSON.
             self.set_header("Content-Type", "application/json; charset=utf-8")
+            self.set_header("Content-Encoding", "gzip")
             self.set_header("Content-Disposition", _content_disposition(target.name))
-            self.set_header("Content-Length", total)
+            # Content-Length = octets ENVOYÉS (compressés), pas la taille décompressée.
+            self.set_header("Content-Length", target.stat().st_size)
             if stored_hash:
                 self.set_header("ETag", f'"{stored_hash}"')
             self._schedule_audit_file_download(
@@ -1878,8 +1911,8 @@ class DatastoreDownloadAPIHandler(BaseHandler):
                 gzip=True,
                 ip_address=self.request.remote_ip,
             )
-            for chunk in buffer:
-                self.write(chunk)
+            # Streaming des octets gzip bruts (fichier déjà compressé sur disque).
+            await stream_file_to_handler(self, target, FILE_CHUNK_BYTES)
             return
 
         mime = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
@@ -1928,6 +1961,16 @@ class DatastorePreviewAPIHandler(BaseHandler):
                         f"(max {MAX_PREVIEW_FILE_BYTES // (1024 * 1024)} Mo)."
                     ),
                 }
+            # Garde gzip : un fichier compressé lu en texte afficherait du binaire
+            # (« \x1f\x8b… »). Les classeurs .afz.json sont normalement interceptés
+            # en amont (``_preview_workbook``) ; ce filet couvre tout autre fichier
+            # gzippé qui arriverait ici plutôt que d'afficher de la bouillie.
+            with open(file_path, "rb") as _fh:
+                if _is_gzip_magic(_fh.read(2)):
+                    return {
+                        "type": "info",
+                        "content": "Fichier compressé (binaire) — aperçu non disponible.",
+                    }
             # ``errors="replace"`` : on préfère afficher des ``?`` qu'un 500.
             text = file_path.read_text(encoding="utf-8", errors="replace")
             # A8-F2 — compter les lignes du fichier COMPLET avant de tronquer le
@@ -1945,7 +1988,18 @@ class DatastorePreviewAPIHandler(BaseHandler):
             preview: dict = {"type": "text", "content": text}
 
             if ext == ".csv":
-                reader = csv.reader(io.StringIO(text))
+                # Séparateur détecté via le SSoT ``csv_loader._detect_separator``
+                # (csv.Sniffer sur ``;,\t|`` + fallback ``;`` FR). Avant,
+                # ``csv.reader`` prenait ``,`` par défaut → un CSV FR à ``;``
+                # (export Excel/Sage standard) s'affichait en 1 SEULE colonne et
+                # splittait sur la virgule décimale (« 1 234,56 ») = tableau
+                # d'aperçu structurellement FAUX, silencieusement. Le loader
+                # external-sheets sniffait déjà ; le preview ré-implémentait
+                # naïvement — on factorise sur le même helper.
+                from app.services.external_sheets.csv_loader import _detect_separator
+
+                delimiter = _detect_separator(text)
+                reader = csv.reader(io.StringIO(text), delimiter=delimiter)
                 rows: list[list[str]] = []
                 for i, row in enumerate(reader):
                     rows.append(row)
@@ -2031,6 +2085,57 @@ class DatastorePreviewAPIHandler(BaseHandler):
             logger.error("Erreur parsing Excel: %s", e, exc_info=True)
             return {"type": "error", "content": "Impossible de prévisualiser ce fichier Excel."}
 
+    def _preview_workbook(self, file_path: Path) -> dict:
+        """Aperçu d'un classeur ``.afz.json`` (gzip transparent via SSoT).
+
+        Les ``.afz.json`` sont stockés gzippés sur disque. Avant, un simple clic
+        les routait vers ``_preview_text_file`` (extension ``.json``) →
+        ``read_text`` sur des octets gzip → bouillie binaire (« \\x1f\\x8b… »)
+        affichée dans le panneau d'aperçu. Ici on décode via ``decode_afz_bytes``
+        (SSoT, gzip-aware + tolérant) et on renvoie un résumé d'onglets, en
+        invitant au double-clic (``openWorkbook``) pour l'ouverture complète dans
+        la grille. Le type ``info`` est déjà rendu par le frontend (aucune
+        modification de renderer nécessaire).
+        """
+        from app.services.classeur.reader import decode_afz_bytes
+
+        try:
+            raw = file_path.read_bytes()
+        except OSError:
+            return {"type": "error", "content": "Fichier introuvable."}
+        try:
+            obj = decode_afz_bytes(raw, source=str(file_path))
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Aperçu classeur .afz.json échoué : %s", exc)
+            return {"type": "error", "content": "Classeur illisible ou corrompu."}
+
+        tabs = obj.get("tabs") if isinstance(obj, dict) else None
+        if not isinstance(tabs, list) or not tabs:
+            return {"type": "info", "content": "Classeur vide ou format non reconnu."}
+
+        labels: list[str] = []
+        for tab in tabs[:8]:
+            if not isinstance(tab, dict):
+                continue
+            label = str(tab.get("label") or "Feuille")
+            row_count = tab.get("row_count")
+            if not isinstance(row_count, int):
+                row_count = tab.get("totalRowCount")
+            labels.append(f"{label} ({row_count} lignes)" if isinstance(row_count, int) else label)
+
+        n_tabs = len(tabs)
+        suffix = "…" if n_tabs > 8 else ""
+        plural = "s" if n_tabs > 1 else ""
+        return {
+            "type": "info",
+            "content": (
+                f"Classeur Komptia — {n_tabs} onglet{plural} : "
+                + ", ".join(labels)
+                + suffix
+                + ". Double-cliquez pour l'ouvrir dans la grille."
+            ),
+        }
+
     def _preview_image(self, file_path: Path) -> dict:
         """Aperçu d'une image (base64). Limite : ``MAX_PREVIEW_IMAGE_BYTES``."""
         try:
@@ -2069,6 +2174,14 @@ class DatastorePreviewAPIHandler(BaseHandler):
             return self.write_json({"success": False, "error": "Fichier introuvable"}, 404)
         ext = target.suffix.lower()
         preview: dict = {"type": "unknown", "content": None}
+
+        # Classeur .afz.json : stocké gzippé sur disque, son extension est ``.json``
+        # donc il tomberait dans la branche texte ci-dessous → ``read_text`` sur du
+        # gzip = bouillie binaire au simple clic. On l'intercepte ici pour décoder
+        # via le SSoT ``decode_afz_bytes`` (gzip-aware) et renvoyer un résumé.
+        if target.name.lower().endswith(".afz.json"):
+            preview = await asyncio.to_thread(self._preview_workbook, target)
+            return self.write_json({"success": True, "file": info, "preview": preview})
 
         # Les parsers (csv, json, openpyxl) sont sync → off-load pour ne
         # pas bloquer l'event-loop sur un fichier de 5 Mo.
@@ -2226,7 +2339,7 @@ class DatastoreSqlExecuteAPIHandler(BaseHandler):
             except OSError as exc:
                 logger.warning(
                     "Erreur lecture fichier SQL",
-                    extra={"user_id": user.id, "name": target.name, "error": str(exc)},
+                    extra={"user_id": user.id, "target_name": target.name, "error": str(exc)},
                 )
                 return self.write_json(
                     {"success": False, "error": "Impossible de lire le fichier."}, 500
@@ -2407,22 +2520,89 @@ class DatastoreSqlSaveAPIHandler(BaseHandler):
                 500,
             )
 
-        def _write_file() -> Optional[str]:
-            """Retourne ``"exists"`` si conflit non-overwrite, ``None`` sinon."""
-            mode = "w" if overwrite else "x"
+        try:
+            rel = str(target.relative_to(user_dir))
+        except ValueError:
+            rel = filename
+
+        file_size = len(sql_bytes)
+        file_hash = calculate_hash_from_bytes(sql_bytes)
+
+        # T10 — alignement sur le pipeline upload SSoT. L'ancien handler écrivait
+        # en direct (``open("w"/"x")``) SANS : (a) compter dans le quota, (b) créer
+        # de FileMetadata (→ .sql invisible des stats/context-files/cleanup,
+        # incohérence FS↔BDD dès la création — chemin nominal), (c) écriture
+        # atomique (crash = .sql tronqué + original perdu), (d) audit. On réutilise
+        # les mêmes helpers que ``DatastoreUploadAPIHandler``.
+        target_exists = await asyncio.to_thread(target.exists)
+        if target_exists and not overwrite:
+            return self.write_json(
+                {
+                    "success": False,
+                    "error": "Un fichier portant ce nom existe déjà.",
+                    "code": "exists",
+                    "filename": filename,
+                },
+                409,
+            )
+
+        # Quota check AVANT écriture (session courte isolée, comme l'upload).
+        async with get_session() as quota_db:
+            storage_mgr_quota = StorageManager(quota_db, DATASTORE_DIR)
+            can_save, quota_error = await storage_mgr_quota.check_quota(user.id, file_size)
+        if not can_save:
+            return self.write_json(
+                {"success": False, "error": quota_error, "error_code": "QUOTA_EXCEEDED"},
+                413,
+            )
+
+        # Overwrite : décrémenter + délier l'ancien AVANT de réécrire.
+        # ``register_upload`` n'UPSERT PAS (ré-INSERT + ré-incrément atomique) →
+        # sans deletion préalable on dupliquerait le FileMetadata et doublerait le
+        # quota. ``register_deletion`` no-op gracieusement (False) si l'ancien .sql
+        # est legacy (créé avant T10, sans metadata).
+        if target_exists and overwrite:
+            await _storage_register_deletion_with_retry(user.id, rel)
             try:
-                with target.open(mode, encoding="utf-8") as f:
-                    f.write(sql)
+                await asyncio.to_thread(target.unlink)
+            except FileNotFoundError:
+                pass
+
+        def _write_atomic_sql() -> Optional[str]:
+            """Écrit le .sql atomiquement. ``"exists"`` si une course a recréé le fichier."""
+            if overwrite:
+                # Cible déjà déliée → ``.tmp`` UNIQUE + ``os.replace`` pour que le
+                # fichier visible apparaisse atomiquement (un reader ne voit jamais
+                # un .sql partiel). Token unique (T9) = pas de collision .tmp entre
+                # 2 saves concurrents. Cleanup du .tmp orphelin si crash write↔replace.
+                tmp_target = _unique_tmp_path(target)
+                try:
+                    tmp_target.write_bytes(sql_bytes)
+                    os.replace(str(tmp_target), str(target))
+                except BaseException:
+                    try:
+                        if tmp_target.exists():
+                            tmp_target.unlink()
+                    except OSError:
+                        pass
+                    raise
+                return None
+            # Non-overwrite : création exclusive atomique (``O_EXCL``) = race-safe
+            # (pas d'overwrite silencieux d'un fichier créé entre le check et l'écriture).
+            try:
+                fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
                 return "exists"
+            with os.fdopen(fd, "wb") as f:
+                f.write(sql_bytes)
             return None
 
         try:
-            outcome = await asyncio.to_thread(_write_file)
+            outcome = await asyncio.to_thread(_write_atomic_sql)
         except OSError as exc:
             logger.warning(
                 "Erreur écriture fichier SQL",
-                extra={"user_id": user.id, "name": target.name, "error": str(exc)},
+                extra={"user_id": user.id, "target_name": target.name, "error": str(exc)},
             )
             return self.write_json(
                 {"success": False, "error": "Impossible d'écrire le fichier."}, 500
@@ -2439,12 +2619,28 @@ class DatastoreSqlSaveAPIHandler(BaseHandler):
                 409,
             )
 
-        try:
-            rel = str(target.relative_to(user_dir))
-        except ValueError:
-            rel = filename
+        # FileMetadata + quota (session isolée + retry, fichier déjà sur disque),
+        # puis audit fire-and-forget — exactement le pipeline de l'upload.
+        metadata = await _storage_register_upload_with_retry(
+            user.id,
+            target,
+            rel,
+            file_size=file_size,
+            file_hash=file_hash,
+        )
+        _schedule_audit_fire_and_forget(
+            action=AuditAction.FILE_UPLOAD,
+            user_id=user.id,
+            entity_id=metadata.id,
+            details={"filename": rel, "size": file_size},
+            ip_address=self.request.remote_ip,
+            op_label="sql_save",
+        )
 
-        return self.write_json({"success": True, "filename": filename, "path": rel}, 201)
+        # ``file_hash`` renvoyé pour parité ETag avec l'upload (If-Match ultérieur).
+        return self.write_json(
+            {"success": True, "filename": filename, "path": rel, "file_hash": file_hash}, 201
+        )
 
 
 # ─── API : Lister les dossiers (pour modale de déplacement) ─────
@@ -2832,7 +3028,17 @@ class SaveSearchAPIHandler(BaseHandler):
                 storage_mgr = StorageManager(session, DATASTORE_DIR)
                 can_upload, error_msg = await storage_mgr.check_quota(user.id, file_size)
                 if not can_upload:
-                    return self.write_json({"success": False, "error": error_msg}, 413)
+                    # ``error_code`` machine-readable : le client distingue le
+                    # quota app (JSON, status 413) de l'oversize passerelle nginx
+                    # (HTML, status 413 aussi) — cf. _saveToPathAsync côté JS.
+                    return self.write_json(
+                        {
+                            "success": False,
+                            "error": error_msg,
+                            "error_code": "QUOTA_EXCEEDED",
+                        },
+                        413,
+                    )
 
                 relative_path = str(file_path.relative_to(user_dir))
                 metadata = await storage_mgr.register_upload(
@@ -2895,7 +3101,7 @@ class SaveSearchAPIHandler(BaseHandler):
                 "Recherche sauvegardée",
                 extra={
                     "user_id": user.id,
-                    "filename": filename,
+                    "saved_filename": filename,
                     "size_bytes": file_size,
                     "search_id": search_id,
                 },
@@ -2907,6 +3113,23 @@ class SaveSearchAPIHandler(BaseHandler):
                     "path": relative_path,
                     "size": file_size,
                     "size_human": _human_size(file_size),
+                    # #18e (triage caps 2026-06-10) — le connector applique
+                    # min(caller, cap admin) : si le cap admin a tronqué la
+                    # ré-exécution, le CSV sauvegardé est PARTIEL. Avant ce
+                    # flag, aucun signal — l'utilisateur archivait/diffusait
+                    # un fichier incomplet en silence.
+                    "truncated": bool(getattr(query_result, "truncated", False)),
+                    **(
+                        {
+                            "warning": (
+                                "Résultat tronqué au cap de lignes "
+                                "(/admin/database) — le CSV sauvegardé est "
+                                "PARTIEL."
+                            )
+                        }
+                        if getattr(query_result, "truncated", False)
+                        else {}
+                    ),
                 }
             )
 

@@ -21,6 +21,22 @@
 {% set _has_grid_widget = any(w.get('widget_type') == 'grid' for w in dashboard.get('widgets', [])) %}
 {% if _is_owner or _has_grid_widget %}
 <link rel="stylesheet" href="/static/css/iris-grid.css">
+{# Sélecteur de feuilles externes : GridTabManager rend INCONDITIONNELLEMENT le
+   bouton [+] « Ajouter feuilles externes… » dans la barre d'onglets. Sans ce
+   script (window.ExternalSheetsPicker), le clic affichait une alert « pas
+   chargé ». Le DOM modal #ext-sheets-modal est inclus en bas de {% block content %}.
+   Même ordre que iris/datastore/automations (picker AVANT iris-grid.js). #}
+<script src="/static/js/components/external_sheets_picker.js" nonce="{{ handler.csp_nonce }}"></script>
+{# Hard-deps du grid (tokenizer + save-helpers + grid-store) AVANT iris-grid.js.
+   Corrige le « window.AnonTokenizer absent » : ce template les oubliait.
+   SSoT : templates/partials/_grid_deps.html. #}
+{% include "../partials/_grid_deps.html" %}
+{# Panneau Confidentialité du widget grille : « Voir détail » d'un terme
+   (window.PrivacyDetailPanel) et « Améliorer l'anonymisation »
+   (window.PrivacyImprovePseudos). Sans ces scripts les 2 boutons étaient morts.
+   Chargés AVANT iris-grid.js (modules autonomes, créent leur propre DOM). #}
+<script src="/static/js/privacy/term-detail-panel.js" nonce="{{ handler.csp_nonce }}"></script>
+<script src="/static/js/privacy/improve-pseudos.js" nonce="{{ handler.csp_nonce }}"></script>
 <script src="/static/js/iris-grid.js" nonce="{{ handler.csp_nonce }}"></script>
 {% end %}
 <style>
@@ -38,7 +54,36 @@
     }
     .widget-card:hover .widget-actions { opacity: 1; }
     .widget-actions { opacity: 0; transition: opacity 0.15s; }
+    /* Modifs non enregistrées : les actions restent visibles SANS hover
+       (sinon l'indicateur dirty serait invisible — perte silencieuse). */
+    .widget-card .widget-actions.has-dirty { opacity: 1; }
     .widget-loading { display: flex; align-items: center; justify-content: center; min-height: 90px; }
+
+    /* ── Bouton « Enregistrer » du widget grille ─────────────────────────
+       4 états : repos (gris discret), .is-dirty (point ambre), .is-saving
+       (icône pulsée), .is-saved (flash vert bref). Le point est un ::after
+       positionné — pas d'élément DOM supplémentaire à synchroniser. */
+    .btn-save-widget { position: relative; transition: color .15s; }
+    .btn-save-widget.is-dirty { color: #d97706; }                /* amber-600 */
+    .dark .btn-save-widget.is-dirty { color: #fbbf24; }          /* amber-400 */
+    .btn-save-widget.is-dirty::after {
+        content: ''; position: absolute; top: 1px; right: 1px;
+        width: 7px; height: 7px; border-radius: 9999px;
+        background: #f59e0b;                                     /* amber-500 */
+        /* Halo = fond réel de la carte (.widget-card → var(--bg-surface)) :
+           suit les deux thèmes automatiquement (revue adv. : un hexa dark
+           hardcodé divergeait du slate-900 réel des cartes). */
+        box-shadow: 0 0 0 2px var(--bg-surface, #fff);
+    }
+    .btn-save-widget.is-saving .btn-save-widget-icon {
+        animation: save-widget-pulse 0.9s ease-in-out infinite;
+    }
+    .btn-save-widget.is-saved { color: #059669; }                /* emerald-600 */
+    .dark .btn-save-widget.is-saved { color: #34d399; }          /* emerald-400 */
+    @keyframes save-widget-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: .35; }
+    }
 
     /* ── KPI Card (style Power BI) : compact, pas de chrome h3 ── */
     .widget-card-kpi { min-height: 92px; }
@@ -418,7 +463,6 @@
     <div class="hidden">
         <select id="period-filter"><option value="30" selected>30 jours</option></select>
         <button id="btn-save-template"></button>
-        <button id="btn-schedule"></button>
         <button id="btn-add-filter"></button>
     </div>
 
@@ -438,99 +482,6 @@
     <div id="drill-down-bar" class="hidden" style="display:none !important">
         <div id="drill-down-chips"></div>
         <button id="btn-clear-drill"></button>
-    </div>
-
-    <!-- Schedule Modal -->
-    <div id="schedule-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-lg shadow-xl w-full max-w-lg dark:bg-gray-900">
-            <div class="flex items-center justify-between px-6 py-4 border-b">
-                <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Planifier l'envoi par email</h3>
-                <button id="schedule-modal-close" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-                </button>
-            </div>
-            <div class="px-6 py-4 space-y-4 max-h-[70vh] overflow-y-auto">
-                <!-- Active toggle -->
-                <div class="flex items-center justify-between">
-                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Envoi automatique</label>
-                    <label class="relative inline-flex items-center cursor-pointer">
-                        <input id="sched-enabled" type="checkbox" class="sr-only peer">
-                        <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:bg-brand-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full dark:bg-gray-800"></div>
-                    </label>
-                </div>
-                <!-- Schedule type -->
-                <div id="sched-config-section">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Fréquence</label>
-                        <select id="sched-type" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100">
-                            <option value="daily">Quotidien</option>
-                            <option value="weekly">Hebdomadaire</option>
-                            <option value="monthly">Mensuel</option>
-                        </select>
-                    </div>
-                    <div class="flex gap-3 mt-3" id="sched-time-row">
-                        <div class="flex-1">
-                            <label class="block text-xs text-gray-500 mb-1 dark:text-gray-400">Heure</label>
-                            <input id="sched-hour" type="number" min="0" max="23" value="9" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100">
-                        </div>
-                        <div class="flex-1">
-                            <label class="block text-xs text-gray-500 mb-1 dark:text-gray-400">Minute</label>
-                            <input id="sched-minute" type="number" min="0" max="59" value="0" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100">
-                        </div>
-                    </div>
-                    <div id="sched-dow-row" class="hidden mt-3">
-                        <label class="block text-xs text-gray-500 mb-1 dark:text-gray-400">Jour de la semaine</label>
-                        <select id="sched-dow" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100">
-                            <option value="mon">Lundi</option>
-                            <option value="tue">Mardi</option>
-                            <option value="wed">Mercredi</option>
-                            <option value="thu">Jeudi</option>
-                            <option value="fri">Vendredi</option>
-                            <option value="sat">Samedi</option>
-                            <option value="sun">Dimanche</option>
-                        </select>
-                    </div>
-                    <div id="sched-day-row" class="hidden mt-3">
-                        <label class="block text-xs text-gray-500 mb-1 dark:text-gray-400">Jour du mois</label>
-                        <input id="sched-day" type="number" min="1" max="28" value="1" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100">
-                    </div>
-                    <div class="mt-3">
-                        <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Destinataires</label>
-                        <textarea id="sched-recipients" rows="2" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100" placeholder="email1@exemple.com, email2@exemple.com"></textarea>
-                        <p class="text-xs text-gray-400 mt-0.5 dark:text-gray-500">Séparés par des virgules. Si vide, envoyé à votre adresse.</p>
-                    </div>
-                    <div class="mt-3">
-                        <label class="block text-sm font-medium text-gray-700 mb-1 dark:text-gray-300">Format de la pièce jointe</label>
-                        <select id="sched-format" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100">
-                            <option value="excel">Excel (.xlsx)</option>
-                            <option value="csv">CSV</option>
-                        </select>
-                    </div>
-                    <div class="mt-3">
-                        <label class="block text-xs text-gray-500 mb-1 dark:text-gray-400">Sujet personnalisé (optionnel)</label>
-                        <input id="sched-subject" type="text" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100" placeholder="Laisser vide pour le sujet par défaut">
-                    </div>
-                    <div class="mt-3">
-                        <label class="block text-xs text-gray-500 mb-1 dark:text-gray-400">Message personnalisé (optionnel)</label>
-                        <textarea id="sched-message" rows="2" class="w-full border rounded-lg px-3 py-2 text-sm bg-white dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100" placeholder="Texte ajouté en haut de l'email"></textarea>
-                    </div>
-                </div>
-                <!-- Last sent info -->
-                <div id="sched-last-sent" class="hidden text-xs text-gray-400 border-t pt-3 dark:text-gray-500">
-                    Dernier envoi : <span id="sched-last-sent-date">—</span>
-                </div>
-            </div>
-            <div class="flex items-center justify-between px-6 py-4 border-t bg-gray-50 rounded-b-lg dark:bg-gray-900">
-                <button id="btn-send-now" class="btn btn-secondary text-sm">
-                    <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
-                    Envoyer maintenant
-                </button>
-                <div class="flex gap-2">
-                    <button id="btn-sched-cancel" class="btn btn-secondary text-sm">Annuler</button>
-                    <button id="btn-sched-save" class="btn btn-primary text-sm">Enregistrer</button>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- Save as Template Modal -->
@@ -627,6 +578,15 @@
                 </div>
                 {% if dashboard['user_id'] == handler.current_user.id %}
                 <div class="widget-actions flex items-center gap-1">
+                    {% if w['widget_type'] == 'grid' %}
+                    <!-- Sauvegarde manuelle du classeur du widget grille : capture
+                         TOUT l'état affiché (feuilles + SQL + cellules + mise en
+                         forme) façon Enregistrer /datastore. Point ambre = modifs
+                         non enregistrées (visible sans hover via .has-dirty). -->
+                    <button class="p-1 text-gray-400 hover:text-emerald-600 rounded btn-save-widget dark:text-gray-500 dark:hover:text-emerald-400" data-id="{{ w['id'] }}" title="Enregistrer le widget (feuilles, SQL et mise en forme — Ctrl+S dans la grille)">
+                        <svg class="w-3.5 h-3.5 btn-save-widget-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                    </button>
+                    {% end %}
                     <button class="p-1 text-gray-400 hover:text-blue-600 rounded btn-edit-widget dark:text-gray-500" data-widget="{{ json_encode(w) }}" title="Modifier">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
                     </button>
@@ -1013,6 +973,14 @@
     </div>
 </div>
 
+{# DOM du sélecteur de feuilles externes (#ext-sheets-modal), requis par
+   external_sheets_picker.js chargé dans {% block head %}. Même condition que
+   le chargement de la grille pour ne pas injecter de DOM inutile au viewer
+   readonly sans widget grille. #}
+{% if _is_owner or _has_grid_widget %}
+{% include "../partials/external_sheets_modal.html" %}
+{% end %}
+
 {% end %}
 
 {% block scripts %}
@@ -1029,6 +997,7 @@
     // pour la rejouer en fin de cycle — sinon la garde de concurrence ci-dessous
     // la perdrait silencieusement (données qui ne suivent pas le filtre choisi).
     var _reloadQueued = false;
+    var _queuedForce = false;  // force-refresh demandé pendant un load déjà en vol
     // AbortController du fetch /widgets/llm en cours (fix UX7 review
     // globale 2026-05-18). null = pas de run en cours. Set au début
     // du fetch IA, abort() au Annuler/backdrop, null reset au finally.
@@ -1221,6 +1190,24 @@
         var el = document.getElementById(containerId);
         if (!el) return;
 
+        // Anti-perte AVANT le branchement erreur (revue adv. 2026-06-10) :
+        // un refresh qui revient en erreur (Sage down, règle d'accès…) ne
+        // doit JAMAIS remplacer une grille portant des modifications non
+        // enregistrées par un message d'erreur (le DOM de la grille — et le
+        // travail en cours — serait détruit). On garde la grille intacte et
+        // on signale l'échec du rafraîchissement par toast.
+        var isGridWidget = (data.type === 'grid' || widgetConfig.widget_type === 'grid');
+        if (isGridWidget && el._tabMgr && el._tabMgr._dirty) {
+            if (!el._dirtySkipNotified && typeof showToast === 'function') {
+                el._dirtySkipNotified = true;
+                showToast('Widget « ' + (widgetConfig.title || 'grille')
+                    + ' » non rafraîchi : modifications non enregistrées. '
+                    + 'Enregistrez le widget pour reprendre les rafraîchissements.',
+                    'warning');
+            }
+            return;
+        }
+
         if (data.error) {
             el.innerHTML = '<div class="text-sm text-red-500 text-center py-4">' + escapeHtml(data.error) + '</div>';
             return;
@@ -1246,6 +1233,12 @@
             // undo/redo, export). Le fallback `widgetConfig.widget_type ==
             // 'grid'` couvre le cas data.error (le backend renvoie pas de
             // data.type mais on veut afficher le message dans la grille).
+            //
+            // (Le garde anti-perte « grille dirty » est appliqué en TÊTE de
+            // renderWidget, AVANT le branchement data.error — cf. revue adv.
+            // 2026-06-10 : un refresh en erreur ne doit pas non plus écraser
+            // une grille avec des modifications non enregistrées.)
+            el._dirtySkipNotified = false;
             renderIrisGrid(el, data, widgetConfig);
         } else if (type === 'chart' || widgetConfig.widget_type === 'chart') {
             renderChart(el, widgetConfig, data, renderSpec);
@@ -1263,6 +1256,39 @@
                 console.warn('widget type unsupported:', type, widgetConfig);
             }
         }
+
+        // #18c (2026-06-10) — signal de troncature pour les widgets non-grid
+        // (le grid a son propre badge via GridTabManager). Deux cas distincts :
+        //  - source_truncated : le FETCH a atteint le cap admin → les valeurs
+        //    AGRÉGÉES (KPI, buckets de graphe) sont calculées sur des données
+        //    partielles — c'est le signal le plus grave (chiffres partiels).
+        //  - truncated : seul l'AFFICHAGE est limité (cap de rendu post-
+        //    agrégation) — les chiffres sont justes, la liste est coupée.
+        if (type !== 'grid' && data && (data.source_truncated || data.truncated)) {
+            var truncNote = document.createElement('div');
+            truncNote.className = 'mt-1 text-[11px] text-amber-600 dark:text-amber-400';
+            if (data.source_truncated) {
+                truncNote.textContent = '⚠ Données sources tronquées au cap de lignes '
+                    + '(/admin/database) — les valeurs affichées peuvent être partielles.';
+            } else {
+                var shownCount = (data.rows && data.rows.length)
+                    || (data.labels && data.labels.length) || 500;
+                truncNote.textContent = '⚠ Affichage limité à '
+                    + shownCount + ' éléments sur '
+                    + (typeof data.row_count === 'number' ? data.row_count : '?') + '.';
+            }
+            // Charts : Plotly possède ``el`` (newPlot + resize y mesurent la
+            // hauteur) — la notice vit dans le PARENT pour ne pas perturber
+            // le layout du graphe (revue adv. 2026-06-10).
+            var noteHost = (type === 'chart' || (widgetConfig && widgetConfig.widget_type === 'chart'))
+                ? (el.parentElement || el) : el;
+            // Anti-double-notice au re-render : purge les notices précédentes
+            // du host (le innerHTML='' des renderers ne couvre pas le parent).
+            var oldNotes = noteHost.querySelectorAll(':scope > .widget-trunc-note');
+            for (var oni = 0; oni < oldNotes.length; oni++) { oldNotes[oni].remove(); }
+            truncNote.className += ' widget-trunc-note';
+            noteHost.appendChild(truncNote);
+        }
     }
 
     // ── renderIrisGrid : copie conforme de renderSQLResults() (iris.js:1649).
@@ -1270,21 +1296,15 @@
     // qui pose le DOM interne (tabs, table, copilot bar). SSoT visuel et
     // comportemental partagé avec /iris et /datastore.
     //
-    // Adversarial review CRIT-1/2 (2026-05-26) : (1) persistId scopé par
-    // userId pour anti-leak cross-user sur poste partagé ; (2) override
+    // Adversarial review CRIT-2 (2026-05-26) : override
     // _scheduleAnonymizationScan pour ne PAS spam /api/anonymization/
     // scan-workbook au render (les rows de widget sont déjà RLS-filtered
     // côté SQL Server via rls_source="dashboard_widget", pas besoin de
     // re-scanner côté client — c'est utile pour les classeurs user mais
     // pas pour les widgets dashboard).
-    function _getKomptiaUserId() {
-        try {
-            var meta = document.querySelector('meta[name="komptia-user-id"]');
-            if (meta && meta.content) return String(meta.content);
-            if (window.komptiaCurrentUserId != null) return String(window.komptiaCurrentUserId);
-        } catch (e) { /* defensive */ }
-        return 'anon';
-    }
+    // (L'ancien _getKomptiaUserId/setPersistId — persistance localStorage —
+    // a été retiré : écriture morte jamais restaurée sur le dashboard,
+    // remplacée par la sauvegarde serveur du classeur du widget.)
 
     function renderIrisGrid(el, data, widgetConfig) {
         // Fail-loud si iris-grid.js n'est pas chargé (cas où l'utilisateur
@@ -1302,18 +1322,25 @@
         // Cleanup d'un éventuel GridTabManager précédent (auto-refresh,
         // multi-render). Sans ça, les listeners + timers du tabMgr précédent
         // restent attachés → memory leak (adversarial review M-13). Pas de
-        // GridTabManager.destroy() exposé — on flush ce qu'on peut (timers
-        // de persistState + débrancher des refs DOM).
+        // T12c — teardown du manager avant remplacement : destroy() ferme les
+        // timers ET les listeners ``document`` des grilles enfants (le mouseup
+        // ferme sur toute la grille → fuite cross-instance sous auto-refresh
+        // dashboard) + déréférence du registre _activeManagers. Fallback manuel
+        // si l'asset iris-grid.js est en version cache antérieure (destroy absent).
         if (el._tabMgr) {
             try {
-                if (el._tabMgr._persistStateTimer) {
-                    clearTimeout(el._tabMgr._persistStateTimer);
-                }
-                if (el._tabMgr._autosavePeriodicTimer) {
-                    clearInterval(el._tabMgr._autosavePeriodicTimer);
-                }
-                if (el._tabMgr._anonScanTimer) {
-                    clearTimeout(el._tabMgr._anonScanTimer);
+                if (typeof el._tabMgr.destroy === 'function') {
+                    el._tabMgr.destroy();
+                } else {
+                    if (el._tabMgr._persistStateTimer) {
+                        clearTimeout(el._tabMgr._persistStateTimer);
+                    }
+                    if (el._tabMgr._autosavePeriodicTimer) {
+                        clearInterval(el._tabMgr._autosavePeriodicTimer);
+                    }
+                    if (el._tabMgr._anonScanTimer) {
+                        clearTimeout(el._tabMgr._anonScanTimer);
+                    }
                 }
             } catch (e) { /* defensive */ }
             el._tabMgr = null;
@@ -1332,6 +1359,13 @@
         try {
             var tabMgr = new window.GridTabManager(card);
             el._tabMgr = tabMgr;
+            // Marque ce manager comme widget dashboard. Sert UNIQUEMENT au rappel
+            // (toast) lors de l'import de feuilles externes : sur un widget, une
+            // feuille importée ne survit au refresh que si le widget est ENREGISTRÉ
+            // comme classeur. (Le dashboard est strict-owner — `get_dashboard`
+            // filtre `Dashboard.user_id` → 404 pour un non-owner ; aucun partage
+            // n'existe. Il n'y a donc pas de gating « viewer » à faire ici.)
+            tabMgr._dashboardWidget = true;
 
             // Override _scheduleAnonymizationScan : pour un widget dashboard,
             // les rows sont déjà filtrées côté SQL Server (RLS), pas besoin
@@ -1340,16 +1374,151 @@
             // dashboard. Adversarial review CRIT-3.
             tabMgr._scheduleAnonymizationScan = function() { /* noop dashboard */ };
 
-            // PersistId scopé par USER+dashboard+widget — anti-leak
-            // cross-user sur poste partagé (cf. mémoire
-            // feedback_localstorage_cross_user_leak). Le préfixe 'u' évite
-            // collision avec les autres usages localStorage qui n'ont pas
-            // ce schéma.
             var widgetId = widgetConfig && widgetConfig.id;
-            if (widgetId !== undefined && widgetId !== null
-                    && typeof tabMgr.setPersistId === 'function') {
-                var safeUserId = _getKomptiaUserId();
-                tabMgr.setPersistId('u' + safeUserId + '-dash' + DASHBOARD_ID + '-w' + widgetId);
+            // Mode classeur : le backend a fourni le classeur sauvegardé du
+            // widget, hydraté avec les exécutions SQL fraîches.
+            var workbookMode = !!(data && data.workbook
+                && Array.isArray(data.workbook.tabs));
+
+            // ── Persistance = bouton « Enregistrer » UNIQUEMENT ──────────
+            // Le widget se sauvegarde comme un classeur /datastore (état
+            // complet : feuilles, SQL, cellules, mise en forme) via le bouton
+            // du header — Ctrl+S et le menu « Enregistrer » de la grille sont
+            // routés ici par _saveDelegate. Modèle 100% manuel : autosave et
+            // AutoRecover sont débranchés, et l'ancien persistState
+            // localStorage (setPersistId) est supprimé — c'était une écriture
+            // morte sur le dashboard (jamais restaurée : setPersistId était
+            // appelé AVANT le 1er addTab, _loadPersistedState early-return).
+            if (IS_OWNER && widgetId !== undefined && widgetId !== null) {
+                tabMgr._widgetWorkbookHash = (data && data.workbook_hash) || null;
+                tabMgr._saveDelegate = function() {
+                    return saveGridWidget(widgetId, el);
+                };
+            }
+            tabMgr._startAutosave = function() { /* sauvegarde manuelle uniquement (widget) */ };
+            tabMgr._autosaveDisabled = true;
+            tabMgr._writeAutoRecover = function() { /* noop widget (pas de clé fiable) */ };
+            // Tri/filtre/masquage de colonne ne passent QUE par onStateChange
+            // (persistState) — pas par snapshotWorkbook → sans ce hook ils ne
+            // marqueraient jamais dirty alors que le save LES capture (le
+            // point ambre doit s'allumer). _persistId est null ici (pas de
+            // localStorage), on recycle le hook pour le dirty uniquement.
+            tabMgr.persistState = function() {
+                if (!tabMgr._restoringState) tabMgr._setDirty(true);
+            };
+            // L'astérisque de titre document n'a aucun sens ici (N widgets
+            // par page) : l'état dirty pilote le point ambre du bouton
+            // « Enregistrer » du header à la place.
+            tabMgr._refreshDirtyTitle = function() {
+                if (widgetId !== undefined && widgetId !== null) {
+                    updateSaveWidgetButton(widgetId, !!tabMgr._dirty);
+                }
+            };
+
+            // Feature « Requête SQL » : contexte d'autorisation + persistance,
+            // posé AVANT le 1er addTab pour que la barre d'onglets affiche
+            // l'item de menu [+] dès le premier rendu. Owner-only (IS_OWNER) :
+            // un viewer ne peut pas éditer la config du widget.
+            if (IS_OWNER && widgetId !== undefined && widgetId !== null) {
+                tabMgr._sqlTabContext = {
+                    canAuthor: true,
+                    // MODE CLASSEUR : la structure des feuilles vit dans le
+                    // classeur — un seul chemin de persistance, le bouton
+                    // « Enregistrer » (le dirty est posé par snapshotWorkbook
+                    // à chaque mutation). resolve(true) pour que la signature
+                    // interne du manager avance normalement, sans PUT.
+                    //
+                    // MODE LEGACY (widget jamais enregistré) : comportement
+                    // historique inchangé — remplace la liste d'onglets SQL
+                    // côté serveur. On envoie UNIQUEMENT la liste
+                    // (read-modify-write serveur) → jamais la config
+                    // complète, donc pas de clobber de la requête principale
+                    // par une copie cliente périmée. Renvoie une
+                    // Promise<bool> (false = échec → le manager restaure sa
+                    // signature interne pour ré-essayer au prochain changement).
+                    persist: workbookMode ? function() {
+                        return Promise.resolve(true);
+                    } : function(sheets) {
+                        // Deux contrats (read-modify-write serveur, jamais la
+                        // config complète) :
+                        //  - feuille principale DE CONFIANCE (source_sql fourni) →
+                        //    ``{sheets}`` : liste ORDONNÉE complète, le backend
+                        //    splitte feuille 0 → query, reste → extra_tabs.
+                        //  - sinon (défensif, source_sql absent) → ``{extra_tabs}``
+                        //    legacy : la principale n'est PAS dans la liste (pas
+                        //    d'externalSource) → on ne touche QUE les onglets
+                        //    additionnels, jamais la requête principale.
+                        var payload = tabMgr._primarySheetTrusted
+                            ? { sheets: sheets }
+                            : { extra_tabs: sheets };
+                        return fetch('/api/dashboards/' + DASHBOARD_ID
+                                + '/widgets/' + widgetId + '/extra-tabs', {
+                            method: 'PUT',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Xsrftoken': getCookie('_xsrf')
+                            },
+                            body: JSON.stringify(payload)
+                        }).then(function(res) {
+                            return res.json().catch(function() { return {}; });
+                        }).then(function(j) {
+                            if (j && j.success) return true;
+                            if (j && j.error && typeof showToast === 'function') {
+                                showToast(j.error, 'error');
+                            }
+                            return false;
+                        }).catch(function() {
+                            if (typeof showToast === 'function') {
+                                showToast('Erreur réseau (onglet non sauvegardé).', 'error');
+                            }
+                            return false;
+                        });
+                    }
+                };
+            }
+
+            if (workbookMode) {
+                // ── MODE CLASSEUR ────────────────────────────────────────
+                // Le backend a ré-exécuté TOUTES les feuilles SQL du
+                // classeur (la 1ʳᵉ avec filtres/drill du dashboard) et
+                // fusionné les données fraîches dedans — on l'ouvre par le
+                // MÊME chemin que /datastore (loadWorkbook : feuilles
+                // manuelles, mise en forme, tris/filtres, cellules SQL).
+                // _restoringState : pas de snapshot/dirty parasite pendant
+                // l'hydratation (même pattern que _restoreWorkbookState).
+                tabMgr._primarySheetTrusted = true;
+                tabMgr._restoringState = true;
+                var okLoad = false;
+                try {
+                    okLoad = tabMgr.loadWorkbook(data.workbook);
+                } finally {
+                    tabMgr._restoringState = false;
+                }
+                if (!okLoad) {
+                    throw new Error('loadWorkbook a refusé le classeur du widget');
+                }
+                // Bandeaux d'erreur par feuille (parité onglets SQL legacy) :
+                // une feuille SQL en échec est VIDE + message explicite —
+                // jamais un snapshot périmé présenté comme frais.
+                var wbTabs = data.workbook.tabs;
+                for (var wbi = 0; wbi < wbTabs.length && wbi < tabMgr.tabs.length; wbi++) {
+                    var wt = wbTabs[wbi] || {};
+                    if (wt.error && tabMgr.tabs[wbi] && tabMgr.tabs[wbi].containerEl) {
+                        var wbErrBanner = document.createElement('div');
+                        wbErrBanner.className = 'text-sm text-red-500 py-3 px-2';
+                        wbErrBanner.textContent = 'Erreur de cette requête : ' + wt.error;
+                        tabMgr.tabs[wbi].containerEl.insertBefore(
+                            wbErrBanner, tabMgr.tabs[wbi].containerEl.firstChild);
+                    }
+                }
+                tabMgr._setDirty(false);
+                // Baseline de persistance (cf. commentaire du mode legacy).
+                if (tabMgr._sqlTabContext
+                        && typeof tabMgr._collectSqlQueryTabs === 'function') {
+                    tabMgr._lastPersistedSqlTabsSig =
+                        JSON.stringify(tabMgr._collectSqlQueryTabs());
+                }
+                return;
             }
 
             var columns = (data && data.columns) || [];
@@ -1360,9 +1529,86 @@
                 ? data.row_count : rows.length;
             var label = (widgetConfig && widgetConfig.title) || 'Résultat';
 
-            // closable=false : pas de bouton X sur l'onglet principal d'un
-            // widget (différent de /iris où plusieurs tabs cohabitent).
-            tabMgr.addTab(label, columns, rows, sql, rowCount, null, false);
+            // Classeur référencé mais introuvable/corrompu côté serveur :
+            // les requêtes SQL (miroir config) tournent quand même, mais les
+            // feuilles manuelles / mise en forme sont perdues — l'annoncer
+            // EXPLICITEMENT (jamais de dégradation silencieuse).
+            if (data && data.workbook_missing) {
+                var missNote = document.createElement('div');
+                missNote.className = 'mt-1 text-[11px] text-amber-600 dark:text-amber-400';
+                missNote.textContent = '⚠ Le classeur enregistré de ce widget est '
+                    + 'introuvable — seules les requêtes SQL sont affichées. '
+                    + 'Ré-enregistrez le widget pour recréer le classeur.';
+                el.appendChild(missNote);
+            }
+
+            // L'onglet principal devient une FEUILLE SQL de 1ère classe (sheet[0])
+            // UNIQUEMENT si le backend a fourni `source_sql` = la requête
+            // D'ORIGINE (config["query"], JAMAIS le `sql` affiché qui peut être
+            // filtre-wrappé `SELECT * FROM (<query>) WHERE …`). Persister la
+            // version wrappée corromprait data_source_config["query"] → on refuse
+            // ce fallback. Si `source_sql` est absent (cache d'avant-déploiement,
+            // ne devrait pas durer), on retombe sur l'ancien comportement : la
+            // principale n'est PAS persistable (pas d'externalSource) et la
+            // persistance reste en mode legacy `extra_tabs` (cf. persist ci-dessus)
+            // → aucune corruption possible.
+            // closable=false : pas de bouton X (la feuille principale est
+            // indispensable — query obligatoire — et fixée en 1ère position).
+            var mainSourceSql = (data && typeof data.source_sql === 'string')
+                ? data.source_sql : null;
+            var mainMeta = (mainSourceSql !== null)
+                ? { externalSource: { type: 'sql_query', query: mainSourceSql } }
+                : null;
+            tabMgr._primarySheetTrusted = (mainSourceSql !== null);
+            // SQL de la grille principale = requête D'ORIGINE (source_sql) quand
+            // on l'a, PAS le `sql` filtre-wrappé : sinon le bouton "Modifier &
+            // réexécuter" ouvrirait la version wrappée (avec ses `?` de filtre) et
+            // un save persisterait du SQL corrompu dans config["query"]. Les
+            // `rows` restent les données filtrées RÉELLEMENT exécutées (correctes).
+            var mainGridSql = (mainSourceSql !== null) ? mainSourceSql : sql;
+            tabMgr.addTab(label, columns, rows, mainGridSql, rowCount, mainMeta, false);
+
+            // Feature « Requête SQL » : recrée les onglets SQL additionnels.
+            // Ils sont ré-exécutés CÔTÉ SERVEUR à chaque affichage (renvoyés
+            // dans data.tabs) → toujours frais et survivent au refresh sans
+            // snapshot ni localStorage. Chacun porte son SQL via
+            // externalSource:{type:'sql_query'} (collecté par
+            // _collectSqlQueryTabs pour la persistance). Un onglet en erreur
+            // (RLS, SQL invalide) affiche un bandeau explicite au lieu d'une
+            // grille vide trompeuse (anti données fausses silencieuses).
+            var extraTabs = (data && Array.isArray(data.tabs)) ? data.tabs : [];
+            for (var ti = 0; ti < extraTabs.length; ti++) {
+                var et = extraTabs[ti] || {};
+                var etLabel = et.label || ('Requête ' + (ti + 1));
+                var etSql = (typeof et.sql === 'string') ? et.sql : '';
+                var etRows = et.rows || [];
+                var etCount = (typeof et.row_count === 'number')
+                    ? et.row_count : etRows.length;
+                var tabInfo = tabMgr.addTab(
+                    etLabel, et.columns || [], etRows, etSql, etCount,
+                    { externalSource: { type: 'sql_query', query: etSql } },
+                    true
+                );
+                if (et.error && tabInfo && tabInfo.containerEl) {
+                    var errBanner = document.createElement('div');
+                    errBanner.className = 'text-sm text-red-500 py-3 px-2';
+                    errBanner.textContent = 'Erreur de cette requête : ' + et.error;
+                    tabInfo.containerEl.insertBefore(
+                        errBanner, tabInfo.containerEl.firstChild);
+                }
+            }
+
+            // Baseline de persistance = état chargé depuis le backend → évite
+            // un PUT parasite au 1er rename/close d'un onglet non-SQL.
+            if (tabMgr._sqlTabContext
+                    && typeof tabMgr._collectSqlQueryTabs === 'function') {
+                tabMgr._lastPersistedSqlTabsSig =
+                    JSON.stringify(tabMgr._collectSqlQueryTabs());
+            }
+            // Revient sur l'onglet principal (addTab a basculé sur le dernier).
+            if (extraTabs.length > 0 && typeof tabMgr._switchTab === 'function') {
+                tabMgr._switchTab(0);
+            }
         } catch (e) {
             // Fail-loud — capture erreur d'init de la grille pour pouvoir
             // diagnostiquer via feedback-reporter (capture window.onerror
@@ -1372,6 +1618,142 @@
                 console.error('renderIrisGrid init error:', e);
             }
         }
+    }
+
+    // ── Sauvegarde manuelle du classeur d'un widget grille ────────────────
+    // Un seul chemin de persistance : serialize() complet de la grille
+    // (feuilles SQL + manuelles, cellules, mise en forme, cellules SQL) →
+    // gzip → PUT /api/dashboards/{id}/widgets/{wid}/workbook. Peu importe QUI
+    // a modifié le SQL (éditeur, copilot, collage) : on capture l'état réel.
+
+    function _findSaveWidgetBtn(widgetId) {
+        return document.querySelector('.btn-save-widget[data-id="' + widgetId + '"]');
+    }
+
+    function updateSaveWidgetButton(widgetId, dirty) {
+        var btn = _findSaveWidgetBtn(widgetId);
+        if (!btn) return;
+        btn.classList.toggle('is-dirty', !!dirty);
+        if (dirty) btn.classList.remove('is-saved');
+        // Les actions du widget sont masquées hors hover (opacity 0) — un
+        // indicateur dirty invisible = perte silencieuse → on force la
+        // visibilité du groupe tant que des modifs ne sont pas enregistrées.
+        var actions = btn.closest('.widget-actions');
+        if (actions) actions.classList.toggle('has-dirty', !!dirty);
+        btn.title = dirty
+            ? 'Modifications non enregistrées — cliquez pour enregistrer le widget'
+            : 'Enregistrer le widget (feuilles, SQL et mise en forme — Ctrl+S dans la grille)';
+    }
+
+    // Anti double-clic / double Ctrl+S : une seule sauvegarde en vol par
+    // widget — les appels concurrents reçoivent la promesse en cours.
+    var _saveWidgetInFlight = {};
+
+    function saveGridWidget(widgetId, contentEl) {
+        var el = contentEl || document.getElementById('widget-content-' + widgetId);
+        var tabMgr = el ? el._tabMgr : null;
+        var btn = _findSaveWidgetBtn(widgetId);
+        if (!tabMgr || typeof tabMgr.serializeToGzipBlob !== 'function') {
+            showToast('Grille non initialisée — rechargez la page.', 'error');
+            return Promise.resolve(false);
+        }
+        if (_saveWidgetInFlight[widgetId]) return _saveWidgetInFlight[widgetId];
+        if (btn) { btn.classList.add('is-saving'); btn.classList.remove('is-saved'); }
+        // Compteur de mutations AVANT le serialize : si l'utilisateur édite
+        // PENDANT la sauvegarde en vol, on ne reset PAS dirty au succès — la
+        // version envoyée ne reflète plus l'état affiché, marquer « propre »
+        // serait un mensonge (même protection _dirtySeq que _saveToPathAsync).
+        var seqAtStart = tabMgr._dirtySeq || 0;
+        var p = tabMgr.serializeToGzipBlob().then(function(payload) {
+            var headers = { 'X-Xsrftoken': getCookie('_xsrf') };
+            // If-Match : anti-clobber si le même widget est ouvert dans un
+            // autre onglet (412 explicite plutôt qu'un écrasement silencieux).
+            if (tabMgr._widgetWorkbookHash) {
+                headers['If-Match'] = tabMgr._widgetWorkbookHash;
+            }
+            return fetch('/api/dashboards/' + DASHBOARD_ID + '/widgets/'
+                    + widgetId + '/workbook', {
+                method: 'PUT',
+                headers: headers,
+                body: payload.blob
+            });
+        }).then(function(res) {
+            return res.json().catch(function() { return {}; }).then(function(j) {
+                return { status: res.status, body: j || {} };
+            });
+        }).then(function(r) {
+            var j = r.body;
+            if (j.success) {
+                tabMgr._widgetWorkbookHash = j.workbook_hash || null;
+                // Reset dirty UNIQUEMENT si aucune mutation pendant l'inflight.
+                if ((tabMgr._dirtySeq || 0) === seqAtStart
+                        && typeof tabMgr._setDirty === 'function') {
+                    tabMgr._setDirty(false);
+                }
+                // Bascule en persistance « classeur » (revue adv. 2026-06-10) :
+                // un widget qui vient d'être enregistré ne doit PLUS auto-PUTter
+                // sa structure via l'API extra-tabs legacy — le backend
+                // réécrirait le classeur côté serveur et le hash If-Match local
+                // deviendrait périmé → 412 fantôme à chaque save suivant.
+                if (tabMgr._sqlTabContext) {
+                    tabMgr._sqlTabContext.persist = function() {
+                        return Promise.resolve(true);
+                    };
+                }
+                // Rafraîchit le snapshot de config de la modale d'édition
+                // (data-widget figé au render de la page) : sans ça, ouvrir
+                // « Modifier » re-remplirait le champ SQL avec la requête
+                // PRÉ-save (le serveur reporte workbook_file d'office en
+                // défense en profondeur, mais le SQL affiché serait périmé).
+                if (j.widget && btn) {
+                    var actionsWrap = btn.closest('.widget-actions');
+                    var editBtn = actionsWrap
+                        ? actionsWrap.querySelector('.btn-edit-widget') : null;
+                    if (editBtn) {
+                        try {
+                            editBtn.dataset.widget = JSON.stringify(j.widget);
+                        } catch (e) { /* defensive */ }
+                    }
+                }
+                if (btn) {
+                    btn.classList.add('is-saved');
+                    setTimeout(function() { btn.classList.remove('is-saved'); }, 2000);
+                }
+                showToast('Widget enregistré — il se rechargera avec ces feuilles et ce SQL.', 'success');
+                // Règle « le SQL gagne », annoncée UNE fois par page : les
+                // valeurs saisies à la main sur une feuille SQL seront
+                // remplacées par la ré-exécution au prochain chargement —
+                // jamais de perte silencieuse sans avertissement.
+                if (!window._komptiaSqlWinsNoticeShown) {
+                    window._komptiaSqlWinsNoticeShown = true;
+                    showToast('Rappel : les feuilles SQL sont ré-exécutées à chaque '
+                        + 'chargement — les valeurs saisies à la main sur une feuille '
+                        + 'SQL seront remplacées par le résultat de la requête. '
+                        + 'Utilisez une feuille manuelle pour conserver des saisies.',
+                        'info');
+                }
+                return true;
+            }
+            if (r.status === 412) {
+                showToast(j.error || 'Ce widget a été modifié dans un autre onglet — rechargez la page avant d\'enregistrer.', 'error');
+            } else if (r.status === 413) {
+                showToast(j.error || 'Classeur trop volumineux (quota de stockage atteint).', 'error');
+            } else if (r.status === 401 || r.status === 403) {
+                showToast('Session expirée — reconnectez-vous puis réessayez.', 'error');
+            } else {
+                showToast(j.error || 'Erreur lors de l\'enregistrement du widget (' + r.status + ').', 'error');
+            }
+            return false;
+        }).catch(function() {
+            showToast('Erreur réseau — le widget n\'a pas été enregistré.', 'error');
+            return false;
+        }).then(function(ok) {
+            if (btn) btn.classList.remove('is-saving');
+            delete _saveWidgetInFlight[widgetId];
+            return ok;
+        });
+        _saveWidgetInFlight[widgetId] = p;
+        return p;
     }
 
     function renderTextWidget(el, data) {
@@ -1875,8 +2257,8 @@
     });
 
     // ── Load Widget Data ──
-    async function loadAllWidgetData() {
-        if (isLoading) { _reloadQueued = true; return false; }
+    async function loadAllWidgetData(forceRefresh) {
+        if (isLoading) { _reloadQueued = true; _queuedForce = _queuedForce || !!forceRefresh; return false; }
         isLoading = true;
         var refreshBtn = document.getElementById('btn-refresh');
         if (refreshBtn) refreshBtn.classList.add('spin-active');
@@ -1890,6 +2272,8 @@
             if (fp) params.push('filters=' + encodeURIComponent(fp));
             var dp = getDrillParam();
             if (dp) params.push('drill=' + encodeURIComponent(dp));
+            // ?refresh=1 → bypass du cache de résultats serveur (bouton « Rafraîchir »).
+            if (forceRefresh) params.push('refresh=1');
             if (params.length) url += '?' + params.join('&');
             var res = await fetch(url);
             var result = await res.json();
@@ -1914,11 +2298,31 @@
                 }
             });
 
-            // Update last refresh indicator
+            // Update last refresh indicator — HONNÊTE sur le cache : si une ou
+            // plusieurs données viennent du cache serveur (``_cache`` présent),
+            // on affiche l'âge MAX (la donnée la plus vieille) au lieu de « à
+            // l'instant », qui serait trompeur (stale silencieux interdit,
+            // règle consequences #5).
             var lastRefreshEl = document.getElementById('last-refresh');
             if (lastRefreshEl) {
-                var now = new Date();
-                lastRefreshEl.textContent = 'Mis à jour à ' + now.toLocaleTimeString('fr-FR', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+                var maxAge = -1;
+                Object.keys(dataMap || {}).forEach(function(k) {
+                    var d = dataMap[k];
+                    if (d && d._cache && typeof d._cache.age_seconds === 'number' && d._cache.age_seconds > maxAge) {
+                        maxAge = d._cache.age_seconds;
+                    }
+                });
+                if (maxAge >= 0) {
+                    // « jusqu'à X s » (pas « il y a X s ») : un dashboard mixte a
+                    // des widgets frais (miss) ET en cache — on annonce l'âge MAX
+                    // sans prétendre que TOUT est si vieux.
+                    lastRefreshEl.textContent = maxAge < 1
+                        ? 'Données en cache · Rafraîchir pour actualiser'
+                        : "Données en cache (jusqu'à " + maxAge + ' s) · Rafraîchir pour actualiser';
+                } else {
+                    var now = new Date();
+                    lastRefreshEl.textContent = 'Mis à jour à ' + now.toLocaleTimeString('fr-FR', {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+                }
                 lastRefreshEl.classList.remove('hidden');
             }
             return true;
@@ -1930,7 +2334,9 @@
             if (refreshBtn) refreshBtn.classList.remove('spin-active');
             // Rejoue un rechargement demandé pendant le cycle (cf. _reloadQueued).
             // Borné : le flag est remis à false AVANT le replay, donc pas de boucle.
-            if (_reloadQueued) { _reloadQueued = false; loadAllWidgetData(); }
+            // Rejoue en PRÉSERVANT l'intention de force-refresh (sinon un clic
+            // « Rafraîchir » pendant un load en vol retomberait en lecture cache).
+            if (_reloadQueued) { _reloadQueued = false; var _f = _queuedForce; _queuedForce = false; loadAllWidgetData(_f); }
         }
     }
 
@@ -1942,7 +2348,7 @@
 
     // Refresh button — also resets auto-refresh countdown
     document.getElementById('btn-refresh').addEventListener('click', function() {
-        loadAllWidgetData().then(function(ok) {
+        loadAllWidgetData(true).then(function(ok) {  // true → ?refresh=1 : force une exécution Sage fraîche
             if (ok) showToast('Données rafraîchies.', 'success');
         });
         if (parseInt(document.getElementById('auto-refresh').value) > 0) {
@@ -2853,6 +3259,27 @@
     });
 
     // Delete widget buttons
+    // Bouton « Enregistrer » du widget grille (mode classeur).
+    document.querySelectorAll('.btn-save-widget').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            saveGridWidget(parseInt(this.dataset.id, 10));
+        });
+    });
+
+    // Garde anti-perte : confirmation native du navigateur si on quitte ou
+    // recharge la page avec des grilles non enregistrées.
+    window.addEventListener('beforeunload', function(e) {
+        var els = document.querySelectorAll('[id^="widget-content-"]');
+        for (var i = 0; i < els.length; i++) {
+            if (els[i]._tabMgr && els[i]._tabMgr._dirty) {
+                e.preventDefault();
+                e.returnValue = '';
+                return '';
+            }
+        }
+    });
+
     document.querySelectorAll('.btn-delete-widget').forEach(function(btn) {
         btn.addEventListener('click', async function(e) {
             e.stopPropagation();
@@ -3201,6 +3628,19 @@
     // alors que la barre montrait le défaut sélectionné (« données fausses
     // silencieuses »). Séquencer évite aussi le double fetch + le flash non
     // filtré. loadFilters ne rejette jamais (try/catch interne) → .then fiable.
+    // Sweep des états de grille obsolètes (TTL 30j) sur les DEUX stores
+    // (localStorage + IndexedDB), incluant les clés dashboard ``u{id}-dash..-w*``
+    // qui n'étaient JAMAIS purgées : l'unique sweep tournait sur /iris, qu'un
+    // utilisateur 100% dashboard ne visite jamais → croissance non bornée (F5).
+    // Guard : GridTabManager n'est chargé que si la page a un widget grid
+    // (lazy-load). Idempotent, ms-level.
+    try {
+        if (typeof GridTabManager !== 'undefined'
+                && typeof GridTabManager.purgeStaleKeys === 'function') {
+            GridTabManager.purgeStaleKeys();
+        }
+    } catch (e) { /* noop */ }
+
     loadFilters().then(function() {
         if ({{ len(dashboard.get('widgets', [])) }} > 0) loadAllWidgetData();
     });
@@ -4041,7 +4481,7 @@
 </script>
 
 {# Onboarding tour 1ère visite — composant chargé globalement via base.html.
-   Activation 1x par user grâce à localStorage (key 'dashboards_v1'). Pattern
+   Activation 1x par user grâce à localStorage (key 'dashboards_v2'). Pattern
    identique à /iris (cf. templates/iris.html L4269). 4 steps explicatifs,
    non-bloquants. Skip dispo. #}
 <script nonce="{{ handler.csp_nonce }}">
@@ -4049,28 +4489,28 @@
         if (!window.KomptiaOnboarding) return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'dashboards_v1',
+                key: 'dashboards_v2',
                 title: 'Bienvenue dans le composeur',
                 steps: [
                     {
                         icon: 'sparkle',
                         title: 'Créez votre premier graphique',
-                        text: 'Décrivez en français ce que vous voulez voir, ou collez une recherche existante : Komptia construit le graphique pour vous (type, titre, couleurs, mise en page). Vous ajustez ensuite à la souris si besoin.'
+                        text: 'Cliquez sur « Ajouter un widget », puis collez (ou écrivez) une requête SQL — vous pouvez aussi la charger depuis votre datastore via « Depuis le datastore ». Ajoutez si vous voulez quelques instructions en français dans « Instructions pour l\'IA » : Komptia choisit alors le type de graphique, le titre, le format des chiffres et la mise en page les plus adaptés.'
                     },
                     {
                         icon: 'chart',
                         title: 'Organisez votre tableau de bord',
-                        text: 'Glissez-déposez les graphiques pour les réordonner. Ajoutez des blocs « Texte » pour structurer en sections (titres, notes, contexte). Ajustez la largeur de chaque graphique entre un quart et la pleine page.'
+                        text: 'Glissez-déposez les graphiques par leur poignée pour les réordonner. Tirez le coin inférieur droit d\'un widget pour ajuster sa largeur, entre un quart et la pleine page. Ajoutez des blocs « Texte » (depuis « Ajouter un widget ») pour structurer en sections avec des titres et des notes.'
                     },
                     {
-                        icon: 'bell',
-                        title: 'Filtrer pour affiner l\'analyse',
-                        text: 'Le bouton « + Filtre » en haut ajoute un filtre commun à tous les graphiques du tableau (période, catégorie, client...). Pratique pour comparer plusieurs scénarios sans dupliquer les graphiques.'
+                        icon: 'zap',
+                        title: 'Des widgets variés',
+                        text: '« Ajouter un widget » propose trois types : « Graphique IA » pour un visuel assisté par l\'IA, « Texte » pour un bloc de mise en page, et « Grille » — un tableau interactif identique à celui d\'Iris (tri, filtres et exploration en un clic). Chaque widget se modifie ou se supprime au survol.'
                     },
                     {
                         icon: 'rocket',
-                        title: 'Exporter pour partager',
-                        text: 'Le bouton « Exporter » génère un PDF ou une image du tableau de bord, prêt à être joint à un email ou imprimé pour une réunion. Le rendu est identique à ce que vous voyez à l\'écran.'
+                        title: 'Gardez vos données fraîches',
+                        text: 'Le bouton Rafraîchir relance toutes les requêtes du tableau de bord. Le menu « Auto » à côté programme un rafraîchissement automatique (de 30 secondes à 24 heures) pour garder vos chiffres à jour sans intervention. Lancez-vous : ajoutez votre premier widget.'
                     }
                 ]
             });

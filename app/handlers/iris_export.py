@@ -18,7 +18,7 @@ Différences avec l'export client-side existant :
 from __future__ import annotations
 
 import json
-from typing import Final
+from typing import Final, Optional
 
 import tornado.web
 
@@ -61,8 +61,12 @@ _MAX_PAYLOAD_BYTES: Final[int] = 50 * 1024 * 1024  # 50 MiB
 50 MiB couvre les cas extrêmes (gros snapshot frontend) sans ouvrir un
 DoS via JSON géant."""
 
-_DEFAULT_MAX_ROWS_PER_TAB: Final[int] = 100_000
-"""Cap par défaut. Le client peut demander moins (jamais plus côté serveur)."""
+_DEFAULT_MAX_ROWS_PER_TAB: Final[Optional[int]] = None
+"""Cap par défaut. ``None`` (depuis le 2026-06-10) = cap admin
+``DatabaseConnection.max_rows`` (/admin/database), résolu par
+``QueryExecutor.execute`` — doctrine no-double-cap : l'ancien 100 000
+hardcodé écrasait la config admin dans les deux sens. Le client peut
+toujours demander un cap explicite (≤ plafond anti-DoS ci-dessous)."""
 
 _HARD_CAP_MAX_ROWS_PER_TAB: Final[int] = 200_000
 """Plafond absolu — un classeur dont chaque onglet retourne 200k lignes

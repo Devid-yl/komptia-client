@@ -394,12 +394,37 @@ class AIStatsService:
         """
         return redact_pii_best_effort(comment)
 
+    @staticmethod
+    def _apply_recent_filters(query, status, model_name, user_id):
+        """Applique les filtres communs (status/model/user) à une requête sur
+        ``AIPerformanceLog``.
+
+        Retourne ``(query, ok)`` où ``ok=False`` signale un ``status`` invalide
+        (→ 0 résultat). UTILISÉ par ``get_recent_queries`` ET
+        ``count_recent_queries`` : c'est la source UNIQUE de la logique de
+        filtrage, sans quoi le total (count) et la page (fetch) pourraient
+        diverger silencieusement → ``total_pages`` faux (pagination cassée).
+        """
+        if status:
+            try:
+                query = query.where(AIPerformanceLog.status == QueryStatus(status))
+            except ValueError:
+                return query, False
+        if model_name:
+            # Exact match : l'admin choisit dans une liste = pas de risque de
+            # typo. Pas de LIKE (anti-DoS par wildcard).
+            query = query.where(AIPerformanceLog.model_name == model_name)
+        if user_id is not None:
+            query = query.where(AIPerformanceLog.user_id == user_id)
+        return query, True
+
     async def get_recent_queries(
         self,
         limit: int = 20,
         status: Optional[str] = None,
         model_name: Optional[str] = None,
         user_id: Optional[int] = None,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Récupère les requêtes récentes (avec redaction PII feedback).
 
@@ -409,26 +434,19 @@ class AIStatsService:
         d'échecs sur claude-haiku ? »).
         Fix : ajout des params ``model_name`` (exact match sur ``model_name``)
         et ``user_id`` (filtre user_id strict).
+
+        2026-06-05 : ajout ``offset`` pour la pagination serveur de
+        ``/admin/ai-performance`` (cf. ``count_recent_queries`` pour le total).
         """
         limit = self._validate_limit(limit)
+        offset = offset if isinstance(offset, int) and offset > 0 else 0
         async with get_session() as session:
             query = select(AIPerformanceLog).order_by(AIPerformanceLog.created_at.desc())
+            query, ok = self._apply_recent_filters(query, status, model_name, user_id)
+            if not ok:
+                return []  # status invalide → aucun résultat
 
-            if status:
-                try:
-                    query = query.where(AIPerformanceLog.status == QueryStatus(status))
-                except ValueError:
-                    return []  # Invalid status → no results
-
-            if model_name:
-                # Exact match : l'admin choisit dans une liste = pas de risque
-                # de typo. Pas de LIKE (anti-DoS par wildcard).
-                query = query.where(AIPerformanceLog.model_name == model_name)
-
-            if user_id is not None:
-                query = query.where(AIPerformanceLog.user_id == user_id)
-
-            query = query.limit(limit)
+            query = query.limit(limit).offset(offset)
             result = await session.execute(query)
             logs = result.scalars().all()
 
@@ -441,6 +459,26 @@ class AIStatsService:
                     d["feedback_comment"] = self._redact_feedback_comment(d["feedback_comment"])
                 output.append(d)
             return output
+
+    async def count_recent_queries(
+        self,
+        status: Optional[str] = None,
+        model_name: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> int:
+        """Compte total des requêtes (mêmes filtres que ``get_recent_queries``).
+
+        Sert à calculer ``total_pages`` pour la pagination serveur. Partage
+        ``_apply_recent_filters`` avec le fetch → impossible que le total et
+        la page affichée se contredisent.
+        """
+        async with get_session() as session:
+            query = select(func.count()).select_from(AIPerformanceLog)
+            query, ok = self._apply_recent_filters(query, status, model_name, user_id)
+            if not ok:
+                return 0
+            result = await session.execute(query)
+            return int(result.scalar() or 0)
 
     async def get_usage_stats(self, days: int = 30) -> Dict[str, Any]:
         """
@@ -1066,7 +1104,7 @@ class AIStatsService:
             "fallback": {
                 "count_period": fallback_count,
                 "period_days": days,
-                "last_at_iso": (last_fallback_at.isoformat() if last_fallback_at else None),
+                "last_at_iso": clock.iso_utc(last_fallback_at),
             },
         }
 

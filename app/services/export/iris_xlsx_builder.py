@@ -44,10 +44,13 @@ logger = logging.getLogger(__name__)
 
 # ── Constantes ─────────────────────────────────────────────────────────────
 
-_DEFAULT_MAX_ROWS_PER_TAB: int = 100_000
-"""Cap d'export par onglet. Justification : un cabinet comptable typique
-manipule jusqu'à ~100k transactions par exercice. Au-delà, l'export est
-de toute façon ingérable dans Excel (lenteur, taille fichier)."""
+# (Historique) ``_DEFAULT_MAX_ROWS_PER_TAB = 100_000`` a été RETIRÉ le
+# 2026-06-10 : ce défaut hardcodé écrasait le cap admin
+# ``DatabaseConnection.max_rows`` dans les deux sens (doctrine no-double-cap,
+# finding #18b du triage caps). Les défauts de ``build_iris_xlsx`` /
+# ``materialize_workbook_sql_tabs`` sont désormais ``None`` = cap admin
+# résolu par ``QueryExecutor.execute``. Un caller peut toujours passer un
+# cap explicite (preview, param client de /api/iris/export-xlsx-full).
 
 _MAX_DETAIL_ROWS: int = 5_000
 """Cap par feuille de détail. Plus bas que le cap principal parce que
@@ -61,13 +64,15 @@ hors-cadre. Le builder refuse au-delà pour protéger la RAM serveur."""
 _MAX_DETAIL_SHEETS_PER_EXPORT: int = 1_000
 """Garde-fou similaire pour les feuilles de détail (cellDetails)."""
 
-_DEFAULT_SQL_TIMEOUT_S: int = 180
-"""Timeout par requête SQL réexécutée. La valeur 30s par défaut de
-``QueryExecutor.execute()`` est trop courte pour un export "données
-complètes" : sur Sage Coala, une requête qui retourne 100k lignes peut
-prendre 30-60s rien qu'au transit réseau. 180s couvre largement
-99% des cas. Un onglet qui timeoute est skippé (warning ajouté au
-résultat de l'export) — l'export reste utilisable sur les autres."""
+# T12a (2026-06-10) — plus de timeout hardcodé. ``sql_timeout_s`` défaut ``None``
+# → ``QueryExecutor.execute`` résout le timeout admin (``connector.timeout``,
+# configuré via /admin/database), SSoT unique (même doctrine que ``max_rows_per_tab``
+# et les 4 call-sites nettoyés le 2026-06-08 : copilot_iris_bridge ×2,
+# sql_rewrite_service, training_store). L'ancien ``180`` hardcodé IGNORAIT
+# silencieusement un timeout admin plus strict (ex. 120s). Un caller qui a
+# légitimement besoin de plus pour un export lourd peut passer un override
+# explicite ; un onglet qui timeoute est skippé avec un warning VISIBLE
+# (surfacé jusqu'au récap email/PDF depuis T8).
 
 _RLS_SOURCE = "iris_export_xlsx_full"
 
@@ -160,8 +165,8 @@ async def build_iris_xlsx(
     payload: Dict[str, Any],
     user: Any,
     *,
-    max_rows_per_tab: int = _DEFAULT_MAX_ROWS_PER_TAB,
-    sql_timeout_s: int = _DEFAULT_SQL_TIMEOUT_S,
+    max_rows_per_tab: Optional[int] = None,
+    sql_timeout_s: Optional[int] = None,
     executor: Optional[QueryExecutor] = None,
     anonymize: bool = False,
 ) -> Dict[str, Any]:
@@ -170,10 +175,17 @@ async def build_iris_xlsx(
     Args:
         payload: dict au format ``serialize()`` (clé ``tabs`` requise)
         user: utilisateur authentifié pour la RLS sur la réexécution SQL
-        max_rows_per_tab: cap par onglet (default ``_DEFAULT_MAX_ROWS_PER_TAB``)
-        sql_timeout_s: timeout par requête en secondes (default 180s — 30s
-            par défaut du QueryExecutor est trop court pour un export
-            "données complètes")
+        max_rows_per_tab: cap par onglet. ``None`` (défaut depuis le
+            2026-06-10) = cap admin ``DatabaseConnection.max_rows``
+            (/admin/database), résolu par ``QueryExecutor.execute`` —
+            doctrine « admin = unique source de vérité, pas de double cap » :
+            l'ancien défaut 100 000 hardcodé ÉCRASAIT la config admin dans
+            les deux sens (admin 10k → l'export prenait 100k ; admin 500k →
+            cappé à 100k). Un appelant peut toujours passer un cap explicite
+            (ex. preview à 100 lignes).
+        sql_timeout_s: timeout par requête en secondes. ``None`` (défaut) →
+            ``QueryExecutor`` résout le timeout admin (``connector.timeout``,
+            SSoT /admin/database). Passer une valeur pour un override explicite.
         executor: injectable pour tests, sinon ``get_query_executor()``
         anonymize: si ``True``, applique les pseudonymes configurés par
             l'utilisateur sur ``/data/privacy`` aux VALEURS de cellules avant
@@ -279,8 +291,8 @@ async def materialize_workbook_sql_tabs(
     tabs: List[Dict[str, Any]],
     user: Any,
     *,
-    max_rows_per_tab: int = _DEFAULT_MAX_ROWS_PER_TAB,
-    sql_timeout_s: int = _DEFAULT_SQL_TIMEOUT_S,
+    max_rows_per_tab: Optional[int] = None,
+    sql_timeout_s: Optional[int] = None,
     executor: Optional[QueryExecutor] = None,
     rls_source: str = _RLS_SOURCE,
     logger_prefix: str = "materialize_workbook_sql_tabs",
@@ -301,8 +313,12 @@ async def materialize_workbook_sql_tabs(
             RLS). ``None`` accepté pour les contextes système (ex: jobs
             cron) — le QueryExecutor refusera fail-closed si l'enforcer
             l'exige.
-        max_rows_per_tab: cap par onglet (default 100k)
-        sql_timeout_s: timeout par requête (default 180s)
+        max_rows_per_tab: cap par onglet. ``None`` (défaut depuis le
+            2026-06-10) = cap admin ``DatabaseConnection.max_rows``, résolu
+            par ``QueryExecutor.execute`` (doctrine no-double-cap — l'ancien
+            défaut 100k hardcodé écrasait la config admin dans les 2 sens)
+        sql_timeout_s: timeout par requête. ``None`` (défaut) → timeout admin
+            (``connector.timeout``, SSoT). Override explicite possible.
         executor: injectable pour tests
         rls_source: identifiant RLS pour audit (different par caller)
         logger_prefix: préfixe pour les logs (different par caller)
@@ -337,6 +353,7 @@ async def materialize_workbook_sql_tabs(
         sql_text = (tab.get("sql") or "").strip()
         label = tab.get("label") or f"Onglet {idx + 1}"
         normalized = _normalize_tab_to_array_format(tab)
+        re_exec_failed = False  # #16 — ré-exec SQL KO → fallback snapshot
 
         if sql_text:
             try:
@@ -361,6 +378,7 @@ async def materialize_workbook_sql_tabs(
                     f"({exc.user_message or 'accès denied'}). Snapshot d'entrée utilisé."
                 )
                 warnings.append(msg)
+                re_exec_failed = True
                 sql_skipped.append({"idx": idx, "label": label, "reason": "rls_denied"})
                 logger.info(
                     "%s: RLS denied for tab %d (%s): %s",
@@ -375,6 +393,7 @@ async def materialize_workbook_sql_tabs(
                     f"({type(exc).__name__}). Snapshot d'entrée utilisé."
                 )
                 warnings.append(msg)
+                re_exec_failed = True
                 sql_skipped.append(
                     {
                         "idx": idx,
@@ -390,6 +409,43 @@ async def materialize_workbook_sql_tabs(
                     label,
                     exc_info=True,
                 )
+
+        # #134 — surfacer TOUTE troncature de l'onglet en warning VISIBLE (sinon
+        # l'utilisateur télécharge un fichier incomplet présenté comme complet =
+        # données fausses silencieuses). Deux origines :
+        #  - ré-exec SQL qui a hit le cap (``normalized["truncated"]`` posé plus haut) ;
+        #  - snapshot SOURCE déjà tronqué au chargement (``tab["truncated"]``, cf.
+        #    #133/#86 — non recopié par ``_normalize_tab_to_array_format``).
+        # Cohérent avec les warnings RLS / SQL-error émis ci-dessus, surfacés
+        # côté client via le header ``X-Iris-Export-Warnings`` (iris-grid.js).
+        #
+        # ⚠️ Pour un onglet SQL, la RÉ-EXEC serveur est AUTORITAIRE (son résultat
+        # est dans ``normalized["truncated"]``, posé plus haut) et SUPERSÈDE le
+        # flag client ``tab["truncated"]`` — ce dernier ne reflète que le cap
+        # d'AFFICHAGE (~500 lignes) du snapshot frontend, justement ce que
+        # l'export full corrige. On ne consulte donc le flag source client QUE
+        # pour les onglets SANS SQL (snapshot pur) ; sinon un onglet que le
+        # serveur vient de re-récupérer COMPLET déclencherait un faux « tronqué ».
+        # #16 fix 2026-06-11 — si la ré-exec SQL a ÉCHOUÉ (RLS/erreur), on est
+        # retombé sur le snapshot d'entrée → la ré-exec n'est PAS autoritaire, on
+        # consulte donc AUSSI le flag source (sinon un snapshot tronqué partirait
+        # sans signal de troncature, l'user ne voyant que « ré-exec échouée »).
+        # NB (revue adv. 2026-06-11) : le terme ``or re_exec_failed`` est en
+        # pratique BELT-AND-SUSPENDERS dans le code actuel — ``_normalize_tab_to_
+        # array_format`` fait ``out = dict(tab)`` (recopie ``truncated``) et la
+        # ligne 370 ne l'écrase QUE dans la branche SQL réussie ; donc sur échec,
+        # ``normalized.get("truncated")`` est DÉJÀ vrai. On garde ce terme comme
+        # garde explicite au cas où ``_normalize`` cesserait un jour de recopier
+        # ``truncated`` (ne pas le retirer en croyant qu'il est mort).
+        source_truncated = (not sql_text or re_exec_failed) and bool(tab.get("truncated"))
+        if normalized.get("truncated") or source_truncated:
+            normalized["truncated"] = True
+            if label not in truncated_tabs:
+                truncated_tabs.append(label)
+            warnings.append(
+                f"Onglet « {label} » : données tronquées — l'export ne contient "
+                f"pas toutes les lignes du résultat complet."
+            )
 
         enriched_tabs.append(normalized)
 
@@ -703,11 +759,22 @@ def _populate_sheet(
     if not columns:
         return 0
 
+    # #30 (revue adv.) — SSoT formule-safe partagée CSV/XLSX (output_safety).
+    from app.utils.output_safety import excel_safe_cell
+
     # Headers à la row ``header_row``.
     for col_idx, col_name in enumerate(columns, start=1):
         # Strip illégaux XLSX sur le nom aussi (rare mais robuste).
         header_text = _XLSX_ILLEGAL_CHARS_RE.sub("", str(col_name)) if col_name is not None else ""
-        c = ws.cell(row=header_row, column=col_idx, value=header_text)
+        # #30 fix 2026-06-11 (revue adv. → SSoT) — injection de formule (CWE-1236)
+        # sur l'EN-TÊTE, neutralisée via ``excel_safe_cell`` (SSoT partagée CSV/
+        # XLSX, output_safety.py) : préfixe `'` sur TOUS les préfixes dangereux
+        # (=, +, -, @, tab, CR — cf. CSV_FORMULA_PREFIXES), types natifs préservés.
+        # Avant : `data_type='f'→'s'` ne couvrait QUE `=` (openpyxl ne classe 'f'
+        # que pour `=`) → +,-,@,tab,CR restaient injectables. Un alias SQL
+        # `AS "=cmd|..."` / nom de colonne Sage / pseudonyme ne peut plus devenir
+        # une formule exécutable chez un destinataire EXTERNE.
+        c = ws.cell(row=header_row, column=col_idx, value=excel_safe_cell(header_text))
         c.font = header_font
         c.fill = header_fill
         c.alignment = header_align
@@ -734,7 +801,11 @@ def _populate_sheet(
         for col_idx, val in enumerate(values, start=1):
             coerced = _coerce_cell_value(val)
             try:
-                cell = ws.cell(row=r_idx, column=col_idx, value=coerced)
+                # #30 (revue adv. → SSoT) — excel_safe_cell neutralise l'injection
+                # de formule (=,+,-,@,tab,CR) sur les chaînes ET préserve les types
+                # natifs (nombres/dates restent sommables/triables). Remplace
+                # l'ancien backstop `data_type='f'→'s'` qui ne couvrait que `=`.
+                cell = ws.cell(row=r_idx, column=col_idx, value=excel_safe_cell(coerced))
             except Exception:  # noqa: BLE001 — defensive: ne JAMAIS crash l'export
                 # Filet de sécurité : si openpyxl ou lxml rejette malgré la
                 # sanitization (surrogate orphelin, encodage partiel raté,
@@ -742,7 +813,7 @@ def _populate_sheet(
                 # une représentation ASCII safe au lieu de planter le build.
                 fallback = _safe_ascii_fallback(coerced)
                 try:
-                    cell = ws.cell(row=r_idx, column=col_idx, value=fallback)
+                    cell = ws.cell(row=r_idx, column=col_idx, value=excel_safe_cell(fallback))
                 except Exception:  # noqa: BLE001
                     cell = ws.cell(row=r_idx, column=col_idx, value="[non exportable]")
 

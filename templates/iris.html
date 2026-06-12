@@ -117,6 +117,28 @@
     #messagesArea::-webkit-scrollbar-track { background: transparent; }
     #messagesArea::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
+    /* IRIS-events-loadmore (#54) — bouton « charger l'historique plus ancien ».
+       Fond transparent + bordure/texte en variables dark-aware (lisible en
+       dark mode, cf. PREV-4). */
+    .iris-load-older-btn {
+        display: inline-flex; align-items: center; gap: 0.4rem;
+        padding: 0.4rem 0.9rem;
+        background: transparent;
+        border: 1px solid var(--border, #e2e8f0);
+        border-radius: 9999px;
+        color: var(--text-secondary, #475569);
+        font-size: 0.8125rem; cursor: pointer;
+        transition: border-color 0.15s ease, color 0.15s ease;
+    }
+    .iris-load-older-btn:hover:not(:disabled) {
+        border-color: var(--accent-primary, #2563eb);
+        color: var(--accent-primary, #2563eb);
+    }
+    .iris-load-older-btn:disabled { opacity: 0.55; cursor: default; }
+    .iris-load-older-status {
+        font-size: 0.72rem; color: var(--text-muted, #64748b); margin-top: 0.3rem;
+    }
+
     /* Welcome */
     #welcomeState {
         display: flex;
@@ -402,6 +424,63 @@
         from { opacity: 0; transform: translateY(10px); }
         to { opacity: 1; transform: translateY(0); }
     }
+    /* Avertissement « conversation longue » (TRIM) — sticky en tête de la zone
+       de messages. Ton ambre DISCRET (≠ bannière SQL indigo) : informe sans
+       alarmer ; lisible en clair et sombre. */
+    .iris-length-warning {
+        position: sticky;
+        top: 0;
+        z-index: 6;
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        padding: 0.625rem 0.875rem;
+        margin-bottom: 0.5rem;
+        background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+        border: 1px solid rgba(217, 119, 6, 0.35);
+        border-radius: 10px;
+        font-size: 0.8rem;
+        color: #92400e;
+        animation: iris-banner-enter 0.3s ease;
+    }
+    .iris-length-warning-text { flex: 1; line-height: 1.4; }
+    .iris-length-warning-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        flex-shrink: 0;
+    }
+    .iris-length-warning-btn {
+        padding: 0.3rem 0.7rem;
+        background: #d97706;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.15s;
+        white-space: nowrap;
+    }
+    .iris-length-warning-btn:hover { background: #b45309; }
+    .iris-length-warning-btn-danger {
+        background: none;
+        color: #b91c1c;
+        border: 1px solid rgba(185, 28, 28, 0.4);
+    }
+    .iris-length-warning-btn-danger:hover { background: rgba(185, 28, 28, 0.08); }
+    .iris-length-warning-dismiss {
+        background: none;
+        border: none;
+        color: #92400e;
+        font-size: 1.1rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0 0.2rem;
+        flex-shrink: 0;
+        opacity: 0.6;
+    }
+    .iris-length-warning-dismiss:hover { opacity: 1; }
     .iris-sql-card-header {
         display: flex;
         align-items: center;
@@ -412,6 +491,17 @@
         font-size: 0.75rem;
         font-weight: 600;
         color: var(--brand);
+    }
+    /* Bannière « non pré-validé par le SGBD » (oracle fail-open, FAILLE 1).
+       COPIE SYNCHRONE de static/css/iris-grid.css (.iris-sql-oracle-warning) —
+       /iris ne charge PAS iris-grid.css : garder les deux en phase. */
+    .iris-sql-oracle-warning {
+        padding: 0.5rem 0.875rem;
+        background: #fef3c7;
+        border-bottom: 1px solid #f59e0b;
+        color: #92400e;
+        font-size: 0.78rem;
+        line-height: 1.4;
     }
     .iris-sql-table-wrap {
         overflow-x: auto;
@@ -425,6 +515,21 @@
         overflow-y: auto;
         box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.3);
         cursor: default;
+    }
+    /* Affordance défilement (copie SYNCHRONE de iris-grid.css — NON chargé
+       sur /iris) : fade bas tant que le contenu déborde et que le scroll
+       n'est pas activé au clic. */
+    .iris-sql-table-wrap.has-overflow:not(.scroll-active) {
+        box-shadow: inset 0 -18px 14px -14px rgba(0, 0, 0, 0.28);
+    }
+    .dark .iris-sql-table-wrap.has-overflow:not(.scroll-active) {
+        box-shadow: inset 0 -20px 16px -14px rgba(0, 0, 0, 0.65);
+    }
+    /* En fullscreen le cap 60vh saute (max-height:none) : le scrollbar natif
+       est l'affordance, on neutralise le fade (classe has-overflow possiblement
+       stale, ré-évaluée seulement au prochain _rebuildBody). */
+    .grid-fullscreen .iris-sql-table-wrap.has-overflow {
+        box-shadow: none;
     }
     .iris-sql-table-wrap::-webkit-scrollbar { width: 4px; height: 4px; }
     .iris-sql-table-wrap::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 2px; }
@@ -1500,6 +1605,11 @@
         justify-content: space-between;
         margin-top: 0.5rem;
         padding: 0 0.25rem;
+        /* line-height: 1 → normalise la hauteur des boîtes de texte du footer
+           pour que ``align-items: center`` aligne vraiment ``Iris — modèle`` (texte
+           nu, posé sur sa baseline) avec le point/la barre (centrés géométriquement).
+           Sans ça, l'asymétrie ascendante/descendante de la police décale le texte. */
+        line-height: 1;
     }
     .iris-model-info {
         font-size: 0.6875rem;
@@ -1539,6 +1649,32 @@
         --cw-fill: var(--status-error);
         color: var(--status-error);
     }
+    /* Fenêtre non confirmée (modèle pas encore enrichi) : le texte du total
+       est préfixé « ≈ » côté JS ; on l'atténue + curseur d'aide pour signaler
+       que la valeur est provisoire sans crier au rouge (ce n'est pas une
+       erreur, juste une donnée à confirmer). Cf. context_window_verified. */
+    .iris-context-window.cw-unverified { opacity: 0.72; cursor: help; }
+    .iris-context-window.cw-unverified .iris-cw-text { font-style: italic; }
+    /* Groupe gauche du footer : point de statut WS + coût LLM, collés — le coût
+       juste à droite du point rouge/vert. L'espacement point↔coût vient du
+       ``margin-right`` de ``.iris-ws-status``. */
+    .iris-footer-left {
+        display: inline-flex;
+        align-items: center;
+    }
+    /* Puce coût LLM — cumul $ de la conversation. Même registre visuel discret
+       que .iris-model-info / .iris-context-window. L'explication s'affiche au
+       survol prolongé (attribut title posé côté JS), pas via une icône « i ». */
+    .iris-cost {
+        font-size: 0.6875rem;
+        color: rgba(0,0,0,0.4);
+        cursor: default;
+    }
+    .iris-cost[hidden] { display: none; }
+    /* Coût minorant (≥1 appel sur un modèle hors registre pricing) : atténué +
+       curseur d'aide ; « ≥ » posé côté JS, le title explique pourquoi. */
+    .iris-cost.cost-partial { opacity: 0.72; cursor: help; }
+    .iris-cost.cost-partial .iris-cost-text { font-style: italic; }
 
     /* ------------------------------------------------------------------ */
     /* Animations                                                            */
@@ -1759,9 +1895,64 @@
     }
     .grid-copilot-status.error {
         color: #dc2626;
+        /* Multi-ligne + scroll pour les erreurs longues — COPIE SYNCHRONE de
+           static/css/iris-grid.css (.grid-copilot-status.error). Toute évolution
+           doit être répercutée des deux côtés (dette : unifier les 2 sources). */
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        max-height: 6em;
+        overflow-y: auto;
+    }
+    /* Bouton « Signaler » sur les erreurs 5xx copilot (axe 5 du contrat,
+       tâche #19). Discret : même teinte que l'erreur, bordure fine — il
+       fait partie du message, pas un CTA flottant. ``position:sticky``
+       (review #19) : la zone .error scrolle (max-height 6em) et le bouton
+       est le dernier enfant — sticky le garde TOUJOURS visible au bas de
+       la boîte, même sur un message de 400+ chars. Fond opaque obligatoire
+       (le texte défile dessous). min-height 32px = cible tactile.
+       COPIE SYNCHRONE de static/css/iris-grid.css. */
+    .grid-copilot-status .copilot-report-btn {
+        display: block;
+        position: sticky;
+        bottom: 0;
+        margin-top: 0.25rem;
+        padding: 0.25rem 0.6rem;
+        min-height: 32px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        line-height: 1.4;
+        color: #dc2626;
+        background: var(--bg-surface, #fff);
+        border: 1px solid #dc2626;
+        border-radius: 0.25rem;
+        cursor: pointer;
+    }
+    .grid-copilot-status .copilot-report-btn:hover {
+        background: rgba(220, 38, 38, 0.08);
+    }
+    .grid-copilot-status .copilot-report-btn:focus-visible {
+        outline: 2px solid currentColor;
+        outline-offset: 2px;
     }
     .grid-copilot-status.success {
         color: #16a34a;
+    }
+    .grid-copilot-status.warning {
+        color: #d97706;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        max-height: 6em;
+        overflow-y: auto;
+    }
+    .grid-copilot-status.info {
+        color: #2563eb;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        max-height: 6em;
+        overflow-y: auto;
     }
     /* WCAG 1.4.1 Use of Color : la sévérité ne doit pas reposer
        UNIQUEMENT sur la couleur. Préfixes textuels visibles +
@@ -1773,6 +1964,14 @@
     }
     .grid-copilot-status.success::before {
         content: "Succès : ";
+        font-weight: 600;
+    }
+    .grid-copilot-status.warning::before {
+        content: "Attention : ";
+        font-weight: 600;
+    }
+    .grid-copilot-status.info::before {
+        content: "Info : ";
         font-weight: 600;
     }
 
@@ -3897,6 +4096,12 @@
         border-color: rgb(var(--brand-light-rgb) / 0.3);
     }
     .dark .iris-sql-card-header { background: rgb(var(--brand-light-rgb) / 0.15); color: #fca5a5; }
+    /* Variante sombre de la bannière oracle (copie synchrone iris-grid.css). */
+    .dark .iris-sql-oracle-warning {
+        background: rgba(245, 158, 11, 0.12);
+        border-bottom-color: rgba(245, 158, 11, 0.45);
+        color: #fcd34d;
+    }
     .dark .iris-tool-blocked { color: #fca5a5; }
     .dark .iris-tool-line-err-badge { background: rgba(239,68,68,0.2); color: #fca5a5; }
 
@@ -3936,6 +4141,17 @@
     }
 
     .dark .iris-system-message { color: rgba(255,255,255,0.55); }
+    .dark .iris-length-warning {
+        background: linear-gradient(135deg, rgba(146,64,14,0.18) 0%, rgba(180,83,9,0.22) 100%);
+        border-color: rgba(217,119,6,0.4);
+        color: #fde68a;
+    }
+    .dark .iris-length-warning-text { color: #fde68a; }
+    .dark .iris-length-warning-dismiss { color: #fcd34d; }
+    .dark .iris-length-warning-btn-danger {
+        color: #fca5a5;
+        border-color: rgba(248,113,113,0.4);
+    }
 
     .dark .iris-datastore-picker {
         background: #0f172a;
@@ -4007,7 +4223,20 @@
     .dark .grid-copilot-input::placeholder { color: var(--text-muted); }
     .dark .grid-copilot-status { color: var(--text-faint); }
     .dark .grid-copilot-status.error { color: #fca5a5; }
+    .dark .grid-copilot-status .copilot-report-btn {
+        color: #fca5a5;
+        border-color: #fca5a5;
+        /* Fond opaque dark : --bg-surface n'est pas défini dans ce scope, le
+           fallback #fff de la règle light serait blanc en dark (sticky par-
+           dessus le texte qui défile). Token surface du thème dark copilot. */
+        background: var(--bg-surface-3, #1f2937);
+    }
+    .dark .grid-copilot-status .copilot-report-btn:hover {
+        background: rgba(252, 165, 165, 0.12);
+    }
     .dark .grid-copilot-status.success { color: #86efac; }
+    .dark .grid-copilot-status.warning { color: #fcd34d; }
+    .dark .grid-copilot-status.info { color: #93c5fd; }
     .dark .grid-resize-btn {
         background: rgba(255,255,255,0.04);
         border-color: rgba(255,255,255,0.08);
@@ -4061,6 +4290,7 @@
         --cw-fill: #f87171;
         color: var(--status-error);
     }
+    .dark .iris-cost { color: rgba(255,255,255,0.45); }
     .dark .iris-rag-sources summary {
         color: rgba(255,255,255,0.5);
     }
@@ -4730,6 +4960,47 @@
         color: rgba(252, 211, 77, 1);
     }
 
+    /* T16/T17/T18 — bandeau « hypothèse à valider » + bouton « continuer vers
+       le SQL » des runs preview (arrêt à une phase intermédiaire). Réutilise
+       les tokens --status-warn / --status-warn-bg (cadrage « prudence »). */
+    .iris-pipeline-recap-hypothesis {
+        border-left-color: var(--status-warn);
+    }
+    .iris-recap-hypothesis {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px 12px;
+        padding: 8px 10px;
+        margin-bottom: 8px;
+        border-radius: 6px;
+        background: var(--status-warn-bg);
+        border: 1px solid var(--status-warn);
+    }
+    .iris-recap-hypothesis-text {
+        flex: 1 1 200px;
+        font-size: 0.86rem;
+        line-height: 1.35;
+        color: var(--status-warn);
+    }
+    .iris-recap-continue-btn {
+        flex: 0 0 auto;
+        padding: 6px 14px;
+        font-size: 0.84rem;
+        font-weight: 600;
+        color: #fff;                 /* clair : --status-warn = #b45309 foncé → texte blanc OK */
+        background: var(--status-warn);
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: opacity 0.15s ease;
+    }
+    .iris-recap-continue-btn:hover { opacity: 0.88; }
+    .iris-recap-continue-btn:disabled { opacity: 0.55; cursor: default; }
+    /* Dark : --status-warn = #fcd34d (jaune clair) → texte FONCÉ pour contraste
+       WCAG (anti « badge invisible en dark »). */
+    .dark .iris-recap-continue-btn { color: #1a1a1a; }
+
 </style>
 {% end %}
 
@@ -4765,6 +5036,18 @@
         <!-- Zone de messages -->
         <div id="messagesArea">
 
+            {# IRIS-events-loadmore (#54) — bouton « charger l'historique plus
+               ancien ». Masqué par défaut ; affiché par iris.js quand la conv a
+               des events au-delà du cap de rendu (500). Reste en TÊTE : le
+               prepend insère les events anciens APRÈS lui. #}
+            <div id="loadOlderContainer" style="display:none;text-align:center;padding:0.5rem 0;">
+                <button type="button" id="loadOlderBtn" class="iris-load-older-btn">
+                    <i class="bi bi-arrow-up-circle" aria-hidden="true"></i>
+                    Charger l'historique plus ancien
+                </button>
+                <div id="loadOlderStatus" class="iris-load-older-status" role="status" aria-live="polite"></div>
+            </div>
+
             <!-- Welcome state -->
             <div id="welcomeState">
                 <div class="iris-welcome-icon">
@@ -4784,8 +5067,14 @@
                 <script nonce="{{ handler.csp_nonce }}">
                 (function() {
                     var container = document.getElementById('examplePrompts');
+                    // IRIS-welcome — sans LLM configuré, le textarea + l'upload
+                    // sont déjà disabled et le bloc « Configuration requise »
+                    // s'affiche. Les exemples cliquables, eux, étaient rendus
+                    // inconditionnellement → un clic lançait un envoi voué à
+                    // échouer (erreur générique confuse). On ne les rend pas.
+                    var llmReady = {% if llm_ready %}true{% else %}false{% end %};
                     var suggestions = {% raw welcome_suggestions %};
-                    if (!suggestions || suggestions.length === 0) {
+                    if (!llmReady || !suggestions || suggestions.length === 0) {
                         container.style.display = 'none';
                         return;
                     }
@@ -4816,6 +5105,14 @@
                 </div>
                 <span class="iris-typing-text" style="margin-left:0.5rem;font-size:0.8rem;color:var(--text-muted);"></span>
             </div>
+
+            {# IRIS-4 (a11y) — région live SR-only UNIQUE pour annoncer aux
+               lecteurs d'écran les statuts transitoires non visibles autrement :
+               « Iris réfléchit… », perte/rétablissement de la connexion serveur.
+               role=status implique aria-live=polite + aria-atomic. Persistante
+               (jamais display:none) pour que les changements de texte soient
+               annoncés de façon fiable (cf. WAI-ARIA live regions). #}
+            <div id="irisSrStatus" role="status" aria-live="polite" class="sr-only"></div>
 
         </div>
 
@@ -4886,8 +5183,13 @@
                 </button>
             </div>
             <div class="iris-input-footer">
-                <span class="iris-ws-status" id="wsStatus">
-                    <span class="iris-ws-dot" title="Rouge : déconnecté — Vert : connecté au serveur"></span>
+                <span class="iris-footer-left">
+                    <span class="iris-ws-status" id="wsStatus">
+                        <span class="iris-ws-dot" title="Rouge : déconnecté — Vert : connecté au serveur"></span>
+                    </span>
+                    <span class="iris-cost" id="irisCostIndicator" hidden>
+                        <span class="iris-cost-text" id="irisCostValue"></span>
+                    </span>
                 </span>
                 <span class="iris-model-info" id="modelInfo">Iris — {{ model_display }}</span>
                 <span class="iris-context-window" id="contextWindowIndicator" hidden>
@@ -4924,6 +5226,11 @@
     // Donnees initiales exposees au JS
     window.IRIS_CONFIG = {
         conversationId: {% if conversation_id %}{{ conversation_id }}{% else %}null{% end %},
+        // Compteur de messages + seuil d'alerte « conversation longue ».
+        // Au-delà du cap de replay, l'historique se recharge tronqué → on
+        // prévient l'utilisateur avant et on propose d'effacer la conversation.
+        conversationMessageCount: {{ conversation_message_count }},
+        conversationWarnThreshold: {{ conversation_warn_threshold }},
         currentUser: {% if current_user %}{% raw json_encode(current_user.username) %}{% else %}""{% end %},
         conversationMessages: {% raw conversation_messages %},
         // Source de vérité pour le replay DOM-IDENTIQUE au refresh.
@@ -4939,7 +5246,16 @@
         // si un futur refactor changeait le type côté serveur, json_encode resterait sûr).
         modelDisplay: {% raw json_encode(model_display or '') %},
         contextWindow: {% if context_window %}{% raw json_encode(context_window) %}{% else %}null{% end %},
+        // Fenêtre confirmée par une source fiable ? false → l'indicateur
+        // affiche « ≈ à confirmer » au lieu d'un chiffre potentiellement faux
+        // (modèle choisi mais jamais enrichi). Cf. context_window_verified.
+        contextWindowVerified: {% raw json_encode(context_window_verified) %},
         initialContextTokens: {% raw json_encode(initial_context_tokens or 0) %},
+        // Puce coût LLM /iris — cumul $ de la conversation (resette à l'effacement).
+        // Source = get_conversation_cost_usd_for_ui (SSoT). 0 → puce masquée au boot.
+        initialConversationCostUsd: {% raw json_encode(initial_conversation_cost_usd or 0) %},
+        // True si un modèle hors registre pricing minore le total (UI préfixe « ≈ »).
+        initialConversationCostPartial: {% raw json_encode(initial_conversation_cost_partial) %},
         // Task #11 — Configuration upload SSoT (extensions + taille max).
         // Dérivée de ``_ALLOWED_EXTENSIONS`` et ``_MAX_UPLOAD_SIZE`` côté
         // backend. Le JS (iris.js) consomme uploadConfig.extensions pour
@@ -4954,14 +5270,9 @@
     };
 </script>
 <script src="{{ static_url('js/components/external_sheets_picker.js') }}" nonce="{{ handler.csp_nonce }}"></script>
-{# Tokenizer d'anonymisation — miroir Py↔JS partagé. Charger AVANT
-   iris-grid.js : le modal d'anonymisation y délègue tokenize/auto-pseudo.
-   Cf. ``static/js/anonymization/tokenizer.js`` pour le contrat. #}
-<script src="{{ static_url('js/anonymization/tokenizer.js') }}" nonce="{{ handler.csp_nonce }}"></script>
-{# Helpers de save anonymisation (validation client + format state_errors).
-   Source de vérité unique consommée par iris-grid.js ET privacy-page.js.
-   Cf. ``static/js/anonymization/save-helpers.js`` pour le contrat. #}
-<script src="{{ static_url('js/anonymization/save-helpers.js') }}" nonce="{{ handler.csp_nonce }}"></script>
+{# Hard-deps du grid (tokenizer + save-helpers + grid-store), ordre garanti.
+   SSoT : templates/partials/_grid_deps.html (idem datastore/dashboard/automations). #}
+{% include "partials/_grid_deps.html" %}
 {# Détail d'un terme anonymisé (coverage + audit). Chargé sur /iris pour que
    le modal "Confidentialité" d'iris-grid puisse ouvrir le panneau détail
    en cliquant sur une rangée. Le composant crée son DOM à la volée. #}
@@ -4994,7 +5305,7 @@
                    un fichier" — c'était LA cause probable du 0 usage
                    du trombone constaté dans les logs (cf. brainstorm
                    initial F16 et task #22). */
-                key: 'iris_v2',
+                key: 'iris_v3',
                 title: 'Bienvenue sur Iris',
                 steps: [
                     {
@@ -5008,11 +5319,6 @@
                         text: 'Si Iris se trompe sur une notion métier, dites-le simplement (« plutôt ce critère », « exclus ces dossiers »). Iris s\'adapte et reformule.'
                     },
                     {
-                        /* Task #22 — step trombone pour découvrabilité.
-                           Mentionne les 2 sources possibles (PC + datastore)
-                           qui correspondent aux 2 items du menu déroulant
-                           (cf. uploadFromPC / uploadFromDatastore dans le
-                           template). */
                         icon: 'sparkle',
                         title: '📎 Joindre un fichier à analyser',
                         text: 'Cliquez sur le bouton trombone à gauche de la zone de saisie pour analyser un CSV, un Excel ou un classeur Komptia. Vous avez deux options : depuis votre ordinateur, ou directement depuis le datastore.'
@@ -5020,7 +5326,7 @@
                     {
                         icon: 'rocket',
                         title: 'Des résultats interactifs',
-                        text: 'Triez, filtrez, exportez en Excel ou PDF directement depuis le tableau. Vous pouvez aussi enregistrer la question pour la rejouer plus tard d\'un seul clic.'
+                        text: 'Triez, filtrez, exportez en Excel ou CSV directement depuis le tableau. Vous pouvez aussi enregistrer la question pour la rejouer plus tard d\'un seul clic.'
                     },
                     {
                         icon: 'bell',

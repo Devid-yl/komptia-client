@@ -9,8 +9,9 @@ Valide et sécurise les requêtes SQL générées par le LLM:
 - Whitelist des tables autorisées
 """
 
-import re
 import logging
+import os
+import re
 from typing import List, Dict, Any, Optional, Set, Tuple
 from difflib import get_close_matches
 from enum import Enum
@@ -196,13 +197,11 @@ def _load_all_columns_from_ddl() -> Dict[str, Set[str]]:
 
     result: Dict[str, Set[str]] = {}
     try:
-        import sqlite3
-        from app.config import get_config
+        from app.core.database import open_local_sqlite_connection
 
-        config = get_config()
-        db_path = config.database.path
-
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        # Connexion DBAPI brute sur la BDD LOCALE, AVEC le PRAGMA key SQLCipher
+        # posé par le helper (sinon base chiffrée illisible : « file is not a db »).
+        conn = open_local_sqlite_connection(timeout=5.0)
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA busy_timeout = 5000")
@@ -1561,6 +1560,59 @@ class Verdict:
     proof: Optional[Proof] = None  # toujours présent si passes=False
     sql_used: Optional[str] = None  # SQL après transformations RLS (si différent)
     provenance: Optional[List[Dict[str, Any]]] = None  # arbre transformations
+    #: Tri-state : ``True`` = l'oracle SGBD (PARSEONLY/FMTONLY) a tourné et a
+    #: validé ; ``False`` = oracle INJOIGNABLE, le verdict passe en fail-open
+    #: SANS pré-validation SGBD (le caller DOIT propager le marqueur
+    #: ``ORACLE_NOT_PREVALIDATED_WARNING`` jusqu'à l'utilisateur — pas de
+    #: contournement muet) ; ``None`` = oracle non tenté (``skip_oracle=True``
+    #: ou verdict rejeté avant la Phase 3).
+    oracle_validated: Optional[bool] = None
+
+
+# ── Politique de dégradation de l'oracle quand la BDD source est injoignable ──
+#
+# Historiquement le fail-open était SILENCIEUX : Sage down au moment de la
+# validation → la requête contournait PARSEONLY/FMTONLY sans aucune trace
+# visible pour l'utilisateur. Deux modes désormais :
+#
+#   - fail-open (DÉFAUT, ``ORACLE_FAIL_CLOSED`` absent/0) : la requête passe
+#     MAIS ``Verdict.oracle_validated=False`` + le marqueur ci-dessous doit
+#     remonter jusqu'à l'utilisateur (tool result + event ``sql_results``).
+#   - fail-closed (``ORACLE_FAIL_CLOSED=1``) : refus net avec ``Proof``
+#     ``rule_id="ORACLE_UNAVAILABLE"`` — aucune requête non pré-validée ne part.
+#
+# Lu DYNAMIQUEMENT à chaque appel (pas figé à l'import) : testable par
+# monkeypatch d'env et modifiable au runtime sans redémarrage (cohérent avec
+# le pattern ops ``IRIS_DISABLE_EG_FOR_SQL_PATH``).
+
+ORACLE_FAIL_CLOSED_ENV: str = "ORACLE_FAIL_CLOSED"
+
+#: Marqueur utilisateur unique côté BACKEND — repris tel quel par les tool
+#: results (``execute_sql``/``test_sql``/``compare_query_variants``/
+#: ``create_report``). L'event ``sql_results`` ne transporte qu'un BOOLÉEN
+#: (``oracle_prevalidated``) : la bannière frontend (``_makeOracleWarn`` dans
+#: ``static/js/iris.js`` + widget) porte une COPIE SYNCHRONE reformulée de ce
+#: texte — toute modif de formulation doit être reportée des deux côtés.
+ORACLE_NOT_PREVALIDATED_WARNING: str = (
+    "Résultat non pré-validé par le SGBD : la base source était injoignable "
+    "au moment de la validation (PARSEONLY/FMTONLY non exécutés). La syntaxe "
+    "et l'existence des tables/colonnes n'ont pas été vérifiées avant exécution."
+)
+
+
+def oracle_fail_closed_enabled() -> bool:
+    """``True`` si l'admin a activé le mode fail-closed via ``ORACLE_FAIL_CLOSED``.
+
+    Valeurs truthy acceptées : ``1``/``true``/``yes``/``on`` (insensible à la
+    casse). Tout le reste — y compris l'absence de la variable — conserve le
+    comportement historique fail-open.
+    """
+    return os.environ.get(ORACLE_FAIL_CLOSED_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _compute_sql_hash(sql: str) -> str:
@@ -1711,9 +1763,7 @@ def _check_deterministic_guards(
     unquoted_matches = _VALIDATOR_UNQUOTED_PLACEHOLDER_PATTERN.findall(sql)
     if unquoted_matches:
         unique_tokens = sorted(set(unquoted_matches))[:10]
-        provenance.append(
-            _provenance_entry("guard_unquoted_placeholder", count=len(unique_tokens))
-        )
+        provenance.append(_provenance_entry("guard_unquoted_placeholder", count=len(unique_tokens)))
         return Verdict(
             passes=False,
             proof=Proof(
@@ -1868,16 +1918,26 @@ async def validate_for_iris(
           - `passes=False` + `proof` (Proof structuré inspectable par Iris)
         Toujours `provenance` (arbre des transformations appliquées).
 
-    **Fail-open transitoire (T16-M8 doc, 2026-05-26)** : si l'oracle SQL Server
-    est temporairement inaccessible (`SageConnectionError`), le caller (wrapper
-    `_validate_sql_columns` / `_handle_execute_sql` / `_handle_test_sql`) DOIT
-    catcher l'exception et faire passer la query (laissant l'exécution réelle
-    reporter l'erreur réseau à l'utilisateur via son canal normal).
+    **Politique oracle injoignable (2026-06-12, remplace le contrat T16-M8)** :
+    `SageConnectionError` n'est PLUS propagée au caller — la politique est
+    centralisée ICI (les call-sites divergeaient). Deux modes :
 
-    **CRITIQUE** : ce fail-open ne s'applique QU'À l'oracle (Phase 3). Les guards
-    déterministes (Phase 1 : read_only, system_table, unquoted_placeholder)
-    et le RLS (Phase 2) sont exécutés AVANT l'oracle et restent actifs même
-    en cas de Sage down. Voir `test_M8_deterministic_guards_active_even_when_sage_down`.
+      - **fail-open (DÉFAUT)** : retourne `Verdict(passes=True,
+        oracle_validated=False)`. Le caller DOIT propager le marqueur
+        `ORACLE_NOT_PREVALIDATED_WARNING` jusqu'à l'utilisateur (tool result
+        + event `sql_results`) — plus de contournement muet. Contrairement à
+        l'ancien contrat (verdict jeté), le `sql_used` post-RLS est CONSERVÉ.
+      - **fail-closed (`ORACLE_FAIL_CLOSED=1`)** : retourne `passes=False`
+        avec `Proof(rule_id="ORACLE_UNAVAILABLE")` — refus clair et transitoire.
+
+    Les `except SageConnectionError` restants chez les callers sont du
+    defense-in-depth (dead code attendu) — ils ne portent plus la politique.
+
+    **CRITIQUE** : cette politique ne s'applique QU'À l'oracle (Phase 3). Les
+    guards déterministes (Phase 1 : read_only, system_table,
+    unquoted_placeholder) et le RLS (Phase 2) sont exécutés AVANT l'oracle et
+    restent actifs même Sage down (fail-closed inconditionnel pour le RLS).
+    Voir `test_M8_deterministic_guards_active_even_when_sage_down`.
     """
     sql_hash = _compute_sql_hash(sql)
     provenance: List[Dict[str, Any]] = [
@@ -1915,9 +1975,7 @@ async def validate_for_iris(
         # Sans normalisation, certaines syntaxes MySQL/Postgres (LIMIT)
         # seront rejetées par PARSEONLY. C'est OK : Iris reçoit alors un
         # SYNTAX_INVALID actionnable.
-        logger.debug(
-            "_normalize_sql_syntax failed (skipping): %s", _norm_exc
-        )
+        logger.debug("_normalize_sql_syntax failed (skipping): %s", _norm_exc)
 
     # ── Phase 1 : Gardes déterministes ─────────────────────────────────────
     guard_verdict = _check_deterministic_guards(sql, sql_hash, provenance)
@@ -1995,7 +2053,66 @@ async def validate_for_iris(
 
     # ── Phase 3 : Oracle SQL Server (PARSEONLY + FMTONLY) ─────────────────
     if not skip_oracle:
-        oracle_verdict = await validate_sql_via_sqlserver(sql, connector)
+        # Politique d'indisponibilité CENTRALISÉE ici (plus dans les call-sites,
+        # qui divergeaient). ``validate_sql_via_sqlserver`` continue de re-raise
+        # ``SageConnectionError`` (contrat testé) ; on l'attrape UNE fois.
+        from app.core.exceptions import SageConnectionError
+
+        try:
+            oracle_verdict = await validate_sql_via_sqlserver(sql, connector)
+        except SageConnectionError as _sage_exc:
+            fail_closed = oracle_fail_closed_enabled()
+            provenance.append(
+                _provenance_entry(
+                    "sql_server_oracle_unreachable",
+                    fail_mode="closed" if fail_closed else "open",
+                    exception_class=type(_sage_exc).__name__,
+                )
+            )
+            if fail_closed:
+                logger.warning(
+                    "Oracle SGBD injoignable + ORACLE_FAIL_CLOSED=1 → requête refusée "
+                    "(fail-closed). sql_hash=%s",
+                    sql_hash,
+                )
+                return Verdict(
+                    passes=False,
+                    proof=Proof(
+                        rule_id="ORACLE_UNAVAILABLE",
+                        rule_doc=(
+                            "La base de données source est injoignable et le mode "
+                            "ORACLE_FAIL_CLOSED est actif : la requête est refusée "
+                            "car elle ne peut pas être pré-validée par le SGBD "
+                            "(PARSEONLY/FMTONLY). Ce refus est transitoire — il ne "
+                            "signifie PAS que le SQL est invalide."
+                        ),
+                        evidence={
+                            "phase": "ORACLE",
+                            "fail_mode": "closed",
+                            "exception_class": type(_sage_exc).__name__,
+                        },
+                        sql_hash=sql_hash,
+                        sql_server_says=str(_sage_exc)[:500],
+                        suggested_fix=(
+                            "Réessaie quand la base source sera de nouveau joignable, "
+                            "ou demande à l'administrateur de vérifier la connexion "
+                            "(ou de repasser en mode fail-open via ORACLE_FAIL_CLOSED=0)."
+                        ),
+                        provenance=list(provenance),
+                    ),
+                    provenance=provenance,
+                )
+            logger.warning(
+                "Oracle SGBD injoignable → fail-open AVEC marqueur "
+                "« non pré-validé » propagé (oracle_validated=False). sql_hash=%s",
+                sql_hash,
+            )
+            return Verdict(
+                passes=True,
+                sql_used=sql,
+                provenance=provenance,
+                oracle_validated=False,
+            )
         provenance.append(
             _provenance_entry(
                 "sql_server_oracle",
@@ -2013,5 +2130,8 @@ async def validate_for_iris(
                 ),
                 provenance=provenance,
             )
+        return Verdict(
+            passes=True, sql_used=sql, provenance=provenance, oracle_validated=True
+        )
 
     return Verdict(passes=True, sql_used=sql, provenance=provenance)

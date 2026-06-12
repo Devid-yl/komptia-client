@@ -74,6 +74,7 @@ async def startup_check() -> Dict[str, Any]:
         ("sage_config", _check_sage_config),
         ("llm_config", _check_llm_config),
         ("environment_coherence", _check_environment_coherence),
+        ("timezone", _check_timezone_configured),
         ("ws_origins", _check_ws_origins),
         ("debug_off", _check_debug_off),
         ("disk_space", _check_disk_space),
@@ -306,6 +307,33 @@ async def _check_environment_coherence() -> Dict[str, str]:
         return {"status": "warning", "detail": "Cohérence environnement non vérifiable"}
 
 
+async def _check_timezone_configured() -> Dict[str, str]:
+    """Surface au boot un fuseau horaire = UTC en production (donnée fausse silencieuse).
+
+    Komptia stocke en UTC et convertit à l'AFFICHAGE vers ``config.server.timezone``
+    (SSoT). Si le conteneur tourne en UTC faute de variable ``TZ`` (docker-compose
+    pose ``TZ=${TZ:-UTC}`` en défaut), toutes les dates s'affichent en UTC SANS
+    erreur — ex. +4h pour un cabinet en ``America/Guadeloupe``. On le signale
+    (warning, PAS error : un déploiement réellement en UTC est légitime).
+    """
+    try:
+        from app.config import config
+        from app.core import clock
+
+        tz_name = clock.machine_tz_name()
+        if config.is_production() and tz_name == "UTC":
+            return {
+                "status": "warning",
+                "detail": "Fuseau horaire = UTC : les dates s'affichent en UTC.",
+                "fix": "Si vos utilisateurs ne sont pas en UTC, posez TZ=<nom IANA> "
+                "(ex. America/Guadeloupe) dans .env puis redémarrez (make update).",
+            }
+        return {"status": "ok", "detail": f"Fuseau horaire : {tz_name}"}
+    except Exception:
+        logger.warning("Timezone check failed", exc_info=True)
+        return {"status": "warning", "detail": "Fuseau horaire non vérifiable"}
+
+
 def _origins_missing_scheme(raw_csv: str) -> List[str]:
     """Origines de ``KOMPTIA_ALLOWED_ORIGINS`` (CSV) dépourvues de schéma http(s)://.
 
@@ -530,10 +558,15 @@ def run_disk_space_check_job() -> Optional[Dict[str, str]]:
     """
     import asyncio
 
+    from app.core.database import dedicated_session_scope
+
     async def _run() -> Dict[str, str]:
         result = await _check_disk_space()
         if result.get("status") == "error":
-            await _maybe_send_disk_alert(result.get("detail", ""))
+            # _maybe_send_disk_alert lit support_email + config SMTP en BDD → engine
+            # dédié à cette boucle asyncio.run (cross-loop : pas l'engine global poolé).
+            async with dedicated_session_scope():
+                await _maybe_send_disk_alert(result.get("detail", ""))
         return result
 
     try:

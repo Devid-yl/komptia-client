@@ -82,9 +82,14 @@ class NullAnalysisResult:
     co_occurrence_groups: List[List[str]]
     rows_with_any_null: int
     rows_fully_complete: int
+    # #81 — combien de colonnes ont réellement été passées à l'analyse de
+    # co-occurrence vs combien ont été OMISES par le cap. Défauts à 0 pour la
+    # rétro-compat (early-return sans dépassement).
+    co_occurrence_columns_analyzed: int = 0
+    co_occurrence_columns_omitted: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "total_rows": self.total_rows,
             "total_columns": self.total_columns,
             "columns_with_nulls": self.columns_with_nulls,
@@ -100,11 +105,26 @@ class NullAnalysisResult:
             "column_stats": [cs.to_dict() for cs in self.column_stats if cs.has_nulls],
             "co_occurrence_groups": self.co_occurrence_groups,
         }
+        # #81 — quand le cap a écarté des colonnes, le LLM DOIT savoir que la
+        # co-occurrence est PARTIELLE (sinon il conclut « ces colonnes-là sont
+        # les seules liées » alors que les colonnes 101+ n'ont pas été testées).
+        if self.co_occurrence_columns_omitted > 0:
+            d["co_occurrence_truncated"] = True
+            d["co_occurrence_columns_analyzed"] = self.co_occurrence_columns_analyzed
+            d["co_occurrence_columns_omitted"] = self.co_occurrence_columns_omitted
+        return d
 
 
 # ---------------------------------------------------------------------------
 # Co-occurrence analysis (purement quantitative — Jaccard programmatique)
 # ---------------------------------------------------------------------------
+
+# Cap dur du nombre de colonnes analysées en co-occurrence (protège du
+# O(N²) sur des résultats très larges). #81 — le dépassement est désormais
+# SURFACÉ (to_dict + report) pour que le LLM ne présente pas une analyse
+# partielle comme exhaustive. SSoT : utilisé par _find_co_occurrence_groups
+# ET analyze_nulls (calcul du nombre de colonnes omises).
+_CO_OCCURRENCE_MAX_COLUMNS = 100
 
 
 def _find_co_occurrence_groups(
@@ -119,12 +139,15 @@ def _find_co_occurrence_groups(
     if not rows or len(columns_with_nulls) < 2:
         return []
 
-    # Cap at 100 columns to avoid O(N²) explosion on very wide result sets
-    if len(columns_with_nulls) > 100:
+    # Cap pour éviter l'explosion O(N²) sur des résultats très larges.
+    # Le nombre de colonnes omises est recalculé et surfacé par analyze_nulls.
+    if len(columns_with_nulls) > _CO_OCCURRENCE_MAX_COLUMNS:
         logger.warning(
-            "Co-occurrence analysis capped at 100 columns (got %d)", len(columns_with_nulls)
+            "Co-occurrence analysis capped at %d columns (got %d)",
+            _CO_OCCURRENCE_MAX_COLUMNS,
+            len(columns_with_nulls),
         )
-        columns_with_nulls = columns_with_nulls[:100]
+        columns_with_nulls = columns_with_nulls[:_CO_OCCURRENCE_MAX_COLUMNS]
 
     # Construire les ensembles de lignes NULL par colonne
     null_row_sets: Dict[str, set] = {}
@@ -257,6 +280,11 @@ def analyze_nulls(
 
     # Co-occurrence
     co_groups = _find_co_occurrence_groups(rows, columns_with_nulls_names)
+    # #81 — combien de colonnes le cap a-t-il écartées de l'analyse de
+    # co-occurrence ? (SSoT du cap : _CO_OCCURRENCE_MAX_COLUMNS)
+    _n_co_cols = len(columns_with_nulls_names)
+    co_cols_analyzed = min(_n_co_cols, _CO_OCCURRENCE_MAX_COLUMNS)
+    co_cols_omitted = max(0, _n_co_cols - _CO_OCCURRENCE_MAX_COLUMNS)
 
     # Annoter les co-null columns sur chaque stat
     co_map: Dict[str, List[str]] = {}
@@ -282,6 +310,8 @@ def analyze_nulls(
         co_occurrence_groups=co_groups,
         rows_with_any_null=rows_with_any_null,
         rows_fully_complete=total_rows - rows_with_any_null,
+        co_occurrence_columns_analyzed=co_cols_analyzed,
+        co_occurrence_columns_omitted=co_cols_omitted,
     )
 
 
@@ -349,6 +379,25 @@ def generate_null_report(analysis: NullAnalysisResult) -> str:
         lines.append(
             "\nCes colonnes sont fréquemment vides en même temps "
             "(seuil : > 70 % de leurs NULL sur les mêmes lignes)."
+        )
+
+    # #81 — quand le cap a écarté des colonnes, le signaler EXPLICITEMENT pour
+    # que ni le LLM ni l'utilisateur ne prennent les groupes ci-dessus pour
+    # exhaustifs. Formulation neutre vis-à-vis du RÉSULTAT (review Moyen) :
+    # qu'il y ait ou non des groupes détectés, on dit seulement que les liens
+    # IMPLIQUANT les colonnes non testées ne peuvent être ni affirmés ni exclus
+    # — sans laisser entendre que les colonnes testées ont, elles, donné un
+    # résultat.
+    if analysis.co_occurrence_columns_omitted > 0:
+        _total_co = (
+            analysis.co_occurrence_columns_analyzed + analysis.co_occurrence_columns_omitted
+        )
+        lines.append(
+            f"\n⚠ Analyse de co-occurrence PARTIELLE : "
+            f"{analysis.co_occurrence_columns_analyzed} colonnes sur {_total_co} testées "
+            f"({analysis.co_occurrence_columns_omitted} colonnes à NULL non testées, cap de "
+            f"performance). D'éventuels liens IMPLIQUANT ces colonnes non testées ne peuvent "
+            f"être ni affirmés ni exclus."
         )
 
     return "\n".join(lines)

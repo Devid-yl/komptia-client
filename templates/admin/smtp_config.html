@@ -345,7 +345,7 @@ loadConfig();
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'admin_smtp_config_v1',
+                key: 'admin_smtp_config_v2',
                 title: 'Configurer l\'envoi d\'emails',
                 steps: [
                     {
@@ -356,17 +356,17 @@ loadConfig();
                     {
                         icon: 'zap',
                         title: 'Saisir les paramètres',
-                        text: 'Remplissez les champs : serveur SMTP (par exemple smtp.gmail.com), port (587 pour TLS, 465 pour SSL), identifiant, mot de passe et adresse d\'expéditeur. Pour Gmail/Outlook, utilisez un mot de passe d\'application dédié plutôt que votre mot de passe principal.'
+                        text: 'Remplissez les champs : serveur SMTP (par exemple smtp.gmail.com), port (587 pour TLS, 465 pour SSL), identifiant, mot de passe et email expéditeur. Pour Gmail/Outlook, utilisez un mot de passe d\'application dédié plutôt que votre mot de passe principal.'
                     },
                     {
                         icon: 'shield',
                         title: 'Tester avant de sauvegarder',
-                        text: 'Le bouton « Tester » envoie un email de vérification à l\'adresse d\'expéditeur. Si vous le recevez, la configuration est bonne. Si vous obtenez une erreur, le message vous dit précisément ce qui cloche (port bloqué, mauvaise authentification, certificat...).'
+                        text: 'Le bouton « Tester la configuration » envoie un email de vérification à votre propre adresse (celle de votre compte admin connecté). Si vous le recevez, la configuration est bonne. Sinon, le message vous dit précisément ce qui cloche (authentification refusée, connexion SMTP impossible, champ obligatoire manquant).'
                     },
                     {
-                        icon: 'bell',
-                        title: 'Sécurité',
-                        text: 'Préférez toujours un mot de passe d\'application (Gmail, Outlook proposent cette option) plutôt que votre mot de passe principal. Activez TLS (port 587) ou SSL (port 465) : Komptia refuse les serveurs SMTP en clair pour ne pas exposer vos identifiants sur le réseau.'
+                        icon: 'shield',
+                        title: 'Sécurité des identifiants',
+                        text: 'Préférez toujours un mot de passe d\'application (Gmail, Outlook proposent cette option) plutôt que votre mot de passe principal. Laissez la case « Utiliser TLS (recommandé) » cochée pour chiffrer la connexion : si vous la décochez, vos identifiants transitent en clair sur le réseau. Le champ « Email support » mérite aussi une adresse interne de confiance, car il reçoit les SQL bruts des demandes d\'écriture d\'Iris.'
                     }
                 ]
             });

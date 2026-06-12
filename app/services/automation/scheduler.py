@@ -6,6 +6,7 @@ Utilise APScheduler avec SQLAlchemyJobStore pour la persistance des jobs.
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import (
     datetime,
@@ -13,7 +14,7 @@ from datetime import (
     timezone,
 )  # noqa: F401 (timezone: fix bug pré-existant ligne ~295)
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -24,7 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
 
 from app.core import clock
-from app.core.database import get_db_url
+from app.core.database import get_db_url, make_sync_engine
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def _purge_orphan_iris_conversations_sync() -> None:
         from app.services.cleanup.db_retention import _get_retention_days
 
         retention_days = _get_retention_days("AUTOMATION_CONV_RETENTION_DAYS")
-        engine = create_engine(get_db_url())
+        engine = make_sync_engine(get_db_url())
         try:
             cutoff = clock.now() - timedelta(days=retention_days)
             cutoff_naive_utc = cutoff.replace(tzinfo=None)
@@ -91,7 +92,7 @@ def _purge_idempotency_logs_sync() -> None:
         from sqlalchemy import delete as _sql_delete
         from sqlalchemy.orm import Session
 
-        engine = create_engine(get_db_url())
+        engine = make_sync_engine(get_db_url())
         try:
             now = clock.now()
             with Session(engine) as session:
@@ -333,14 +334,10 @@ class AutomationScheduler:
 
         # Create engine with WAL mode + busy_timeout so APScheduler
         # doesn't hold exclusive locks that block the async app.
-        engine = create_engine(self.db_url)
-
-        @event.listens_for(engine, "connect")
-        def _set_sqlite_pragmas(dbapi_connection, connection_record):
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode = WAL")
-            cursor.execute("PRAGMA busy_timeout = 30000")
-            cursor.close()
+        # make_sync_engine pose WAL + busy_timeout (via setup_pragmas) ET
+        # PRAGMA key (SQLCipher) — sinon le jobstore APScheduler ne pourrait
+        # pas lire une base chiffrée (« file is not a database »).
+        engine = make_sync_engine(self.db_url)
 
         # Configuration du job store
         jobstores = {"default": SQLAlchemyJobStore(engine=engine, tablename="apscheduler_jobs")}
@@ -901,7 +898,17 @@ def build_trigger(trigger_type: str, config: Dict[str, Any]):
         day = AutomationScheduler._safe_int(config.get("day", 1), 1, 1, 31)
         hour = AutomationScheduler._safe_int(config.get("hour", 9), 9, 0, 23)
         minute = AutomationScheduler._safe_int(config.get("minute", 0), 0, 0, 59)
-        return CronTrigger(day=day, hour=hour, minute=minute, timezone=tz)
+        # #19 fix 2026-06-11 — un jour > 28 n'existe PAS dans tous les mois
+        # (fév=28/29 ; avr/juin/sep/nov=30). ``CronTrigger(day=31)`` SAUTE
+        # SILENCIEUSEMENT ces mois → l'automatisation ne tourne pas (ex: aucun
+        # rapport en février pour un « mensuel le 31 » = donnée/livraison
+        # manquante silencieuse). On interprète day >= 29 comme « dernier jour
+        # du mois » (APScheduler ``day='last'``) : l'auto tourne CHAQUE mois sur
+        # le dernier jour disponible, jamais sautée. Le preview (même
+        # build_trigger, SSoT) reflète les vraies dates. day <= 28 inchangé
+        # (existe dans tous les mois).
+        day_field = "last" if day >= 29 else day
+        return CronTrigger(day=day_field, hour=hour, minute=minute, timezone=tz)
 
     elif trigger_type == "cron":
         # Expression cron personnalisée
@@ -1109,7 +1116,7 @@ def cleanup_orphaned_executions_job():
         from datetime import timedelta
         from sqlalchemy.orm import Session
 
-        engine = create_engine(get_db_url())
+        engine = make_sync_engine(get_db_url())
         try:
             cutoff = clock.now() - timedelta(hours=_ORPHAN_EXECUTION_CUTOFF_HOURS)
             with Session(engine) as session:
@@ -1198,6 +1205,34 @@ def cleanup_orphaned_executions_job():
         logger.error("Erreur nettoyage exécutions orphelines", exc_info=True)
 
 
+def _resolve_report_path_within_dir(
+    report_file_path: str, reports_dir_resolved: Path
+) -> Optional[Path]:
+    """Résout ``REPORTS_DIR/report_file_path`` et garantit le containment
+    anti-traversal (CWE-22) AVANT toute suppression de fichier.
+
+    Utilise ``Path.is_relative_to`` — PAS ``str.startswith`` : un préfixe sans
+    séparateur final laisse passer un dossier *frère* dont le nom commence par
+    celui du dossier autorisé (ex : base ``…/reports`` matcherait
+    ``…/reports_archive/x``). Aligné sur ``report_storage.py`` (3 sites
+    ``is_relative_to(REPORTS_DIR.resolve())``).
+
+    Returns:
+        Le ``Path`` résolu s'il est contenu dans ``reports_dir_resolved``,
+        sinon ``None`` — le caller traite ce cas comme une tentative de
+        traversal et n'``unlink`` PAS le fichier.
+    """
+    # Garde anti-corruption : un ``file_path`` NULL/vide (colonne pourtant
+    # ``nullable=False``, mais une ligne legacy/corrompue reste possible) ferait
+    # crasher ``reports_dir_resolved / None`` (TypeError) → abort du job ENTIER
+    # pour tous les autres rapports. ``""`` résoudrait vers le dossier lui-même.
+    # On route ces cas vers la branche "skip + delete record" (retour None).
+    if not report_file_path:
+        return None
+    resolved = (reports_dir_resolved / report_file_path).resolve()
+    return resolved if resolved.is_relative_to(reports_dir_resolved) else None
+
+
 def cleanup_expired_reports_job():
     """Job système sérialisable pour nettoyage des rapports expirés.
 
@@ -1211,7 +1246,7 @@ def cleanup_expired_reports_job():
         from app.models.report import Report
         from app.config import REPORTS_DIR
 
-        engine = create_engine(get_db_url())
+        engine = make_sync_engine(get_db_url())
         deleted_count = 0
         try:
             with Session(engine) as session:
@@ -1224,9 +1259,12 @@ def cleanup_expired_reports_job():
                 reports_dir_resolved = Path(REPORTS_DIR).resolve()
                 for report in reports:
                     if report.is_expired:
-                        file_path = (Path(REPORTS_DIR) / report.file_path).resolve()
-                        # Path traversal check
-                        if not str(file_path).startswith(str(reports_dir_resolved)):
+                        # Path traversal check (is_relative_to, pas startswith :
+                        # cf. _resolve_report_path_within_dir) AVANT tout unlink.
+                        file_path = _resolve_report_path_within_dir(
+                            report.file_path, reports_dir_resolved
+                        )
+                        if file_path is None:
                             logger.warning(
                                 "Path traversal détecté pour rapport #%s: %s",
                                 report.id,
@@ -1601,18 +1639,21 @@ def start_scheduler():
     # zombies executing (crash app pendant l'exécution Sage). Toutes les
     # 15 min — granularité suffisante vs un TTL admin de 24h par défaut.
     #
-    # **2026-05-19** : on passe la fonction async directement (module-level
-    # callable), PAS via une closure ``_iris_write_cleanup_job`` nested.
-    # APScheduler refuse de sérialiser une closure (référence callable
-    # non-déterministe) → le job échouait à l'enregistrement, le cleanup
-    # ne tournait jamais et les zombies s'accumulaient silencieusement.
-    # Cohérent avec le pattern du job juste au-dessus
-    # (``cleanup_wait_tokens_job`` passé directement).
+    # **2026-06-11** (corrige le fix incomplet du 2026-05-19) : le callable
+    # planifié doit être (1) MODULE-LEVEL — APScheduler refuse de sérialiser
+    # une closure pour le jobstore persistant — ET (2) SYNC — le
+    # ``BackgroundScheduler`` (threads) appelle ``job.func()`` sans await,
+    # donc une ``async def`` passée directement crée une coroutine jamais
+    # awaitée : le job logge "executed successfully" mais ne tourne JAMAIS
+    # (RuntimeWarning "coroutine ... was never awaited" constaté en prod).
+    # Le 2026-05-19 avait corrigé (1) mais réintroduit (2) en croyant imiter
+    # ``cleanup_wait_tokens_job`` — qui est en réalité un wrapper SYNC.
+    # Garde-fou : tests/unit/test_scheduler_no_raw_async_jobs.py.
     try:
-        from app.services.ai.iris_write_session import cleanup_expired_and_zombie
+        from app.services.ai.iris_write_session import cleanup_expired_and_zombie_job
 
         scheduler.scheduler.add_job(
-            cleanup_expired_and_zombie,
+            cleanup_expired_and_zombie_job,
             CronTrigger(minute="*/15"),
             id="system_cleanup_iris_sql_write",
             name="Cleanup iris_sql_write_audit (expired + zombies)",
@@ -1646,16 +1687,18 @@ def start_scheduler():
     # à 03:00 et le cleanup anon à 03:30 pour avoir des chiffres
     # frais avant les éventuelles purges qui réduisent l'occupation).
     #
-    # **NB — fonction module-level requise** : APScheduler doit pouvoir
-    # sérialiser une référence textuelle ``module:func`` pour le jobstore
-    # persistant. Une closure imbriquée dans ``start_scheduler`` casse :
-    # "Job cannot be serialized since the reference to its callable could
-    # not be determined". Le wrapper est donc dans ``db_usage.py``.
+    # **NB — fonction module-level ET sync requise** : APScheduler doit
+    # pouvoir sérialiser une référence textuelle ``module:func`` pour le
+    # jobstore persistant (une closure imbriquée casse), et le
+    # ``BackgroundScheduler`` n'await jamais — une ``async def`` directe ne
+    # tournerait JAMAIS (cf. commentaire du job iris_sql_write ci-dessus +
+    # tests/unit/test_scheduler_no_raw_async_jobs.py). Le wrapper sync est
+    # donc dans ``db_usage.py``.
     try:
-        from app.services.db_usage import db_usage_recompute_job
+        from app.services.db_usage import db_usage_recompute_job_sync
 
         scheduler.scheduler.add_job(
-            db_usage_recompute_job,
+            db_usage_recompute_job_sync,
             CronTrigger(hour=2, minute=0),  # Quotidien 02:00
             id="system_db_usage_recompute",
             name="Recalcul quota BDD par user (Phase 2 storage accounting)",
@@ -1706,61 +1749,6 @@ def start_scheduler():
     except (SQLAlchemyError, OSError, ValueError, ImportError) as e:
         logger.warning("⚠️ Impossible d'enregistrer le job cleanup_apscheduler_jobs : %s", e)
 
-    # Charger les planifications de dashboard actives
-    try:
-        _load_dashboard_schedules(scheduler)
-    except Exception:
-        logger.warning("⚠️ Erreur chargement planifications dashboard", exc_info=True)
-
-
-def _load_dashboard_schedules(scheduler: AutomationScheduler) -> None:
-    """Charge les DashboardSchedule actifs au démarrage et crée les jobs."""
-    from sqlalchemy.orm import Session
-
-    from app.services.dashboard.delivery_service import send_dashboard_delivery_job
-
-    engine = create_engine(get_db_url())
-    count = 0
-    try:
-        with Session(engine) as session:
-            try:
-                from app.models.dashboard import DashboardSchedule
-
-                result = session.execute(
-                    select(DashboardSchedule).where(
-                        DashboardSchedule.is_active == True  # noqa: E712
-                    )
-                )
-                schedules = result.scalars().all()
-            except SQLAlchemyError:
-                logger.warning("Table DashboardSchedule non trouvée", exc_info=True)
-                return
-
-            for sched in schedules:
-                job_id = f"dashboard_schedule_{sched.id}"
-                stype = sched.schedule_type
-                sconfig = sched.schedule_config or {}
-                # Cluster-F (F3) 2026-05-26 — préserver le next_run persisté
-                # du jobstore (cf. loader.py pour doctrine misfire-grace).
-                if scheduler.get_job(job_id) is not None:
-                    continue
-                try:
-                    scheduler.add_job(
-                        job_id=job_id,
-                        func=send_dashboard_delivery_job,
-                        trigger_type=stype,
-                        trigger_config=sconfig,
-                        args=[sched.id],
-                        name=f"Dashboard delivery schedule #{sched.id}",
-                    )
-                    count += 1
-                except (ValueError, KeyError):
-                    logger.warning("Config invalide pour schedule #%d", sched.id, exc_info=True)
-    finally:
-        engine.dispose()
-
-    if count:
-        logger.info("✅ %d planification(s) dashboard chargée(s)", count)
 
 
 def shutdown_scheduler(wait: bool = True):

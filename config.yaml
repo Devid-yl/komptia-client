@@ -22,6 +22,11 @@ server:
   # n'est joignable que via le proxy (docker-compose: 127.0.0.1:8888) — sinon
   # ces en-têtes sont usurpables. Défaut `false` = fail-safe.
   trust_proxy_headers: false
+  # Fuseau horaire de l'affichage des dates (nom IANA). SOURCE DE VÉRITÉ unique
+  # côté serveur : tout est stocké en UTC puis converti vers ce fuseau au rendu.
+  # Décommenter pour FORCER ici (prioritaire sur la variable d'env TZ). Laissé
+  # commenté = on suit `TZ` (docker-compose / .env), sinon le fuseau machine.
+  # timezone: America/Guadeloupe
 
 # Base de données locale
 database:

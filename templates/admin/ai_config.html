@@ -117,73 +117,78 @@
                     <summary class="cursor-pointer select-none hover:text-gray-700 dark:hover:text-gray-300 py-1">
                         LLM local (anonymisation &amp; fallback)
                     </summary>
-                    <div class="mt-2 space-y-3 pt-2">
-                        <p class="text-xs text-gray-500 dark:text-gray-400">
-                            Optionnel. Sert à (1) faire ou refaire la liste
-                            des termes à anonymiser dans les classeurs et
-                            (2) servir de fallback quand le LLM cloud est
-                            indisponible.
-                        </p>
-                        {# Install / start / restart / upgrade Ollama : tout depuis cette page.
-                           Statut texte et boutons sont DANS DEUX CONTENEURS DISTINCTS pour
-                           éviter le wrap mixte quand le statut est long (ex: "✓ Ollama
-                           installé et démarré (ollama version is 0.24.0)" qui poussait
-                           certains boutons sous le span et d'autres restaient en haut). #}
-                        <div id="local-llm-install-info" class="text-xs">Détection…</div>
-                        <div class="flex items-center gap-2 flex-wrap">
-                            <button type="button" id="btn-local-llm-start"
-                                    class="btn btn-secondary text-xs"
-                                    style="display:none;">Démarrer Ollama</button>
-                            <button type="button" id="btn-local-llm-restart"
-                                    class="btn btn-secondary text-xs"
-                                    style="display:none;"
-                                    title="Tuer et relancer Ollama (utile si bloqué)">Redémarrer</button>
-                            <button type="button" id="btn-local-llm-upgrade"
-                                    class="btn btn-secondary text-xs"
-                                    style="display:none;"
-                                    title="brew upgrade ollama (Mac) ou install.sh (Linux)">Mettre à jour</button>
-                        </div>
+                    <div class="mt-2 space-y-2 pt-2">
+                        {# Toggle en HAUT (action principale) ; la description des 2 usages
+                           est repliée dans le (i) cliquable — plus de paragraphe permanent. #}
                         <div class="flex items-center justify-between py-1">
-                            <label class="text-sm text-gray-700 dark:text-gray-300" for="cfg-local_llm_enabled">
-                                Activer
+                            <label class="text-sm text-gray-700 dark:text-gray-300 flex items-center gap-1" for="cfg-local_llm_enabled">
+                                Activer le LLM local
+                                <button type="button" class="info-icon" data-info="Optionnel. Sert à (1) détecter / refaire la liste des termes à anonymiser dans les classeurs, et (2) servir de secours quand le LLM cloud est indisponible (rate-limit, réseau, panne)."></button>
                             </label>
                             <input type="checkbox" id="cfg-local_llm_enabled"
                                    class="w-4 h-4 rounded border-gray-300 text-gray-900 focus:ring-gray-900 dark:border-gray-700 dark:text-gray-100"
                                    {% if config.get('local_llm_enabled', False) %}checked{% end %}>
                         </div>
-                        <div>
-                            <label class="label" for="cfg-local_llm_base_url">URL</label>
-                            <input type="text" class="input"
-                                   id="cfg-local_llm_base_url"
-                                   placeholder="http://localhost:11434/v1"
-                                   value="{{ config.get('local_llm_base_url', '') }}">
-                            <div class="flex items-center gap-2 mt-1">
+
+                        <div class="border-t border-gray-100 dark:border-gray-800 pt-2 space-y-2">
+                            {# Ligne statut UNIQUE : libellé + badge + un seul bouton « Tester »
+                               (teste l'URL saisie ; sonde automatiquement les URL standard si
+                               elle échoue — fusionne l'ancien « Tester maintenant » + « Auto-détecter »). #}
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="text-sm text-gray-700 dark:text-gray-300">Serveur Ollama</span>
                                 <span id="local-llm-status-badge" class="badge badge-neutral">—</span>
                                 <button type="button" id="btn-local-llm-detect"
                                         class="text-xs underline cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
                                         style="background:none;border:none;padding:0;color:inherit;">
-                                    Tester maintenant
+                                    Tester
                                 </button>
                             </div>
+
+                            {# URL + (i) topologie : le (i) absorbe l'explication longue
+                               (OLLAMA_HOST=0.0.0.0, sidecar, hôte, machine distante). #}
+                            <div class="flex items-center gap-1">
+                                <input type="text" class="input flex-1"
+                                       id="cfg-local_llm_base_url"
+                                       placeholder="http://localhost:11434/v1"
+                                       value="{{ config.get('local_llm_base_url', '') }}">
+                                <button type="button" class="info-icon" data-info="L'URL que le SERVEUR de l'app utilise pour joindre Ollama — le test part du serveur, pas de votre navigateur. Selon où tourne l'app : même machine que Ollama → http://localhost:11434/v1 ; app en Docker avec le sidecar Ollama → http://ollama:11434/v1 ; app en Docker et Ollama sur l'hôte → http://host.docker.internal:11434/v1 (ou l'IP de la passerelle Docker) ; Ollama sur une autre machine → son IP réseau, ex. http://192.168.1.50:11434/v1. Piège fréquent : Ollama n'écoute que sur 127.0.0.1 par défaut, donc injoignable depuis une autre machine ou depuis Docker — démarrez-le avec OLLAMA_HOST=0.0.0.0. Le bouton « Tester » sonde aussi les URL standard depuis le serveur si l'URL saisie échoue."></button>
+                            </div>
+
+                            {# Statut d'install + actions daemon — mode BINAIRE local (dev) ;
+                               masquées en mode sidecar/externe par detectLocalLlmInstall (data.managed).
+                               install-info porte la version + l'état ; libellés courts. #}
+                            <div id="local-llm-install-info" class="text-xs">Détection…</div>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <button type="button" id="btn-local-llm-start"
+                                        class="btn btn-secondary text-xs"
+                                        style="display:none;">Démarrer</button>
+                                <button type="button" id="btn-local-llm-restart"
+                                        class="btn btn-secondary text-xs"
+                                        style="display:none;"
+                                        title="Tuer et relancer Ollama (utile si bloqué)">Redémarrer</button>
+                                <button type="button" id="btn-local-llm-upgrade"
+                                        class="btn btn-secondary text-xs"
+                                        style="display:none;"
+                                        title="brew upgrade ollama (Mac) ou install.sh (Linux)">Mettre à jour</button>
+                            </div>
+
+                            {# Résultats d'auto-détection (clic = remplit l'URL, non destructif). #}
+                            <div id="local-llm-candidates" class="mt-1 space-y-1" style="display:none;"></div>
                         </div>
-                        <div>
+
+                        {# Modèle : sélection de l'installé + puces d'installation rapide
+                           (fusionne l'ancienne phrase « Recommandés… » et le champ de pull). #}
+                        <div class="border-t border-gray-100 dark:border-gray-800 pt-2">
                             <label class="label" for="cfg-local_llm_model_select">Modèle</label>
-                            <!-- Hidden input = source de vérité (lue par collectConfig). -->
                             <input type="hidden" id="cfg-local_llm_model"
                                    value="{{ config.get('local_llm_model', '') }}">
-                            <!-- Dropdown : peuplé dynamiquement par detectLocalLlmStatus.
-                                 État initial = "(aucun modèle installé)" tant que la
-                                 détection n'a pas répondu. -->
                             <div class="flex items-center gap-2">
                                 <select class="input flex-1" id="cfg-local_llm_model_select">
                                     <option value="">(aucun modèle installé)</option>
                                 </select>
-                                {# Icône poubelle discrète : supprime le modèle sélectionné
-                                   d'Ollama (libère disque) + nettoie LlmModel BDD + reset
-                                   config si actif. Double-click pattern : 1er clic =
-                                   confirmation visuelle (icône rouge + tooltip), 2e clic
-                                   dans 4s = exécute. Masqué tant qu'aucun modèle réel
-                                   sélectionné (placeholder "" → bouton hidden). #}
+                                {# Poubelle discrète : supprime le modèle sélectionné (disque +
+                                   LlmModel BDD). Double-clic : 1er = arme (rouge), 2e dans 4s = exécute.
+                                   Masquée tant qu'aucun modèle réel sélectionné. #}
                                 <button type="button" id="btn-local-llm-delete"
                                         class="px-2 py-1 rounded text-gray-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
                                         title="Supprimer ce modèle du disque"
@@ -192,13 +197,17 @@
                                     <i class="bi bi-trash3"></i>
                                 </button>
                             </div>
-                            <p class="text-xs text-gray-500 mt-1 dark:text-gray-400">
-                                Recommandés (3B params, ~2 Go RAM) : <code>phi3:mini</code>,
-                                <code>llama3.2:3b</code>, <code>qwen2.5:3b</code>.
-                            </p>
-                            <div class="flex items-center gap-2 mt-2">
+                            {# Puces 3B (~2 Go RAM) : un clic remplit le champ ci-dessous
+                               (non destructif — le téléchargement reste un clic explicite). #}
+                            <div class="flex items-center gap-1 mt-2 flex-wrap">
+                                <span class="text-xs text-gray-500 dark:text-gray-400">Installer :</span>
+                                <button type="button" class="local-llm-model-chip text-xs px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 cursor-pointer" data-model="phi3:mini">+ phi3:mini</button>
+                                <button type="button" class="local-llm-model-chip text-xs px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 cursor-pointer" data-model="llama3.2:3b">+ llama3.2:3b</button>
+                                <button type="button" class="local-llm-model-chip text-xs px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 cursor-pointer" data-model="qwen2.5:3b">+ qwen2.5:3b</button>
+                            </div>
+                            <div class="flex items-center gap-2 mt-1">
                                 <input type="text" class="input flex-1" id="cfg-local_llm_pull_name"
-                                       placeholder="Télécharger un nouveau modèle (ex: phi3:mini)">
+                                       placeholder="ou un autre nom de modèle…">
                                 <button type="button" id="btn-local-llm-pull"
                                         class="btn btn-secondary text-xs">Télécharger</button>
                             </div>
@@ -416,7 +425,7 @@
                         <span id="health-status" class="badge badge-neutral">...</span>
                     </div>
                     <div class="flex items-center justify-between text-sm">
-                        <span class="text-gray-500 dark:text-gray-400">Derniere sync</span>
+                        <span class="text-gray-500 dark:text-gray-400">Derniere sync reussie</span>
                         <span class="font-medium text-gray-900 dark:text-gray-100" id="last-sync">-</span>
                     </div>
                     <div class="flex items-center justify-between text-sm">
@@ -1026,13 +1035,65 @@ async function testApiKey() {
         showAlert('Initialisation du provider...', 'success');
         await new Promise(function(r) { setTimeout(r, 2000); });
 
-        // 3. Load models dynamically from the provider API
-        showAlert('Chargement des modeles...', 'success');
-        var models = await loadModelsForProvider(provider);
+        // 3. Découverte + enrichissement en 1 passe via POST /api/ai/models/refresh :
+        //    upsert les modèles de l'API dans ``llm_models`` PUIS enrichit leurs
+        //    fenêtres/tarifs depuis LiteLLM. Sans ça, un modèle choisi ici
+        //    n'atterrissait jamais dans la table → fenêtre fallback 200K (bug
+        //    « 200K peu importe le modèle »). Fallback gracieux sur le listing
+        //    live si le refresh réseau échoue (la dropdown se remplit quand même).
+        showAlert('Découverte et enrichissement des modèles…', 'success');
+        var refreshData = null;
+        try {
+            var refreshRes = await fetch('/api/ai/models/refresh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Xsrftoken': getCookie('_xsrf') },
+                body: JSON.stringify({ provider: provider })
+            });
+            refreshData = await refreshRes.json();
+        } catch (e) {
+            refreshData = null; // réseau KO → fallback listing live ci-dessous
+        }
+
+        var models = (refreshData && refreshData.success
+                      && Array.isArray(refreshData.models) && refreshData.models.length)
+            ? refreshData.models
+            : await loadModelsForProvider(provider);
 
         if (models.length > 0) {
             updateModelSelect('cfg-primary_model', models);
-            showAlert('Cle valide ! ' + models.length + ' modele(s) disponible(s)', 'success');
+            // Messages par cas (axe 5 — taxonomie erreurs/warnings) :
+            if (refreshData && refreshData.success) {
+                var baseMsg = 'Clé valide ! ' + models.length + ' modèle(s) disponible(s)';
+                if (refreshData.discovery_failed) {
+                    // Provider joignable mais list_models a échoué (clé partielle,
+                    // endpoint custom KO). On a la liste live mais la découverte
+                    // n'a rien persisté → fenêtres possiblement incomplètes.
+                    showAlert(baseMsg + ' — la découverte côté provider a échoué'
+                        + (refreshData.discovery_error
+                            ? ' (' + refreshData.discovery_error + ')' : '')
+                        + '. Les fenêtres peuvent être incomplètes.', 'error');
+                } else if (refreshData.enrich_failed) {
+                    // Découverte OK mais enrichissement LiteLLM KO → fenêtres
+                    // provisoires « à confirmer ». Cas (c) dégradé non bloquant.
+                    showAlert(baseMsg + ' — fenêtres/tarifs non confirmés (registre '
+                        + 'LiteLLM injoignable). Réessayez « Mettre à jour fenêtres '
+                        + '& tarifs » plus tard.', 'error');
+                } else if (refreshData.unverified > 0) {
+                    showAlert(baseMsg + ' — ' + refreshData.unverified
+                        + ' modèle(s) à fenêtre non confirmée.', 'success');
+                } else {
+                    showAlert(baseMsg + '.', 'success');
+                }
+            } else {
+                // Refresh indisponible (503 BDD occupée, réseau). On a la liste
+                // live mais la table n'est pas synchronisée. Propager le message
+                // backend s'il existe (cas (c) : « base occupée, réessayez »).
+                var hint = (refreshData && refreshData.error)
+                    ? ' ' + refreshData.error
+                    : ' Cliquez « Mettre à jour fenêtres & tarifs ».';
+                showAlert('Clé valide ! ' + models.length + ' modèle(s) (liste directe — '
+                    + 'fenêtres non synchronisées).' + hint, 'error');
+            }
         } else {
             showAlert('Clé enregistrée mais aucun modèle retourné. Vérifiez la clé ou saisissez le nom du modèle manuellement.', 'error');
         }
@@ -1104,6 +1165,22 @@ async function syncSchema() {
         }
         var data = await res.json();
         if (data && data.success) {
+            // #36 (2026-06-10) — success:true n'implique PAS complete:true :
+            // des sections (functions/fk/synonymes/vues…) ont pu échouer →
+            // connaissance Iris PARTIELLE (jointures manquantes = SQL faux
+            // possibles). Le backend envoie complete/incomplete_sections
+            // depuis #76 ; sans cette branche, le front les JETAIT et
+            // l'admin croyait la sync intégrale.
+            if (data.complete === false) {
+                var failedSections = (data.incomplete_sections || [])
+                    .map(function (s) { return s && s.section ? s.section : '?'; })
+                    .join(', ');
+                showAlert('Synchronisation INCOMPLÈTE — section(s) en échec : '
+                    + (failedSections || 'inconnues')
+                    + '. La connaissance d’Iris est partielle (jointures/fonctions '
+                    + 'manquantes possibles). Relancez la sync ou vérifiez les '
+                    + 'permissions Sage.', 'error');
+            }
             // Refresh les stats affichées en bas du card (last_sync, tables_count, views_count).
             if (typeof checkHealth === 'function') checkHealth();
         } else {
@@ -1123,7 +1200,10 @@ async function checkHealth() {
         var el = document.getElementById('health-status');
         if (data.healthy) { el.className = 'badge badge-success'; el.textContent = 'Operationnel'; }
         else { el.className = 'badge badge-error'; el.textContent = 'Probleme'; }
-        if (data.last_sync) document.getElementById('last-sync').textContent = data.last_sync;
+        // last_sync = ISO horodaté (offset) ; on l'affiche en heure NAVIGATEUR
+        // via le SSoT KomptiaFormat (fallback : ISO brut si le helper manque).
+        if (data.last_sync) document.getElementById('last-sync').textContent =
+            (window.KomptiaFormat ? KomptiaFormat.dateTimeFr(data.last_sync) : data.last_sync);
         if (data.tables_count !== undefined) document.getElementById('table-count').textContent = data.tables_count;
         if (data.views_count !== undefined) document.getElementById('view-count').textContent = data.views_count;
     } catch (err) {
@@ -1634,28 +1714,64 @@ async function detectLocalLlmInstall() {
             return;
         }
         var data = await res.json();
-        if (!data.installed) {
-            installInfo.innerHTML =
-                '<span class="text-amber-600">⚠ Ollama non installé sur ce serveur.</span> ' +
-                '<a href="https://ollama.com" target="_blank" class="underline">Télécharger Ollama</a> ' +
-                'puis recharger cette page.';
-            hideAll();
-        } else if (data.running) {
-            installInfo.innerHTML =
-                '<span class="text-green-600">✓ Ollama installé et démarré</span>' +
-                (data.version ? ' (' + data.version + ')' : '');
-            if (startBtn) startBtn.style.display = 'none';
-            // Toujours visibles quand Ollama tourne — restart résout les
-            // zombies, upgrade met à jour la version.
-            if (restartBtn) restartBtn.style.display = '';
-            if (upgradeBtn) upgradeBtn.style.display = '';
+        // managed: 'binary' = Ollama est un binaire que CETTE app gère (dev / bare-metal)
+        // → boutons Démarrer/Redémarrer/Mettre à jour pertinents. 'external' = serveur
+        // Ollama hors de l'app (sidecar Docker, hôte, autre machine du réseau) qu'on ne
+        // pilote PAS par subprocess → ces boutons renverraient 409, on les masque. Le
+        // reste du pilotage (statut, test/auto-détection d'URL, téléchargement + choix de
+        // modèle, activation) marche en HTTP et reste dispo dans le bloc ci-dessous.
+        // Fallback prudent : une réponse sans `managed` est traitée comme 'external'
+        // (on n'affiche jamais un bouton qui 409).
+        var managed = data.managed || 'external';
+        if (managed === 'binary') {
+            if (!data.installed) {
+                // Défensif : avec managed==='binary' le binaire `ollama` EST présent,
+                // donc le serveur met toujours installed=true → branche normalement
+                // inatteignable. Gardée par sûreté si l'API d'install-status évolue.
+                installInfo.innerHTML =
+                    '<span class="text-amber-600">⚠ Ollama non installé sur ce serveur.</span> ' +
+                    '<a href="https://ollama.com" target="_blank" rel="noopener" class="underline">Télécharger Ollama</a> ' +
+                    'puis recharger cette page.';
+                hideAll();
+            } else if (data.running) {
+                installInfo.innerHTML =
+                    '<span class="text-green-600">✓ Ollama actif</span>' +
+                    (data.version ? ' <span class="text-gray-400">v' + escapeHtml(data.version) + '</span>' : '');
+                if (startBtn) startBtn.style.display = 'none';
+                // Toujours visibles quand Ollama tourne — restart résout les
+                // zombies, upgrade met à jour la version.
+                if (restartBtn) restartBtn.style.display = '';
+                if (upgradeBtn) upgradeBtn.style.display = '';
+            } else {
+                installInfo.innerHTML =
+                    '<span class="text-amber-600">⚠ Daemon Ollama arrêté.</span>' +
+                    (data.version ? ' <span class="text-gray-400">v' + escapeHtml(data.version) + '</span>' : '');
+                if (startBtn) startBtn.style.display = '';
+                if (restartBtn) restartBtn.style.display = 'none';
+                if (upgradeBtn) upgradeBtn.style.display = '';
+            }
         } else {
-            installInfo.innerHTML =
-                '<span class="text-amber-600">⚠ Ollama installé mais pas démarré.</span>' +
-                (data.version ? ' <span class="text-gray-400">' + data.version + '</span>' : '');
-            if (startBtn) startBtn.style.display = '';
-            if (restartBtn) restartBtn.style.display = 'none';
-            if (upgradeBtn) upgradeBtn.style.display = '';
+            // Serveur Ollama EXTERNE (sidecar Docker / hôte / autre machine).
+            hideAll();
+            if (data.running) {
+                // Le badge « Serveur Ollama ✓ Connecté » (ligne statut) couvre déjà la
+                // joignabilité → pas de 2e libellé redondant ici.
+                installInfo.innerHTML = '';
+            } else {
+                // L'innerHTML ci-dessous est une chaîne LITTÉRALE (aucune interpolation)
+                // → sans risque. Le hint, lui (adapté à la topologie côté serveur :
+                // Docker → `make llm-local-enable` ; bare-metal → installer/URL distante),
+                // est injecté via textContent → échappement garanti même si sa source
+                // évoluait un jour vers une valeur non constante.
+                installInfo.innerHTML =
+                    '<span class="text-amber-600">⚠ Serveur Ollama injoignable.</span>';
+                if (data.hint) {
+                    var hintBox = document.createElement('div');
+                    hintBox.className = 'text-gray-500 dark:text-gray-400 mt-1';
+                    hintBox.textContent = data.hint;
+                    installInfo.appendChild(hintBox);
+                }
+            }
         }
     } catch (e) {
         installInfo.innerHTML = '<span class="text-red-600">Erreur réseau</span>';
@@ -1751,23 +1867,31 @@ async function detectLocalLlmStatus() {
     var badge = document.getElementById('local-llm-status-badge');
     var modelSelect = document.getElementById('cfg-local_llm_model_select');
     var modelInput = document.getElementById('cfg-local_llm_model');
-    if (!badge) return;
+    if (!badge) return false;
     badge.textContent = 'Sondage…';
     badge.className = 'badge badge-neutral';
     try {
-        var res = await fetch('/api/admin/llm-local/status', {
+        // Teste l'URL ACTUELLEMENT dans le champ (tapée ou cliquée), pas encore
+        // sauvegardée — sinon le test refléterait l'ancienne URL en BDD.
+        var urlField = document.getElementById('cfg-local_llm_base_url');
+        var typed = (urlField && urlField.value) ? urlField.value.trim() : '';
+        var qs = typed ? ('?url=' + encodeURIComponent(typed)) : '';
+        var res = await fetch('/api/admin/llm-local/status' + qs, {
             headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
         });
         if (!res.ok) {
             badge.textContent = 'Erreur ' + res.status;
             badge.className = 'badge badge-error';
-            return;
+            return false;
         }
         var data = await res.json();
+        var reachable = !!data.reachable;
         if (data.reachable) {
             badge.textContent = '✓ Connecté' + (data.ollama_native ? ' (Ollama)' : '');
             badge.className = 'badge badge-success';
         } else {
+            // Plus de hint-paragraphe : l'explication (OLLAMA_HOST=0.0.0.0, topologie)
+            // est dans le (i) de l'URL, et « Tester » auto-détecte si l'URL échoue.
             badge.textContent = data.error ? '✗ Injoignable' : '✗ Non démarré';
             badge.className = 'badge badge-warning';
         }
@@ -1798,7 +1922,7 @@ async function detectLocalLlmStatus() {
             noneOpt.value = '';
             noneOpt.textContent = data.reachable
                 ? '(aucun modèle installé — télécharger ci-dessous)'
-                : '(Ollama non joignable — démarrer ci-dessus)';
+                : '(serveur Ollama non joignable)';
             modelSelect.appendChild(noneOpt);
             modelSelect.disabled = true;
         }
@@ -1817,9 +1941,83 @@ async function detectLocalLlmStatus() {
             modelSelect._syncWired = true;
         }
         _updateDeleteIconVisibility();
+        return reachable;
     } catch (e) {
         badge.textContent = '✗ Erreur réseau';
         badge.className = 'badge badge-error';
+        return false;
+    }
+}
+
+// Auto-détection topologie : sonde côté SERVEUR les URL Ollama candidates
+// (localhost, sidecar, host.docker.internal, passerelle Docker, configurée) et
+// propose celles joignables. NON destructif — un clic remplit le champ URL ;
+// l'admin valide ensuite via « Sauvegarder ».
+async function autoDetectLocalLlm() {
+    var box = document.getElementById('local-llm-candidates');
+    var btn = document.getElementById('btn-local-llm-detect');
+    if (!box) return;
+    var prev = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = 'Détection…'; btn.disabled = true; }
+    box.style.display = '';
+    box.textContent = '';
+    var info = document.createElement('div');
+    info.className = 'text-xs text-gray-500 dark:text-gray-400';
+    info.textContent = 'Sondage des URL standard depuis le serveur…';
+    box.appendChild(info);
+    try {
+        var res = await fetch('/api/admin/llm-local/detect', {
+            headers: { 'X-Xsrftoken': (typeof getCookie === 'function') ? getCookie('_xsrf') : '' }
+        });
+        if (!res.ok) {
+            info.textContent = 'Auto-détection indisponible (erreur ' + res.status + ').';
+            return;
+        }
+        var data = await res.json();
+        box.textContent = '';
+        var cands = Array.isArray(data.candidates) ? data.candidates : [];
+        var reachable = cands.filter(function(c) { return c.reachable; });
+        if (reachable.length === 0) {
+            var none = document.createElement('p');
+            none.className = 'text-xs text-gray-500 dark:text-gray-400';
+            none.textContent = 'Aucune URL standard joignable depuis le serveur'
+                + (data.in_docker ? ' (app en conteneur)' : '')
+                + '. Saisissez l\'adresse de votre machine Ollama, et vérifiez qu\'il '
+                + 'écoute sur 0.0.0.0 (OLLAMA_HOST). URL testées : '
+                + cands.map(function(c) { return c.url; }).join(', ') + '.';
+            box.appendChild(none);
+            return;
+        }
+        var title = document.createElement('p');
+        title.className = 'text-xs text-gray-600 dark:text-gray-300';
+        title.textContent = 'URL joignables (cliquez pour utiliser, puis Sauvegarder) :';
+        box.appendChild(title);
+        reachable.forEach(function(c) {
+            var row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'block w-full text-left text-xs px-2 py-1 rounded border '
+                + 'border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800 cursor-pointer';
+            var models = (typeof c.models_count === 'number' && c.models_count > 0)
+                ? ' — ' + c.models_count + ' modèle(s)'
+                : ' — 0 modèle';
+            row.textContent = '✓ ' + c.url + models
+                + (c.url === data.recommended ? '  (recommandé)' : '');
+            row.addEventListener('click', function() {
+                var urlField = document.getElementById('cfg-local_llm_base_url');
+                if (urlField) { urlField.value = c.url; }
+                box.style.display = 'none';
+                detectLocalLlmStatus();
+            });
+            box.appendChild(row);
+        });
+    } catch (e) {
+        box.textContent = '';
+        var err = document.createElement('p');
+        err.className = 'text-xs text-red-600';
+        err.textContent = 'Auto-détection : erreur réseau.';
+        box.appendChild(err);
+    } finally {
+        if (btn) { btn.textContent = prev; btn.disabled = false; }
     }
 }
 
@@ -2029,10 +2227,21 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     // Re-détection quand l'admin change l'URL
     document.getElementById('cfg-local_llm_base_url')?.addEventListener('change', detectLocalLlmStatus);
-    document.getElementById('btn-local-llm-detect')?.addEventListener('click', function(e) {
+    // « Tester » fusionné : teste l'URL saisie ; si injoignable, sonde
+    // automatiquement les URL standard (remplace l'ancien bouton « Auto-détecter »).
+    document.getElementById('btn-local-llm-detect')?.addEventListener('click', async function(e) {
         e.preventDefault();
         detectLocalLlmInstall();
-        detectLocalLlmStatus();
+        var reachable = await detectLocalLlmStatus();
+        if (!reachable) { autoDetectLocalLlm(); }
+    });
+    // Puces de modèles recommandés : un clic pré-remplit le champ de téléchargement
+    // (non destructif — le téléchargement reste un clic explicite sur « Télécharger »).
+    document.querySelectorAll('.local-llm-model-chip').forEach(function(chip) {
+        chip.addEventListener('click', function() {
+            var input = document.getElementById('cfg-local_llm_pull_name');
+            if (input) { input.value = chip.getAttribute('data-model') || ''; input.focus(); }
+        });
     });
     document.getElementById('btn-local-llm-start')?.addEventListener('click', startLocalLlm);
     document.getElementById('btn-local-llm-restart')?.addEventListener('click', restartLocalLlm);
@@ -2048,28 +2257,28 @@ document.addEventListener('DOMContentLoaded', function() {
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'admin_ai_config_v1',
+                key: 'admin_ai_config_v2',
                 title: 'Configurer l\'intelligence artificielle',
                 steps: [
                     {
                         icon: 'sparkle',
                         title: 'Connecter votre fournisseur IA',
-                        text: 'Collez votre clé API dans le champ « Clé API » (Anthropic, OpenAI, Mistral, Groq, DeepSeek...). Komptia détecte automatiquement le fournisseur à partir du préfixe de la clé et liste les modèles disponibles. Sans clé valide, Iris ne peut pas répondre.'
+                        text: 'Collez votre clé API dans le champ « Clé API » (Anthropic, OpenAI, Mistral, Groq, DeepSeek...). Komptia détecte automatiquement le fournisseur à partir du préfixe de la clé et affiche le type détecté. Cliquez ensuite sur « Tester » pour charger la liste des modèles disponibles. Sans clé valide, Iris ne peut pas répondre.'
                     },
                     {
                         icon: 'zap',
                         title: 'Choisir le modèle principal',
-                        text: 'Sélectionnez le modèle qu\'Iris utilisera (par exemple Sonnet pour la précision, Haiku pour la rapidité). Vous pouvez ajuster les paramètres (température, nombre maximal de tokens) si vous savez ce que vous faites — les valeurs par défaut conviennent à la plupart des usages.'
+                        text: 'Dans le menu « Modèle », sélectionnez celui qu\'Iris utilisera (par exemple Sonnet pour la précision, Haiku pour la rapidité). La section « Paramètres de génération » vous laisse ajuster la température, le nombre de tentatives de correction et le délai (timeout) — les valeurs par défaut conviennent à la plupart des usages.'
                     },
                     {
                         icon: 'chart',
                         title: 'Suivre votre consommation',
-                        text: 'La section « Consommation API » affiche le nombre de requêtes, les tokens utilisés et le coût estimé sur 7, 30 ou 90 jours. Le détail par utilisateur permet de voir qui consomme quoi. Idéal pour surveiller le budget mensuel.'
+                        text: 'La section « Consommation API » affiche le nombre de requêtes, les tokens utilisés et le coût estimé sur 7, 30 ou 90 jours. Le détail « Par modèle » et « Par utilisateur » permet de voir qui consomme quoi. Idéal pour surveiller le budget mensuel.'
                     },
                     {
-                        icon: 'bell',
-                        title: 'Apprentissage automatique',
-                        text: 'Si l\'apprentissage est activé, Iris retient les questions validées (👍) et les paires question/SQL pour s\'améliorer sur votre base. Vous pouvez tout réinitialiser à zéro depuis la section « Réinitialisation » en bas de page (action irréversible).'
+                        icon: 'shield',
+                        title: 'Apprentissage et réinitialisation',
+                        text: 'Quand « Auto-apprentissage » est activé, Iris retient automatiquement les paires question/SQL des runs réussis pour s\'améliorer sur votre base ; sinon, seuls les feedbacks validés alimentent sa mémoire. Pour tout remettre à zéro, la section « Réinitialisation documentation IA » en bas de page supprime toutes les données d\'entraînement (DDL, documentation métier, exemples) — action irréversible, confirmation demandée.'
                     }
                 ]
             });

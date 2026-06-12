@@ -121,6 +121,16 @@ _PII_PATTERNS = {
 }
 
 
+def iter_pii_kinds() -> tuple:
+    """Accesseur PUBLIC des kinds PII built-in (``EMAIL``, ``IBAN``…).
+
+    SSoT pour les consommateurs externes (ex: ``copilot_memory`` qui doit
+    reconnaître les placeholders ``[KIND_N]``) — leur évite d'importer le
+    dict privé ``_PII_PATTERNS`` (couplage cassable par refactor).
+    """
+    return tuple(_PII_PATTERNS)
+
+
 def _ipv4_check(ip: str) -> bool:
     """Validation IPv4 — chaque octet doit être dans ``[0, 255]``. Élimine
     les faux positifs sur ``999.999.999.999`` ou versions logicielles."""

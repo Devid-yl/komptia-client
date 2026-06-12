@@ -106,34 +106,59 @@ def format_for_prompt(journal: dict) -> str:
 
     parts = []
 
+    # #37 — les 4 sections tables/relations/values/filters affichent désormais
+    # un marqueur « (+N non affichées) » quand elles dépassent leur cap (parité
+    # avec les colonnes l.115-116) ET slicent la FIN (`[-cap:]`, découvertes
+    # récentes = plus pertinentes). Sans marqueur, le LLM croit la liste
+    # exhaustive — fatal pour les FILTRES dont l'en-tête promet « utilise
+    # EXACTEMENT ces correspondances » : il filtrerait sur la mauvaise colonne
+    # (donnée fausse silencieuse). (validated_sql/errors NON concernés : déjà
+    # cappés à last-N à l'écriture, leur slice prompt ne tronque jamais plus.)
+
     # Tables et colonnes
     tables = journal.get("tables", {})
     if tables:
+        items = list(tables.items())
         lines = []
-        for tname, cols in list(tables.items())[:_MAX_TABLES]:
+        for tname, cols in items[-_MAX_TABLES:]:
             cols_str = ", ".join(cols[:15])
             if len(cols) > 15:
                 cols_str += f" (+{len(cols)-15})"
             lines.append(f"  {tname}({cols_str})")
-        parts.append("Tables inspectées :\n" + "\n".join(lines))
+        block = "Tables inspectées :\n" + "\n".join(lines)
+        if len(items) > _MAX_TABLES:
+            block += f"\n  … (+{len(items) - _MAX_TABLES} tables non affichées)"
+        parts.append(block)
 
     # Relations
     relations = journal.get("relations", [])
     if relations:
-        parts.append("Relations :\n  " + "\n  ".join(relations[:_MAX_RELATIONS]))
+        block = "Relations :\n  " + "\n  ".join(relations[-_MAX_RELATIONS:])
+        if len(relations) > _MAX_RELATIONS:
+            block += f"\n  … (+{len(relations) - _MAX_RELATIONS} non affichées)"
+        parts.append(block)
 
     # Valeurs vérifiées
     values = journal.get("values", [])
     if values:
-        parts.append("Valeurs vérifiées :\n  " + "\n  ".join(values[:_MAX_VALUES]))
+        block = "Valeurs vérifiées :\n  " + "\n  ".join(values[-_MAX_VALUES:])
+        if len(values) > _MAX_VALUES:
+            block += f"\n  … (+{len(values) - _MAX_VALUES} non affichées)"
+        parts.append(block)
 
     # Filtres WHERE validés (critique pour ne pas confondre les colonnes)
     filters = journal.get("filters", [])
     if filters:
-        parts.append(
+        block = (
             "Filtres WHERE validés (utilise EXACTEMENT ces correspondances colonne=valeur) :\n  "
-            + "\n  ".join(filters[:_MAX_FILTERS])
+            + "\n  ".join(filters[-_MAX_FILTERS:])
         )
+        if len(filters) > _MAX_FILTERS:
+            block += (
+                f"\n  … (+{len(filters) - _MAX_FILTERS} filtres non affichés — "
+                "liste NON exhaustive, vérifie la colonne si un filtre manque)"
+            )
+        parts.append(block)
 
     # SQL validés
     validated = journal.get("validated_sql", [])

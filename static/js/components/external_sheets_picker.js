@@ -11,6 +11,8 @@
  *   { type: 'workbook'|'excel'|'csv',
  *     label: str, columns: [], rows: [[]], row_count: int,
  *     merges: [],          // pour les feuilles Excel avec merged cells
+ *     sql: str,            // SQL de la feuille source ('' si aucun — Excel/CSV)
+ *     cellDetails: {},     // SQL/détails par cellule de la feuille source ({} si aucun)
  *     source: {...} }      // méta-info (type, path, sheet_name...) pour sérialisation
  *
  * En mode 'source', on retourne uniquement le descripteur de source :
@@ -693,6 +695,14 @@
                         rows: data.rows || [],
                         row_count: data.row_count || 0,
                         merges: [],
+                        // SQL de la feuille + SQL des cellules (cellDetails) : le
+                        // backend les renvoie déjà (reader.read_tab_data) — les
+                        // transporter fidèlement pour que l'import ne les perde
+                        // pas. Gardes de type : un .afz corrompu ne doit pas
+                        // propager autre chose qu'un str / un dict.
+                        sql: (typeof data.sql === 'string') ? data.sql : '',
+                        cellDetails: (data.cellDetails && typeof data.cellDetails === 'object'
+                            && !Array.isArray(data.cellDetails)) ? data.cellDetails : {},
                         source: {
                             type: 'workbook',
                             classeur: s.classeur,
@@ -810,9 +820,12 @@
     }
 
     function escapeHtml(s) {
+        // #101 (cohérence escaping) — échappe AUSSI `'` : un escaper HTML complet
+        // (& < > " ') reste sûr si une future réutilisation passe en contexte
+        // attribut (`title='...'`). Aligné sur iris-common.escapeAttr.
         if (s == null) return '';
         return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function cssEscape(s) {

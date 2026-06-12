@@ -98,7 +98,7 @@ import re
 from typing import Any, Dict, Final, Iterable, List, Optional, Set, Tuple
 
 from app.services.anonymization import patterns as anon_patterns
-from app.services.anonymization.pseudonymizer import Pseudonymizer
+from app.services.anonymization.pseudonymizer import Pseudonymizer, _canonical_key_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -1551,6 +1551,21 @@ def build_user_pseudonymizer(
     if not isinstance(terms, dict):
         return pseudo
 
+    # Scope filter (perf copilot) : pré-calcule l'ensemble CANONIQUE des
+    # tokens du classeur courant. Le matching est case/accent/whitespace-
+    # insensible (``_canonical_key_runtime``, même notion que la regex de
+    # substitution) — sinon un terme configuré ``"Crédit"`` serait écarté du
+    # scope quand le classeur contient ``"CREDIT"``, et la valeur fuiterait en
+    # clair au LLM. L'optimisation ne doit JAMAIS dégrader la couverture
+    # d'anonymisation. (Le pré-filtre SQL amont ``repository.get_state_for_user``
+    # matche lui aussi sur ``term_canonical`` depuis 2026-06-09 — les deux
+    # couches sont désormais canonical, defense-in-depth.)
+    scope_canonical: Optional[Set[str]] = None
+    if scope_tokens is not None:
+        scope_canonical = {
+            _canonical_key_runtime(t) for t in scope_tokens if isinstance(t, str) and t
+        }
+
     for term, entry in terms.items():
         if not isinstance(entry, dict):
             continue
@@ -1558,10 +1573,9 @@ def build_user_pseudonymizer(
             continue
         if not isinstance(term, str) or not term:
             continue
-        # Scope filter : skip les termes qui ne peuvent pas matcher le
-        # classeur courant. Ne s'applique QUE si ``scope_tokens`` non None —
-        # sinon on garde le comportement complet (aucune régression test).
-        if scope_tokens is not None and term not in scope_tokens:
+        # Ne s'applique QUE si ``scope_tokens`` non None — sinon on garde le
+        # comportement complet (aucune régression test).
+        if scope_canonical is not None and _canonical_key_runtime(term) not in scope_canonical:
             continue
         middle = entry.get("pseudo")
         # Catégorie : utilisée par l'auto-gen pour produire un placeholder

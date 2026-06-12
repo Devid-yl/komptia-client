@@ -5,7 +5,7 @@ Responsabilités de ce module :
 * Construire les URL de connexion (``get_database_url`` async via ``aiosqlite``
   et ``get_db_url`` synchrone pour APScheduler).
 * Initialiser l'engine et la factory de sessions (``init_database``) une seule
-  fois par processus (``NullPool`` + verrou ``asyncio`` pour garantir
+  fois par processus (pool borné + verrou ``asyncio`` pour garantir
   l'idempotence même sous appels concurrents).
 * Brancher les *connection hooks* dans le bon ordre : chiffrement SQLCipher →
   chargement optionnel de ``sqlite-vec`` → PRAGMA WAL/foreign_keys/cache/
@@ -30,11 +30,13 @@ import asyncio
 import os
 import re
 import sqlite3
+import sys
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Final, Mapping, Sequence
 
-from sqlalchemy import Row, event, text
+from sqlalchemy import Engine, Row, create_engine, event, text
 from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -44,9 +46,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from app.config import config
+from app.utils.json_safe import dumps_safe
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -129,10 +132,20 @@ _VEC_MISSING_MARKERS: Final[tuple[str, ...]] = ("no such module: vec0",)
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
+# Override per-contexte de la factory de sessions, posé par
+# ``dedicated_session_scope`` pour le code lancé via ``asyncio.run`` sur un
+# thread (jobs APScheduler). Ces jobs tournent sur une boucle asyncio DÉDIÉE et
+# ne doivent PAS réutiliser l'engine global (dont le pool est lié à la boucle
+# Tornado — une connexion poolée porte un thread aiosqlite + des futures liés à
+# SA boucle). ``ContextVar`` est isolé par thread ET par contexte ``asyncio.run``,
+# donc l'override n'affecte jamais la boucle Tornado.
+_session_factory_override: ContextVar["async_sessionmaker[AsyncSession] | None"] = ContextVar(
+    "_session_factory_override", default=None
+)
+
 # Cache du résultat du test d'import/chargement de ``sqlite-vec`` : ``None``
-# tant que la tentative n'a pas eu lieu, ``True``/``False`` ensuite.
-# ``NullPool`` ouvre une connexion par session (≈ 20 à l'init), inutile de
-# retenter un import défaillant chaque fois.
+# tant que la tentative n'a pas eu lieu, ``True``/``False`` ensuite. Inutile de
+# retenter un import défaillant à chaque nouvelle connexion physique.
 _sqlite_vec_available: bool | None = None
 
 # Verrou asyncio pour sérialiser les appels concurrents à ``init_database`` ;
@@ -191,7 +204,214 @@ def get_db_url() -> str:
     return f"sqlite:///{db_path}"
 
 
+# --- Activation SQLCipher (chiffrement at-rest, conditionnel) -------------
+
+
+def _bind_sqlcipher_if_configured() -> None:
+    """Redirige le DBAPI SQLite (pysqlite sync + aiosqlite async) vers
+    ``sqlcipher3`` SI une clé de chiffrement est configurée ET ``sqlcipher3``
+    importable. **No-op total en mode clair** (pas de ``SQLCIPHER_KEY``) :
+    ``sqlite3`` stdlib reste intact → dev/tests inchangés.
+
+    Appelée au **call-time** (début de ``init_database`` et ``make_sync_engine``),
+    donc AVANT toute création d'engine mais APRÈS le chargement complet de la
+    config — aucune ouverture de connexion à l'import (cf. convention du module).
+    Idempotente : un second appel est un no-op.
+
+    Mécanisme : on substitue ``sys.modules['sqlite3']`` AVANT que SQLAlchemy
+    n'importe ``aiosqlite`` (aucun import top-level d'aiosqlite dans ``app/`` —
+    vérifié) ; ainsi ``aiosqlite.core`` fera ``import sqlite3`` et capturera
+    ``sqlcipher3`` (sa ``sqlite_version`` reflète alors le vrai moteur). On
+    re-pointe aussi ``aiosqlite.core.sqlite3`` par défense-en-profondeur si le
+    module est déjà importé.
+    """
+    if not config.database.encryption_key:
+        return  # mode clair : sqlite3 stdlib intact (dev/tests non cassés)
+
+    try:
+        import sqlcipher3.dbapi2 as _sqlcipher_dbapi2  # type: ignore[import-untyped]
+    except ImportError:
+        # sqlcipher3 absent : on NE patche PAS et on ne masque rien. Le garde
+        # fail-closed de setup_encryption (``cipher_version`` vide) refusera le
+        # boot avec un message actionnable plutôt que chiffrer « pour de faux ».
+        logger.warning(
+            "SQLCIPHER_KEY définie mais sqlcipher3 non importable — binding "
+            "ignoré ; le boot échouera au garde fail-closed setup_encryption "
+            "(installer sqlcipher3==0.6.2)."
+        )
+        return
+
+    if sys.modules.get("sqlite3") is _sqlcipher_dbapi2:
+        return  # déjà bindé (idempotence)
+
+    sys.modules["sqlite3"] = _sqlcipher_dbapi2
+    sys.modules["sqlite3.dbapi2"] = _sqlcipher_dbapi2
+    # CRUCIAL pour le chemin SYNC (jobstore APScheduler) : le dialecte pysqlite de
+    # SQLAlchemy fait littéralement ``from sqlite3 import dbapi2 as sqlite`` dans
+    # ``import_dbapi``. Or ``_sqlcipher_dbapi2`` est un MODULE (pas un package, pas
+    # de ``__path__``) dont ``__name__`` vaut ``"sqlcipher3.dbapi2"`` : sans cet
+    # attribut, Python tente d'importer le sous-module ``sqlcipher3.dbapi2.dbapi2``
+    # → ``ImportError: cannot import name 'dbapi2' from 'sqlcipher3.dbapi2'`` et
+    # TOUT engine sync crashe (vu en prod sur ``GET /automations``). On expose donc
+    # un attribut ``dbapi2`` auto-référent : ``from sqlite3 import dbapi2`` résout
+    # alors directement sur le module bindé (la stdlib expose de même ``sqlite3``
+    # comme package + sous-module ``dbapi2``). Le chemin async (aiosqlite,
+    # ``import sqlite3``) n'est pas affecté.
+    _sqlcipher_dbapi2.dbapi2 = _sqlcipher_dbapi2  # type: ignore[attr-defined]
+    try:
+        import aiosqlite.core as _aio_core
+
+        _aio_core.sqlite3 = _sqlcipher_dbapi2  # type: ignore[attr-defined]
+    except ImportError:
+        pass  # aiosqlite pas encore importé : la substitution sys.modules suffira
+    logger.info("SQLCipher bindé (aiosqlite + pysqlite) — chiffrement at-rest actif")
+
+
+def _sqlite_error_types() -> tuple[type[BaseException], ...]:
+    """Classes d'erreur DBAPI à catcher : ``sqlite3.Error`` stdlib + le DBAPI
+    SQLCipher actif si bindé.
+
+    ``sqlcipher3.dbapi2.Error`` n'hérite PAS de ``sqlite3.Error`` stdlib (modules
+    distincts). Sans cet élargissement, une erreur SQLCipher dans
+    ``setup_sqlite_vec`` ne serait pas catchée et deviendrait FATALE au boot au
+    lieu de dégrader proprement en TF-IDF. Résolu au call-time : ``sys.modules``
+    reflète déjà le binding quand les hooks s'exécutent.
+    """
+    live = sys.modules.get("sqlite3")
+    live_err = getattr(live, "Error", None)
+    if isinstance(live_err, type) and live_err is not sqlite3.Error:
+        return (sqlite3.Error, live_err)
+    return (sqlite3.Error,)
+
+
+def make_sync_engine(url: str | None = None, **engine_kwargs: Any) -> Engine:
+    """Crée un engine SQLAlchemy **synchrone** câblé avec les mêmes hooks de
+    connexion critiques que l'engine async (``PRAGMA key`` + PRAGMAs perf).
+
+    Source unique de vérité pour TOUT call-site sync (jobstore APScheduler, jobs
+    de cleanup, branding, delivery dashboards, onboarding…). Avant cette factory,
+    ~29 call-sites faisaient ``create_engine(get_db_url())`` brut SANS ``PRAGMA
+    key`` → la base chiffrée leur apparaissait « file is not a database » dès que
+    SQLCipher est actif (crash APScheduler au boot). Passer par ici garantit que
+    la clé est posée sur chaque connexion.
+
+    ``url`` permet de surcharger l'URL (ex. jobstore APScheduler avec une base
+    de test isolée) ; par défaut ``get_db_url()``. Appelle
+    ``_bind_sqlcipher_if_configured`` en premier (idempotent) pour couvrir les
+    entry-points sync qui n'ont jamais appelé ``init_database``.
+    """
+    _bind_sqlcipher_if_configured()
+    # Sérialiseur JSON tolérant (SSoT app/utils/json_safe) : sans lui, une
+    # colonne JSON recevant un ``datetime``/``Decimal`` (rows SQL Server via
+    # pyodbc) crashe l'INSERT — incident F_STEP_EXECUTION 2026-06-12 où une
+    # exécution RÉUSSIE était requalifiée en échec par son propre journal.
+    # ``setdefault`` : un caller peut surcharger explicitement.
+    engine_kwargs.setdefault("json_serializer", dumps_safe)
+    engine = create_engine(url or get_db_url(), **engine_kwargs)
+
+    @event.listens_for(engine, "connect")
+    def _on_sync_connect(dbapi_connection: Any, connection_record: Any) -> None:
+        # Ordre critique : PRAGMA key AVANT toute autre requête (sinon base
+        # chiffrée = « fichier invalide »), puis PRAGMAs perf. Pas de sqlite-vec
+        # sur les engines sync (jobstore/cleanup ne font pas de recherche
+        # vectorielle).
+        setup_encryption(dbapi_connection, connection_record)
+        setup_pragmas(dbapi_connection, connection_record)
+
+    return engine
+
+
+def make_async_engine(**engine_kwargs: Any) -> AsyncEngine:
+    """Crée un engine SQLAlchemy **async** câblé avec les mêmes hooks de
+    connexion critiques que l'engine principal (``PRAGMA key`` SQLCipher +
+    sqlite-vec + PRAGMAs perf).
+
+    Pour les rares call-sites async qui DOIVENT créer leur propre engine plutôt
+    que réutiliser celui d'``init_database`` — typiquement un job APScheduler qui
+    tourne dans un thread avec sa propre boucle ``asyncio`` (un ``AsyncEngine``
+    ne se partage pas entre boucles). Sans ces hooks, une base chiffrée serait
+    illisible (« file is not a database »).
+    """
+    _bind_sqlcipher_if_configured()
+    # Même sérialiseur JSON tolérant que l'engine principal : les jobs
+    # PLANIFIÉS (APScheduler, thread + boucle dédiée) écrivent eux aussi
+    # F_STEP_EXECUTION — sans ça, le fix de l'incident 2026-06-12 ne
+    # couvrirait que les exécutions manuelles.
+    engine_kwargs.setdefault("json_serializer", dumps_safe)
+    engine = create_async_engine(get_database_url(), **engine_kwargs)
+    _register_connection_hooks(engine)
+    return engine
+
+
+def open_local_sqlite_connection(timeout: float = 30.0, **connect_kwargs: Any) -> Any:
+    """Ouvre une connexion DBAPI **synchrone brute** sur la BDD LOCALE avec le
+    ``PRAGMA key`` SQLCipher posé AVANT toute autre requête.
+
+    SSoT pour les rares accès DBAPI bruts (hors SQLAlchemy) à la base locale —
+    aujourd'hui ``schema_loader`` et ``sql_validator``. Sans le ``PRAGMA key``,
+    une base chiffrée apparaît « file is not a database » dès la 1re requête (le
+    binding a fait de ``sqlite3`` un ``sqlcipher3`` process-wide, mais la clé
+    doit être posée PAR CONNEXION). No-op (base claire) si pas de clé ;
+    fail-closed si clé posée mais moteur non-SQLCipher.
+
+    ⚠️ NE PAS utiliser pour la BDD **source Sage** (``sqlite_sage_connector``) :
+    base distincte, jamais chiffrée par ``SQLCIPHER_KEY``.
+    """
+    _bind_sqlcipher_if_configured()
+    import sqlite3 as _sqlite3  # résolu au call-time → sqlcipher3 si bindé
+
+    conn = _sqlite3.connect(config.database.path, timeout=timeout, **connect_kwargs)
+    # PRAGMA key AVANT toute autre requête. setup_encryption tolère une connexion
+    # DBAPI brute (il n'utilise que .cursor()/.execute()).
+    setup_encryption(conn, None)
+    return conn
+
+
 # --- Hooks de connexion (ordre critique) ---------------------------------
+
+
+# Une clé SQLCipher en hex brut est utilisée TELLE QUELLE (aucune dérivation
+# PBKDF2) : 64 caractères = 32 octets de clé (le salt est lu dans l'en-tête de
+# la base), 96 = 32 octets de clé + 16 octets de salt explicite. Toute autre
+# forme est traitée comme une passphrase (dérivée via PBKDF2). C'est la
+# convention de SQLCipher lui-même (cf. _build_pragma_key_hex).
+_RAW_KEY_HEX_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}|[0-9a-f]{96}", re.IGNORECASE)
+
+
+def _build_pragma_key_hex(encryption_key: str) -> str:
+    """Construit les chiffres hex à injecter dans ``PRAGMA key = "x'<hex>'"``.
+
+    Deux chemins, choisis automatiquement d'après la forme de la clé (c'est la
+    convention de SQLCipher lui-même) :
+
+    * **Raw key** — clé déjà en hex brut (64 ou 96 caractères) : renvoyée telle
+      quelle (en minuscules). SQLCipher l'utilise directement comme clé de
+      chiffrement → **aucune dérivation PBKDF2**. C'est le format produit par
+      ``openssl rand -hex 32`` / ``secrets.token_hex(32)`` (cf. ``make
+      first-run``), donc le cas par défaut d'un déploiement Komptia.
+    * **Passphrase** — toute autre forme (phrase humaine, longueur ≠ 64/96, ou
+      caractères non-hex) : hex de l'UTF-8, puis SQLCipher dérive la clé via
+      PBKDF2 (256k itérations par défaut). Indispensable pour étirer un secret
+      à faible entropie.
+
+    Sécurité : passer une clé de 256 bits aléatoires en raw key n'enlève AUCUNE
+    garantie. PBKDF2 ne fait que ralentir le brute-force d'un secret *devinable*
+    ; une clé aléatoire de 32 octets ne l'est pas. Le gain est purement de la
+    performance — la dérivation par connexion (~250 ms sur un petit CPU,
+    multipliée par requête avec ``NullPool``) disparaît. La détection
+    ``fullmatch`` réserve le raw key aux chaînes hex de longueur EXACTE → une
+    passphrase humaine conserve toujours son PBKDF2.
+
+    ⚠️ Changer la forme de clé d'une base EXISTANTE la rend illisible (« file is
+    not a database ») car la clé effective diffère : c'est un échec BRUYANT au
+    boot (jamais de données fausses silencieuses), pas une corruption.
+    """
+    if _RAW_KEY_HEX_RE.fullmatch(encryption_key):
+        # .lower() OBLIGATOIRE : la garde aval ``re.fullmatch(r"[0-9a-f]+", …)``
+        # de setup_encryption est sans IGNORECASE → une clé hex en MAJUSCULES y
+        # serait rejetée (ValueError au boot) sans cette normalisation.
+        return encryption_key.lower()
+    return encryption_key.encode("utf-8").hex()
 
 
 def setup_encryption(
@@ -204,11 +424,12 @@ def setup_encryption(
     requête antérieure au ``PRAGMA key`` verrait la base comme un fichier non
     SQLite ("file is not a database").
 
-    La clé utilisateur est encodée en hex pour éviter les ennuis d'échappement
-    dans le littéral ``x'...'`` (SQLCipher n'accepte pas le binding ``?`` sur
-    les PRAGMA). Une validation regex défense-en-profondeur garantit que la
-    chaîne injectée ne contient que des caractères hex, même si ``encode()``
-    venait à produire autre chose dans un futur Python.
+    Le littéral hex injecté est construit par :func:`_build_pragma_key_hex`
+    (raw key sans PBKDF2 si la clé est déjà en hex 64/96, sinon passphrase
+    dérivée). SQLCipher n'accepte pas le binding ``?`` sur les PRAGMA, d'où
+    l'injection d'un littéral ``x'...'``. Une validation regex
+    défense-en-profondeur garantit que la chaîne injectée ne contient que des
+    caractères hex.
     """
     encryption_key = config.database.encryption_key
     if not encryption_key:
@@ -216,7 +437,7 @@ def setup_encryption(
 
     cursor = dbapi_connection.cursor()
     try:
-        hex_key = encryption_key.encode("utf-8").hex()
+        hex_key = _build_pragma_key_hex(encryption_key)
         if not re.fullmatch(r"[0-9a-f]+", hex_key):
             raise ValueError("Invalid encryption key format")
         cursor.execute(f"PRAGMA key = \"x'{hex_key}'\"")
@@ -254,7 +475,7 @@ def setup_encryption(
             raise RuntimeError(_msg)
         else:
             logger.debug("Chiffrement SQLCipher activé (cipher_version=%s)", cipher_version)
-    except (sqlite3.Error, UnicodeEncodeError, ValueError) as exc:
+    except (*_sqlite_error_types(), UnicodeEncodeError, ValueError) as exc:
         # On ne log pas la clé elle-même, seulement le type d'erreur.
         logger.error("Erreur configuration chiffrement: %s", type(exc).__name__)
         raise
@@ -301,7 +522,7 @@ def setup_sqlite_vec(
             "sqlite-vec indisponible via ce driver (%s) — recherche vectorielle désactivée",
             exc,
         )
-    except sqlite3.Error as exc:
+    except _sqlite_error_types() as exc:
         _sqlite_vec_available = False
         logger.warning("Erreur SQLite au chargement de sqlite-vec: %s", exc)
 
@@ -337,7 +558,7 @@ def setup_pragmas(
         # raisonnement complet et la note SQLCipher.
         try:
             cursor.execute(f"PRAGMA mmap_size = {_MMAP_SIZE_BYTES}")
-        except sqlite3.Error as exc:
+        except _sqlite_error_types() as exc:
             # SQLCipher sans memory-mapping compilé : on log et on continue
             # (PRAGMA mmap_size renvoie 0 silencieusement sur la plupart
             # des builds, mais on protège contre une variante stricte).
@@ -428,29 +649,40 @@ class _Migration:
     source_table: str | None = None
 
 
-# Stable identifier for the value_mapping → value_mapping_archive snapshot
-# (cf. ``app/models/value_mapping_archive.py`` and the corresponding
-# ``data`` migration below). Réutilisé dans le ``WHERE NOT EXISTS`` de la
-# migration et exposé pour les tests de garde — toute divergence de ces
-# deux occurrences casserait l'idempotence sans crash visible.
-_VALUE_MAPPING_ARCHIVE_INITIAL_REASON: Final[str] = "pre-refactor-task-18"
-
-# BLOCKING #2 review BDD : valider la constante archive_reason au boot
-# pour empêcher qu'un futur dev introduise une valeur contenant des chars
-# qui casseraient la SQL inline (apostrophe, espace, NULL byte). La regex
-# admet [a-z0-9_-] strict.
-_ARCHIVE_REASON_PATTERN = re.compile(r"^[a-z0-9_-]+$")
-if not _ARCHIVE_REASON_PATTERN.match(_VALUE_MAPPING_ARCHIVE_INITIAL_REASON):
-    raise RuntimeError(
-        f"_VALUE_MAPPING_ARCHIVE_INITIAL_REASON invalide : "
-        f"{_VALUE_MAPPING_ARCHIVE_INITIAL_REASON!r}. Doit matcher [a-z0-9_-]+. "
-        "Toute apostrophe ou espace casserait silencieusement l'idempotence "
-        "de la migration snapshot_legacy_lossy_pre_task_18 (cf. WHERE NOT "
-        "EXISTS qui se base sur cette valeur en littéral SQL)."
-    )
+# ``value_mapping_archive`` (snapshot legacy task #18) + sa constante
+# ``_VALUE_MAPPING_ARCHIVE_INITIAL_REASON`` : SUPPRIMÉS 2026-06-11 sur demande
+# utilisateur (David) — plus aucun lecteur runtime, aucune FK. Cf. la migration
+# ``drop_value_mapping_archive_2026_06_11`` plus bas qui DROP la table.
 
 
 _MIGRATIONS: Final[tuple[_Migration, ...]] = (
+    # llm_models.context_window_verified (2026-06-03) : distingue une fenêtre
+    # CONFIRMÉE (LiteLLM / override / seed) d'une valeur PROVISOIRE (défaut
+    # 200_000 posé par sync_from_provider quand l'API provider n'expose pas la
+    # fenêtre, avant que l'enrich LiteLLM ne confirme). L'indicateur /iris lit
+    # ce flag pour ne pas afficher un chiffre faux. Cf. bug « 200K peu importe
+    # le modèle » : un modèle choisi depuis la dropdown live mais jamais enrichi.
+    _Migration(
+        "llm_models",
+        "context_window_verified",
+        "ALTER TABLE llm_models ADD COLUMN context_window_verified BOOLEAN DEFAULT FALSE",
+        "column",
+    ),
+    # Back-fill : les modèles DÉJÀ en base au moment de cette migration viennent
+    # du seed (valeurs code fiables) — ``last_synced_at IS NULL`` les distingue
+    # des modèles découverts par sync_from_provider (qui portent un timestamp et
+    # une fenêtre 200K provisoire à confirmer). Sans ce back-fill, des modèles
+    # corrects (haiku=200K, opus=1M) seraient marqués « à confirmer » à tort.
+    # Self-idempotent : au 2ᵉ boot, ces rows ont verified=TRUE → WHERE ne matche
+    # plus rien ; les modèles synced (last_synced_at NOT NULL) ne sont jamais
+    # touchés (ils dépendent de l'enrich pour passer verified).
+    _Migration(
+        "llm_models",
+        "backfill_context_window_verified",
+        "UPDATE llm_models SET context_window_verified = TRUE "
+        "WHERE context_window_verified = FALSE AND last_synced_at IS NULL",
+        "data",
+    ),
     _Migration(
         "search_history",
         "feedback_status",
@@ -497,32 +729,91 @@ _MIGRATIONS: Final[tuple[_Migration, ...]] = (
     # dédiée ``depends_on`` pour homogénéiser. Self-idempotent : la clause
     # ``WHERE depends_on IS NULL`` ne matche aucune row au 2e run après
     # backfill réussi. Sqlite's json_array(scalar) crée ``["scalar"]``.
+    #
+    # ⚠️ Casse : SQLAlchemy ``Enum(TrainingDataType)`` stocke le NOM du
+    # membre (``'SYNONYM'`` majuscule), pas sa value (``'synonym'``). La
+    # 1ʳᵉ version de cette migration comparait la value → NO-OP silencieux
+    # à chaque boot (0 row backfillée). Corrigé 2026-06-09 ; le ``IN``
+    # couvre les deux casses par défense (rows écrites en raw SQL).
     _Migration(
         "training_data",
         "backfill_synonym_depends_on",
         "UPDATE training_data "
         "SET depends_on = json_array(json_extract(metadata, '$.target')) "
-        "WHERE data_type = 'synonym' "
+        "WHERE data_type IN ('SYNONYM', 'synonym') "
         "  AND depends_on IS NULL "
         "  AND json_extract(metadata, '$.target') IS NOT NULL",
         "data",
     ),
     # Phase 1.6 (#43) — Backfill : re-classifier les vues stockées comme
-    # ``data_type='ddl'`` en ``data_type='view'``. Pré-Phase 1.6, le sync
+    # ``data_type='DDL'`` en ``data_type='VIEW'``. Pré-Phase 1.6, le sync
     # stockait les vues via ``add_ddl()`` (legacy). Maintenant qu'on a
     # ``add_view()`` avec ``depends_on``, on migre pour homogénéiser et
     # permettre au closure transitif (Phase 2.1) de les distinguer des
     # tables physiques. Détection : ``source LIKE 'auto_sync_view%'``
     # — c'est le marqueur déposé par schema_sync (cf. ligne ~890).
-    # Self-idempotent : ``WHERE data_type='ddl'`` ne matche plus après
+    # Self-idempotent : ``WHERE data_type IN (...)`` ne matche plus après
     # le 1er run.
+    #
+    # ⚠️ Casse : comme ci-dessus, le stockage est le NOM du membre enum
+    # (``'DDL'``/``'VIEW'`` MAJUSCULES). La 1ʳᵉ version comparait/écrivait
+    # les values minuscules → double no-op : WHERE jamais matché, et le
+    # SET aurait écrit ``'view'`` que l'ORM ne sait pas relire
+    # (``LookupError`` au SELECT). Conséquence avant correction : chaque
+    # vue existait EN DOUBLE (legacy ``DDL/auto_sync_view`` + ``VIEW``
+    # du add_view actuel). Corrigé 2026-06-09 ; la migration suivante
+    # (``dedup_active_view_rows``) résorbe le double stockage — elle est
+    # OBLIGATOIRE car ``add_view`` upserte via ``scalar_one_or_none()``
+    # qui lèverait ``MultipleResultsFound`` avec 2 rows VIEW actives de
+    # même ``table_name``.
     _Migration(
         "training_data",
         "reclassify_views_from_ddl",
         "UPDATE training_data "
-        "SET data_type = 'view' "
-        "WHERE data_type = 'ddl' "
+        "SET data_type = 'VIEW' "
+        "WHERE data_type IN ('DDL', 'ddl') "
         "  AND source LIKE 'auto_sync_view%'",
+        "data",
+    ),
+    # Dédup post-reclassification : garde UNE seule row VIEW active par
+    # ``table_name`` (la plus récente = MAX(id), c'est la forme écrite par
+    # ``add_view`` après la forme legacy), désactive les autres
+    # (``is_active=0`` — on ne supprime JAMAIS, cf. doctrine « ne pas
+    # delete l'existant »). Sur une BDD legacy-only (jamais re-syncée
+    # depuis Phase 1.6), il n'y a qu'une row par vue → no-op. Les rows
+    # sans ``table_name`` sont exclues (GROUP BY NULL fusionnerait tout).
+    # Self-idempotent : au 2ᵉ run chaque table_name n'a plus qu'une row
+    # active → ``NOT IN`` ne matche rien.
+    #
+    # HYPOTHÈSE keeper = MAX(id) (revue adv. 2026-06-10) : valable parce
+    # qu'aujourd'hui SEUL ``training_store.add_view`` écrit des rows VIEW
+    # (en upsert) — la row au plus grand id est donc toujours la plus
+    # récente écriture du sync. Si un jour des rows VIEW « manuelles »
+    # coexistent (import/restore/UI d'édition), ajouter un tie-breaker
+    # ``updated_at``/``source`` AVANT de compter sur cette migration.
+    #
+    # EFFET DE BORD assumé (fail-closed, doctrine mode invisible) : les
+    # rows legacy reclassées ont ``depends_on`` NULL → la closure
+    # transitive les traite en « dépendances inconnues » et les CACHE aux
+    # users restreints jusqu'à la prochaine sync schéma (qui re-peuple
+    # depends_on via add_view). ACTION POST-DEPLOY : lancer une sync
+    # après le 1er boot (déjà dans la checklist déploiement du fix vues).
+    # Les admins ne sont jamais filtrés — seuls les users à règles
+    # data-access sont concernés, et dans le sens sûr (cacher trop).
+    _Migration(
+        "training_data",
+        "dedup_active_view_rows",
+        "UPDATE training_data "
+        "SET is_active = 0 "
+        "WHERE data_type = 'VIEW' "
+        "  AND is_active = 1 "
+        "  AND table_name IS NOT NULL "
+        "  AND id NOT IN ("
+        "    SELECT MAX(id) FROM training_data "
+        "    WHERE data_type = 'VIEW' AND is_active = 1 "
+        "      AND table_name IS NOT NULL "
+        "    GROUP BY table_name"
+        "  )",
         "data",
     ),
     _Migration(
@@ -1443,36 +1734,18 @@ _MIGRATIONS: Final[tuple[_Migration, ...]] = (
         "ALTER TABLE value_mapping DROP COLUMN anonymized_value",
         "drop_column",
     ),
-    # 2. Snapshot one-shot ``value_mapping → value_mapping_archive`` (tâche
-    #    #18). Adapté 2026-05-22 : retrait de ``anonymized_value`` du
-    #    SELECT/INSERT (colonne supprimée le même jour). Le snapshot reste
-    #    utile pour traçabilité avant le drop de la colonne — comme
-    #    ``Base.metadata.create_all`` recrée la table au boot (model
-    #    restauré), la migration data peut tourner et copier les rows.
+    # 2. value_mapping_archive : snapshot legacy SUPPRIMÉ 2026-06-11 sur demande
+    #    utilisateur (David). C'était un snapshot one-shot de l'ancien cache
+    #    ``value_mapping`` (système d'anonymisation lossy pré-2026-05-22, retiré).
+    #    Plus AUCUN lecteur runtime (modèle + audit script + tests retirés ;
+    #    aucune FK ni dépendance). DROP pour libérer l'espace (~Go : snapshot
+    #    d'un value_mapping à 29M+ rows) en dev ET prod au prochain boot.
+    #    ``IF EXISTS`` natif → idempotent.
     _Migration(
         "value_mapping_archive",
-        "snapshot_legacy_lossy_pre_task_18",
-        (
-            "INSERT INTO value_mapping_archive ("
-            "table_name, column_name, real_value, real_value_lower, "
-            "value_type, created_at, "
-            "archived_at, archive_reason"
-            ") "
-            "SELECT table_name, column_name, real_value, real_value_lower, "
-            "value_type, created_at, "
-            f"CURRENT_TIMESTAMP, '{_VALUE_MAPPING_ARCHIVE_INITIAL_REASON}' "
-            "FROM value_mapping "
-            "WHERE NOT EXISTS ("
-            "SELECT 1 FROM value_mapping_archive "
-            f"WHERE archive_reason = '{_VALUE_MAPPING_ARCHIVE_INITIAL_REASON}' LIMIT 1"
-            ")"
-        ),
-        "data",
-        idempotency_check_sql=(
-            "SELECT 1 FROM value_mapping_archive "
-            f"WHERE archive_reason = '{_VALUE_MAPPING_ARCHIVE_INITIAL_REASON}' LIMIT 1"
-        ),
-        source_table="value_mapping",
+        "drop_value_mapping_archive_2026_06_11",
+        "DROP TABLE IF EXISTS value_mapping_archive",
+        "drop_table",
     ),
     # 3. DROP des 5 tables FTS5 dérivées de value_mapping (orphelines après
     #    suppression de anonymized_value — les triggers FTS pointaient sur
@@ -1670,6 +1943,65 @@ _MIGRATIONS: Final[tuple[_Migration, ...]] = (
         "ON email_logs(sent_by_user_id, sent_at)",
         "index",
     ),
+    # Feature « arrêt de la pipeline à une phase choisie » (preview Iris —
+    # docs/design/iris_stop_at_phase.md). Colonne ADD-only : NULL = run
+    # complet (rétro-compat). Le statut STOPPED_EARLY ajouté à l'enum
+    # PipelineRunStatus n'exige PAS de migration (SQLEnum sans CHECK sur
+    # SQLite — create_constraint=False par défaut → VARCHAR libre).
+    _Migration(
+        "pipeline_runs",
+        "stop_after_phase",
+        "ALTER TABLE pipeline_runs ADD COLUMN stop_after_phase VARCHAR(20)",
+        "column",
+    ),
+    # B6 (bug hunt) — idempotence resume : lien preview→continuation pour
+    # refuser un 2e resume tant qu'un enfant non-terminal existe. Colonne
+    # ADD-only + index (fresh DB l'a via le modèle ; existante via ces 2
+    # migrations). NULL = run normal (pas une continuation).
+    _Migration(
+        "pipeline_runs",
+        "resumed_from_run_id",
+        "ALTER TABLE pipeline_runs ADD COLUMN resumed_from_run_id INTEGER",
+        "column",
+    ),
+    _Migration(
+        "pipeline_runs",
+        "ix_pipeline_runs_resumed_from",
+        "CREATE INDEX IF NOT EXISTS ix_pipeline_runs_resumed_from "
+        "ON pipeline_runs(resumed_from_run_id)",
+        "index",
+    ),
+    # anonymization_terms.term_canonical (2026-06-09) : clé canonique NFKD
+    # strip-accents + casefold, pour les lectures scopées case/accent-
+    # insensibles (copilot scope + strategies proper-noun lookup). La colonne
+    # est ajoutée ici (vide), puis BACKFILLÉE en Python au boot
+    # (``_backfill_anonymization_term_canonical``) — le canonical ne peut PAS
+    # être calculé en SQL (NFKD n'existe pas côté SQLite). Les écritures
+    # ultérieures peuplent via ``repository.upsert_terms``.
+    _Migration(
+        "anonymization_terms",
+        "term_canonical",
+        "ALTER TABLE anonymization_terms ADD COLUMN term_canonical VARCHAR(500)",
+        "column",
+    ),
+    _Migration(
+        "anonymization_terms",
+        "ix_anonymization_term_user_canonical",
+        "CREATE INDEX IF NOT EXISTS ix_anonymization_term_user_canonical "
+        "ON anonymization_terms(user_id, term_canonical)",
+        "index",
+    ),
+    # F_WEBHOOK_TRIGGER.hmac_secret (FAILLE 2, 2026-06-12) : secret partagé
+    # HMAC-SHA256 par webhook (signature X-Komptia-Signature sur l'inbound).
+    # NULL = compat token-seul (webhooks existants inchangés) ; le secret est
+    # généré côté serveur à la création (``require_signature: true``) ou à la
+    # rotation. Fresh DB : colonne créée via le modèle ; existante : ici.
+    _Migration(
+        "F_WEBHOOK_TRIGGER",
+        "hmac_secret",
+        "ALTER TABLE F_WEBHOOK_TRIGGER ADD COLUMN hmac_secret VARCHAR(128)",
+        "column",
+    ),
 )
 
 
@@ -1866,6 +2198,88 @@ async def _normalize_users_email_case_insensitive(engine: AsyncEngine) -> None:
             )
 
 
+async def _backfill_anonymization_term_canonical(engine: AsyncEngine) -> None:
+    """Backfille ``anonymization_terms.term_canonical`` pour les rows legacy.
+
+    Le canonical (NFKD strip-accents + casefold) ne peut PAS être calculé en
+    SQL : SQLite n'a ni NFKD ni casefold Unicode-aware (son ``LOWER()`` est
+    ASCII-only et ne retire pas les accents). On lit donc en Python les rows
+    où ``term_canonical IS NULL`` et on applique
+    :func:`app.services.anonymization.repository._canonical_key` — **SSoT**
+    avec l'écrit (``upsert_terms``) et les lectures (``get_state_for_user``,
+    ``strategies``). UPDATE par id en batches.
+
+    Idempotente : au 2ᵉ boot, plus aucune row NULL → SELECT vide → no-op.
+    Skippée si la table OU la colonne n'existe pas encore (boot frais avant
+    ``create_all``, ou avant la migration ADD COLUMN — d'où l'appel APRÈS la
+    boucle de migrations SQL).
+    """
+    # SSoT : la MÊME clé de match (case+accent+whitespace) que l'écrit
+    # (``upsert_terms``) et les lectures scopées. ``""`` possible pour un terme
+    # dégénéré (marques combinantes only) — stocké tel quel (non-NULL → pas
+    # re-traité ; les lectures filtrent les clés vides).
+    from app.services.anonymization.repository import _canonical_match_key
+
+    async with engine.begin() as conn:
+        check = await conn.execute(
+            text(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='anonymization_terms'"
+            )
+        )
+        if check.first() is None:
+            return
+        cols = (await conn.execute(text("PRAGMA table_info(anonymization_terms)"))).fetchall()
+        if not any(c[1] == "term_canonical" for c in cols):
+            return
+
+        rows = (
+            await conn.execute(
+                text("SELECT id, term FROM anonymization_terms WHERE term_canonical IS NULL")
+            )
+        ).fetchall()
+        if not rows:
+            return
+
+        update_sql = text(
+            "UPDATE anonymization_terms SET term_canonical = :canon WHERE id = :cid"
+        )
+        updated = 0
+        batch: list[dict[str, Any]] = []
+        for row_id, term in rows:
+            if not isinstance(term, str):
+                # ``term`` est NOT NULL str ; un non-str = corruption → laissé
+                # NULL et signalé par le WARNING post-backfill ci-dessous.
+                continue
+            batch.append({"cid": row_id, "canon": _canonical_match_key(term)})
+            if len(batch) >= 500:
+                await conn.execute(update_sql, batch)
+                updated += len(batch)
+                batch = []
+        if batch:
+            await conn.execute(update_sql, batch)
+            updated += len(batch)
+        if updated:
+            logger.info(
+                "Backfill anonymization_terms.term_canonical : %d row(s) legacy peuplée(s)",
+                updated,
+            )
+        # Observabilité (review migration finding #8) : un reliquat NULL après
+        # backfill = rows ``term`` non-str/corrompues, exclues des lectures
+        # scopées. Visible plutôt que silencieux.
+        remaining = (
+            await conn.execute(
+                text("SELECT COUNT(*) FROM anonymization_terms WHERE term_canonical IS NULL")
+            )
+        ).scalar()
+        if remaining:
+            logger.warning(
+                "Backfill term_canonical : %d row(s) restent NULL (term non-str/corrompu ?) "
+                "— exclues des lectures scopées copilot/strategies",
+                remaining,
+            )
+
+
 async def _run_migrations(engine: AsyncEngine) -> None:
     """Applique les migrations additives définies dans ``_MIGRATIONS``.
 
@@ -1923,6 +2337,25 @@ async def _run_migrations(engine: AsyncEngine) -> None:
                     exc_info=True,
                 )
                 raise
+
+    # Backfill Python POST-migrations (la colonne term_canonical existe
+    # désormais) — calcul du canonical impossible en SQL (NFKD/casefold).
+    # FAIL-SOFT (review migration finding #2) : le backfill est idempotent et
+    # ré-essayé au prochain boot ; une erreur transitoire (lock, I/O) ne doit
+    # PAS bricker le boot. En cas d'échec, les rows non backfillées restent à
+    # ``term_canonical=NULL`` → exclues des lectures scopées copilot/strategies
+    # (PAS pire que l'état PRÉ-migration qui ratait déjà ces variantes ; le
+    # path Iris principal scope=None n'est de toute façon pas concerné). Les
+    # écritures ultérieures (``upsert_terms``) auto-réparent les rows touchées.
+    try:
+        await _backfill_anonymization_term_canonical(engine)
+    except Exception:
+        logger.warning(
+            "Backfill anonymization_terms.term_canonical échoué (non-bloquant, "
+            "ré-essai au prochain boot ; rows non backfillées exclues des "
+            "lectures scopées d'ici là)",
+            exc_info=True,
+        )
 
 
 # --- Tables vectorielles (sqlite-vec) ------------------------------------
@@ -2043,15 +2476,40 @@ async def _init_vector_tables(engine: AsyncEngine) -> None:
 # --- Cycle de vie de l'engine --------------------------------------------
 
 
+def _local_engine_pool_kwargs() -> dict[str, Any]:
+    """Kwargs de pool pour le moteur SQLite LOCAL async (lus depuis la config).
+
+    Pool BORNÉ (``AsyncAdaptedQueuePool``) au lieu de ``NullPool`` : réutilise
+    les connexions chaudes — les hooks ``connect`` (PRAGMA key + PRAGMAs) ne
+    rejouent que sur une connexion physique NEUVE, pas à chaque session — et
+    PLAFONNE la concurrence (``NullPool`` ouvrait une connexion + un thread
+    aiosqlite par session, sans borne → explosion possible sous pic ou boucle).
+
+    Tailles lues dans ``config.database.local_*`` — knobs DÉDIÉS, distincts de
+    ``config.database.pool_size`` (executor de threads Sage). Les rares sessions
+    tenues pendant un ``await`` long (sync registre Ollama, ingestion
+    d'embeddings) sont des opérations à concurrence ≈ 1 → aucun risque
+    d'épuisement avec ces bornes.
+    """
+    return {
+        "poolclass": AsyncAdaptedQueuePool,
+        "pool_size": config.database.local_pool_size,
+        "max_overflow": config.database.local_max_overflow,
+        "pool_timeout": config.database.local_pool_timeout,
+    }
+
+
 async def init_database() -> AsyncEngine:
     """Initialise l'engine, la factory de sessions et applique les migrations.
 
     Idempotent et safe sous appels concurrents (verrou asyncio) — toute
     séquence ``init_database() … init_database()`` retourne le même engine.
-    Utilise ``NullPool`` : chaque session obtient une connexion fraîche,
-    fermée à la sortie du ``async with``. Cet choix évite les conflits
-    cross-event-loop et les "database is locked" dus à des connexions
-    partagées entre coroutines.
+    Le moteur utilise un pool borné (``AsyncAdaptedQueuePool``, cf.
+    ``_local_engine_pool_kwargs``) : les connexions chaudes sont réutilisées et
+    la concurrence est plafonnée. Une connexion poolée est détenue par UNE seule
+    session à la fois (jamais partagée entre coroutines), puis rendue au pool ;
+    l'engine ne sert que la boucle Tornado (les jobs ont des engines séparés via
+    ``make_sync_engine`` / ``make_async_engine``).
     """
     global _engine, _session_factory
 
@@ -2070,10 +2528,17 @@ async def init_database() -> AsyncEngine:
         if not config.database.encryption_key:
             logger.warning("⚠️ Pas de clé de chiffrement configurée (SQLCIPHER_KEY)")
 
+        # Active SQLCipher (no-op si pas de clé) AVANT create_async_engine, pour
+        # que l'import d'aiosqlite déclenché par SQLAlchemy capture le DBAPI
+        # sqlcipher3 (sinon la base chiffrée serait illisible).
+        _bind_sqlcipher_if_configured()
+
         engine = create_async_engine(
             database_url,
             echo=config.database.echo,
-            poolclass=NullPool,
+            # Sérialiseur JSON tolérant (SSoT json_safe) — cf. make_sync_engine.
+            json_serializer=dumps_safe,
+            **_local_engine_pool_kwargs(),
         )
         _register_connection_hooks(engine)
 
@@ -2305,10 +2770,67 @@ async def close_database() -> None:
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
-    """Retourne la factory de sessions ; échoue si l'init n'a pas eu lieu."""
+    """Retourne la factory de sessions active pour le contexte courant.
+
+    Honore un override posé par ``dedicated_session_scope`` (jobs lancés via
+    ``asyncio.run`` sur un thread → engine dédié à leur boucle). Sinon retourne
+    la factory globale d'``init_database`` (boucle Tornado) ; échoue si l'init
+    n'a pas eu lieu.
+    """
+    override = _session_factory_override.get()
+    if override is not None:
+        return override
     if _session_factory is None:
         raise RuntimeError("Base de données non initialisée. Appelez init_database() d'abord.")
     return _session_factory
+
+
+@asynccontextmanager
+async def dedicated_session_scope() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    """Engine async DÉDIÉ pour un job lancé via ``asyncio.run`` sur un thread.
+
+    Les jobs APScheduler tournent dans un thread worker, sur une boucle asyncio
+    NEUVE créée par ``asyncio.run``. L'engine global (``init_database``) a un pool
+    lié à la boucle Tornado : une connexion poolée porte un thread aiosqlite + des
+    futures liés à SA boucle → la réutiliser depuis la boucle du job lèverait
+    ``RuntimeError: got Future attached to a different loop`` (ou corromprait la
+    session). Ce scope crée un engine dédié à la boucle courante, fait que
+    ``get_session`` / ``get_session_factory`` l'utilisent pour la durée du job
+    (via ``_session_factory_override``), puis le dispose à la sortie.
+
+    SSoT du pattern (avant : dupliqué inline dans ``run_daily_triggers_sync``).
+
+    ⚠️ Invariant : tout ce que le job ``await`` — y compris les tasks différées
+    qu'il planifie (ex. l'audit ``EmailLog`` de ``run_then_drain_email_log``) —
+    doit s'exécuter DANS ce scope. Une task créée dans le contexte du scope hérite
+    de l'override ; une planifiée hors scope retomberait sur l'engine global
+    (cross-loop). Le wrapping enveloppe le job entier précisément pour cette raison.
+
+    Usage::
+
+        async def _job():
+            async with dedicated_session_scope():
+                await ...  # tout get_session() ici cible l'engine dédié
+        asyncio.run(_job())
+    """
+    engine = make_async_engine()
+    factory = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+    )
+    token = _session_factory_override.set(factory)
+    try:
+        yield factory
+    finally:
+        # reset AVANT dispose : l'override est restauré même si dispose lève.
+        _session_factory_override.reset(token)
+        try:
+            await engine.dispose()
+        except Exception:  # noqa: BLE001 — ne JAMAIS masquer l'exception du job
+            logger.warning(
+                "dedicated_session_scope: engine.dispose() a échoué (ressources "
+                "aiosqlite potentiellement non libérées)",
+                exc_info=True,
+            )
 
 
 @asynccontextmanager
@@ -2362,7 +2884,11 @@ __all__ = [
     "close_database",
     "get_session",
     "get_session_factory",
+    "dedicated_session_scope",
     "get_database_url",
     "get_db_url",
+    "make_sync_engine",
+    "make_async_engine",
+    "open_local_sqlite_connection",
     "execute_raw",
 ]

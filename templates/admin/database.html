@@ -499,7 +499,7 @@ document.addEventListener('click', (e) => {
         if (!window.KomptiaOnboarding || typeof window.KomptiaOnboarding.start !== 'function') return;
         try {
             window.KomptiaOnboarding.start({
-                key: 'admin_database_v1',
+                key: 'admin_database_v2',
                 title: 'Connecter Komptia à votre base de données',
                 steps: [
                     {
@@ -519,8 +519,8 @@ document.addEventListener('click', (e) => {
                     },
                     {
                         icon: 'bell',
-                        title: 'Surveiller l\'état',
-                        text: 'La colonne « Statut » de chaque ligne indique si la connexion est active et opérationnelle. Si elle tombe (réseau, serveur arrêté), Iris affiche un message clair à l\'utilisateur — sans planter ni renvoyer de résultats vides.'
+                        title: 'Suivre l\'état dans le tableau',
+                        text: 'La colonne « Statut » indique quelle connexion est utilisée : « Active » ou « Inactive ». Pour savoir si elle répond vraiment, regardez la colonne « Dernier test » (OK / Échec) — relancez « Tester » au moindre doute. Si la base devient injoignable en cours d\'usage, Iris affiche un message clair à l\'utilisateur sans planter ni renvoyer de résultats vides.'
                     }
                 ]
             });

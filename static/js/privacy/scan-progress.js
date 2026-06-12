@@ -416,7 +416,22 @@
                             var addedBdd = Number(stats.terms_added_to_bdd) || 0;
                             var filesScanned = Number(stats.files_scanned) || 0;
                             var dashboardsScanned = Number(stats.dashboards_scanned) || 0;
-                            var trunc = evt.truncated ? ' (tronqué au cap serveur)' : '';
+                            // #40 — libellé spécifique quand le cap touche les
+                            // messages Iris : enjeu confidentialité (les plus
+                            // anciens non scannés → leurs valeurs partent en clair
+                            // au LLM tant qu'elles ne sont pas configurées à la main).
+                            var trunc = '';
+                            if (evt.iris_scan_error) {
+                                // #40 review — la phase messages Iris a ÉCHOUÉ :
+                                // aucun message couvert, relancer le scan.
+                                trunc = ' (⚠ phase messages Iris NON terminée —'
+                                    + ' relancez le scan pour les couvrir)';
+                            } else if (evt.iris_truncated) {
+                                trunc = ' (cap atteint : messages Iris les plus anciens'
+                                    + ' NON scannés — configurez leurs termes manuellement)';
+                            } else if (evt.truncated) {
+                                trunc = ' (tronqué au cap serveur)';
+                            }
                             // Pas d'innerHTML avec interpolation user — on construit
                             // les nodes via createElement + textContent (CSP-safe).
                             var resultsEl = $('scan-results');
@@ -534,17 +549,21 @@
                     if (data && data.status && data.status !== 'ok' && mode === 'llm') {
                         if (typeof deps.toast === 'function') {
                             var msgByStatus = {
-                                'not_configured': 'LLM local non configuré — sélection manuelle uniquement.',
+                                'not_configured': 'LLM local non configuré — bascule sur la détection regex.',
+                                'unreachable': data.error_message
+                                    || 'LLM local injoignable (service arrêté ?) — bascule sur la détection regex.',
                                 'timeout': 'LLM local lent — chunk non classifié, retentez.',
                                 'error': data.error_message || 'Erreur LLM local — chunk non classifié.'
                             };
                             var toastMsg = msgByStatus[data.status] || ('Auto-classify : ' + data.status);
                             deps.toast(toastMsg, 'warning');
                         }
-                        // Si LLM pas configuré : bascule vers regex pour finir
-                        // le traitement (pas la peine d'envoyer les chunks
-                        // suivants au même mur).
-                        if (data.status === 'not_configured') {
+                        // LLM pas configuré OU injoignable (service éteint) :
+                        // inutile de marteler les chunks suivants au même mur.
+                        // On bascule sur la regex (qui ne dépend pas du LLM) pour
+                        // que le scan ABOUTISSE quand même — dégradation gracieuse
+                        // ET message clair, jamais un échec silencieux.
+                        if (data.status === 'not_configured' || data.status === 'unreachable') {
                             state.classifyInFlight = false;
                             return performAutoClassify('regex', deps);
                         }

@@ -19,6 +19,7 @@ Doctrine sécurité :
 """
 
 import logging
+import os
 import re
 from typing import Any, Dict, Final, List, Optional
 
@@ -38,6 +39,26 @@ from app.models.ai_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Fallback ultime de l'endpoint LLM local (Ollama), AVANT toute config admin.
+# Source unique de vérité : tous les call-sites (runtime fallback, handlers
+# admin, sync registre) passent par ce helper au lieu de hardcoder l'URL.
+# Dérivé de l'environnement (``OLLAMA_BASE_URL``) → le ``docker-compose.yml``
+# pose ``http://ollama:11434/v1`` (DNS du sidecar) sur le service app, tandis
+# qu'en dev bare-metal (variable absente) on retombe sur ``localhost``. Aucun
+# hardcode spécifique au déploiement dans le code métier (cf. règle GÉNÉRICITÉ).
+_LOCAL_LLM_BASE_URL_FALLBACK: Final[str] = "http://localhost:11434/v1"
+
+
+def default_local_llm_base_url() -> str:
+    """Endpoint LLM local par défaut (env ``OLLAMA_BASE_URL`` sinon localhost).
+
+    Utilisé UNIQUEMENT quand l'admin n'a pas configuré ``local_llm_base_url``
+    en BDD (la valeur BDD reste prioritaire). Lu dynamiquement à chaque appel
+    pour rester cohérent si l'environnement change entre deux requêtes.
+    """
+    return (os.getenv("OLLAMA_BASE_URL") or _LOCAL_LLM_BASE_URL_FALLBACK).strip()
 
 
 # Alias rétro-compatible — la source de vérité reste ``SECRET_CONFIG_KEYS``
@@ -242,6 +263,22 @@ class AIConfigService:
         """
         await self._load_cache()
 
+        key_str = key.value if isinstance(key, AIConfigKey) else key
+        return self._cache.get(key_str, default)
+
+    def get_cached_sync(self, key: AIConfigKey | str, default: Any = None) -> Any:
+        """Lecture SYNCHRONE du cache en mémoire — pour les chemins qui ne
+        peuvent PAS ``await`` (code exécuté dans ``asyncio.to_thread``).
+
+        Ne déclenche PAS de chargement BDD : si le cache n'est pas encore
+        chargé (boot à froid, avant la 1ʳᵉ lecture async), retourne ``default``.
+        Le cache étant peuplé au démarrage et à chaque requête config, le cas
+        « non chargé » est marginal — et le ``default`` reste un fallback sûr.
+        À n'utiliser QUE lorsque ``await get(...)`` est impossible ; sinon
+        préférer la version async (toujours à jour).
+        """
+        if not self._cache_loaded:
+            return default
         key_str = key.value if isinstance(key, AIConfigKey) else key
         return self._cache.get(key_str, default)
 

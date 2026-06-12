@@ -392,7 +392,7 @@
                                 {# F18 (2026-05-26) : ``<time data-fmt-local>`` pour conversion
                                    timezone côté navigateur (cf. local-datetime.js). Fallback SSR
                                    UTC explicite — sinon "16:30" trompe un user en GMT-5. #}
-                                {% if ex._username %}{{ ex._username }} &middot; {% end %}<time datetime="{{ ex.started_at.isoformat() }}" data-fmt-local="short">{{ ex.started_at.strftime('%d/%m %H:%M') }} UTC</time>{% if ex.duration_seconds %} &middot; {{ "%.1f" % ex.duration_seconds }}s{% end %}
+                                {% if ex._username %}{{ ex._username }} &middot; {% end %}<time datetime="{{ iso_utc(ex.started_at) }}" data-fmt-local="short">{{ ex.started_at.strftime('%d/%m %H:%M') }} UTC</time>{% if ex.duration_seconds %} &middot; {{ "%.1f" % ex.duration_seconds }}s{% end %}
                             </p>
                         </div>
                         <span class="text-[9px] font-medium px-1.5 py-0.5 rounded {% if ex.status == 'success' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300{% elif ex.status == 'failed' %}bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300{% elif ex.status == 'running' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300{% else %}bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300{% end %}">
@@ -425,7 +425,7 @@
                             <p class="text-xs text-gray-900 truncate dark:text-gray-100">{{ s.question }}</p>
                             <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate">
                                 {# F18 (2026-05-26) : ``<time data-fmt-local>`` pour conversion timezone. #}
-                                {{ s._username }} &middot; <time datetime="{{ s.created_at.isoformat() }}" data-fmt-local="short">{{ s.created_at.strftime('%d/%m %H:%M') }} UTC</time>{% if s.result_count is not None %} &middot; {{ s.result_count }} r.{% end %}{% if s.generation_time %} &middot; {{ "%.1f" % s.generation_time }}s{% end %}
+                                {{ s._username }} &middot; <time datetime="{{ iso_utc(s.created_at) }}" data-fmt-local="short">{{ s.created_at.strftime('%d/%m %H:%M') }} UTC</time>{% if s.result_count is not None %} &middot; {{ s.result_count }} r.{% end %}{% if s.generation_time %} &middot; {{ "%.1f" % s.generation_time }}s{% end %}
                             </p>
                         </div>
                         {% if s.feedback == 'positive' %}<span class="text-[10px]"><i class="bi bi-hand-thumbs-up"></i></span>{% elif s.feedback == 'negative' %}<span class="text-[10px]"><i class="bi bi-hand-thumbs-down"></i></span>{% end %}
@@ -471,7 +471,7 @@
                     {% for e in recent_errors %}
                     <li class="px-4 py-1.5">
                         <p class="text-xs text-red-600 truncate dark:text-red-400">{{ e.question }}</p>
-                        <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate">{# F18 #}{{ e._username }} &middot; <time datetime="{{ e.created_at.isoformat() }}" data-fmt-local="short">{{ e.created_at.strftime('%d/%m %H:%M') }} UTC</time></p>
+                        <p class="text-[10px] text-gray-400 dark:text-gray-500 truncate">{# F18 #}{{ e._username }} &middot; <time datetime="{{ iso_utc(e.created_at) }}" data-fmt-local="short">{{ e.created_at.strftime('%d/%m %H:%M') }} UTC</time></p>
                     </li>
                     {% end %}
                 </ul>
@@ -542,29 +542,29 @@ window.DashboardCharts.mount({ isAdmin: true });
 {% if show_onboarding %}
 if (window.KomptiaOnboarding) {
     window.KomptiaOnboarding.start({
-        key: 'dashboard_admin_v1',
+        key: 'dashboard_admin_v2',
         title: 'Configuration administrateur',
         steps: [
             {
                 icon: 'sparkle',
                 title: 'Vous êtes administrateur',
-                text: 'Votre rôle vous donne accès à la configuration de l\'application, à la supervision des utilisateurs et aux paramètres de l\'intelligence artificielle. Les utilisateurs standards n\'ont accès qu\'à leur propre espace.',
+                text: 'Votre rôle vous donne accès à la configuration de l\'application, à la supervision des utilisateurs et aux paramètres de l\'intelligence artificielle. Les utilisateurs standards n\'ont accès qu\'à leur propre espace.'
             },
             {
                 icon: 'chart',
                 title: 'Configurez la base de données',
-                text: 'Allez dans « Base de données » dans le menu de gauche pour relier Komptia à votre base de données métier (SQL Server). Sans cette connexion active, Iris ne peut pas répondre aux questions métier.',
+                text: 'Allez dans « Base de données » dans le menu de gauche pour relier Komptia à votre base de données métier (SQL Server). Sans cette connexion active, Iris ne peut pas répondre aux questions métier.'
             },
             {
                 icon: 'bell',
                 title: 'Surveillez l\'activité en temps réel',
-                text: 'Les indicateurs « Sécurité & supervision » remontent les sessions actives, les connexions échouées (au-delà de {{ security_stats.get("failed_logins_threshold", 20) }} = alerte), les quotas dépassés et les exécutions bloquées. Survolez le « i » de chaque indicateur pour le détail.',
+                text: 'La section « Sécurité & supervision temps réel » remonte les sessions actives, les connexions échouées (au-delà de {{ security_stats.get("failed_logins_threshold", 20) }} = alerte), les quotas dépassés et les exécutions bloquées. Survolez le libellé de chaque indicateur pour afficher son explication détaillée.'
             },
             {
                 icon: 'rocket',
                 title: 'Créez les comptes utilisateurs',
-                text: 'Allez dans « Utilisateurs » pour créer des comptes. Définissez le rôle (administrateur ou utilisateur), le quota de stockage et les permissions. Les utilisateurs apparaîtront ensuite dans le tableau « Suivi des utilisateurs » plus bas.',
-            },
+                text: 'Allez dans « Utilisateurs » pour créer des comptes. Définissez le rôle (administrateur ou utilisateur), le quota de stockage et les permissions. Les comptes apparaîtront ensuite dans le tableau « Monitoring utilisateurs » plus bas.'
+            }
         ],
     });
 }

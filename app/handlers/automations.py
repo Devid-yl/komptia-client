@@ -42,7 +42,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import tornado.web
 from sqlalchemy import case, func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
@@ -85,6 +85,34 @@ from app.utils.validators import (
 logger = get_logger(__name__)
 
 
+# AUTO-1 — exécutions manuelles en fire-and-forget : strong-refs sur les tasks
+# de fond (asyncio ne garde qu'une weak-ref → GC possible avant la fin sans ça).
+_MANUAL_EXEC_TASKS: "set[asyncio.Task]" = set()
+
+
+async def _run_manual_automation_bg(automation_id: int, user_id: int, name: str) -> None:
+    """Lance le run manuel via la SSoT ``execute_automation`` (sérialisée par le
+    lock per-automation) SANS bloquer la requête HTTP. Le panneau « En cours »
+    (poller /api/executions/running) suit la progression ; l'issue est tracée
+    via le modèle ``Execution``. Best-effort : on logge, on ne propage jamais."""
+    try:
+        result = await execute_automation(
+            automation_id,
+            manual=True,
+            trigger_source="manual",
+            triggered_by_user_id=user_id,
+        )
+        if not result.get("success"):
+            logger.warning(
+                "Exécution manuelle « %s » terminée en échec : %s",
+                name,
+                result.get("error"),
+                extra={"automation_id": automation_id},
+            )
+    except Exception:  # noqa: BLE001 — tâche détachée : ne jamais propager
+        logger.exception("Exécution manuelle « %s » : crash inattendu", name)
+
+
 # ── Constantes locales ────────────────────────────────────────
 # Valeurs techniques proprement typees et partagees entre handlers. Elles ne
 # dependent ni du client ni de l'environnement (les seuils business pilotes
@@ -106,6 +134,12 @@ MAX_STEPS_PER_IMPORT: int = 50
 MAX_EDGES_PER_IMPORT: int = 200
 MAX_REORDER_STEPS: int = 100
 MAX_RUNNING_DISPLAY: int = 10
+
+#: AUTO-3 — fenêtre (s) pendant laquelle une exécution TERMINÉE reste remontée au
+#: moniteur frontend avec son VRAI statut (success/failed/partial/cancelled),
+#: pour qu'un run disparu de la liste « running » n'apparaisse pas faussement
+#: « terminé » en vert. Doit couvrir l'intervalle de poll (3–15 s) + du slack.
+_RECENT_FINISHED_WINDOW_SECONDS: int = 60
 MAX_HISTORY_DAYS: int = 365
 DEFAULT_HISTORY_DAYS: int = 7
 MAX_IMPORT_FILE_BYTES: int = 512 * 1024
@@ -443,8 +477,22 @@ async def _bump_version_and_set_etag(
     current = int(automation.version or 1)
     new_version = await _cas_bump_automation_version(session, automation.id, current)
     if new_version is None:
-        # Race avec un autre commit (multi-instance ou autre handler).
-        # Relire pour donner au client la version exacte.
+        # Race avec un autre commit (multi-instance ou autre handler) : la
+        # version BDD a bougé → la CAS a matché 0 ligne.
+        #
+        # ⚠️ ROLLBACK OBLIGATOIRE avant d'émettre le 409 (fix consolidé
+        # 2026-06-10). ``db_session()`` (base.py) COMMIT sur sortie NORMALE du
+        # bloc ``async with`` (``yield`` puis ``session.commit()``), et tous les
+        # callers font ``return`` sur ce ``None``. Sans rollback ici, la
+        # mutation déjà ``flush``ée (step/edge ajouté) serait PERSISTÉE alors
+        # qu'on répond 409 « rejeté » → changement commité sans bump de version
+        # + réponse d'échec = incohérence (donnée fausse silencieuse cross-tab).
+        # Le rollback garantit la sémantique « conflit → rien n'est persisté →
+        # le client retry sur l'état à jour ». Corrige les 8 call-sites d'un
+        # coup (SSoT du bump optimiste).
+        await session.rollback()
+        # Relire APRÈS rollback pour donner au client la version exacte (le
+        # rollback a expiré l'identity-map → ``get`` re-SELECT la vraie valeur).
         refreshed = await session.get(Automation, automation.id)
         current_db = int(refreshed.version) if refreshed else current
         _emit_version_conflict(handler, current_db)
@@ -668,12 +716,25 @@ async def _safe_error_for_user(
         return sanitized
 
 
-def _validate_step_config(step_type: str, config: dict) -> Optional[str]:
-    """Refuse les cles de config inconnues pour le type d'etape donne.
+# Cap des champs config libres de type "text" (body email, instructions
+# copilot/iris, prompt rapport). Aligne sur la convention email pro
+# ``contact_mailer_service.MAX_EMAIL_BODY_LENGTH = 10_000`` (constante non
+# importee : ce cap couvre TOUS les champs texte de step, pas que les emails).
+# Donnees reelles : la plus grosse config persistee fait < 400 caracteres —
+# le cap protege la colonne JSON et les emails sortants (croissance non
+# bornee, axe 21) sans jamais toucher un usage legitime.
+_TEXT_CONFIG_MAX_CHARS = 10_000
 
-    Consulte ``STEP_TYPE_META[step_type].config_schema`` — une cle hors
-    schema est rejetee a la source (evite qu'un client malicieux pousse des
-    champs arbitraires dans la JSON BDD, exploitables en aval).
+
+def _validate_step_config(step_type: str, config: dict) -> Optional[str]:
+    """Valide la config d'un step contre ``STEP_TYPE_META[step_type]``.
+
+    - Cles inconnues : rejetees a la source (evite qu'un client malicieux
+      pousse des champs arbitraires dans la JSON BDD, exploitables en aval).
+    - Champs de type ``text`` (textarea libre) : doivent etre des str
+      (ou None/absents) et tenir sous ``_TEXT_CONFIG_MAX_CHARS`` — un body
+      multi-Mo pousse via l'API gonflerait la colonne JSON et chaque email
+      envoye (self-DoS stockage/deliverabilite).
     Retourne un message d'erreur en cas de probleme, None sinon.
     """
     try:
@@ -688,6 +749,16 @@ def _validate_step_config(step_type: str, config: dict) -> Optional[str]:
     extra = set(config.keys()) - allowed_keys
     if extra:
         return f"Cles de config inconnues pour {step_type}: {', '.join(sorted(extra))}"
+    for key, spec in schema.items():
+        if spec.get("type") != "text" or key not in config:
+            continue
+        val = config[key]
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            return f"Le champ « {key} » doit etre du texte."
+        if len(val) > _TEXT_CONFIG_MAX_CHARS:
+            return f"Le champ « {key} » depasse {_TEXT_CONFIG_MAX_CHARS} caracteres ({len(val)})."
     return None
 
 
@@ -1304,6 +1375,53 @@ class AutomationToggleHandler(AuthenticatedHandler):
                         )
                         return
 
+                    # #21 fix 2026-06-11 — refs mortes (fail-fast à l'activation).
+                    # validate_all (structurel) ne peut PAS vérifier l'existence des
+                    # fichiers /datastore référencés (aucun accès FS). Un step
+                    # load_workbook (config 'path') ou load_saved_query (config
+                    # 'sql_path') pointant un fichier SUPPRIMÉ passait l'activation
+                    # puis ÉCHOUAIT au run (souvent planifié → découvert tard). On
+                    # vérifie ici (accès session + user_id) que les refs des steps
+                    # ENABLED existent (les disabled sont ignorés au runtime, comme
+                    # validate_all). Limite connue : un fichier supprimé APRÈS
+                    # activation → le run échouera proprement (ValueError claire) ;
+                    # ce check ne couvre que l'état au moment du toggle.
+                    from app.handlers.datastore import _safe_path, _user_dir
+
+                    _ref_fields = {"load_workbook": "path", "load_saved_query": "sql_path"}
+                    _user_dir_path = _user_dir(automation.user_id)
+                    _dead_refs = []
+                    for _s in automation.steps:
+                        if not getattr(_s, "is_enabled", True):
+                            continue
+                        _stype = (
+                            _s.step_type.value if hasattr(_s.step_type, "value") else _s.step_type
+                        )
+                        _field = _ref_fields.get(_stype)
+                        if not _field:
+                            continue
+                        _rel = ((_s.config or {}).get(_field) or "").strip()
+                        if not _rel:
+                            # Config incomplète : déjà du ressort de validate_all.
+                            continue
+                        _target = _safe_path(_user_dir_path, _rel)
+                        if _target is None or not _target.exists() or not _target.is_file():
+                            _dead_refs.append({"step": _s.name, "path": _rel})
+                    if _dead_refs:
+                        self.set_status(400)
+                        self.write(
+                            {
+                                "success": False,
+                                "error": (
+                                    "Activation refusee : une ou plusieurs etapes "
+                                    "referencent un fichier /datastore introuvable "
+                                    "(supprime ou deplace). Corrigez-les avant d'activer."
+                                ),
+                                "dead_refs": _dead_refs,
+                            }
+                        )
+                        return
+
                 automation.is_active = would_activate
                 new_is_active = automation.is_active
                 auto_id = automation.id
@@ -1479,7 +1597,7 @@ def _parse_iso_datetime(value: Any) -> datetime:
 
     Le navigateur envoie ``YYYY-MM-DDTHH:MM`` sans timezone — on l'accepte
     tel quel (datetime naive) ; APScheduler interprete via la TZ du
-    scheduler (Europe/Paris) au moment du fire. Une string aware est
+    scheduler (TZ serveur dynamique) au moment du fire. Une string aware est
     egalement acceptee si le client la fournit.
     """
     if isinstance(value, datetime):
@@ -1489,6 +1607,14 @@ def _parse_iso_datetime(value: Any) -> datetime:
     s = value.strip()
     if not s:
         raise ValueError("Date/heure requise.")
+    # TZ-2 (#48) — le frontend envoie désormais l'heure en UTC via
+    # ``Date.toISOString()`` (suffixe 'Z'). ``datetime.fromisoformat`` n'accepte
+    # 'Z' qu'à partir de Python 3.11 → on normalise en '+00:00' pour rester
+    # compatible 3.10. Une string UTC aware ainsi parsée ne sera PAS re-localisée
+    # en TZ serveur par l'appelant (tzinfo non-None) → l'instant absolu voulu par
+    # l'utilisateur est préservé, indépendamment du fuseau serveur.
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
     try:
         return datetime.fromisoformat(s)
     except ValueError as e:
@@ -1533,6 +1659,21 @@ def _validate_schedule_payload(
 
     if schedule_type == "once":
         run_date_dt = _parse_iso_datetime(schedule_config.get("run_date"))
+        # TZ-2 (#48, revue adversariale) — DEFENSE-IN-DEPTH : le frontend envoie
+        # désormais TOUJOURS l'heure en UTC (Date.toISOString → 'Z'). Un client
+        # buggé/malveillant qui fournirait un offset NON-UTC (ex. '+05:00')
+        # programmerait le run à un instant FAUX SILENCIEUX (APScheduler honore
+        # l'offset). On fail-closed : une valeur AWARE doit être en UTC. Le naïf
+        # legacy reste localisé en TZ serveur ci-dessous (rétro-compat).
+        if (
+            run_date_dt.tzinfo is not None
+            and run_date_dt.utcoffset() is not None
+            and run_date_dt.utcoffset().total_seconds() != 0  # type: ignore[union-attr]
+        ):
+            raise ValueError(
+                "L'heure doit être en UTC (le navigateur la convertit "
+                "automatiquement). Offset non-UTC refusé."
+            )
         # Si l'utilisateur n'a pas specifie de TZ (datetime naif), on assume
         # la TZ machine (config.timezone). Sans ca, le datetime serait
         # interprete par APScheduler comme UTC ou comme une autre TZ
@@ -1970,8 +2111,15 @@ class AutomationDeleteHandler(AuthenticatedHandler):
                 was_active = automation.is_active
                 name = automation.name
                 auto_id = automation.id
-                if was_active:
-                    await unschedule_automation(auto_id)
+                # #32 fix 2026-06-11 — déprogrammer INCONDITIONNELLEMENT (avant :
+                # seulement `if was_active`). Un job APScheduler orphelin peut
+                # survivre sur une auto ``is_active=False`` (toggle-off dont
+                # l'unschedule a échoué en silence, job stale persisté par le
+                # SQLAlchemyJobStore, race) → sans ce retrait au delete, le job
+                # re-fire après ``misfire_grace_time`` sur une auto SUPPRIMÉE.
+                # ``unschedule_automation`` est idempotent (job absent → False,
+                # exception catchée → False, jamais de raise) donc sûr ici.
+                await unschedule_automation(auto_id)
 
                 await _audit_automation_event(
                     self,
@@ -3039,31 +3187,28 @@ class AutomationExecuteHandler(AuthenticatedHandler):
                 )
                 await session.commit()
 
-            result = await execute_automation(
-                automation_id_int,
-                manual=True,
-                trigger_source="manual",
-                triggered_by_user_id=self.current_user.id,
+            # AUTO-1 — fire-and-forget : on dispatche le run en tâche de fond
+            # (même SSoT ``execute_automation``, sérialisée par le lock
+            # per-automation) et on rend la main IMMÉDIATEMENT. Avant, on
+            # awaitait tout le run (extract+LLM+PDF+email, parfois plusieurs
+            # minutes) en tenant la requête HTTP → bouton figé, message
+            # « lancée » mensonger, et un 504 proxy → retry nginx → DOUBLE envoi
+            # mail. Le panneau « En cours » (poller /api/executions/running)
+            # suit la progression ; « Exécution lancée » devient donc VRAI.
+            _task = asyncio.create_task(
+                _run_manual_automation_bg(
+                    automation_id_int, self.current_user.id, auto_name
+                ),
+                name=f"manual-exec-{automation_id_int}",
             )
-
-            if result.get("success"):
-                logger.info(
-                    "Execution manuelle lancee pour %s",
-                    auto_name,
-                    extra={
-                        "automation_id": automation_id_int,
-                        "execution_id": result.get("execution_id"),
-                    },
-                )
-                self.write(
-                    {
-                        "success": True,
-                        "execution_id": result.get("execution_id"),
-                        "message": "Execution lancee avec succes",
-                    }
-                )
-            else:
-                self.write({"success": False, "error": result.get("error", "Erreur inconnue")})
+            _MANUAL_EXEC_TASKS.add(_task)
+            _task.add_done_callback(_MANUAL_EXEC_TASKS.discard)
+            logger.info(
+                "Execution manuelle dispatchée pour %s",
+                auto_name,
+                extra={"automation_id": automation_id_int},
+            )
+            self.write({"success": True, "message": "Exécution lancée"})
 
         except tornado.web.HTTPError:
             raise
@@ -3194,8 +3339,8 @@ class AutomationExecutionsAPIHandler(AuthenticatedHandler):
                         {
                             "id": ex.id,
                             "status": ex.status,
-                            "started_at": ex.started_at.isoformat() if ex.started_at else None,
-                            "finished_at": (ex.finished_at.isoformat() if ex.finished_at else None),
+                            "started_at": clock.iso_utc(ex.started_at),
+                            "finished_at": clock.iso_utc(ex.finished_at),
                             "duration_seconds": ex.duration_seconds,
                             "result_rows": ex.result_rows,
                             "output_filename": (
@@ -3781,7 +3926,7 @@ class AutomationStepsAPIHandler(AuthenticatedHandler):
         try:
             async with self.db_session() as session:
                 # S4 — Ownership 404 d'abord, rate-limit apres (helper combo).
-                await _get_owned_then_rate_limit(
+                automation = await _get_owned_then_rate_limit(
                     session,
                     auto_id,
                     self.current_user.id,
@@ -3877,6 +4022,18 @@ class AutomationStepsAPIHandler(AuthenticatedHandler):
                         "step_type": step_type,
                     },
                 )
+                # T4 2026-06-10 — bumper la version (cohérence optimistic-lock).
+                # Créer un nœud change la structure → les autres onglets doivent
+                # être invalidés (avant ce fix, POST /steps ne bumpait PAS la
+                # version, donc un autre onglet ignorait l'ajout = trou cross-tab).
+                # Pas de `_check_if_match_or_409` ici : la création reste
+                # PERMISSIVE (un client à version périmée peut quand même créer un
+                # nœud) ; le CAS depuis la version chargée n'échoue que sur une
+                # vraie race serveur concurrente → 409 émis, on rollback (le
+                # client re-synchronise via le handler de conflit côté canvas).
+                new_version = await _bump_version_and_set_etag(self, session, automation)
+                if new_version is None:
+                    return  # 409 version_conflict émis ; le context rollback
                 await session.commit()
                 await session.refresh(step)
                 step_dict = step.to_dict()
@@ -3890,7 +4047,7 @@ class AutomationStepsAPIHandler(AuthenticatedHandler):
             from app.services.anonymization.auto_scan import schedule_target_rescan
 
             schedule_target_rescan(self.current_user.id, "automation", auto_id)
-            self.write({"success": True, "step": step_dict})
+            self.write({"success": True, "step": step_dict, "version": new_version})
 
         except tornado.web.HTTPError:
             raise
@@ -3927,6 +4084,10 @@ class AutomationStepDetailAPIHandler(AuthenticatedHandler):
                 step = await session.get(AutomationStep, s_id)
                 if not step or step.automation_id != auto_id:
                     raise tornado.web.HTTPError(404, "Etape non trouvee")
+
+                # #25 — état AVANT modif, pour détecter une VRAIE réactivation
+                # (False→True) distincte d'un autosave no-op (True→True).
+                _was_enabled = step.is_enabled
 
                 if "name" in body:
                     name = (body["name"] or "").strip()[:MAX_NAME_LENGTH]
@@ -3988,6 +4149,72 @@ class AutomationStepDetailAPIHandler(AuthenticatedHandler):
                     self.set_status(400)
                     self.write({"success": False, "error": "; ".join(errors)})
                     return
+
+                # #25 fix 2026-06-11 — réactiver un step (is_enabled False→True)
+                # sur une auto ACTIVE doit garder le DAG valide. Avant, le PUT ne
+                # validait QUE le step seul en ``partial=True`` (configs incomplètes
+                # tolérées) → un step réactivé avec config incomplète (ou créant un
+                # double-envoi / orphelin) rendait l'auto active invalide → ÉCHEC
+                # silencieux au prochain run planifié. On re-valide le DAG complet
+                # (symétrie avec l'activation, AutomationToggleHandler) UNIQUEMENT
+                # sur une vraie transition False→True — PAS un autosave no-op
+                # True→True qui spammerait des 400 en plein édition canvas. Les
+                # ``select`` ci-dessous renvoient — via l'IDENTITY MAP — la MÊME
+                # instance ``step`` déjà chargée par ``session.get`` et mutée en
+                # mémoire (``is_enabled=True``/config), donc la re-validation voit
+                # bien l'état post-édition. (NB : la session est ``autoflush=False``,
+                # ce n'est PAS un flush qui assure la fraîcheur mais l'identity map ;
+                # ne pas s'appuyer sur un autoflush inexistant.) Un rollback annule
+                # ensuite la mutation en attente si la validation échoue.
+                if automation.is_active and _was_enabled is False and step.is_enabled is True:
+                    from app.services.automation.dag_validator import (
+                        errors_to_json,
+                        validate_all,
+                    )
+
+                    _re_nodes_q = await session.execute(
+                        select(AutomationStep).where(AutomationStep.automation_id == auto_id)
+                    )
+                    _re_edges_q = await session.execute(
+                        select(AutomationEdge).where(AutomationEdge.automation_id == auto_id)
+                    )
+                    _re_nodes = [
+                        {
+                            "id": s.id,
+                            "step_type": (
+                                s.step_type.value if hasattr(s.step_type, "value") else s.step_type
+                            ),
+                            "name": s.name,
+                            "config": s.config or {},
+                            "is_enabled": s.is_enabled,
+                        }
+                        for s in _re_nodes_q.scalars().all()
+                    ]
+                    _re_edges = [
+                        {
+                            "id": e.id,
+                            "from_step_id": e.from_step_id,
+                            "to_step_id": e.to_step_id,
+                            "data_type": e.data_type,
+                        }
+                        for e in _re_edges_q.scalars().all()
+                    ]
+                    _re_errors = list(validate_all(_re_nodes, _re_edges, for_activation=True))
+                    if _re_errors:
+                        await session.rollback()
+                        self.set_status(400)
+                        self.write(
+                            {
+                                "success": False,
+                                "error": (
+                                    "Reactivation refusee : reactiver cette etape rendrait "
+                                    "l'automatisation active invalide. Desactivez "
+                                    "l'automatisation pour l'editer, ou completez l'etape d'abord."
+                                ),
+                                "errors": errors_to_json(_re_errors),
+                            }
+                        )
+                        return
 
                 # Cluster-N — Step 2/2 : bump APRÈS validate(partial=True)
                 # (le 400 ci-dessus n'a alors pas créé d'ETag fantôme).
@@ -4162,6 +4389,7 @@ class AutomationStepsReorderAPIHandler(AuthenticatedHandler):
             async with self.db_session() as session:
                 await _get_owned_automation_or_404(session, auto_id, self.current_user.id)
 
+                applied = []
                 for order, raw_step_id in enumerate(step_ids):
                     try:
                         sid = int(raw_step_id)
@@ -4170,6 +4398,23 @@ class AutomationStepsReorderAPIHandler(AuthenticatedHandler):
                     step = await session.get(AutomationStep, sid)
                     if step and step.automation_id == auto_id:
                         step.step_order = order
+                        applied.append(sid)
+
+                # V11 (2026-06-10) — Audit STEP_REORDER. Toute mutation de la
+                # structure du DAG doit être traçable (compliance, comme
+                # STEP_CREATE/UPDATE/DELETE). La constante AuditAction.STEP_REORDER
+                # existait mais n'était jamais appelée ici (seul handler de
+                # mutation non audité). Auditer SEULEMENT si des étapes ont
+                # réellement bougé (pas de spam audit_logs sur un payload no-op),
+                # même pattern que AutomationLayoutAPIHandler.
+                if applied:
+                    await _audit_automation_event(
+                        self,
+                        session,
+                        action=AuditAction.STEP_REORDER,
+                        entity_id=auto_id,
+                        details={"step_ids": applied, "count": len(applied)},
+                    )
 
                 await session.commit()
 
@@ -4205,7 +4450,12 @@ class RunningExecutionsAPIHandler(AuthenticatedHandler):
                     .join(Automation, Automation.id == Execution.automation_id)
                     .where(
                         Automation.user_id == self.current_user.id,
-                        Execution.status.in_(["pending", "running"]),
+                        # ENGINE-3-ux (#49) — inclure 'waiting' : un run suspendu sur
+                        # un step email_wait_response ne doit PAS disparaître du
+                        # moniteur (sinon l'user croit qu'il a fini/planté). Le
+                        # frontend le rend avec un badge « en attente d'une réponse
+                        # par email ». Le champ ``status`` est déjà exposé ci-dessous.
+                        Execution.status.in_(["pending", "running", "waiting"]),
                     )
                     .options(joinedload(Execution.automation).selectinload(Automation.steps))
                     .order_by(Execution.started_at.desc())
@@ -4272,7 +4522,7 @@ class RunningExecutionsAPIHandler(AuthenticatedHandler):
                             "automation_id": ex.automation_id,
                             "automation_name": ex.automation.name if ex.automation else "?",
                             "status": ex.status,
-                            "started_at": ex.started_at.isoformat() if ex.started_at else None,
+                            "started_at": clock.iso_utc(ex.started_at),
                             "elapsed_seconds": elapsed_seconds,
                             "total_steps": total_steps,
                             "completed_steps": completed,
@@ -4283,11 +4533,42 @@ class RunningExecutionsAPIHandler(AuthenticatedHandler):
                         }
                     )
 
+                # AUTO-3 — exécutions TERMINÉES récemment (fenêtre courte) avec
+                # leur VRAI statut. Le moniteur frontend les utilise pour
+                # afficher « terminée » / « ÉCHOUÉE » / « annulée » correctement
+                # quand un run disparaît de la liste running, au lieu d'un
+                # « terminée » vert systématique (un échec passait pour un succès).
+                _recent_cutoff = clock.now() - timedelta(
+                    seconds=_RECENT_FINISHED_WINDOW_SECONDS
+                )
+                recent_result = await session.execute(
+                    select(Execution)
+                    .join(Automation, Automation.id == Execution.automation_id)
+                    .where(
+                        Automation.user_id == self.current_user.id,
+                        Execution.status.in_(["success", "failed", "partial", "cancelled"]),
+                        Execution.finished_at.is_not(None),
+                        Execution.finished_at >= _recent_cutoff,
+                    )
+                    .options(joinedload(Execution.automation))
+                    .order_by(Execution.finished_at.desc())
+                    .limit(MAX_RUNNING_DISPLAY)
+                )
+                recently_finished = [
+                    {
+                        "execution_id": ex.id,
+                        "automation_name": ex.automation.name if ex.automation else "?",
+                        "status": ex.status,
+                    }
+                    for ex in recent_result.scalars().unique().all()
+                ]
+
             self.write(
                 {
                     "success": True,
                     "running": running_data,
                     "count": len(running_data),
+                    "recently_finished": recently_finished,
                 }
             )
 
@@ -4349,8 +4630,8 @@ class ExecutionStepsAPIHandler(AuthenticatedHandler):
                             "attempt_number": s.attempt_number,
                             "status": s.status,
                             "trace_id": s.trace_id,
-                            "started_at": s.started_at.isoformat() if s.started_at else None,
-                            "finished_at": s.finished_at.isoformat() if s.finished_at else None,
+                            "started_at": clock.iso_utc(s.started_at),
+                            "finished_at": clock.iso_utc(s.finished_at),
                             "duration_ms": s.duration_ms,
                             "rows_in": s.rows_in,
                             "rows_out": s.rows_out,
@@ -4489,6 +4770,10 @@ class AutomationEditHandler(AuthenticatedHandler):
             automation_id=auto_id_val,
             automation_name=name,
             page_title=f"Edition — {name}",
+            # TZ-1 — nom de la TZ serveur DYNAMIQUE (SSoT clock.machine_tz_name,
+            # honore l'override admin config.server.timezone). Remplace le
+            # hardcode « Europe/Paris » qui était faux hors de Paris.
+            server_timezone=clock.machine_tz_name(),
         )
 
 
@@ -4962,13 +5247,19 @@ class AutomationEdgesAPIHandler(AuthenticatedHandler):
         try:
             async with self.db_session() as session:
                 # S4 — Ownership 404 d'abord, rate-limit apres (helper combo).
-                await _get_owned_then_rate_limit(
+                automation = await _get_owned_then_rate_limit(
                     session,
                     auto_id,
                     self.current_user.id,
                     _edges_write_limiter,
                     *RATE_LIMIT_EDGES_WRITE,
                 )
+                # EDGE-1 — fail-fast If-Match AVANT mutation (cohérent avec
+                # PUT /steps). Sans ça, un autre onglet ayant modifié le DAG
+                # entre-temps verrait sa connexion créée sur une version périmée
+                # → désync silencieuse multi-onglets. Read-only : check tôt OK.
+                if not _check_if_match_or_409(self, automation):
+                    return
 
                 # Verifier que les deux steps appartiennent bien a cette automation
                 steps_result = await session.execute(
@@ -5063,6 +5354,13 @@ class AutomationEdgesAPIHandler(AuthenticatedHandler):
                         "data_type": data_type,
                     },
                 )
+                # EDGE-1 — bump version (optimistic concurrency) en DERNIER acte
+                # avant commit : pose l'ETag que le client ré-hydrate, et fait
+                # 409 les prochaines mutations des autres onglets (qui n'ont pas
+                # cette arête) → ils savent qu'ils doivent resynchroniser.
+                new_version = await _bump_version_and_set_etag(self, session, automation)
+                if new_version is None:
+                    return  # 409 émis (race CAS multi-instance)
                 await session.commit()
                 await session.refresh(edge)
                 edge_dict = edge.to_dict()
@@ -5074,10 +5372,29 @@ class AutomationEdgesAPIHandler(AuthenticatedHandler):
                 data_type,
                 auto_id,
             )
-            self.write({"success": True, "edge": edge_dict})
+            # ``version`` dans le JSON comme les autres mutations (PUT/DELETE
+            # steps & edges) : POST /edges était la SEULE mutation dont le 200
+            # ne portait la nouvelle version que via le header ETag — un proxy
+            # qui réécrit l'ETag rendait le client stale (revue 2026-06-12).
+            self.write({"success": True, "edge": edge_dict, "version": new_version})
 
         except tornado.web.HTTPError:
             raise
+        except IntegrityError:
+            # EDGE-2 — un edge dupliqué (même from_step_id/to_step_id) viole la
+            # contrainte unique ``uq_automation_edge_from_to``. C'est une erreur
+            # MÉTIER prévisible (la connexion existe déjà), pas une panne serveur :
+            # on répond 409 Conflict actionnable au lieu d'un 500 opaque. Couvre
+            # aussi la course multi-onglets (deux ajouts concurrents du même edge,
+            # le 2ᵉ flush lève IntegrityError après le pré-check structural).
+            logger.info(
+                "Arete DAG dupliquee refusee (%s -> %s) pour automation %s",
+                from_step_id,
+                to_step_id,
+                automation_id,
+            )
+            self.set_status(409)
+            self.write({"success": False, "error": "Cette connexion existe déjà."})
         except SQLAlchemyError:
             logger.error("Erreur creation arete automation %s", automation_id, exc_info=True)
             self.set_status(500)
@@ -5616,8 +5933,20 @@ class ExecutionLogsCSVHandler(AuthenticatedHandler):
                             "step_type": se.step_type,
                             "status": se.status,
                             "attempt_number": se.attempt_number,
-                            "started_at": (se.started_at.isoformat() if se.started_at else ""),
-                            "finished_at": (se.finished_at.isoformat() if se.finished_at else ""),
+                            # Export CSV (fichier hors-ligne, AUCUNE couche JS
+                            # pour reconvertir) → heure SERVEUR (doctrine
+                            # « exports → heure serveur »), pas l'ISO UTC brut
+                            # (l'utilisateur ouvre dans Excel et verrait l'UTC).
+                            "started_at": (
+                                clock.format_local_fr(se.started_at, with_time=True)
+                                if se.started_at
+                                else ""
+                            ),
+                            "finished_at": (
+                                clock.format_local_fr(se.finished_at, with_time=True)
+                                if se.finished_at
+                                else ""
+                            ),
                             "duration_ms": se.duration_ms or 0,
                             "rows_in": se.rows_in or 0,
                             "rows_out": se.rows_out or 0,

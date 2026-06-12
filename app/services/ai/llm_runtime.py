@@ -153,7 +153,7 @@ class LLMCallError(Exception):
         cause: Optional[BaseException] = None,
     ):
         super().__init__(message)
-        self.kind = kind  # "overloaded" | "rate_limit" | "network" | "generic"
+        self.kind = kind  # "overloaded" | "rate_limit" | "network" | "unreachable" | "generic"
         self.cause = cause
 
 
@@ -329,6 +329,12 @@ def _build_llm_request(
         max_tokens=max_tokens,
         options=dict(user_request.options) if user_request.options else {},
         prompt_cache_prefix=user_request.prompt_cache_prefix,
+        # #19a (triage anonymisation 2026-06-10) — ce rebuild DROPPAIT
+        # user_id : la couche 2 provider (pseudonymizer /data-privacy,
+        # appliquée par generate() ssi request.user_id) était neutralisée
+        # pour TOUT caller passant par call_llm, notamment le
+        # prompt_cache_prefix de result_assistant (valeurs réelles).
+        user_id=user_request.user_id,
     )
 
 
@@ -471,6 +477,23 @@ def _map_error_to_user_message(exc: BaseException) -> LLMCallError:
         return LLMCallError(
             "Timeout sur l'appel LLM. Réessaie ou simplifie ta demande.",
             kind="network",
+            cause=exc,
+        )
+
+    # Connexion REFUSÉE / endpoint injoignable (≠ timeout) : le service LLM
+    # n'est pas là (typiquement Ollama local arrêté). Kind distinct
+    # ``"unreachable"`` pour que les callers (improve_pseudo, auto_classify)
+    # FAIL-FAST au lieu de réduire le chunk / retenter — réduire la taille ne
+    # fait pas réapparaître un service éteint (c'était 28 s de grind inutile).
+    # ⚠️ ``httpx.ConnectError`` ⊂ ``httpx.NetworkError`` et
+    # ``ConnectionRefusedError`` ⊂ ``ConnectionError`` ⊂ ``OSError`` : cette
+    # branche DOIT précéder le catch réseau générique ci-dessous, sinon elle
+    # ne serait jamais atteinte. On ne range ici QUE le « refus de connexion »
+    # (service down) ; un reset/abort mid-flux reste ``"network"`` (transitoire).
+    if isinstance(exc, (httpx.ConnectError, ConnectionRefusedError)):
+        return LLMCallError(
+            "Service LLM injoignable (connexion refusée). Vérifie qu'il est démarré.",
+            kind="unreachable",
             cause=exc,
         )
 
@@ -967,10 +990,11 @@ async def stream_llm_with_tools(
 
     # Résolu UNE FOIS avant l'ouverture du stream — un swap admin au milieu
     # du stream n'affecte pas les events déjà en cours d'émission.
-    # ``is_stream=True`` permet au resolver d'alerter l'admin si un override
-    # ``scope=all`` est demandé alors que le runtime stream n'implémente pas
-    # encore le fallback Ollama (cf. ``llm_providers.py:stream_with_tools``,
-    # dette P1 #15). Le param ``fallback_policy`` reste passé pour cohérence.
+    # ``is_stream=True`` : trace historique pour le resolver. Dette P1 #15
+    # SOLDÉE le 2026-06-10 — ``manager.stream_with_tools`` bascule désormais
+    # sur le fallback local via le flux simulé quand le primary échoue AVANT
+    # le premier event (après, on propage : re-streamer dupliquerait le
+    # contenu déjà parti au client). Cf. test_stream_fallback_local.py.
     effective_policy = await _resolve_effective_fallback_policy(profile, is_stream=True)
 
     try:

@@ -404,7 +404,15 @@ async def _send_admin_notification(
     else:
         return  # Statut intermédiaire — pas de notif
 
-    body_text = f"{msg}\n" f"Audit ID : {audit.id}\n" f"SQL : {audit.generated_sql[:500]}\n"
+    # #80 — SQL COMPLET (cohérent avec le mail d'approbation DBA, l.295, qui
+    # l'inclut entier) : l'admin notifié doit vérifier EXACTEMENT ce qui a été
+    # exécuté. L'ancien ``[:500]` MUET pouvait lui faire croire que le SQL
+    # s'arrêtait là (multi-CTE > 500 chars). Fallback fail-loud sur un
+    # generated_sql None (anomalie attendue impossible à un statut terminal —
+    # on la SIGNALE au lieu d'une ligne « SQL : » vide muette ; best-effort,
+    # ne crashe pas comme l'ancien ``None[:500]``).
+    _sql_for_notif = audit.generated_sql or f"(SQL absent de l'audit #{audit.id} — anomalie)"
+    body_text = f"{msg}\n" f"Audit ID : {audit.id}\n" f"SQL : {_sql_for_notif}\n"
     try:
         await client.send_email(
             to_emails=str(target),
@@ -1098,6 +1106,37 @@ async def cleanup_expired_and_zombie() -> dict[str, int]:
         }
 
 
+def cleanup_expired_and_zombie_job() -> None:
+    """Wrapper sync APScheduler pour :func:`cleanup_expired_and_zombie`.
+
+    Le ``BackgroundScheduler`` (threads) appelle ``job.func()`` SANS await :
+    passer une ``async def`` directement crée une coroutine jamais awaitée
+    (RuntimeWarning "coroutine ... was never awaited" en prod, job marqué
+    "executed successfully" alors que le cleanup ne tourne JAMAIS — bug
+    constaté le 2026-06-11). Pattern identique à
+    ``wait_resume.cleanup_wait_tokens_job`` : module-level (APScheduler
+    sérialise une référence textuelle ``module:func`` pour le jobstore
+    persistant — une closure casse) + bridge ``asyncio.run`` + engine dédié
+    (l'engine global est lié à la boucle Tornado → cross-loop interdit).
+    Pas de ``run_then_drain_email_log`` : le cleanup ne fait que des UPDATE,
+    aucun mail/notification.
+    """
+    import asyncio as _asyncio
+
+    from app.core.database import dedicated_session_scope
+
+    async def _job() -> None:
+        async with dedicated_session_scope():
+            stats = await cleanup_expired_and_zombie()
+            if stats.get("expired") or stats.get("zombies"):
+                logger.info("cleanup_iris_sql_write: %s", stats)
+
+    try:
+        _asyncio.run(_job())
+    except Exception:  # noqa: BLE001 — un lock DB transitoire ne doit pas tuer le job
+        logger.exception("cleanup_expired_and_zombie_job: asyncio.run crash")
+
+
 # Alias rétrocompat (le scheduler utilise le nouveau nom).
 expire_old_pending = cleanup_expired_and_zombie
 
@@ -1125,5 +1164,6 @@ __all__ = [
     "dba_confirm",
     "dba_reject",
     "cleanup_expired_and_zombie",
+    "cleanup_expired_and_zombie_job",  # wrapper sync APScheduler
     "expire_old_pending",  # alias rétrocompat
 ]

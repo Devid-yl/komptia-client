@@ -137,6 +137,12 @@ KNOWN_CALLERS: frozenset[str] = frozenset(
         # Iris one-shot (transformations SQL ad-hoc — bouton "Charger toutes
         # les colonnes" et autres usages programmatiques de transform_sql_via_llm)
         "iris_oneshot_load_all_cols",
+        # Iris one-shot drill-down (zoom sur une cellule/agrégat des résultats —
+        # iris_oneshot.py) et fusion de la mémoire utilisateur Iris
+        # (iris_user_memory.py). Sans ces entrées, /admin/ai-performance ne sait
+        # pas filtrer ces appels et le tracker logue un warning par appel.
+        "iris_oneshot_drilldown",
+        "iris_user_memory_fuse",
         # Pipeline NL→SQL monolithique (scripts/pipeline.py). Chaque phase LLM
         # pose un caller dédié. Sans ces entrées, llm_call_tracker logue un
         # warning par appel et le cost tracking peut diverger (lien étroit
@@ -842,6 +848,142 @@ async def get_conversation_cost_usd(
             exc,
         )
         return (0.0, 0)
+
+
+async def get_conversation_cost_usd_for_ui(
+    conversation_id: int | str | None,
+    *,
+    user_id: int | None = None,
+) -> tuple[float, bool]:
+    """Coût LLM cumulé d'UNE conversation, prêt pour l'affichage user (puce /iris).
+
+    Wrapper *single source of truth* au-dessus de :func:`get_conversation_cost_usd`
+    — appelé À LA FOIS par l'émission de l'event ``done`` (``agent_service``) et par
+    la réhydratation de la page (``IrisPageHandler``). Centraliser ici évite deux
+    implémentations divergentes du même calcul (cf. contrat « pas de duplication »).
+
+    Retourne ``(cost_usd, cost_is_partial)`` où ``cost_is_partial`` vaut ``True``
+    dès qu'au moins un appel de la conversation a un ``cost_usd_snapshot`` NULL
+    (modèle hors registre pricing). L'UI affiche alors « ≥ » (coût minimum) plutôt
+    qu'un chiffre faux présenté comme exact (anti « donnée fausse silencieuse »).
+
+    **Anti-leak (corrige une donnée fausse silencieuse)** : récupère
+    ``Conversation.created_at`` et le passe en ``created_after``. Après un
+    hard-delete « Effacer la conversation », SQLite réutilise l'id (autoincrement
+    sans mot-clé ``AUTOINCREMENT``) ; sans ce filtre, la conversation neuve
+    hériterait du coût des ``AIPerformanceLog`` de la conversation purgée homonyme.
+    C'est exactement ce filtre qui fait que le compteur « se réinitialise » à
+    l'effacement, sans toucher aux logs (conservés pour l'audit admin).
+
+    ``user_id`` est transmis pour l'isolation cross-user (défense en profondeur :
+    un id transversal qui coïnciderait entre comptes ne fuite pas).
+
+    Le ``conversation_id`` est casté en ``str`` AVANT la query :
+    ``AIPerformanceLog.conversation_id`` est ``String(64)`` — un int provoquerait un
+    mismatch de type qui sommerait silencieusement 0.0 (cf. ``iris_automation_bridge``).
+
+    Fail-soft : ``(0.0, False)`` si conv ``None``/inexistante/erreur — un indicateur
+    d'observabilité ne doit jamais casser un rendu de page ou un turn d'agent.
+    """
+    if conversation_id is None:
+        return (0.0, False)
+    try:
+        from sqlalchemy import select
+
+        from app.models.conversation import Conversation
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    select(Conversation.created_at).where(Conversation.id == int(conversation_id))
+                )
+            ).one_or_none()
+        # Conv introuvable (jamais créée, ou purgée mid-stream) → aucun coût à
+        # afficher. On préfère (0.0, False) à une query sans ``created_after``
+        # (qui risquerait d'agréger des logs homonymes post-réutilisation d'id).
+        if row is None:
+            return (0.0, False)
+        created_after = row[0]
+        cost_usd, null_count = await get_conversation_cost_usd(
+            str(conversation_id),
+            created_after=created_after,
+            user_id=user_id,
+        )
+        return (float(cost_usd or 0.0), null_count > 0)
+    except Exception as exc:  # noqa: BLE001 — fail-soft cf. doctrine module
+        logger.warning(
+            "get_conversation_cost_usd_for_ui(conv=%s) failed: %s",
+            conversation_id,
+            exc,
+        )
+        return (0.0, False)
+
+
+async def check_user_budget(user_id: int | None) -> tuple[bool, float, float]:
+    """Garde budget par-utilisateur en mode **alerte** (détection, sans blocage).
+
+    Retourne ``(exceeded, current_cost_usd, cap_usd)``. Détecte un dépassement
+    de ``MAX_USD_PER_USER`` (fenêtre glissante ``BUDGET_WINDOW_HOURS``) pour les
+    flux LLM **hors** boucle de l'agent Iris : ``plan_report`` (rapports IA) et
+    ``run_copilot_agent`` (étape format des automatisations) l'appellent en mode
+    ALERTE (log WARNING, pas de blocage — décision produit).
+
+    ⚠️ **Pas une source unique** : le **chat Iris** garde sa PROPRE logique de
+    plafond (``IrisAgent._check_conversation_budget`` — par-conversation, et
+    **fail-CLOSED** si la conversation est purgée). Elle parse le même
+    cap/fenêtre mais n'est PAS factorisée ici (logique parallèle à garder
+    cohérente).
+
+    Fail-open ``(False, 0.0, 0.0)`` si : ``user_id`` None ; cap configuré
+    <= 0 ou non-numérique (admin a désactivé / corruption) ; fenêtre <= 0
+    ou non-numérique ; erreur BDD (l'observabilité ne casse pas un flux).
+    Lit ``MAX_USD_PER_USER`` / ``BUDGET_WINDOW_HOURS`` depuis ``ai_config``.
+    """
+    if user_id is None:
+        return (False, 0.0, 0.0)
+    try:
+        from app.models.ai_config import AIConfigKey
+        from app.services.ai.config_service import get_ai_config_service
+
+        cfg = get_ai_config_service()
+        cap_raw = await cfg.get(AIConfigKey.MAX_USD_PER_USER.value, default=0.0)
+        window_raw = await cfg.get(AIConfigKey.BUDGET_WINDOW_HOURS.value, default=24)
+        # bool est un sous-type de int — une corruption ``true`` ne doit pas
+        # désactiver ni fixer silencieusement le cap (cf. _check_conversation_budget).
+        if isinstance(cap_raw, bool) or isinstance(window_raw, bool):
+            logger.error(
+                "Budget cap config corrompu (bool) cap=%r window=%r — désactivé.",
+                cap_raw,
+                window_raw,
+            )
+            return (False, 0.0, 0.0)
+        try:
+            cap = float(cap_raw or 0.0)
+        except (TypeError, ValueError):
+            logger.error("MAX_USD_PER_USER invalide (%r) — cap désactivé.", cap_raw)
+            return (False, 0.0, 0.0)
+        try:
+            window_hours = int(window_raw or 0)
+        except (TypeError, ValueError):
+            logger.error("BUDGET_WINDOW_HOURS invalide (%r) — cap désactivé.", window_raw)
+            return (False, 0.0, 0.0)
+        if cap <= 0 or window_hours <= 0:
+            return (False, 0.0, 0.0)
+        current, null_count = await get_user_cost_usd_window(
+            user_id=user_id,
+            window_hours=window_hours,
+        )
+        if null_count > 0:
+            logger.info(
+                "User %s: %d appel(s) LLM cost NULL sur %dh — budget sous-évalué.",
+                user_id,
+                null_count,
+                window_hours,
+            )
+        return (current >= cap, current, cap)
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        logger.warning("check_user_budget(user=%s) failed (fail-open): %s", user_id, exc)
+        return (False, 0.0, 0.0)
 
 
 async def get_user_cost_usd_window(

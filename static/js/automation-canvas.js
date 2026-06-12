@@ -100,6 +100,16 @@
         return function unsub() { _versionListeners.delete(fn); };
     }
 
+    // Cluster-N (fix tempête 409 2026-06-10) — handler de RE-SYNCHRO sur
+    // conflit de version genuine (cross-onglet). Enregistré par le canvas
+    // (`initCanvas`) ; appelé depuis `_doFetch` sur 409. Au niveau module car
+    // `apiFetch` est défini hors de `initCanvas`. Null tant que non enregistré
+    // → fallback sur le toast throttlé.
+    let _onVersionConflict = null;
+    function setVersionConflictHandler(fn) {
+        _onVersionConflict = (typeof fn === 'function') ? fn : null;
+    }
+
     // Cluster-N — Throttle anti-spam quand plusieurs PUT échouent en
     // série avec 409 (autosave avec config invalide encore en mémoire).
     let _lastConflictToastAt = 0;
@@ -109,8 +119,9 @@
         _lastConflictToastAt = now;
         if (typeof window !== 'undefined' && typeof window.showToast === 'function') {
             window.showToast(
-                'Cette automatisation a été modifiée dans un autre onglet. '
-                + 'Rafraîchissez la page pour récupérer la version à jour.',
+                'Cette automatisation a été modifiée ailleurs (autre onglet ou '
+                + 'session) — vue resynchronisée avec la version à jour. '
+                + 'Vérifiez vos dernières modifications.',
                 'warning'
             );
         }
@@ -127,11 +138,25 @@
             ? response.headers.get('ETag') : null;
         if (!etag) return null;
         const cleaned = etag.replace(/^W\//, '').replace(/^"/, '').replace(/"$/, '');
+        // GARDE anti-poisoning (fix « 409 autre onglet » fantôme, 2026-06-12) :
+        // seuls les ETags ENTIÈREMENT numériques sont des versions
+        // d'optimistic-lock (posés par `_set_etag_header` côté backend). Les
+        // endpoints SANS ETag explicite (ex: GET /step-types) reçoivent l'ETag
+        // par défaut de Tornado = sha1 hex du body ; quand ce hash commence
+        // par des chiffres (« 21bef6… »), `parseInt` en extrayait « 21 » →
+        // `_automationVersion` empoisonné → premier autosave en 409 fantôme,
+        // la re-synchro re-fetch step-types → re-poison → boucle sans issue.
+        // Borne 12 chars : une version est un petit entier, un sha1 fait 40.
+        if (!/^\d{1,12}$/.test(cleaned)) return null;
         const parsed = parseInt(cleaned, 10);
         return Number.isFinite(parsed) ? parsed : null;
     }
 
-    async function apiFetch(url, options) {
+    // Exécute UNE requête HTTP. Les mutations posent `If-Match` depuis la
+    // version courante, LUE AU MOMENT DE L'EXÉCUTION — c'est ce qui rend la
+    // sérialisation (`apiFetch`) efficace : une mutation enfilée derrière une
+    // autre lit la version APRÈS le `setAutomationVersion` de la précédente.
+    async function _doFetch(url, options) {
         options = options || {};
         options.credentials = 'same-origin';
         const baseHeaders = {
@@ -161,17 +186,30 @@
             );
             err.status = response.status;
             err.body = json;
-            // Cluster-N — sur 409 version_conflict, on NE met PAS à jour
-            // automaticement `_automationVersion` à la version BDD : ce serait
-            // défaire le but du 409 (next PUT passerait avec If-Match=newVersion
-            // → silent overwrite = exactement le bug qu'on essaie d'éviter).
-            // Le client garde sa stale version → tous ses PUTs continueront
-            // d'échouer avec 409 jusqu'à ce qu'il refresh manuellement.
-            // Toast throttled informe l'utilisateur d'agir.
+            // Cluster-N — 409 version_conflict.
+            // Les mutations étant sérialisées (cf. `apiFetch`), un self-race en
+            // session unique est désormais IMPOSSIBLE : un 409 restant signifie
+            // un VRAI conflit cross-onglet/session. Ancien comportement = geler
+            // la version → storm de 409 jusqu'au refresh manuel. Nouveau : on
+            // adopte la version BDD (`current_version`) pour DÉBLOQUER la file,
+            // puis on délègue la RE-SYNCHRO de la vue au handler enregistré
+            // (re-hydratation depuis le serveur) → l'utilisateur repart de
+            // l'état réel. JAMAIS de blind-retry de la mutation perdue
+            // (anti-overwrite silencieux préservé : on ne ré-émet pas le PUT).
             if (response.status === 409 && json && json.code === 'version_conflict') {
                 err.isVersionConflict = true;
                 err.dbVersion = _readVersionFromResponse(response, json);
-                _maybeShowConflictToast();
+                if (err.dbVersion !== null) setAutomationVersion(err.dbVersion);
+                if (_onVersionConflict) {
+                    try {
+                        _onVersionConflict(err.dbVersion);
+                    } catch (e) {
+                        console.error('[komptiaCanvas] resync handler', e);
+                        _maybeShowConflictToast();
+                    }
+                } else {
+                    _maybeShowConflictToast();
+                }
             }
             throw err;
         }
@@ -179,6 +217,28 @@
         const newVersion = _readVersionFromResponse(response, json);
         if (newVersion !== null) setAutomationVersion(newVersion);
         return json;
+    }
+
+    // Sérialisation des MUTATIONS (Cluster-N / fix tempête 409 2026-06-10).
+    // Toutes les mutations (méthode ≠ GET) passent par une file FIFO à un
+    // seul slot : une mutation ne démarre qu'APRÈS le règlement de la
+    // précédente, donc lit `_automationVersion` une fois que la mutation
+    // d'avant a appelé `setAutomationVersion`. Sans cette file, deux autosaves
+    // concurrents (config debounce 600 ms + POST /edges immédiat, ou 2 PUT
+    // /steps) partaient avec le MÊME If-Match → le CAS serveur en rejetait un
+    // en 409 EN SESSION UNIQUE (bug reproduit en live 2026-06-10). Les GET
+    // restent parallèles (ils ne bumpent pas la version). La file ne se rompt
+    // jamais : la rejection d'une mutation est avalée POUR LA FILE (mais bien
+    // propagée au caller via `result`). Pas de croissance mémoire : seul le
+    // dernier maillon (`_mutationChain`) est retenu.
+    let _mutationChain = Promise.resolve();
+    function apiFetch(url, options) {
+        const method = String((options && options.method) || 'GET').toUpperCase();
+        if (method === 'GET') return _doFetch(url, options);
+        const run = function () { return _doFetch(url, options); };
+        const result = _mutationChain.then(run, run);
+        _mutationChain = result.then(function () {}, function () {});
+        return result;
     }
 
     // ============================================================
@@ -403,9 +463,31 @@
     // ============================================================
     // UX erreur : overlay avec bouton Reessayer
     // ============================================================
+    // DAG-4 — l'overlay #komptia-canvas-empty est RÉUTILISÉ pour afficher les
+    // erreurs de chargement : showCanvasError détruit son contenu d'aide
+    // (« Canvas vide / Glissez une étape »). On mémorise ce HTML d'aide ORIGINAL
+    // une seule fois pour pouvoir le RESTAURER en sortie d'erreur (retry, retour
+    // à l'état vide) — sinon l'overlay reste blanc.
+    let _emptyHelpHTML = null;
+    function restoreEmptyHelp(empty) {
+        empty = empty || document.getElementById('komptia-canvas-empty');
+        if (!empty) return;
+        empty.style.pointerEvents = '';
+        if (empty.classList.contains('komptia-canvas-error-overlay')) {
+            empty.classList.remove('komptia-canvas-error-overlay');
+            if (_emptyHelpHTML !== null) empty.innerHTML = _emptyHelpHTML;
+        }
+    }
+
     function showCanvasError(messageText, retryFn) {
         const empty = document.getElementById('komptia-canvas-empty');
         if (!empty) return;
+
+        // DAG-4 — capturer le contenu d'aide AVANT de le détruire (une seule
+        // fois : si on est déjà en état erreur, ne pas écraser le cache).
+        if (_emptyHelpHTML === null && !empty.classList.contains('komptia-canvas-error-overlay')) {
+            _emptyHelpHTML = empty.innerHTML;
+        }
 
         empty.classList.remove('hidden');
         empty.classList.add('komptia-canvas-error-overlay');
@@ -436,8 +518,9 @@
             btn.className = 'px-4 py-2 bg-brand-600 text-white rounded hover:bg-brand-700';
             btn.textContent = 'Reessayer';
             btn.addEventListener('click', function () {
-                empty.style.pointerEvents = '';
-                empty.classList.remove('komptia-canvas-error-overlay');
+                // DAG-4 — restaure le texte d'aide détruit avant de relancer,
+                // pour que le retour à l'état vide ne soit pas un overlay blanc.
+                restoreEmptyHelp(empty);
                 empty.classList.add('hidden');
                 retryFn();
             });
@@ -1323,7 +1406,15 @@
                 }
             } catch (e) {
                 saveIndicator.fail(e.message);
-                showToast('Erreur sauvegarde : ' + e.message, 'error');
+                // 409 version_conflict : `_doFetch` a déjà déclenché la
+                // re-synchro (toast warning throttlé + re-hydratation). Un
+                // second toast « Erreur sauvegarde : <texte serveur> » est un
+                // doublon trompeur — il suggère une action utilisateur
+                // (« rafraîchissez ») alors que la vue vient d'être
+                // resynchronisée automatiquement.
+                if (!e.isVersionConflict) {
+                    showToast('Erreur sauvegarde : ' + e.message, 'error');
+                }
             }
         }
 
@@ -1888,6 +1979,24 @@
                 savers.forEach(function (d) { promises.push(d.flushAndWait()); });
                 return Promise.all(promises);
             },
+            /** Cluster-N (fix tempête 409 2026-06-10) — réinitialise l'état
+             * d'édition AVANT une re-hydratation forcée (conflit cross-onglet).
+             * ANNULE (pas flush) tous les autosaves en attente, vide les
+             * debouncers + marqueurs JSON invalides, et FERME le panel. Sans ça,
+             * le panel garde une référence de `step` PÉRIMÉE (capturée dans les
+             * closures du formulaire) : les frappes ultérieures muteraient un
+             * objet que `saveStepNow` n'utilise plus → édits silencieusement
+             * perdus + debouncers zombies. On annule au lieu de flush : la
+             * mutation perdue était en conflit, la re-hydratation fait foi
+             * (l'utilisateur ré-applique sur l'état serveur à jour). */
+            resetPending: function () {
+                savers.forEach(function (d) {
+                    try { d.cancel(); } catch (_) { /* noop */ }
+                });
+                savers.clear();
+                invalidJsonFields.clear();
+                try { hide(); } catch (_) { /* noop */ }
+            },
         };
     }
 
@@ -2071,6 +2180,9 @@
 
                 // Empty overlay
                 if (emptyOverlay) {
+                    // DAG-4 — si on ré-affiche l'état vide après une erreur,
+                    // restaurer le texte d'aide (sinon overlay blanc).
+                    if (store.steps.length === 0) restoreEmptyHelp(emptyOverlay);
                     emptyOverlay.classList.toggle('hidden', store.steps.length > 0);
                 }
 
@@ -2103,6 +2215,27 @@
         } catch (_) {
             return; // la showCanvasError est deja affichee avec Retry
         }
+
+        // Cluster-N (fix tempête 409 2026-06-10) — re-synchro sur conflit de
+        // version genuine (cross-onglet/session). Remplace l'ancien GEL
+        // permanent (qui forçait un refresh manuel) par une re-hydratation
+        // idempotente de l'état serveur. `_resyncing` empêche la réentrance si
+        // plusieurs 409 arrivent en rafale. `hydrate()` est idempotent (clear +
+        // rebuild depuis /dag, remet `_automationVersion` à la valeur BDD).
+        let _resyncing = false;
+        setVersionConflictHandler(function () {
+            if (_resyncing) return;
+            _resyncing = true;
+            _maybeShowConflictToast();
+            // Annule les autosaves en attente + ferme le panel AVANT de
+            // re-hydrater : évite que des références de step périmées (closures
+            // du formulaire) écrasent silencieusement l'état serveur re-chargé.
+            try { panel.resetPending(); } catch (_) { /* noop */ }
+            Promise.resolve()
+                .then(function () { return hydrate(); })
+                .catch(function () { /* showCanvasError déjà gérée par hydrate */ })
+                .then(function () { _resyncing = false; });
+        });
 
         // ────────────────────────────────────────────
         // Boutons zoom : `[-] 100% [+]`. Le pourcentage central reset
@@ -2274,23 +2407,34 @@
                         // = valider + activer en une etape. Le bouton est le
                         // CTA principal de l'editeur ; faire valider sans
                         // activer obligeait l'utilisateur a re-toggler depuis
-                        // la liste (action redondante). On envoie un toggle
-                        // target_intent=true ; 409 (deja active) = OK aussi.
+                        // la liste (action redondante).
+                        //
+                        // V1 fix 2026-06-10 : on visait `/api/automations/N/toggle`
+                        // (route INEXISTANTE → 404) avec `{target_intent}` (le
+                        // handler lit `target`). Le CTA n'activait donc JAMAIS
+                        // (404 ≠ 409 → "activation echouee"). Corrigé : route
+                        // réelle `/automations/N/toggle` (cf. routes.py) + champ
+                        // `target:true` (aligné sur le toggle liste). Le serveur
+                        // répond 409 si l'auto est DEJA dans cet état → succès.
                         let activationMsg = 'Automatisation validee et activee';
                         try {
+                            saveIndicator.start();
                             await api.post(
-                                '/api/automations/' + automationId + '/toggle',
-                                { target_intent: true }
+                                '/automations/' + automationId + '/toggle',
+                                { target: true }
                             );
+                            saveIndicator.success();
                         } catch (toggleErr) {
-                            // 409 → deja active. Tout autre code → on
-                            // garde le succes de la validation et on
-                            // signale l'echec d'activation au user.
-                            const msg = (toggleErr && toggleErr.message) || '';
-                            if (msg.indexOf('409') !== -1 || msg.indexOf('deja') !== -1
-                                || msg.indexOf('déjà') !== -1) {
+                            // 409 (status structuré, pas de string-match fragile)
+                            // = `target` == état courant → deja active = succès.
+                            // Tout autre code → on garde le succès de la
+                            // validation mais on signale l'échec d'activation.
+                            if (toggleErr && toggleErr.status === 409) {
+                                saveIndicator.success();
                                 activationMsg = 'Automatisation valide (deja active)';
                             } else {
+                                const msg = (toggleErr && toggleErr.message) || 'inconnue';
+                                saveIndicator.fail(msg);
                                 showToast(
                                     'Validee mais activation echouee : ' + msg
                                     + ' — toggler depuis la liste.',
@@ -2375,8 +2519,7 @@
                     store.stepIdByDrawflowId.set(dfId, step.id);
 
                     if (emptyOverlay) {
-                        emptyOverlay.style.pointerEvents = '';
-                        emptyOverlay.classList.remove('komptia-canvas-error-overlay');
+                        restoreEmptyHelp(emptyOverlay);  // DAG-4 — restaure l'aide
                         emptyOverlay.classList.add('hidden');
                     }
                     saveIndicator.success();
@@ -2492,8 +2635,33 @@
                 saveIndicator.success();
             } catch (e) {
                 rollbackRemoveConnection(outId, inId);
-                saveIndicator.fail(e.message);
-                showToast('Connexion refusee : ' + e.message, 'error');
+                // Sur conflit de version (cross-onglet), le handler de
+                // re-synchro (fix tempête 409 2026-06-10) affiche DÉJÀ son
+                // toast et re-hydrate la vue (qui redessine le graphe). Ne pas
+                // doubler avec un toast « liaison » ici (double-toast trompeur).
+                if (e && e.isVersionConflict) {
+                    // Solder le compteur saveIndicator (le start() ci-dessus) —
+                    // sinon `inflight` reste > 0 → spinner « Enregistre… » bloqué
+                    // (revue adv. consolidée 2026-06-10). La re-synchro EST la
+                    // résolution de cette opération (toast + redraw gérés ailleurs).
+                    saveIndicator.success();
+                    return;
+                }
+                // DAG-2 — surfacer la RAISON précise du refus (cycle / types
+                // incompatibles / …). Le serveur la renvoie dans ``errors[]``
+                // (attaché à ``e.body`` par le helper api), pas dans le
+                // générique ``e.message`` (« Validation DAG echouee »).
+                var _reason = e.message;
+                if (e.body && Array.isArray(e.body.errors) && e.body.errors.length) {
+                    _reason = e.body.errors.map(function (er) {
+                        return er.message || er.code;
+                    }).join(' ; ');
+                }
+                saveIndicator.fail(_reason);
+                // « Connexion refusée » prêtait à confusion (= erreur RÉSEAU).
+                // C'est un refus de LIAISON du graphe (cycle / types
+                // incompatibles / liaison déjà existante).
+                showToast('Impossible de créer la liaison : ' + _reason, 'error');
             }
         });
 
@@ -2588,23 +2756,59 @@
                 if (store.selectedStepId === stepId) panel.hide();
                 panel.removeStep(stepId);
                 if (emptyOverlay && store.steps.length === 0) {
-                    // Reset pointer-events qui a pu rester a 'auto' apres
-                    // un affichage d'erreur (showCanvasError), sinon
-                    // l'overlay intercepte les drops suivants.
-                    emptyOverlay.style.pointerEvents = '';
-                    emptyOverlay.classList.remove('komptia-canvas-error-overlay');
+                    // DAG-4 — reset pointer-events + RESTAURE le texte d'aide
+                    // détruit par un éventuel showCanvasError (sinon overlay
+                    // blanc / intercepte les drops suivants).
+                    restoreEmptyHelp(emptyOverlay);
                     emptyOverlay.classList.remove('hidden');
                 }
                 saveIndicator.success();
             } catch (e) {
                 saveIndicator.fail(e.message);
-                showToast('Suppression etape echouee : ' + e.message, 'error');
-                // Rollback visuel impossible ici (Drawflow a deja retire le node).
-                // L'utilisateur verra l'erreur et peut reload pour resynchroniser.
+                // DAG-1 — Drawflow a déjà retiré le node visuellement, mais le
+                // serveur l'a CONSERVÉ (delete rejeté) → canvas désync (montre
+                // MOINS d'étapes que la réalité). On re-render le DAG depuis le
+                // serveur pour restaurer l'état réel (l'étape réapparaît) au lieu
+                // de laisser l'user reload manuellement. ``renderer.clear()`` dans
+                // ``hydrate`` = ``editor.clear()`` Drawflow, qui n'émet PAS de
+                // ``nodeRemoved`` → aucune cascade de DELETE.
+                showToast(
+                    'Suppression étape échouée : ' + e.message
+                    + ' — resynchronisation du canvas…',
+                    'error'
+                );
+                try {
+                    await hydrate();
+                } catch (e2) {
+                    // Dernier recours si même la resync échoue (serveur down) :
+                    // l'état visuel reste faux, on demande un reload manuel.
+                    showToast('Resynchronisation impossible — rechargez la page.', 'error');
+                }
             } finally {
                 store.removingStepIds.delete(stepId);
             }
         });
+
+        // ────────────────────────────────────────────
+        // DAG-3 — flush des saves EN ATTENTE à la fermeture / navigation
+        // ────────────────────────────────────────────
+        // Une édition de champ faite dans la fenêtre de debounce (600ms) puis
+        // suivie d'une fermeture d'onglet ou navigation immédiate était PERDUE
+        // silencieusement (le timer ne fire jamais). ``visibilitychange``
+        // (hidden) se déclenche page ENCORE VIVANTE (changement d'onglet + juste
+        // avant une navigation dans les navigateurs modernes) → le PUT a le temps
+        // de partir et d'aboutir. ``pagehide`` est le dernier recours sur unload
+        // (best-effort : on dispatche au moins le fetch).
+        if (editable) {
+            var _flushPendingSaves = function () {
+                try { panel.flushAll(); } catch (_) { /* best-effort : champs */ }
+                try { flushLayoutSave.flush(); } catch (_) { /* best-effort : positions */ }
+            };
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'hidden') _flushPendingSaves();
+            });
+            window.addEventListener('pagehide', _flushPendingSaves);
+        }
 
         // ────────────────────────────────────────────
         // nodeSelected / nodeUnselected → panel show/hide

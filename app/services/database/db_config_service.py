@@ -389,13 +389,58 @@ async def get_connection(conn_id: int) -> Optional[DatabaseConnection]:
         return conn
 
 
+def _active_connection_order_by() -> tuple:
+    """Clause d'ordre SSoT pour désigner LA connexion active gagnante.
+
+    Utilisée par ``get_active_connection`` ET
+    ``get_sql_server_version_label_sync`` : les deux lecteurs DOIVENT
+    désigner la même ligne quand l'invariant « une seule active » est
+    cassé, sinon split-brain silencieux (SQL exécuté sur la connexion A
+    avec les garde-fous compat-level de la connexion B).
+    Règle : dernière activée explicitement d'abord (une ligne jamais
+    passée par ``activate_connection`` a ``last_activated_at`` NULL et ne
+    gagne jamais contre une ligne activée), départage par id croissant.
+    """
+    return (
+        DatabaseConnection.last_activated_at.desc().nullslast(),
+        DatabaseConnection.id.asc(),
+    )
+
+
 async def get_active_connection() -> Optional[DatabaseConnection]:
-    """Récupère la connexion active (detached from session)."""
+    """Récupère la connexion active (detached from session).
+
+    Robuste à un invariant cassé : si PLUSIEURS lignes sont ``is_active``
+    (insertion hors-service — script, sqlite manuel, restore — l'app n'en
+    produit jamais deux via ``activate_connection`` qui est atomique), on
+    NE lève PAS ``MultipleResultsFound``. Incident 2026-06-12 : cette
+    exception remontait dans le ``except Exception`` fail-closed de
+    ``init_sage_from_db_config`` → ``mark_unconfigured()`` → message
+    « Aucune connexion configurée » MENSONGER (le vrai problème était
+    l'inverse : deux actives) et SQL refusé à tort sur toute l'app.
+    À la place : gagnante DÉTERMINISTE = dernière activée explicitement
+    (``last_activated_at`` DESC, NULLS LAST — une ligne jamais passée par
+    ``activate_connection`` ne gagne jamais contre une ligne activée),
+    départage par id. + log ERROR actionnable : réactiver la bonne
+    connexion via /admin/database répare les lignes (UPDATE exclusif).
+    """
     async with get_session() as session:
         result = await session.execute(
-            select(DatabaseConnection).where(DatabaseConnection.is_active.is_(True))
+            select(DatabaseConnection)
+            .where(DatabaseConnection.is_active.is_(True))
+            .order_by(*_active_connection_order_by())
         )
-        conn = result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        if len(rows) > 1:
+            logger.error(
+                "Invariant cassé : %d connexions actives simultanément (%s). "
+                "Gagnante déterministe : « %s » (dernière activée). Réactivez "
+                "la connexion voulue via /admin/database pour réparer.",
+                len(rows),
+                ", ".join(f"#{c.id} {c.name}" for c in rows),
+                rows[0].name,
+            )
+        conn = rows[0] if rows else None
         if conn is not None:
             session.expunge(conn)
         return conn
@@ -443,15 +488,11 @@ def _get_sync_engine():
     """
     global _sync_engine_holder
     if _sync_engine_holder is None:
-        from sqlalchemy import create_engine, event
-        from app.core.database import get_db_url, setup_encryption
+        from app.core.database import make_sync_engine
 
-        engine = create_engine(get_db_url())
-        # Wire SQLCipher AVANT toute requête. Sans ce hook, une BDD
-        # chiffrée serait illisible depuis ce sync engine (les hooks
-        # de l'AsyncEngine ne s'appliquent pas ici).
-        event.listens_for(engine, "connect")(setup_encryption)
-        _sync_engine_holder = engine
+        # SSoT : make_sync_engine pose PRAGMA key (SQLCipher) + PRAGMAs perf sur
+        # chaque connexion. Sans clé → no-op (base claire).
+        _sync_engine_holder = make_sync_engine()
     return _sync_engine_holder
 
 
@@ -634,10 +675,15 @@ def get_sql_server_version_label_sync() -> str:
 
         engine = _get_sync_engine()
         with engine.connect() as conn:
+            # MÊME clause d'ordre que get_active_connection (SSoT) : si
+            # l'invariant « une seule active » est cassé, ce lecteur doit
+            # désigner la MÊME gagnante que le connecteur — sinon le label
+            # de version/compat-level viendrait d'une autre BDD que celle
+            # réellement exécutée (mismatch de dialecte silencieux).
             row = conn.execute(
-                _select(DatabaseConnection.server_version).where(
-                    DatabaseConnection.is_active.is_(True)
-                )
+                _select(DatabaseConnection.server_version)
+                .where(DatabaseConnection.is_active.is_(True))
+                .order_by(*_active_connection_order_by())
             ).first()
             if row and row[0]:
                 return row[0]

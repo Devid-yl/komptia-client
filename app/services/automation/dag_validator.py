@@ -661,27 +661,34 @@ def validate_completeness(
                     )
                 )
 
-            # #63 (A7-F2-résidu) — Type-check générique des champs STRING
-            # ``required``. Un champ typé string/text/select qui reçoit une
-            # LISTE (import/API hand-édité ; le canvas envoie toujours un
-            # string) passe ``validate(partial=False)`` (présent + truthy) puis
-            # CRASHE au runtime (executor : ``value.strip()`` → AttributeError
-            # sur une list). On rattrape à l'activation, génériquement — TOUS
-            # les step_types, TOUS les champs string — comme demandé (pas un
-            # patch spécial ``email.to``). Absent/vide reste géré par le check
-            # ``required`` délégué à ``validate()`` ci-dessus.
+            # #63 (A7-F2-résidu) + V8 (2026-06-10) — Type-check générique des
+            # champs typés string/text/select. Un tel champ qui reçoit une LISTE
+            # (import/API hand-édité ; le canvas envoie toujours un string) passe
+            # ``validate(partial=False)`` puis CRASHE au runtime (executor :
+            # ``value.strip()`` → AttributeError sur une list). On rattrape à
+            # l'activation, génériquement — TOUS les step_types, TOUS les champs
+            # string (pas un patch spécial ``email.to``).
+            #
+            # V8 : étendu aux champs NON-``required`` (avant, seuls les required
+            # étaient type-checkés → ``report.title`` / ``report.prompt`` /
+            # ``export_workbook.filename`` (string non-required) passaient en
+            # liste et crashaient au run, executor.py:3167/3228/4069). La
+            # PRÉSENCE des required reste déléguée à ``validate()`` ci-dessus ;
+            # ici on ne valide QUE le TYPE d'une valeur PRÉSENTE (absent/vide →
+            # ``continue``), donc étendre aux non-required n'impose aucune
+            # présence — ça empêche juste un type faux de passer silencieusement.
             try:
                 _meta_t = STEP_TYPE_META.get(StepType(stype)) if isinstance(stype, str) else None
             except (ValueError, TypeError):
                 _meta_t = None
             for _fname, _fspec in (_meta_t or {}).get("config_schema", {}).items():
-                if not isinstance(_fspec, dict) or not _fspec.get("required"):
+                if not isinstance(_fspec, dict):
                     continue
                 if _fspec.get("type") not in ("string", "text", "select"):
                     continue
                 _val = cfg.get(_fname)
                 if _val is None or _val == "":
-                    continue  # absent/vide déjà couvert par le check required
+                    continue  # absent/vide : présence des required gérée par validate()
                 if not isinstance(_val, str):
                     errors.append(
                         ValidationError(
@@ -808,10 +815,18 @@ def validate_completeness(
             )
 
     # --- 4. Double envoi (email destinataires qui se recouvrent) ---
+    # #24 fix 2026-06-11 — ne considérer que les steps email ENABLED. Avant, ce
+    # bloc itérait ``node_ids`` (TOUS), donc un step email DÉSACTIVÉ (ignoré au
+    # runtime DAG) déclenchait à tort EMAIL_NO_RECIPIENT (config vide bloque
+    # l'activation) ET EMAIL_DOUBLE_DELIVERY (ses destinataires « recouvrent »
+    # un email actif = faux positif). On réutilise ``enabled_node_ids`` (SSoT
+    # déjà calculé L737), cohérent avec le check STEP_CONFIG_INCOMPLETE (L632)
+    # et l'adjacence enabled-only de la reachability.
     email_nodes = [
         (nid, nodes_by_id[nid])
         for nid in node_ids
-        if _node_attr(nodes_by_id[nid], "step_type") == "email"
+        if nid in enabled_node_ids
+        and _node_attr(nodes_by_id[nid], "step_type") == "email"
     ]
     email_recipients: List[Tuple[int, Set[str]]] = []
     for nid, node in email_nodes:

@@ -1,0 +1,19 @@
+[Unit]
+# Renouvellement automatique du certificat TLS auto-signé de Komptia.
+# Template versionné : @WORKING_DIR@ / @PYTHON@ sont substitués par
+# scripts/install_cert_timer.py au moment de l'installation (chemins du serveur).
+Description=Komptia — renouvellement automatique du certificat TLS auto-signé
+# nginx.service : le service recharge nginx après régénération.
+# network-online : openssl/date fiables une fois le réseau prêt.
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@WORKING_DIR@
+# renew_cert ne régénère QUE si le cert approche l'expiration (idempotent).
+ExecStart=@PYTHON@ -m scripts.renew_cert
+# Doit tourner en root : écrit /etc/ssl/komptia + `systemctl reload nginx`.
+# (Pas de durcissement ProtectSystem/ReadOnlyPaths : il DOIT écrire /etc et
+# piloter systemd — un durcissement casserait le renouvellement.)
+User=root

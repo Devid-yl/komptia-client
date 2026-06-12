@@ -519,6 +519,21 @@ def _looks_like_pii(token: str) -> bool:
     (concept légitime filtré) est faible — le RAG reste informatif via les
     table_hints et ir_structure_hints. Le coût d'un faux négatif (PII
     envoyée au LLM cloud) est élevé.
+
+    NE PAS RELÂCHER ce filtre pour « améliorer le matching » (vérifié tâche #14,
+    2026-06-10) :
+    - Il s'applique aux **hints de concepts** injectés dans le prompt, issus des
+      questions de paires Q/SQL stockées d'AUTRES requêtes — PAS au scoring RAG
+      (``compute_query_recall_idf`` ne l'utilise pas). Le filtre n'affecte donc
+      pas la qualité du matching.
+    - Les acronymes métier légitimes (« CA », « TVA », « HT », « TTC ») font ≤ 3
+      chars → non matchés par ``_PII_PURE_UPPER_RE`` (≥ 4). Seuls les
+      codes/valeurs ≥ 4 majuscules (noms client, codes entité type « SOFIGEC »)
+      sont filtrés — ce sont des VALEURS, pas des concepts.
+    - Un code que l'utilisateur a tapé est déjà présent en clair dans sa question
+      (input non anonymisé côté free-loop) → le LLM ne le « rate » pas.
+    - Relâcher fuiterait les codes d'AUTRES requêtes stockées dans l'appel LLM
+      courant (cross-query leak). Bénéfice ~nul, risque confidentialité réel.
     """
     if not token:
         return False

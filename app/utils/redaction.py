@@ -30,6 +30,13 @@ DEFAULT_MAX_LEN: Final[int] = 100
 EXPORT_QUESTION_MAX_LEN: Final[int] = 500
 EXPORT_SQL_MAX_LEN: Final[int] = 2000
 
+# #66 — marqueur de troncature ajouté quand ``truncate=True`` coupe réellement.
+# Sans lui, l'admin qui lit le CSV ai_performance (ou le tooltip
+# /admin/ai-performance) ne peut PAS distinguer un SQL/texte tronqué PAR
+# L'EXPORT d'un SQL réellement incomplet. Ajouté APRÈS les ``max_len`` chars de
+# contenu (signal de débordement, ~10 chars hors-budget).
+_TRUNCATION_MARKER: Final[str] = "…[tronqué]"
+
 # Bug 2026-05-26 (ADV-12 + ADV-15) : cap dur sur l'input AVANT le regex.
 # Le pattern ``_LONG_NUMERIC_RE`` montre du backtracking modéré (167ms sur
 # 10k chars d'alternance ``1-1-1-1...``) — pas catastrophique mais sur le
@@ -125,7 +132,14 @@ def redact_pii_best_effort(
     else:
         out = text
     out = _LONG_NUMERIC_RE.sub("[nombre]", out)
-    if truncate:
+    if truncate and len(out) > max_len:
+        # #66 — coupe RÉELLE : on signale. Le marqueur est AJOUTÉ APRÈS les
+        # ``max_len`` caractères de CONTENU (et non dedans) : le contrat
+        # « max_len chars de contenu » reste vrai, le marqueur est un pur signal
+        # de débordement (~10 chars hors-budget, inoffensif pour une cellule CSV
+        # ou un tooltip). Ajouté APRÈS le masquage regex → jamais re-scanné.
+        out = out[:max_len] + _TRUNCATION_MARKER
+    elif truncate:
         out = out[:max_len]
     return out
 

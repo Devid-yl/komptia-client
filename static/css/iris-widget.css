@@ -444,6 +444,18 @@
     margin-top: 0.25rem;
     text-align: right;
 }
+/* Oracle fail-open (FAILLE 1) — avertissement « non pré-validé par le SGBD ».
+   Surcharge de .jw-sql-info : ambre, aligné gauche, lisible (parité avec
+   .iris-sql-oracle-warning de la page /iris). */
+.jw-sql-info.jw-sql-oracle-warning {
+    text-align: left;
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #f59e0b;
+    border-radius: 6px;
+    padding: 0.35rem 0.5rem;
+    font-size: 0.72rem;
+}
 
 /* --- Clarification & Suggestions --- */
 .jw-clarification {
@@ -893,6 +905,11 @@
     border-color: rgba(255, 255, 255, 0.08);
 }
 .dark .jw-sql-info { color: rgba(255, 255, 255, 0.4); }
+.dark .jw-sql-info.jw-sql-oracle-warning {
+    color: #fcd34d;
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.45);
+}
 .dark .jw-tool {
     background: rgba(245, 158, 11, 0.15);
     color: #fcd34d;

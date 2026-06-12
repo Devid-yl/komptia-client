@@ -1,0 +1,20 @@
+[Unit]
+Description=Komptia — vérification trimestrielle de l'expiration du certificat TLS
+
+[Timer]
+# Trimestriel : 1er Jan / Avr / Jui / Oct à 03:30 (heure serveur). La VÉRIFICATION
+# est trimestrielle ; renew_cert ne RÉGÉNÈRE que si le cert est proche de
+# l'expiration (seuil 180 j > 2× l'intervalle ~91 j → aucune expiration ne passe
+# entre deux contrôles).
+OnCalendar=*-01,04,07,10-01 03:30:00
+# Rattrape UNE exécution manquée si le serveur était éteint à l'heure prévue.
+Persistent=true
+# Filet supplémentaire : vérifie aussi 15 min après chaque démarrage. Couvre le
+# cas d'un serveur éteint plusieurs trimestres (Persistent ne rejoue qu'UNE
+# occurrence manquée) → au rallumage, on contrôle l'expiration immédiatement.
+OnBootSec=15min
+# Étale la charge (évite que tous les timers tirent à la même seconde).
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

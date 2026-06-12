@@ -17,8 +17,6 @@ Sécurité :
 
 from __future__ import annotations
 
-import tornado.web
-
 from app.core import clock
 from app.handlers.base import BaseHandler
 from app.services.ai.iris_write_session import (
@@ -26,6 +24,7 @@ from app.services.ai.iris_write_session import (
     dba_confirm,
     dba_reject,
 )
+from app.utils.client_ip import client_ip_for_rate_limit
 from app.utils.iris_write_token_codec import parse_and_verify
 from app.utils.logger import get_logger
 from app.utils.rate_limiter import RateLimiter
@@ -39,13 +38,9 @@ _POST_RATE_MAX: int = 5
 _RATE_WINDOW_S: int = 60
 
 
-def _client_ip(handler: tornado.web.RequestHandler) -> str:
-    return (
-        handler.request.headers.get("X-Real-IP")
-        or handler.request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or handler.request.remote_ip
-        or "unknown"
-    )[:45]
+# SSoT IP rate-limit : cf. app/utils/client_ip.py (ne PAS lire X-Real-IP brut —
+# contournable par rotation de header sur cet endpoint public).
+_client_ip = client_ip_for_rate_limit
 
 
 class IrisSqlWriteDbaHandler(BaseHandler):

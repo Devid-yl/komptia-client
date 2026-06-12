@@ -248,6 +248,26 @@ async def _audit_log_fail_closed(user_id: int, exc: BaseException) -> None:
 #: du cache détaillé via ``load_rules_for_user`` (TTL identique).
 _HAS_RULES_CACHE: Dict[int, Tuple[float, bool]] = {}
 
+#: Token de version O(1) des règles d'accès (par user + époque globale). Bumpé à
+#: chaque invalidation. Sert aux caches EN AVAL (ex: résultats dashboard) pour
+#: invalider AUTOMATIQUEMENT au changement de droits — sinon un résultat déjà
+#: filtré resterait servi jusqu'à son propre TTL (sur-exposition de données au
+#: même user). Époque dans une liste = mutable sans ``global``.
+_RULES_VERSION: Dict[int, int] = {}
+_RULES_VERSION_EPOCH: list = [0]
+
+
+def rules_cache_token(user_id: int) -> str:
+    """Token opaque qui CHANGE dès que les règles d'accès du user (ou le toggle
+    global) changent. À injecter dans la clé d'un cache aval pour invalidation
+    automatique au changement de droits. O(1), aucun accès BDD. Cast invalide →
+    sentinelle ``-1`` (toujours déterministe, jamais d'exception)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        uid = -1
+    return f"{_RULES_VERSION_EPOCH[0]}:{_RULES_VERSION.get(uid, 0)}"
+
 
 def invalidate_user(user_id: int) -> None:
     """Invalide l'entrée cache pour un user (appelé par les handlers admin
@@ -297,6 +317,12 @@ def invalidate_user(user_id: int) -> None:
     # 2) Cache "source" en dernier — re-populé par le prochain
     # ``load_rules_for_user`` qui lira la BDD post-commit (frais).
     _CACHE.pop(user_id, None)
+    # 3) Bump du token de version → invalide les caches AVAL (résultats
+    # dashboard) qui incluent ce token dans leur clé. O(1), sans exception.
+    try:
+        _RULES_VERSION[int(user_id)] = _RULES_VERSION.get(int(user_id), 0) + 1
+    except (TypeError, ValueError):
+        pass
 
 
 def invalidate_all() -> None:
@@ -313,6 +339,10 @@ def invalidate_all() -> None:
     except ImportError:
         pass
     _CACHE.clear()
+    # Époque globale bumpée → invalide TOUS les tokens aval d'un coup (les
+    # entrées de cache dashboard portant l'ancienne époque ne seront plus hit).
+    _RULES_VERSION_EPOCH[0] += 1
+    _RULES_VERSION.clear()
 
 
 # ---------------------------------------------------------------------------

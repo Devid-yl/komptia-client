@@ -25,20 +25,24 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.constants_ai import clamped_max_tokens
 from app.services.ai.llm_providers import LLMRequest
 from app.services.anonymization import anonymize_for_llm
 from app.services.anonymization.proxy import get_confidentiality_prompt
+from app.services.reporting.pie_data import prepare_pie_slices
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-# Valeur généreuse par défaut — les modèles modernes (Haiku 4.5, Sonnet, GPT-4o)
-# acceptent largement plus. Ajustable via get_ai_config_service si besoin.
-_DEFAULT_MAX_OUTPUT_TOKENS = 16000
+# #54 — l'ancienne constante locale ``_DEFAULT_MAX_OUTPUT_TOKENS = 16000``
+# court-circuitait le registre BDD : dès que le cap du modèle actif dépassait
+# 16K, le hardcode gagnait via ``min(16000, cap)``. Supprimée. La SSoT est
+# ``clamped_max_tokens(None, model_name)`` qui lit le registre /admin/ai-models
+# (avec fallback static interne si manager non initialisé) — contrat « LLM
+# dynamique » de CLAUDE.md.
 
 
 # Bascule auto vers le mode agent (tool-loop) quand le payload approche le
@@ -55,6 +59,10 @@ class ReportPlan:
     title: str
     introduction: Optional[str]
     sections: List[Dict[str, Any]]
+    # #56 — nombre de sections proposées par l'IA mais DROPPÉES au cap
+    # ``_MAX_SECTIONS``. >0 → l'exécuteur PDF préfixe une note « rapport
+    # partiel » (sinon David reçoit un rapport amputé qu'il croit complet).
+    sections_omitted: int = 0
 
 
 class ReportPlanError(Exception):
@@ -101,6 +109,26 @@ async def plan_report(
     """
     if not datasets:
         raise ReportPlanError("Aucun dataset fourni")
+
+    # Alerte budget LLM PARTAGÉE (denial-of-wallet — cf. llm_call_tracker).
+    # Placé AVANT le dispatcher oneshot/agent : couvre les DEUX modes (le
+    # rapport oneshot nominal ET le mode agent gros-payload), donc TOUS les
+    # appelants (HTTP /api/reports et automation). Mode ALERTE : log, sans
+    # bloquer (une automatisation planifiée critique ne s'arrête pas en silence).
+    from app.services.ai.llm_call_tracker import check_user_budget
+
+    _bover, _bcur, _bcap = await check_user_budget(
+        user_id if isinstance(user_id, int) else None
+    )
+    if _bover:
+        logger.warning(
+            "Rapport IA généré AU-DELÀ du plafond budget LLM (user=%s, "
+            "%.2f $ / %.2f $) — mode alerte, génération non bloquée "
+            "(suivi : /admin/ai-performance).",
+            user_id,
+            _bcur,
+            _bcap,
+        )
 
     # --- Dispatcher hybride : oneshot vs agent ------------------------------
     # Quand le payload (datasets en markdown) dépasse 70% du budget d'input
@@ -168,6 +196,13 @@ async def plan_report(
             }
         )
 
+    # ⚠ INVARIANT CONFIDENTIALITÉ : l'anonymisation tourne ICI, sur
+    # ``full_input`` (rows BRUTES incluses), AVANT toute construction de
+    # markdown/prompt. ``prompt_datasets`` ci-dessous est donc anonymisé. NE
+    # JAMAIS rendre/tronquer des rows BRUTES en aval (ce serait la fuite #73-bis
+    # — cf. ``result_assistant._build_sample_rows_preview``). Tout rendu de
+    # cellule (``_render_datasets_markdown`` / ``_format_cell``) DOIT consommer
+    # ``prompt_datasets`` (anonymisé), jamais ``datasets`` (brut).
     anon_input, restore_fn = await anonymize_for_llm(user_id, full_input, "REPORT")
     prompt_datasets: List[Dict[str, Any]] = list(anon_input.get("datasets", []))
     sanitized_user_prompt = anon_input.get("user_prompt") or None
@@ -198,6 +233,10 @@ async def plan_report(
         raise ReportPlanError("Provider LLM non configuré") from exc
 
     try:
+        # #54 — soft-limit = ``max_output_tokens`` tel quel (None → cap réel du
+        # modèle depuis le registre admin, SSoT). On capture la valeur résolue
+        # pour pouvoir détecter une réponse coupée par ce plafond (fail-loud).
+        _resolved_max_tokens = clamped_max_tokens(max_output_tokens, model_name)
         response = await call_llm(
             CallProfile(
                 caller="report_planner",
@@ -209,12 +248,7 @@ async def plan_report(
                 system=system,
                 model=model_name,
                 temperature=0.3,
-                # Clamp au cap réel du modèle actif (registre BDD) : un modèle
-                # à 8K de sortie rejetterait un ``max_tokens`` explicite de 16K.
-                # Le soft-limit reste respecté quand il est < cap.
-                max_tokens=clamped_max_tokens(
-                    max_output_tokens or _DEFAULT_MAX_OUTPUT_TOKENS, model_name
-                ),
+                max_tokens=_resolved_max_tokens,
             ),
         )
         raw = (response.content or "").strip()
@@ -225,11 +259,37 @@ async def plan_report(
     if not raw:
         raise ReportPlanError("Réponse LLM vide")
 
+    # #54 — un JSON invalide vient souvent d'une réponse COUPÉE par le plafond
+    # de tokens de sortie (le LLM s'arrête en plein objet). Sans ce diagnostic,
+    # l'utilisateur voit un 502 « JSON invalide » qui masque la vraie cause.
+    _ct = getattr(response, "completion_tokens", None)
+    _looks_token_capped = (
+        isinstance(_ct, int)
+        and isinstance(_resolved_max_tokens, int)
+        and _resolved_max_tokens > 0
+        and _ct >= int(_resolved_max_tokens * 0.95)
+    )
+
+    def _json_error() -> "ReportPlanError":
+        if _looks_token_capped:
+            logger.warning(
+                "Plan LLM: réponse probablement coupée au plafond de tokens "
+                "(completion_tokens=%s ≈ max_tokens=%s)",
+                _ct,
+                _resolved_max_tokens,
+            )
+            return ReportPlanError(
+                f"Réponse IA coupée par le plafond de tokens de sortie "
+                f"({_resolved_max_tokens}) — réduis le nombre de datasets/sections "
+                "ou choisis un modèle à plus grande sortie dans /admin/ai-models."
+            )
+        return ReportPlanError("Le plan retourné par l'IA n'est pas un JSON valide")
+
     # Extract + parse JSON robustly
     plan_json = _extract_json(raw)
     if not plan_json:
         logger.warning("Plan LLM: aucun JSON trouvé. Raw head: %s", raw[:300])
-        raise ReportPlanError("Le plan retourné par l'IA n'est pas un JSON valide")
+        raise _json_error()
     try:
         plan_data_anon = json.loads(plan_json)
     except json.JSONDecodeError as e:
@@ -239,7 +299,7 @@ async def plan_report(
             plan_json[:300],
             raw[:300],
         )
-        raise ReportPlanError("Le plan retourné par l'IA n'est pas un JSON valide")
+        raise _json_error()
 
     # Parse JSON ENCORE anonymisé puis restaure la STRUCTURE (cf. EPIC E4 —
     # restore-then-parse fragile aux PII contenant `"`/`\`/`\n`). Les
@@ -299,6 +359,7 @@ async def plan_report(
         title=validated["title"],
         introduction=validated.get("introduction"),
         sections=validated["sections"],
+        sections_omitted=int(validated.get("sections_omitted", 0) or 0),
     )
 
 
@@ -373,7 +434,8 @@ def _build_system_prompt(user_prompt: Optional[str]) -> str:
         "Tu es un analyste de données. Tu reçois des jeux de données tabulaires et "
         "tu dois concevoir un rapport d'analyse clair et professionnel en français. "
         "Tu décides librement de la longueur, du nombre de sections et de graphiques "
-        "en fonction de la richesse des données. "
+        f"en fonction de la richesse des données (MAXIMUM {_MAX_SECTIONS} sections — "
+        "regroupe ou priorise si l'analyse en demande davantage). "
         "Tu réponds UNIQUEMENT avec un JSON strict, sans texte avant/après, sans "
         "code fence markdown."
     )
@@ -450,7 +512,8 @@ PIE chart (répartitions, parts d'un tout) :
 }
 """)
     parts.append(
-        "Limites : max 30 barres, max 10 tranches de pie, max 8 séries, "
+        f"Limites : max {_MAX_CHARTS_PER_SECTION} graphiques par section, "
+        "max 30 barres, max 10 tranches de pie, max 8 séries, "
         "max 100 points par série. Préfère line pour des évolutions "
         "temporelles, bar pour des comparaisons de catégories, pie pour des "
         "répartitions (≤ 8 catégories)."
@@ -496,6 +559,13 @@ PIE chart (répartitions, parts d'un tout) :
 # ------------------------------------------------------------------
 
 
+#: #86 — cap par cellule texte du markdown dataset envoyé au LLM. Au-delà, la
+#: cellule est coupée (« … ») ET le nombre de cellules tronquées est compté +
+#: annoncé sous le dataset, pour que le LLM ne tire pas de conclusion sur le
+#: CONTENU complet de champs texte partiels (ex. un libellé long coupé).
+_MAX_CELL_CHARS: int = 300
+
+
 def _render_datasets_markdown(datasets: List[Dict[str, Any]]) -> str:
     """Render datasets as markdown tables — ~3x fewer tokens than JSON rows.
 
@@ -524,38 +594,72 @@ def _render_datasets_markdown(datasets: List[Dict[str, Any]]) -> str:
         parts.append("|" + "|".join(["---"] * len(columns)) + "|")
 
         # Rows
+        n_truncated = 0
         for row in rows:
             cells: List[str] = []
             for col in columns:
                 val = row.get(col) if isinstance(row, dict) else None
-                cells.append(_format_cell(val))
+                text, was_truncated = _format_cell(val)
+                if was_truncated:
+                    n_truncated += 1
+                cells.append(text)
             parts.append("| " + " | ".join(cells) + " |")
+
+        # #86 — les cellules trop longues sont remplacées par un marqueur de
+        # longueur (le contenu, DÉJÀ anonymisé, n'est pas montré). On annonce le
+        # total sous le tableau (même bloc dataset lu par le LLM) + log serveur
+        # pour qu'il ne tire aucune conclusion sur ces champs absents.
+        if n_truncated > 0:
+            logger.warning(
+                "Report dataset %s: %d cellule(s) texte > %d chars remplacée(s) "
+                "par un marqueur de longueur",
+                ds_id,
+                n_truncated,
+                _MAX_CELL_CHARS,
+            )
+            parts.append("")
+            parts.append(
+                f"⚠ {n_truncated} cellule(s) texte trop longue(s) (> {_MAX_CELL_CHARS} "
+                "caractères) remplacée(s) par un marqueur de longueur — contenu NON "
+                "disponible pour ces champs, ne tire AUCUNE conclusion dessus."
+            )
 
         parts.append("")  # blank line between datasets
 
     return "\n".join(parts)
 
 
-def _format_cell(val: Any) -> str:
+def _format_cell(val: Any) -> Tuple[str, bool]:
     """Format a cell value for markdown table display.
+
+    Retourne ``(texte, was_truncated)`` — ``was_truncated`` permet à
+    :func:`_render_datasets_markdown` de compter et d'annoncer les coupes (#86).
 
     - None → empty
     - numbers → as-is (preserve precision)
     - strings → escape `|` and newlines
     """
     if val is None:
-        return ""
+        return "", False
     if isinstance(val, bool):
-        return "true" if val else "false"
+        return ("true" if val else "false"), False
     if isinstance(val, (int, float)):
-        return str(val)
+        return str(val), False
     s = str(val)
     # Escape markdown table separators inside cells
     s = s.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
-    # Cap individual cell length to avoid absurd values from malformed data
-    if len(s) > 300:
-        s = s[:297] + "..."
-    return s
+    # ⚠ ORDRE (vérifié) : ici la cellule est DÉJÀ anonymisée — `plan_report`
+    # anonymise `full_input` (rows brutes incluses) à la l.199 AVANT d'appeler
+    # `_render_datasets_markdown` (l.207). Donc PAS de fuite #73-bis sur ce
+    # chemin (contrairement à `result_assistant._build_sample_rows_preview`, qui
+    # tronque AVANT l'anonymisation). L'ancien `s[:297]+"..."` coupait un token
+    # déjà anonymisé → token CASSÉ (`§LONGPSEU…`) trompeur pour le LLM. On le
+    # remplace par un placeholder de LONGUEUR (plus propre, même borne budget,
+    # et robuste si l'ordre anon→render changeait un jour). Cellules ≤ cap :
+    # entières.
+    if len(s) > _MAX_CELL_CHARS:
+        return f"[valeur longue: {len(s)} car.]", True
+    return s, False
 
 
 # ------------------------------------------------------------------
@@ -633,11 +737,33 @@ _MAX_SECTIONS = 20
 _MAX_CHARTS_PER_SECTION = 5
 
 
-def _truncate(value: Any, limit: int) -> Optional[str]:
-    """Return value as a truncated string or None if not a string."""
+#: #55 — marqueur de troncature verbeux pour la PROSE (titre/intro/description/
+#: commentary). SSoT partagée avec ``report_planner_tools`` (mode agent) pour que
+#: la coupe soit signalée de façon identique quel que soit le mode.
+TRUNCATION_NOTICE = " […texte coupé]"
+
+
+def _truncate(
+    value: Any, limit: int, *, field: str = "champ", marker: str = TRUNCATION_NOTICE
+) -> Optional[str]:
+    """Return value as a string truncated to ``limit`` chars, or None if not a string.
+
+    #55 — quand la valeur dépasse ``limit``, on AJOUTE un marqueur (au lieu
+    d'une coupe MUETTE en pleine phrase) et on logue. Le ``commentary`` d'analyse
+    (cap 20000) rendu dans le PDF lu par les collaborateurs ne doit pas paraître
+    complet alors qu'il est tronqué — le prompt promet pourtant « longueur
+    libre » au LLM.
+
+    ``marker`` est verbeux pour la PROSE (titre/intro/description/commentary)
+    et compact (``…``) pour les LABELS de graphes (axes/légende/parts) où la
+    phrase « texte coupé » déborderait la boîte de légende (#55 review).
+    """
     if not isinstance(value, str):
         return None
-    return value[:limit]
+    if len(value) <= limit:
+        return value
+    logger.warning("Plan LLM: %s tronqué %d→%d chars", field, len(value), limit)
+    return value[:limit] + marker
 
 
 def _coerce_int(value: Any) -> Optional[int]:
@@ -669,8 +795,13 @@ def _validate_plan(plan: Any, datasets: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     dataset_by_id = {ds["id"]: ds for ds in datasets}
 
+    # #56 — au-delà de _MAX_SECTIONS, les sections sont DROPPÉES (le prompt
+    # promet pourtant « tu décides du nombre de sections »).
+    capped_out = max(0, len(sections_raw) - _MAX_SECTIONS)
+
+    considered = sections_raw[:_MAX_SECTIONS]
     validated_sections: List[Dict[str, Any]] = []
-    for i, section in enumerate(sections_raw[:_MAX_SECTIONS]):
+    for i, section in enumerate(considered):
         validated = _validate_section(section, dataset_by_id, index=i)
         if validated is not None:
             validated_sections.append(validated)
@@ -678,10 +809,29 @@ def _validate_plan(plan: Any, datasets: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not validated_sections:
         raise ReportPlanError("Aucune section valide dans le plan retourné par l'IA")
 
+    # #56 review (Moyen a) — DEUX causes de drop, MÊME conséquence user (sections
+    # manquantes) : (1) au-delà du cap, (2) sections invalides DANS le cap
+    # (dataset_id halluciné, titre manquant…). On compte les deux pour que la
+    # note PDF reflète TOUT ce que l'IA a proposé mais qui n'a pas été inclus.
+    dropped_invalid = len(considered) - len(validated_sections)
+    sections_omitted = capped_out + dropped_invalid
+    if sections_omitted:
+        logger.warning(
+            "Plan LLM: %d section(s) non incluses (%d au-delà du cap %d, "
+            "%d invalides)",
+            sections_omitted,
+            capped_out,
+            _MAX_SECTIONS,
+            dropped_invalid,
+        )
+
     return {
         "title": title.strip(),
-        "introduction": _truncate(plan.get("introduction"), _MAX_INTRODUCTION_LEN),
+        "introduction": _truncate(
+            plan.get("introduction"), _MAX_INTRODUCTION_LEN, field="introduction"
+        ),
         "sections": validated_sections,
+        "sections_omitted": sections_omitted,
     }
 
 
@@ -706,18 +856,45 @@ def _validate_section(
     ds = dataset_by_id[dataset_id]
     ds_columns = set(ds.get("columns") or [])
 
-    validated_charts: List[Dict[str, Any]] = []
-    for chart in (section.get("charts") or [])[:_MAX_CHARTS_PER_SECTION]:
-        v = _validate_chart(chart, ds_columns)
-        if v is not None:
-            validated_charts.append(v)
+    # #87 — valider TOUS les graphiques d'abord (un chart invalide en tête ne
+    # doit pas masquer un chart valide au-delà — même classe de bug que le
+    # slice-avant-validation de #88), puis cap au max par section.
+    raw_charts = section.get("charts") or []
+    all_validated: List[Dict[str, Any]] = []
+    if isinstance(raw_charts, list):
+        for chart in raw_charts:
+            v = _validate_chart(chart, ds_columns)
+            if v is not None:
+                all_validated.append(v)
+    validated_charts = all_validated[:_MAX_CHARTS_PER_SECTION]
+
+    description = _truncate(section.get("description"), _MAX_DESCRIPTION_LEN)
+    # #87 — les graphiques valides au-delà du cap étaient droppés EN SILENCE.
+    # On note le surplus dans la description (rendue dans le PDF) pour que le
+    # lecteur du rapport sache qu'il manque des graphiques.
+    if len(all_validated) > _MAX_CHARTS_PER_SECTION:
+        n_dropped = len(all_validated) - _MAX_CHARTS_PER_SECTION
+        logger.warning(
+            "Section '%s' : %d graphiques valides, %d au-delà du max %d non affichés",
+            title,
+            len(all_validated),
+            n_dropped,
+            _MAX_CHARTS_PER_SECTION,
+        )
+        _note = (
+            f"⚠ {n_dropped} graphique(s) non affiché(s) "
+            f"(limite : {_MAX_CHARTS_PER_SECTION} par section)."
+        )
+        description = f"{description}\n\n{_note}" if description else _note
 
     return {
         "title": title.strip(),
         "dataset_id": dataset_id,
-        "description": _truncate(section.get("description"), _MAX_DESCRIPTION_LEN),
+        "description": description,
         "charts": validated_charts,
-        "commentary": _truncate(section.get("commentary"), _MAX_COMMENTARY_LEN),
+        "commentary": _truncate(
+            section.get("commentary"), _MAX_COMMENTARY_LEN, field="commentary"
+        ),
     }
 
 
@@ -744,18 +921,40 @@ def _validate_chart(chart: Any, ds_columns: set) -> Optional[Dict[str, Any]]:
         logger.warning("Chart skipped: type invalide '%s'", ctype)
         return None
 
-    title = _truncate(chart.get("title"), _MAX_CHART_TITLE_LEN)
-    x_label = _truncate(chart.get("x_label"), 100)
-    y_label = _truncate(chart.get("y_label"), 100)
+    title = _truncate(chart.get("title"), _MAX_CHART_TITLE_LEN, field="chart_title")
+    # Labels d'axes : marqueur compact « … » (la phrase déborderait l'axe).
+    x_label = _truncate(chart.get("x_label"), 100, field="x_label", marker="…")
+    y_label = _truncate(chart.get("y_label"), 100, field="y_label", marker="…")
 
     if ctype == "bar":
-        cleaned = _clean_bars(chart.get("bars"))
+        cleaned, total_bars = _clean_bars(chart.get("bars"))
         if not cleaned:
             logger.warning("Chart bar skipped: pas de barres valides")
             return None
+        bar_title = title
+        if total_bars > len(cleaned):
+            # #88 — signaler dans le TITRE (rendu dans le PDF) que des barres
+            # valides sont omises : sinon une comparaison amputée passe pour
+            # exhaustive auprès du lecteur du rapport.
+            logger.warning(
+                "Chart bar: %d barres valides, %d affichées (cap %d)",
+                total_bars,
+                len(cleaned),
+                _MAX_BARS_IN_CHART,
+            )
+            _suffix = f"({len(cleaned)} sur {total_bars} barres)"
+            # Le suffixe est l'info IMPORTANTE → on rogne la base du titre (pas
+            # le suffixe) pour rester dans le contrat _MAX_CHART_TITLE_LEN
+            # (review Moyen : sinon le titre dépassait son propre cap et pouvait
+            # être chopé en aval, perdant le suffixe).
+            _base = bar_title or ""
+            _budget = _MAX_CHART_TITLE_LEN - len(_suffix) - 1
+            if len(_base) > _budget:
+                _base = _base[:_budget].rstrip()
+            bar_title = f"{_base} {_suffix}".strip() if _base else _suffix
         return {
             "type": "bar",
-            "title": title,
+            "title": bar_title,
             "x_label": x_label,
             "y_label": y_label,
             "bars": cleaned,
@@ -784,33 +983,53 @@ def _validate_chart(chart: Any, ds_columns: set) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _clean_bars(raw: Any) -> List[Dict[str, Any]]:
+def _clean_bars(raw: Any) -> Tuple[List[Dict[str, Any]], int]:
+    """Valide TOUTES les barres puis cap à ``_MAX_BARS_IN_CHART``.
+
+    Retourne ``(barres_affichées, nb_total_valide)``. #88 — l'ancien
+    ``raw[:_MAX_BARS_IN_CHART]`` tronquait AVANT validation : des barres
+    invalides dans les 30 premières faisaient disparaître des barres VALIDES
+    au-delà du cap, sans aucun signal (comparaison amputée présentée comme
+    complète). On valide tout d'abord, on cap ensuite ; le caller suffixe le
+    titre quand ``total > affichées``. Pas de fausse barre « Autres » : les
+    valeurs d'un bar chart ne sont pas forcément additives (leçon #48 — un
+    « Autres » sommant des moyennes serait faux), donc on signale au lieu
+    d'agréger (contrairement aux pie slices additives de ``_clean_slices``).
+    """
     if not isinstance(raw, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for item in raw[:_MAX_BARS_IN_CHART]:
+        return [], 0
+    valid: List[Dict[str, Any]] = []
+    for item in raw:
         if not isinstance(item, dict):
             continue
-        label = _truncate(item.get("label"), 60)
+        label = _truncate(item.get("label"), 60, field="bar_label", marker="…")
         val = _coerce_number(item.get("value"))
         if label is None or val is None:
             continue
-        out.append({"label": label, "value": val})
-    return out
+        valid.append({"label": label, "value": val})
+    return valid[:_MAX_BARS_IN_CHART], len(valid)
 
 
 def _clean_slices(raw: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw, list):
         return []
-    out: List[Dict[str, Any]] = []
-    for item in raw[:_MAX_SLICES_IN_CHART]:
+    # Valider TOUTES les parts (pas seulement les _MAX_SLICES_IN_CHART premières) :
+    # label non vide + valeur numérique > 0 (_coerce_number rejette bool/NaN/inf).
+    pairs: List[tuple] = []
+    for item in raw:
         if not isinstance(item, dict):
             continue
-        label = _truncate(item.get("label"), 40)
+        label = _truncate(item.get("label"), 40, field="slice_label", marker="…")
         val = _coerce_number(item.get("value"))
         if label is None or val is None or val <= 0:
             continue
-        out.append({"label": label, "value": val})
+        pairs.append((label, val))
+    # #143 : au-delà de _MAX_SLICES_IN_CHART, AGRÉGER la queue dans une part
+    # « Autres » au lieu de la tronquer en silence (sinon le camembert rendu
+    # affiche des pourcentages faux : les parts droppées disparaissaient du
+    # dénominateur). SSoT pie_data.prepare_pie_slices → somme préservée.
+    labels, values, _others, _excl = prepare_pie_slices(pairs, max_slices=_MAX_SLICES_IN_CHART)
+    out = [{"label": lbl, "value": val} for lbl, val in zip(labels, values)]
     return out
 
 
@@ -821,7 +1040,7 @@ def _clean_series(raw: Any) -> List[Dict[str, Any]]:
     for s in raw[:_MAX_SERIES_IN_CHART]:
         if not isinstance(s, dict):
             continue
-        name = _truncate(s.get("name"), 60)
+        name = _truncate(s.get("name"), 60, field="series_name", marker="…")
         points_raw = s.get("points")
         if not isinstance(points_raw, list):
             continue

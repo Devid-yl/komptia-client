@@ -415,6 +415,19 @@ STEP_TYPE_META = {
                 "label": "Copies cachees (bcc)",
             },
             "subject": {"type": "string", "label": "Objet de l'email"},
+            "body": {
+                # Texte brut, PAS du HTML : converti via
+                # plain_text_to_email_html (escape + sauts de ligne -> <br/>)
+                # a l'envoi — meme contrat que EMAIL_WAIT_RESPONSE.body.
+                "type": "text",
+                "label": "Corps du message",
+                "help": (
+                    "Texte brut : les sauts de ligne sont conserves, le HTML "
+                    "n'est pas interprete. Si vide : l'objet de l'email sert "
+                    "de contenu. Les pieces jointes (rapports, exports) sont "
+                    "ajoutees automatiquement."
+                ),
+            },
             "export_anonymized": {
                 "type": "boolean",
                 "label": "Anonymiser les classeurs joints automatiquement",

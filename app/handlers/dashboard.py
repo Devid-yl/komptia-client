@@ -145,7 +145,7 @@ _ONBOARDING_DEPLOY_DATE = _parse_deploy_date()
 def _should_show_onboarding(user: "User") -> bool:
     """Heuristique « newcomer » basée sur ``user.created_at``.
 
-    Conservée pour le tour user (``dashboard_user_v1``) où le créneau
+    Conservée pour le tour user (``dashboard_user_v2``) où le créneau
     « créé après le déploiement de l'onboarding » suffit comme signal.
 
     Pour le tour admin, voir :func:`_should_show_admin_onboarding` qui
@@ -170,11 +170,11 @@ def _should_show_onboarding(user: "User") -> bool:
 # ``key`` passé à ``KomptiaOnboarding.start`` dans ``templates/dashboard/admin.html``.
 # Si le key change template-side, mettre à jour ICI aussi (test de garde
 # vérifie l'alignement).
-_ADMIN_TOUR_KEY: Final[str] = "dashboard_admin_v1"
+_ADMIN_TOUR_KEY: Final[str] = "dashboard_admin_v2"
 
 
 async def _should_show_admin_onboarding(user: "User") -> bool:
-    """Décide si l'admin doit voir le tour ``dashboard_admin_v1``.
+    """Décide si l'admin doit voir le tour ``dashboard_admin_v2``.
 
     Bug 2026-05-26 (F2 CRITIQUE) : avant ce fix, on utilisait simplement
     ``_should_show_onboarding`` qui se basait UNIQUEMENT sur

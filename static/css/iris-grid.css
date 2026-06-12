@@ -338,6 +338,24 @@
         box-shadow: 0 0 0 3px rgb(var(--brand-rgb) / 0.4), 0 4px 12px rgb(var(--brand-rgb) / 0.15);
     }
 
+    /* Bannière « non pré-validé par le SGBD » (oracle fail-open).
+       Ambre = avertissement non bloquant ; role="alert" côté JS pour a11y.
+       ⚠️ COPIE SYNCHRONE dans templates/iris.html (light + .dark) : /iris ne
+       charge PAS ce fichier — toute modif doit être reportée des deux côtés. */
+    .iris-sql-oracle-warning {
+        padding: 0.5rem 0.875rem;
+        background: #fef3c7;
+        border-bottom: 1px solid #f59e0b;
+        color: #92400e;
+        font-size: 0.78rem;
+        line-height: 1.4;
+    }
+    .dark .iris-sql-oracle-warning {
+        background: rgba(245, 158, 11, 0.12);
+        border-bottom-color: rgba(245, 158, 11, 0.45);
+        color: #fcd34d;
+    }
+
     /* Jump-to-SQL banner */
     .iris-sql-jump-banner {
         position: sticky;
@@ -397,6 +415,21 @@
         overflow-y: auto;
         box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.3);
         cursor: default;
+    }
+    /* Affordance défilement : fade bas (inset, pas de ::after → pas de
+       position:relative requis) tant que le contenu déborde et que le
+       scroll n'est pas activé. Dit « il y a plus de lignes dessous »
+       sans chrome supplémentaire.
+       ⚠️ COPIE SYNCHRONE dans templates/iris.html (~l.508) — /iris ne
+       charge PAS ce fichier. */
+    .iris-sql-table-wrap.has-overflow:not(.scroll-active) {
+        box-shadow: inset 0 -18px 14px -14px rgba(0, 0, 0, 0.28);
+    }
+    /* En fullscreen le cap 60vh saute (max-height:none, cf. .grid-fullscreen
+       plus bas) : scrollbar natif = affordance, on neutralise le fade
+       (has-overflow possiblement stale jusqu'au prochain _rebuildBody). */
+    .grid-fullscreen .iris-sql-table-wrap.has-overflow {
+        box-shadow: none;
     }
     .iris-sql-table-wrap::-webkit-scrollbar { width: 4px; height: 4px; }
     .iris-sql-table-wrap::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 2px; }
@@ -1372,9 +1405,71 @@
     }
     .grid-copilot-status.error {
         color: #dc2626;
+        /* Les erreurs backend font jusqu'à 400+ chars (fix 2026-06-10, bug
+           vécu « message illisible ») : multi-ligne + scroll au lieu de la
+           ligne unique ellipsée de la base — qui rendait la suite du
+           message physiquement illisible. Borne max-height : la barre ne
+           pousse pas la grille hors écran. */
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        max-height: 6em;
+        overflow-y: auto;
+    }
+    /* Bouton « Signaler » sur les erreurs 5xx copilot (axe 5 du contrat,
+       tâche #19). Discret : même teinte que l'erreur, bordure fine — il
+       fait partie du message, pas un CTA flottant. ``position:sticky``
+       (review #19) : la zone .error scrolle (max-height 6em) et le bouton
+       est le dernier enfant — sticky le garde TOUJOURS visible au bas de
+       la boîte, même sur un message de 400+ chars. Fond opaque obligatoire
+       (le texte défile dessous). min-height 32px = cible tactile.
+       COPIE SYNCHRONE de templates/iris.html. */
+    .grid-copilot-status .copilot-report-btn {
+        display: block;
+        position: sticky;
+        bottom: 0;
+        margin-top: 0.25rem;
+        padding: 0.25rem 0.6rem;
+        min-height: 32px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        line-height: 1.4;
+        color: #dc2626;
+        background: var(--bg-surface, #fff);
+        border: 1px solid #dc2626;
+        border-radius: 0.25rem;
+        cursor: pointer;
+    }
+    .grid-copilot-status .copilot-report-btn:hover {
+        background: rgba(220, 38, 38, 0.08);
+    }
+    .grid-copilot-status .copilot-report-btn:focus-visible {
+        outline: 2px solid currentColor;
+        outline-offset: 2px;
     }
     .grid-copilot-status.success {
         color: #16a34a;
+    }
+    /* États warning/info (fix 2026-06-10) : utilisés par max_turns_reached
+       (invitation à reprendre / 0-action) et patch_tab partiel — les
+       classes étaient posées par le JS mais JAMAIS définies → texte gris
+       par défaut sans signal visuel. Mêmes règles d'accessibilité que
+       error/success (préfixe ::before). */
+    .grid-copilot-status.warning {
+        color: #d97706;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        max-height: 6em;
+        overflow-y: auto;
+    }
+    .grid-copilot-status.info {
+        color: #2563eb;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        text-overflow: clip;
+        max-height: 6em;
+        overflow-y: auto;
     }
     /* WCAG 1.4.1 Use of Color : la sévérité ne doit pas reposer
        UNIQUEMENT sur la couleur. Préfixes textuels visibles +
@@ -1386,6 +1481,14 @@
     }
     .grid-copilot-status.success::before {
         content: "Succès : ";
+        font-weight: 600;
+    }
+    .grid-copilot-status.warning::before {
+        content: "Attention : ";
+        font-weight: 600;
+    }
+    .grid-copilot-status.info::before {
+        content: "Info : ";
         font-weight: 600;
     }
 
@@ -3603,6 +3706,12 @@
 .dark .grid-container,
 .dark .grid-scroll-wrap { background: transparent; }
 
+/* Affordance défilement (fade bas) — variante dark plus marquée pour
+   rester visible sur fond sombre. */
+.dark .iris-sql-table-wrap.has-overflow:not(.scroll-active) {
+    box-shadow: inset 0 -20px 16px -14px rgba(0, 0, 0, 0.65);
+}
+
 /* ───────────────────────────────────────────────────────────── */
 /* Complément dark : tab bars, tabs, card, sql-details, search   */
 /* (identique au bloc dans iris.html — utilisé sur /datastore et */
@@ -3855,7 +3964,20 @@
 .dark .grid-copilot-input::placeholder { color: var(--text-faint); }
 .dark .grid-copilot-status { color: var(--text-muted); }
 .dark .grid-copilot-status.error { color: #fca5a5; }
+.dark .grid-copilot-status .copilot-report-btn {
+    color: #fca5a5;
+    border-color: #fca5a5;
+    /* Fond opaque dark : --bg-surface n'est pas défini dans ce scope, le
+       fallback #fff de la règle light serait blanc en dark (sticky par-
+       dessus le texte qui défile). Token surface du thème dark copilot. */
+    background: var(--bg-surface-3, #1f2937);
+}
+.dark .grid-copilot-status .copilot-report-btn:hover {
+    background: rgba(252, 165, 165, 0.12);
+}
 .dark .grid-copilot-status.success { color: #86efac; }
+.dark .grid-copilot-status.warning { color: #fcd34d; }
+.dark .grid-copilot-status.info { color: #93c5fd; }
 .dark .grid-copilot-anon-badge {
     box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
 }

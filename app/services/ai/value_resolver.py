@@ -190,8 +190,15 @@ class ValueResolver:
                     for placeholder, real_value in unresolved.items():
                         # Chercher la valeur dans les colonnes varchar/nvarchar
                         # de toutes les tables principales (pas Temp*)
+                        # TOP 100 (cohérent avec max_rows=100 ci-dessous) et
+                        # PAS TOP 5 : avec 5, seules les 5 premières tables (ordre
+                        # alphabétique) sont candidates. Si la valeur user vit dans
+                        # une table plus loin, le placeholder reste NON résolu en
+                        # SILENCE → Iris filtre sur une colonne devinée → 0 ligne ou
+                        # résultats faux sans erreur visible (donnée fausse
+                        # silencieuse). On élargit le pool de candidats.
                         search_sql = """
-                            SELECT TOP 5 t.TABLE_NAME, c.COLUMN_NAME
+                            SELECT TOP 100 t.TABLE_NAME, c.COLUMN_NAME
                             FROM INFORMATION_SCHEMA.COLUMNS c
                             JOIN INFORMATION_SCHEMA.TABLES t
                                 ON c.TABLE_NAME = t.TABLE_NAME
@@ -206,11 +213,25 @@ class ValueResolver:
                         if len(real_value.strip()) < 3:
                             continue
                         try:
+                            # bypass_admin_cap=True : ce sondage INFORMATION_SCHEMA
+                            # est un INTERNAL de pré-vol (jamais montré à l'user),
+                            # comme schema_sync / db_config_service. Sans le bypass,
+                            # le cap UX /admin/database (min(100, max_rows)) re-rétréci
+                            # EN SILENCE le pool de candidats qu'on vient d'élargir à
+                            # 100 → on retombe sur le bug d'origine (placeholder non
+                            # résolu si la table sort tard). #18f review (verdict #18).
                             col_result = await connector.execute(
-                                search_sql, (len(real_value),), max_rows=100
+                                search_sql,
+                                (len(real_value),),
+                                max_rows=100,
+                                bypass_admin_cap=True,
                             )
-                            # Pour chaque table/colonne candidate, chercher la valeur
-                            for row in col_result.rows[:20]:
+                            # Pour chaque table/colonne candidate, chercher la valeur.
+                            # On itère TOUTES les candidates retournées (≤100, borné
+                            # par le TOP 100 SQL) au lieu d'un sous-cap [:20] : la
+                            # boucle s'arrête (break) au premier match, donc le coût
+                            # plein n'est payé que si la valeur est introuvable.
+                            for row in col_result.rows:
                                 tbl, col = row[0], row[1]
                                 try:
                                     check_sql = f"SELECT TOP 1 1 FROM [{tbl}] " f"WHERE [{col}] = ?"
@@ -278,7 +299,11 @@ class ValueResolver:
 
         return resolved
 
-    def build_column_hints(self, resolved: dict[str, list[dict]]) -> str:
+    def build_column_hints(
+        self,
+        resolved: dict[str, list[dict]],
+        all_placeholders: dict[str, str] | None = None,
+    ) -> str:
         """
         Construit un bloc texte à injecter dans le system prompt du LLM.
 
@@ -287,54 +312,103 @@ class ValueResolver:
 
         Args:
             resolved: Résultat de resolve_placeholders()
+            all_placeholders: mapping {token: valeur} d'origine (pii_mapping).
+                Si fourni, on calcule les tokens ~xxx cherchés mais NON résolus
+                et on les SIGNALE LOUD au LLM. Sans ce signal, un token non
+                localisé pousserait Iris à filtrer sur une colonne devinée →
+                0 ligne ou résultats faux SANS erreur visible (doctrine
+                « donnée fausse silencieuse »). La garde d'effet doit vivre au
+                bout de la chaîne, ici, dans le payload réellement consommé.
 
         Returns:
-            Texte à ajouter au system prompt (vide si rien à résoudre)
+            Texte à ajouter au system prompt (vide si rien à résoudre NI à signaler)
         """
-        if not resolved:
+        # Tokens ~xxx présents dans l'input user mais que la résolution n'a pas
+        # rattachés à une colonne. (Les [EMAIL_x], [PHONE_x]… ne sont pas des
+        # candidats — resolve_placeholders ne traite que les ~xxx.)
+        unresolved_tokens: list[str] = []
+        if all_placeholders:
+            unresolved_tokens = [
+                tok
+                for tok in all_placeholders
+                if tok.startswith("~") and tok not in resolved
+            ]
+
+        if not resolved and not unresolved_tokens:
             return ""
 
-        lines = [
-            "\n\n## Correspondance valeurs utilisateur → colonnes",
-            "",
-            "L'utilisateur a mentionné des valeurs que le serveur a anonymisées "
-            "(tokens ~xxx). Voici les colonnes correspondantes :",
-            "",
-        ]
+        lines: list[str] = []
 
-        for placeholder, matches in resolved.items():
-            if len(matches) == 1:
-                m = matches[0]
-                lines.append(
-                    f"- **`{placeholder}`** → colonne `{m['column']}` "
-                    f"de la table `{m['table']}` (type: {m['value_type']})"
-                )
-                # Ajouter les codes associés si disponibles
-                if m.get("related_codes"):
-                    for rc_col, rc_val in m["related_codes"].items():
-                        lines.append(f"  - Code associé : `{m['table']}.{rc_col}` = `'{rc_val}'`")
-            else:
-                # Plusieurs correspondances possibles
-                lines.append(f"- **`{placeholder}`** → correspondances multiples :")
-                for m in matches:
-                    hint = f"  - `{m['table']}.{m['column']}` (type: {m['value_type']})"
+        if resolved:
+            lines.extend(
+                [
+                    "\n\n## Correspondance valeurs utilisateur → colonnes",
+                    "",
+                    "L'utilisateur a mentionné des valeurs que le serveur a anonymisées "
+                    "(tokens ~xxx). Voici les colonnes correspondantes :",
+                    "",
+                ]
+            )
+
+            for placeholder, matches in resolved.items():
+                if len(matches) == 1:
+                    m = matches[0]
+                    lines.append(
+                        f"- **`{placeholder}`** → colonne `{m['column']}` "
+                        f"de la table `{m['table']}` (type: {m['value_type']})"
+                    )
+                    # Ajouter les codes associés si disponibles
                     if m.get("related_codes"):
-                        codes = ", ".join(f"`{c}` = `'{v}'`" for c, v in m["related_codes"].items())
-                        hint += f" — codes associés : {codes}"
-                    lines.append(hint)
+                        for rc_col, rc_val in m["related_codes"].items():
+                            lines.append(
+                                f"  - Code associé : `{m['table']}.{rc_col}` = `'{rc_val}'`"
+                            )
+                else:
+                    # Plusieurs correspondances possibles
+                    lines.append(f"- **`{placeholder}`** → correspondances multiples :")
+                    for m in matches:
+                        hint = f"  - `{m['table']}.{m['column']}` (type: {m['value_type']})"
+                        if m.get("related_codes"):
+                            codes = ", ".join(
+                                f"`{c}` = `'{v}'`" for c, v in m["related_codes"].items()
+                            )
+                            hint += f" — codes associés : {codes}"
+                        lines.append(hint)
 
-        # Construire un exemple à partir du premier token résolu
-        example_token = next(iter(resolved))
-        lines.extend(
-            [
-                "",
-                f"**REGLE** : Utilise directement le token anonymisé (ex: `{example_token}`) "
-                "dans tes requêtes SQL comme valeur de filtre. "
-                f"Exemple : `WHERE colonne = '{example_token}'`. "
-                "Le serveur substituera automatiquement la vraie valeur via requête "
-                "paramétrisée. Ne tente PAS de deviner ou d'écrire la valeur réelle.",
-            ]
-        )
+            # Construire un exemple à partir du premier token résolu
+            example_token = next(iter(resolved))
+            lines.extend(
+                [
+                    "",
+                    f"**REGLE** : Utilise directement le token anonymisé (ex: `{example_token}`) "
+                    "dans tes requêtes SQL comme valeur de filtre. "
+                    f"Exemple : `WHERE colonne = '{example_token}'`. "
+                    "Le serveur substituera automatiquement la vraie valeur via requête "
+                    "paramétrisée. Ne tente PAS de deviner ou d'écrire la valeur réelle.",
+                ]
+            )
+
+        if unresolved_tokens:
+            # Garde d'EFFET (pas juste de présence) : le warning est dans le
+            # payload consommé par le LLM, donc il agit vraiment sur sa décision.
+            lines.extend(
+                [
+                    "\n\n## ⚠ Valeurs utilisateur NON localisées",
+                    "",
+                    "Les tokens suivants correspondent à des valeurs citées par "
+                    "l'utilisateur que le serveur n'a PAS pu rattacher à une colonne "
+                    "(recherche limitée dans le cache ValueMapping + BDD source) :",
+                    "",
+                ]
+            )
+            for tok in unresolved_tokens:
+                lines.append(
+                    f"- **`{tok}`** : valeur non localisée (recherche limitée) — "
+                    "vérifie la colonne cible AVANT de filtrer dessus. Si tu n'es pas "
+                    "certain de la colonne, demande à l'utilisateur plutôt que de "
+                    "deviner : un filtre sur la mauvaise colonne renvoie 0 ligne ou "
+                    "des résultats faux SANS erreur visible."
+                )
 
         return "\n".join(lines)
 

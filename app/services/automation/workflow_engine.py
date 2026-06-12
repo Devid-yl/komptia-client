@@ -53,6 +53,11 @@ class WorkflowContext:
     rows: List[Dict[str, Any]] = field(default_factory=list)
     columns: List[str] = field(default_factory=list)
 
+    # #133 — la source courante (extract_sql) a-t-elle ete TRONQUEE au cap admin ?
+    # Propage jusqu'au step report (single_tab["truncated"]) pour que le planner
+    # marque « TRONQUE A LA SOURCE » au lieu d'agreger un sous-ensemble en silence.
+    truncated: bool = False
+
     # Metadonnees accumulees
     warnings: List[str] = field(default_factory=list)
     stats: Dict[str, Any] = field(default_factory=dict)

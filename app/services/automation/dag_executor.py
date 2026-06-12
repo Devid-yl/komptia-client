@@ -388,6 +388,35 @@ NodeExecutor = Callable[
 ]
 
 
+def _merge_input_warnings(
+    input_workbook: Optional[Dict[str, Any]], extras: Dict[str, Any]
+) -> List[str]:
+    """Combine les warnings de l'``input_workbook`` avec ceux du step (``extras``).
+
+    Fix #10 2026-06-11 (donnée fausse SILENCIEUSE). En fan-in, quand un parent a
+    échoué, ``build_node_input`` pose un warning « Parents failed/skipped ignores
+    a la fusion » DANS ``input_workbook['warnings']``. Avant ce fix, le record du
+    step downstream ne reprenait QUE ``extras['warnings']`` → le warning de
+    fan-in était perdu et un rapport bâti sur des données PARTIELLES (un parent
+    disparu) ne portait aucune trace visible (statut « success »).
+
+    On combine donc les deux sources, en préservant l'ordre (warnings d'input
+    d'abord — ils décrivent les données consommées) et en dédupliquant.
+    """
+    combined: List[str] = []
+    seen: set = set()
+    src_in = input_workbook.get("warnings") if isinstance(input_workbook, dict) else None
+    for _w in (src_in or []):
+        if isinstance(_w, str) and _w not in seen:
+            seen.add(_w)
+            combined.append(_w)
+    for _w in (extras.get("warnings") or []):
+        if isinstance(_w, str) and _w not in seen:
+            seen.add(_w)
+            combined.append(_w)
+    return combined
+
+
 async def _execute_node_with_output(
     node: AutomationStep,
     input_workbook: Optional[Dict[str, Any]],
@@ -402,75 +431,115 @@ async def _execute_node_with_output(
     t_start = time.perf_counter()
     rows_in = workbook_row_count(input_workbook) if input_workbook else 0
 
-    try:
-        output_workbook, extras = await executor_adapter(node, input_workbook, context)
-    except Exception as exc:
-        # Cas special : WaitForResponse n'est PAS une erreur — c'est un
-        # signal que le step a suspendu l'execution en attendant une
-        # reponse externe. On marque le step `waiting` et on remonte
-        # l'exception pour que dag_executor stoppe la cascade SANS
-        # marquer l'execution failed.
-        from app.core.exceptions import WaitForResponse as _WaitForResponse
+    # #18 fix 2026-06-11 — RETRY par step (OPT-IN, défaut max_retries=0). Honore
+    # ``node.max_retries`` / ``node.retry_delay_seconds``, jusqu'ici IGNORÉS par
+    # le DAG (le commentaire d'en-tête « pas de retry » était stale ; le canvas
+    # expose pourtant ces champs → promesse sans code). Mêmes bornes que le
+    # chemin linéaire (0-5 tentatives supplémentaires, délai 1-60 s). SÛR côté
+    # LIVRAISON : un sink (email/report/export) RELÂCHE son claim d'idempotence
+    # sur l'échec qui déclenche le retry (Cluster-E #5b) → la ré-tentative
+    # re-exécute sans skip silencieux, et sans DOUBLE-ENVOI (l'email ne lève que
+    # si sent_count==0, donc rien n'est parti ; un envoi partiel ne lève pas →
+    # pas de retry). ``WaitForResponse`` n'est JAMAIS retry (suspension, pas échec).
+    # ⚠️ COÛT : le retry rejoue l'adapter ENTIER, donc les appels LLM
+    # intermédiaires d'un step report (``plan_report``) sont RE-FACTURÉS à chaque
+    # tentative si l'échec survient APRÈS l'appel LLM (pas de cache inter-essais).
+    # Acceptable car opt-in (défaut 0) — l'utilisateur qui active le retry sur un
+    # step report accepte ce coût ; documenté ici pour ne pas le masquer.
+    raw_retries = getattr(node, "max_retries", 0)
+    max_retries = min(max(raw_retries, 0), 5) if isinstance(raw_retries, int) else 0
+    raw_delay = getattr(node, "retry_delay_seconds", 5)
+    retry_delay = min(max(raw_delay, 1), 60) if isinstance(raw_delay, int) else 5
+    max_attempts = max_retries + 1
 
-        if isinstance(exc, _WaitForResponse):
+    from app.core.exceptions import WaitForResponse as _WaitForResponse
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            output_workbook, extras = await executor_adapter(node, input_workbook, context)
+            break  # succès → sort de la boucle de retry
+        except Exception as exc:
+            # WaitForResponse n'est PAS une erreur — c'est un signal de
+            # suspension (attente d'une réponse externe). On NE retry PAS : on
+            # marque le step `waiting` et on remonte l'exception pour que
+            # dag_executor stoppe la cascade SANS marquer l'execution failed.
+            if isinstance(exc, _WaitForResponse):
+                duration_ms = (time.perf_counter() - t_start) * 1000
+                logger.info(
+                    "DAG node waiting: step_id=%d name='%s' type='%s' wait_token_id=%s",
+                    node.id,
+                    node.name,
+                    node.step_type,
+                    getattr(exc, "wait_token_id", None),
+                )
+                wait_record = StepExecutionRecord(
+                    step_id=node.id,
+                    step_order=node.step_order or 0,
+                    step_name=node.name,
+                    step_type=node.step_type,
+                    status="waiting",
+                    attempt_number=attempt,
+                    started_at=started_at,
+                    finished_at=None,
+                    duration_ms=duration_ms,
+                    rows_in=rows_in,
+                    rows_out=0,
+                    error_message=None,
+                    trace_id=context.trace_id,
+                    step_input=(
+                        workbook_snapshot_for_db(input_workbook) if input_workbook else None
+                    ),
+                )
+                exc.step_record = wait_record  # type: ignore[attr-defined]
+                raise
+
+            # Échec : retry si des tentatives restent (sinon record failed).
+            if attempt < max_attempts:
+                logger.warning(
+                    "DAG node retry: step_id=%d name='%s' tentative %d/%d échouée "
+                    "(%s) — nouvelle tentative dans %d s.",
+                    node.id,
+                    node.name,
+                    attempt,
+                    max_attempts,
+                    type(exc).__name__,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
             duration_ms = (time.perf_counter() - t_start) * 1000
-            logger.info(
-                "DAG node waiting: step_id=%d name='%s' type='%s' wait_token_id=%s",
+            logger.error(
+                "DAG node failed: step_id=%d name='%s' type='%s' error=%s (apres %d tentative(s))",
                 node.id,
                 node.name,
                 node.step_type,
-                getattr(exc, "wait_token_id", None),
+                exc,
+                attempt,
+                exc_info=True,
             )
-            wait_record = StepExecutionRecord(
+            record = StepExecutionRecord(
                 step_id=node.id,
                 step_order=node.step_order or 0,
                 step_name=node.name,
                 step_type=node.step_type,
-                status="waiting",
+                status="failed",
+                attempt_number=attempt,
                 started_at=started_at,
-                finished_at=None,
+                finished_at=clock.now(),
                 duration_ms=duration_ms,
                 rows_in=rows_in,
                 rows_out=0,
-                error_message=None,
+                error_message=format_step_error_message(exc),
+                # Phase 2.5.6 (#77) — propage la classe d'exception pour que le
+                # caller détecte les ``DataAccessDeniedError`` (auto-pause RLS).
+                error_class=type(exc).__name__,
                 trace_id=context.trace_id,
                 step_input=workbook_snapshot_for_db(input_workbook) if input_workbook else None,
             )
-            # On stocke le record + on re-raise pour que la boucle DAG
-            # (run_dag_pipeline) detecte le wait et stoppe proprement.
-            # Le record est attache a l'exception pour que la boucle
-            # puisse le persister apres.
-            exc.step_record = wait_record  # type: ignore[attr-defined]
-            raise
-
-        duration_ms = (time.perf_counter() - t_start) * 1000
-        logger.error(
-            "DAG node failed: step_id=%d name='%s' type='%s' error=%s",
-            node.id,
-            node.name,
-            node.step_type,
-            exc,
-            exc_info=True,
-        )
-        record = StepExecutionRecord(
-            step_id=node.id,
-            step_order=node.step_order or 0,
-            step_name=node.name,
-            step_type=node.step_type,
-            status="failed",
-            started_at=started_at,
-            finished_at=clock.now(),
-            duration_ms=duration_ms,
-            rows_in=rows_in,
-            rows_out=0,
-            error_message=format_step_error_message(exc),
-            # Phase 2.5.6 (#77) — propage la classe d'exception pour que le
-            # caller détecte les ``DataAccessDeniedError`` (auto-pause RLS).
-            error_class=type(exc).__name__,
-            trace_id=context.trace_id,
-            step_input=workbook_snapshot_for_db(input_workbook) if input_workbook else None,
-        )
-        return record, None
+            return record, None
 
     duration_ms = (time.perf_counter() - t_start) * 1000
     rows_out = workbook_row_count(output_workbook) if output_workbook else 0
@@ -483,12 +552,13 @@ async def _execute_node_with_output(
         step_name=node.name,
         step_type=node.step_type,
         status="success",
+        attempt_number=attempt,
         started_at=started_at,
         finished_at=clock.now(),
         duration_ms=duration_ms,
         rows_in=rows_in,
         rows_out=rows_out,
-        warnings=list(extras.get("warnings", [])),
+        warnings=_merge_input_warnings(input_workbook, extras),
         trace_id=context.trace_id,
         step_input=input_snap,
         step_output=output_snap,
@@ -578,7 +648,7 @@ async def execute_node(
             duration_ms=duration_ms,
             rows_in=rows_in,
             rows_out=rows_out,
-            warnings=list(extras.get("warnings", [])),
+            warnings=_merge_input_warnings(input_workbook, extras),
             trace_id=context.trace_id,
             step_input=input_snap,
             step_output=output_snap,
@@ -730,6 +800,7 @@ async def run_dag_pipeline(
     max_parallel: int = DEFAULT_MAX_PARALLEL_NODES,
     edges_override: Optional[List[AutomationEdge]] = None,
     resume_state: Optional[Dict[str, Any]] = None,
+    on_level_complete: Optional[Any] = None,
 ) -> Tuple[DAGRunContext, List[StepExecutionRecord]]:
     """Execute un workflow DAG. Retourne (context_final, records_par_step).
 
@@ -746,6 +817,12 @@ async def run_dag_pipeline(
             synthétiser une chaîne linéaire en mémoire quand une auto a
             des steps mais pas encore d'edges persistées (rétro-compat
             avec les autos créées avant la phase DAG).
+        on_level_complete: Callback async optionnel invoqué APRÈS chaque niveau
+            du DAG avec ``all_records`` (cumulatif). Sert au flush INCRÉMENTAL
+            des StepExecution pour la progression live du moniteur (ENGINE-2).
+            Si ``None`` (ex. chemin resume), aucun flush incrémental — la
+            persistance finale via ``_persist_dag_step_results`` reste garantie.
+            Best-effort : une exception du callback est loggée, le run continue.
 
     Returns:
         (DAGRunContext, List[StepExecutionRecord]) : contexte final pour
@@ -1090,6 +1167,22 @@ async def run_dag_pipeline(
             processed_so_far=processed_so_far,
         )
         processed_so_far.update({r.step_id for r, _ in level_results})
+
+        # ENGINE-2 — persistance INCRÉMENTALE des StepExecution après chaque
+        # niveau pour que le moniteur live voie la progression (0/Y → i/Y) au
+        # lieu d'un 0% figé jusqu'au commit final. Best-effort + idempotent côté
+        # callback (skip les rows déjà persistées) → jamais de doublon ; un flush
+        # qui échoue n'interrompt pas le run (le commit final backstop rattrape).
+        if on_level_complete is not None:
+            try:
+                await on_level_complete(all_records)
+            except Exception as _flush_exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    "DAG run %d: flush incrémental niveau %d échoué (%s), continue",
+                    execution_id,
+                    level_idx,
+                    _flush_exc,
+                )
 
         # Phase 2d : check circuit-breaker apres chaque niveau
         tripped = _check_circuit_breaker(context, automation)

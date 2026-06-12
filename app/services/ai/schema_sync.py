@@ -6,6 +6,7 @@ vers les données d'entraînement (DDL) depuis la base de données directement.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -26,12 +27,13 @@ except ImportError:
     _FCNTL_AVAILABLE = False
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core import clock
 from app.core.database import get_session
+from app.core.exceptions import DatabaseError, QueryError, SageConnectionError
 from app.constants_ai import (
     get_schema_sync_max_rows_tables,
     get_schema_sync_max_rows_views,
@@ -41,6 +43,107 @@ from app.services.ai.training_store import get_training_store
 from app.services.ai.schema_loader import SchemaLoader
 
 logger = logging.getLogger(__name__)
+
+
+# CTE des index de chunks pour la récupération chunkée des définitions
+# (vues ET fonctions). Cause : pyodbc tronque silencieusement les colonnes
+# ``nvarchar(max)`` (OBJECT_DEFINITION / sys.sql_modules.definition) à
+# ~4000 bytes. On chunke donc côté SQL via SUBSTRING (2000 chars = 4000
+# bytes UTF-16, sous le cap), puis on reconstitue côté Python.
+#
+# Limite : 64 chunks × 2000 chars = 128 KB max par définition. COUPLAGE :
+# ces 2 valeurs doivent rester synchronisées avec
+# app.constants_ai.SCHEMA_SYNC_VIEW_CHUNK_COUNT/_SIZE et avec
+# ``sqlite_sage_connector._intercept_metadata_query`` (règles
+# SYS.SQL_MODULES). Si vous changez ici, changez les autres sites aussi.
+_DEF_CHUNKS_CTE = """
+    WITH chunks AS (
+        SELECT n FROM (VALUES
+            (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+            (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+            (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+            (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+            (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),
+            (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),
+            (61),(62),(63),(64)
+        ) AS v(n)
+    )
+"""
+
+# Récupération chunkée par object_id (préférée) : l'``object_id`` vient du
+# catalogue (sys.views / sys.objects) listé juste avant — PAS de
+# re-résolution ``OBJECT_ID('schema.nom')`` qui peut renvoyer NULL côté
+# compte à permissions restreintes (prod) et sauter l'objet en silence.
+_DEF_CHUNK_QUERY_BY_OBJECT_ID = (
+    _DEF_CHUNKS_CTE
+    + """
+    SELECT
+        c.n AS chunk_idx,
+        SUBSTRING(m.definition, (c.n - 1) * 2000 + 1, 2000) AS chunk_data,
+        LEN(m.definition) AS total_len
+    FROM chunks c
+    CROSS JOIN sys.sql_modules m
+    WHERE m.object_id = ?
+      AND (c.n - 1) * 2000 < LEN(m.definition)
+    ORDER BY c.n
+"""
+)
+
+# Fallback legacy par nom qualifié — utilisé seulement si le catalogue n'a
+# pas fourni d'object_id (connecteur custom / colonne absente).
+_DEF_CHUNK_QUERY_BY_NAME = (
+    _DEF_CHUNKS_CTE
+    + """
+    SELECT
+        c.n AS chunk_idx,
+        SUBSTRING(m.definition, (c.n - 1) * 2000 + 1, 2000) AS chunk_data,
+        LEN(m.definition) AS total_len
+    FROM chunks c
+    CROSS JOIN sys.sql_modules m
+    WHERE m.object_id = OBJECT_ID(?)
+      AND (c.n - 1) * 2000 < LEN(m.definition)
+    ORDER BY c.n
+"""
+)
+
+# Cap de warnings individuels « définition introuvable » par sync — au-delà,
+# un seul warning agrégé (évite 400+ lignes de log sur un compte prod sans
+# permission VIEW DEFINITION, tout en gardant le signal actionnable).
+_DEF_SKIP_WARN_CAP = 5
+
+
+async def _fetch_definition_chunked(connector, object_id, qualified_name) -> Tuple[str, int]:
+    """Récupère la définition complète d'une vue/fonction par chunks.
+
+    Préfère ``object_id`` (robuste aux permissions restreintes) et ne
+    retombe sur ``OBJECT_ID(nom)`` que si le catalogue n'a pas fourni
+    d'object_id. Retourne ``(definition, total_len)`` — ``definition``
+    vide signifie « introuvable » (objet invisible, permission VIEW
+    DEFINITION manquante, ou définition réellement vide).
+    """
+    if object_id is not None:
+        result = await connector.execute(
+            _DEF_CHUNK_QUERY_BY_OBJECT_ID, (object_id,), bypass_admin_cap=True
+        )
+    else:
+        result = await connector.execute(
+            _DEF_CHUNK_QUERY_BY_NAME, (qualified_name,), bypass_admin_cap=True
+        )
+    rows = result.to_dicts()
+    if not rows:
+        return "", 0
+    rows_sorted = sorted(rows, key=lambda r: r.get("chunk_idx") or 0)
+    definition = "".join((r.get("chunk_data") or "") for r in rows_sorted)
+    total_len = rows_sorted[-1].get("total_len") or 0
+    if total_len and len(definition) < total_len:
+        logger.warning(
+            "Définition de %s dépasse la capacité de chunking (%d/%d chars "
+            "récupérés). Élargir _DEF_CHUNKS_CTE dans schema_sync.py si besoin.",
+            qualified_name,
+            len(definition),
+            total_len,
+        )
+    return definition, total_len
 
 
 # Pourcentages de progression — séparés en constantes pour rendre explicite
@@ -106,7 +209,7 @@ class _SyncCompleteness:
     """Accumulateur des sections de sync schéma qui ÉCHOUENT silencieusement.
 
     D1-F7 (#76) — Plusieurs sections de ``_sync_from_sage_impl``
-    (functions / synonyms / fk / inferred / cardinality / view_mining)
+    (views / functions / synonyms / fk / inferred / cardinality / view_mining)
     avalent leur exception et continuent (non-bloquant, par design). Mais sans
     traçage, la sync renvoie ``success:True`` alors que la connaissance schéma
     d'Iris est PARTIELLE — ex : si la requête FK échoue, Iris ignore les
@@ -491,7 +594,7 @@ class SchemaSyncService:
                 **changes,
             }
 
-        except (SQLAlchemyError, ConnectionError, OSError) as e:
+        except (SQLAlchemyError, ConnectionError, OSError, DatabaseError) as e:
             duration = time.time() - start_time
 
             # Logger l'échec
@@ -885,10 +988,24 @@ class SchemaSyncService:
             # ========================================
             # 2. Synchroniser les VUES SQL
             # ========================================
+            # Fiabilisation 2026-06-09 (incident prod « 0 vue syncée en
+            # silence ») :
+            # - le catalogue fournit ``v.object_id`` réutilisé tel quel pour
+            #   lire sys.sql_modules (la re-résolution ``OBJECT_ID(nom)``
+            #   renvoyait NULL sur le compte prod restreint → 0 chunk → vue
+            #   sautée SANS trace) ;
+            # - chaque vue sans définition récupérable est COMPTÉE et loguée ;
+            # - la section est suivie par ``_SyncCompleteness`` comme les
+            #   autres (functions/synonyms/fk/...) : échec du catalogue, perte
+            #   de connexion mi-boucle, ou 0/N définitions récupérées →
+            #   ``complete:False`` + section ``views`` dans
+            #   ``incomplete_sections`` (l'admin voit que la connaissance
+            #   d'Iris est partielle au lieu d'un faux « ✅ terminé »).
             views_query = """
                 SELECT
                 s.name as schema_name,
                 v.name as view_name,
+                v.object_id as object_id,
                 CAST(ep.value AS NVARCHAR(MAX)) as description
                 FROM sys.views v
                 INNER JOIN sys.schemas s ON v.schema_id = s.schema_id
@@ -900,17 +1017,47 @@ class SchemaSyncService:
                 ORDER BY s.name, v.name
             """
 
-            views_result = await connector.execute(
-                views_query,
-                max_rows=get_schema_sync_max_rows_views(),
-                bypass_admin_cap=True,
+            views_list: List[Dict[str, Any]] = []
+            try:
+                views_result = await connector.execute(
+                    views_query,
+                    max_rows=get_schema_sync_max_rows_views(),
+                    bypass_admin_cap=True,
+                )
+                views_list = views_result.to_dicts()
+            except (SQLAlchemyError, ConnectionError, DatabaseError) as views_err:
+                # Catalogue illisible (permissions sys.views, connexion…) —
+                # non-bloquant pour le cœur tables/colonnes, mais tracé.
+                _completeness.mark("views", views_err)
+
+            _views_section_failed = any(
+                f["section"] == "views" for f in _completeness.failed
             )
-            views_list = views_result.to_dicts()
+            if not views_list and not _views_section_failed:
+                # 0 vue listée PAR UN CATALOGUE QUI A RÉPONDU : soit la source
+                # n'a réellement aucune vue, soit le compte ne les voit pas
+                # (VIEW DEFINITION / metadata visibility). Indiscernable côté
+                # code → log INFO actionnable pour le diagnostic prod, sans
+                # fausse alerte. (Si le catalogue a LEVÉ, la cause réelle est
+                # déjà marquée — ce diagnostic serait trompeur, revue adv.
+                # 2026-06-10.)
+                logger.info(
+                    "Sync vues : 0 vue visible dans sys.views — si la base "
+                    "source en contient, vérifier les permissions du compte "
+                    "SQL (VIEW DEFINITION / metadata visibility)."
+                )
 
             views_synced = 0
+            views_def_missing = 0
             # Accumulate full view DDLs for later mining (détecteurs 1, 2, 4)
             view_ddls_for_mining: List[Dict[str, str]] = []
             for view_row in views_list:
+                # Distingue « définition jamais stockée » d'un échec APRÈS
+                # add_view réussi (ex. add_documentation de la description) :
+                # dans ce 2ᵉ cas la vue est bien synchronisée — la compter
+                # aussi dans views_def_missing fausserait la comptabilité
+                # (synced + missing > listed, revue adv. 2026-06-10).
+                _view_synced_this_iter = False
                 try:
                     schema_name = view_row["schema_name"]
                     view_name = view_row["view_name"]
@@ -918,173 +1065,177 @@ class SchemaSyncService:
 
                     full_view_name = f"{schema_name}.{view_name}"
 
-                    # Récupérer la définition de la vue, en CHUNKS de 2000 caractères.
-                    # Cause : pyodbc tronque silencieusement les colonnes
-                    # `nvarchar(max)` retournées par `OBJECT_DEFINITION(...)`
-                    # à ~4000 bytes (cap driver msodbcsql / pilote ODBC). Sans
-                    # chunking, les vues longues (>4 KB de DDL) sont stockées
-                    # incomplètes — on perd les derniers JOINs / clauses, ce qui
-                    # masque silencieusement leur sémantique réelle.
-                    #
-                    # Solution : chunker la définition côté SQL via SUBSTRING
-                    # (chaque chunk de 2000 caractères = 4000 bytes en UTF-16,
-                    # sous le cap pyodbc), puis reconstituer la chaîne complète
-                    # côté Python en concaténant dans l'ordre des chunks.
-                    #
-                    # Limite : 64 chunks × 2000 chars = 128 KB max. Largement
-                    # suffisant pour des vues SQL réalistes (>10 KB est déjà
-                    # rare). Si une vue dépasse, on logue un warning ; le DDL
-                    # stocké sera quand même tronqué dans ce cas extrême — à
-                    # élargir si besoin.
-                    #
-                    # COUPLAGE : ces 2 valeurs (64 et 2000) doivent rester
-                    # synchronisées avec :
-                    # - app.constants_ai.SCHEMA_SYNC_VIEW_CHUNK_COUNT/_SIZE
-                    #   (documentation ; helpers get_schema_sync_view_chunk_size())
-                    # - app.services.database.sqlite_sage_connector.
-                    #   _intercept_metadata_query (cas SYS.SQL_MODULES + OBJECT_ID)
-                    # Si vous changez ici, changez les autres sites aussi.
-                    view_def_query = """
-                        WITH chunks AS (
-                            SELECT n FROM (VALUES
-                                (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
-                                (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
-                                (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
-                                (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
-                                (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),
-                                (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),
-                                (61),(62),(63),(64)
-                            ) AS v(n)
-                        )
-                        SELECT
-                            c.n AS chunk_idx,
-                            SUBSTRING(m.definition, (c.n - 1) * 2000 + 1, 2000) AS chunk_data,
-                            LEN(m.definition) AS total_len
-                        FROM chunks c
-                        CROSS JOIN sys.sql_modules m
-                        WHERE m.object_id = OBJECT_ID(?)
-                          AND (c.n - 1) * 2000 < LEN(m.definition)
-                        ORDER BY c.n
-                    """
-                    view_def_result = await connector.execute(
-                        view_def_query, (full_view_name,), bypass_admin_cap=True
+                    definition, _total_len = await _fetch_definition_chunked(
+                        connector,
+                        view_row.get("object_id"),
+                        full_view_name,
                     )
-                    rows = view_def_result.to_dicts()
 
-                    if rows and len(rows) > 0:
-                        # Reconstituer la définition complète en concaténant
-                        # les chunks dans l'ordre. Tolère les clés absentes /
-                        # NULL côté SQL Server par défense.
-                        rows_sorted = sorted(rows, key=lambda r: r.get("chunk_idx") or 0)
-                        definition = "".join((r.get("chunk_data") or "") for r in rows_sorted)
-                        # Détection d'une vue plus grande que la capacité (rare).
-                        # Le total_len SQL Server est la source de vérité ; si on
-                        # a moins de chars qu'attendu, c'est qu'on a saturé le cap.
-                        total_len = rows_sorted[-1].get("total_len") if rows_sorted else 0
-                        if total_len and len(definition) < total_len:
+                    if not definition:
+                        # AVANT 2026-06-09 ce cas était un pass silencieux :
+                        # en prod, AUCUNE vue n'était syncée et la sync
+                        # affichait quand même « ✅ terminé ».
+                        views_def_missing += 1
+                        if views_def_missing <= _DEF_SKIP_WARN_CAP:
                             logger.warning(
-                                "Vue %s dépasse la capacité de chunking "
-                                "(%d/%d chars récupérés). Élargir la liste "
-                                "de chunks dans schema_sync.py si besoin.",
+                                "Sync vues : définition introuvable pour %s "
+                                "(object_id=%s) — vue SAUTÉE. Cause probable : "
+                                "permission VIEW DEFINITION manquante pour le "
+                                "compte SQL.",
                                 full_view_name,
-                                len(definition),
-                                total_len,
+                                view_row.get("object_id"),
                             )
+                        continue
 
-                        if definition:
-                            # Extraire le SELECT (enlever CREATE VIEW ... AS)
-                            definition = definition.strip()
-                            parts = re.split(r"\bAS\b", definition, maxsplit=1, flags=re.IGNORECASE)
-                            if len(parts) >= 2:
-                                select_part = parts[1].strip()
-                            else:
-                                select_part = definition
+                    # Extraire le SELECT (enlever CREATE VIEW ... AS)
+                    definition = definition.strip()
+                    parts = re.split(r"\bAS\b", definition, maxsplit=1, flags=re.IGNORECASE)
+                    if len(parts) >= 2:
+                        select_part = parts[1].strip()
+                    else:
+                        select_part = definition
 
-                            ddl = f"-- Vue: {full_view_name}\nCREATE VIEW {full_view_name} AS\n{select_part}"
+                    ddl = f"-- Vue: {full_view_name}\nCREATE VIEW {full_view_name} AS\n{select_part}"
 
-                            # Phase 1.6 (#43) — extraire dépendances via sqlglot
-                            # pour peupler depends_on. Fail-safe : [] si parsing
-                            # échoue → Phase 2.1 traitera la vue comme "deps
-                            # inconnues" (fail-closed strict).
-                            try:
-                                from app.services.data_access.dependency_parser import (
-                                    extract_dependencies_from_sql,
-                                )
+                    # Phase 1.6 (#43) — extraire dépendances via sqlglot
+                    # pour peupler depends_on. Fail-safe : [] si parsing
+                    # échoue → Phase 2.1 traitera la vue comme "deps
+                    # inconnues" (fail-closed strict).
+                    try:
+                        from app.services.data_access.dependency_parser import (
+                            extract_dependencies_from_sql,
+                        )
 
-                                view_deps = extract_dependencies_from_sql(ddl)
-                            except Exception as parse_err:
-                                logger.warning(
-                                    "Sync vues: extract_dependencies échoué " "pour %s: %s",
-                                    full_view_name,
-                                    parse_err,
-                                )
-                                view_deps = []
+                        view_deps = extract_dependencies_from_sql(ddl)
+                    except Exception as parse_err:
+                        logger.warning(
+                            "Sync vues: extract_dependencies échoué " "pour %s: %s",
+                            full_view_name,
+                            parse_err,
+                        )
+                        view_deps = []
 
-                            # Phase 1.6 (#43) — utiliser add_view (au lieu de
-                            # add_ddl legacy). Le data_type est maintenant VIEW
-                            # distinct de DDL, ce qui permet au closure transitif
-                            # de calculer correctement les dépendances.
-                            # Rétro-compat lecture : ``get_related_ddl`` et
-                            # ``get_ddl_by_table_names`` ont été étendus pour
-                            # inclure data_type IN (DDL, VIEW) côté lecture.
-                            await self.training_store.add_view(
-                                definition=ddl,
-                                view_name=full_view_name.replace(".", "_"),
-                                source="auto_sync_view",
-                                user_id=user_id,
-                                depends_on=view_deps or None,
-                            )
-                            changes["ddl_added"] += 1
-                            views_synced += 1
-                            # Conserver pour le mining (détecteurs 1, 2, 4)
-                            view_ddls_for_mining.append(
-                                {
-                                    "name": view_name,
-                                    "full_name": full_view_name,
-                                    "ddl": ddl,
-                                }
-                            )
-
-                            # Extraire les JOIN patterns depuis le SQL de la vue
-                            # Les vues montrent les jointures VALIDÉES par le DBA.
-                            # On les stocke comme join_pattern: docs pour que le
-                            # RAG les trouve quand le LLM cherche comment joindre.
-                            try:
-                                join_patterns = self._extract_join_patterns(view_name, select_part)
-                                for jp in join_patterns:
-                                    await self.training_store.add_documentation(
-                                        doc=jp["doc"],
-                                        category=jp["category"],
-                                        tags=["auto_sync", "join_pattern", "view_derived"],
-                                        source="schema_sync_view_join",
-                                        user_id=user_id,
-                                    )
-                                if join_patterns:
-                                    changes["doc_added"] += len(join_patterns)
-                            except Exception as jp_err:
-                                logger.debug(
-                                    "Join pattern extraction failed for %s: %s", view_name, jp_err
-                                )
-
-                            # Ajouter la description si disponible
-                            if description:
-                                doc_content = f"Vue {full_view_name}: {description}"
-                                await self.training_store.add_documentation(
-                                    doc=doc_content,
-                                    category=f"vue_{schema_name}",
-                                    tags=["vue", schema_name],
-                                    source="view_description",
-                                    user_id=user_id,
-                                )
-                                changes["doc_added"] += 1
-
-                except (SQLAlchemyError, ConnectionError) as e:
-                    logger.warning(
-                        "Impossible de synchroniser la vue %s: %s",
-                        view_row.get("view_name", "unknown"),
-                        type(e).__name__,
+                    # Phase 1.6 (#43) — utiliser add_view (au lieu de
+                    # add_ddl legacy). Le data_type est maintenant VIEW
+                    # distinct de DDL, ce qui permet au closure transitif
+                    # de calculer correctement les dépendances.
+                    # Rétro-compat lecture : ``get_related_ddl`` et
+                    # ``get_ddl_by_table_names`` ont été étendus pour
+                    # inclure data_type IN (DDL, VIEW) côté lecture.
+                    await self.training_store.add_view(
+                        definition=ddl,
+                        view_name=full_view_name.replace(".", "_"),
+                        source="auto_sync_view",
+                        user_id=user_id,
+                        depends_on=view_deps or None,
                     )
+                    changes["ddl_added"] += 1
+                    views_synced += 1
+                    _view_synced_this_iter = True
+                    # Conserver pour le mining (détecteurs 1, 2, 4)
+                    view_ddls_for_mining.append(
+                        {
+                            "name": view_name,
+                            "full_name": full_view_name,
+                            "ddl": ddl,
+                        }
+                    )
+
+                    # Extraire les JOIN patterns depuis le SQL de la vue
+                    # Les vues montrent les jointures VALIDÉES par le DBA.
+                    # On les stocke comme join_pattern: docs pour que le
+                    # RAG les trouve quand le LLM cherche comment joindre.
+                    try:
+                        join_patterns = self._extract_join_patterns(view_name, select_part)
+                        for jp in join_patterns:
+                            await self.training_store.add_documentation(
+                                doc=jp["doc"],
+                                category=jp["category"],
+                                tags=["auto_sync", "join_pattern", "view_derived"],
+                                source="schema_sync_view_join",
+                                user_id=user_id,
+                            )
+                        if join_patterns:
+                            changes["doc_added"] += len(join_patterns)
+                    except Exception as jp_err:
+                        logger.debug(
+                            "Join pattern extraction failed for %s: %s", view_name, jp_err
+                        )
+
+                    # Ajouter la description si disponible
+                    if description:
+                        doc_content = f"Vue {full_view_name}: {description}"
+                        await self.training_store.add_documentation(
+                            doc=doc_content,
+                            category=f"vue_{schema_name}",
+                            tags=["vue", schema_name],
+                            source="view_description",
+                            user_id=user_id,
+                        )
+                        changes["doc_added"] += 1
+
+                except SageConnectionError as conn_err:
+                    # Connexion source perdue mi-boucle : inutile de marteler
+                    # les vues restantes (timeouts en série). Section marquée
+                    # incomplète ; la sync continue (le cœur tables/colonnes
+                    # est déjà fait).
+                    _completeness.mark("views", conn_err)
+                    logger.warning(
+                        "Sync vues interrompue par perte de connexion source "
+                        "après %d/%d vues.",
+                        views_synced,
+                        len(views_list),
+                    )
+                    break
+                except (SQLAlchemyError, ConnectionError, DatabaseError) as e:
+                    # Échec isolé sur UNE vue : compté + logué (plafonné, même
+                    # cap que le chemin « définition vide » — revue adv.
+                    # 2026-06-10), la boucle continue. AVANT 2026-06-09 ce
+                    # catch ignorait les exceptions applicatives (QueryError…)
+                    # levées par les connecteurs → filet INERTE : l'exception
+                    # sortait de la boucle et tuait la sync entière sans trace.
+                    if not _view_synced_this_iter:
+                        views_def_missing += 1
+                    if views_def_missing <= _DEF_SKIP_WARN_CAP or _view_synced_this_iter:
+                        logger.warning(
+                            "Impossible de synchroniser la vue %s: %s%s",
+                            view_row.get("view_name", "unknown"),
+                            type(e).__name__,
+                            (
+                                " (définition stockée, enrichissement doc échoué)"
+                                if _view_synced_this_iter
+                                else ""
+                            ),
+                        )
                     continue
+
+            if views_def_missing > _DEF_SKIP_WARN_CAP:
+                logger.warning(
+                    "Sync vues : %d définitions de vues introuvables ou en "
+                    "échec au total (les %d premières sont détaillées "
+                    "ci-dessus).",
+                    views_def_missing,
+                    _DEF_SKIP_WARN_CAP,
+                )
+            if views_def_missing > 0:
+                # Connaissance PARTIELLE = section incomplète, dès la 1ʳᵉ vue
+                # manquante — pas seulement le cas 0/N (revue adv. 2026-06-10 :
+                # un compte avec VIEW DEFINITION sur un seul schéma donnait
+                # 12/400 syncées et complete:True, variante directe de
+                # l'incident prod). ``mark`` est idempotent sémantiquement :
+                # on n'ajoute pas de doublon si un échec amont a déjà marqué.
+                if not any(f["section"] == "views" for f in _completeness.failed):
+                    _completeness.mark(
+                        "views",
+                        QueryError(
+                            f"{views_def_missing}/{len(views_list)} définitions "
+                            "de vues non récupérées"
+                        ),
+                    )
+            # Comptes exposés dans le résultat + l'audit changes_detail :
+            # l'admin peut comparer listées vs syncées au lieu de déduire.
+            changes["views_listed"] = len(views_list)
+            changes["views_def_missing"] = views_def_missing
 
             if _cancelled():
                 return {"success": False, "error": "Synchronisation annulée."}
@@ -1107,6 +1258,7 @@ class SchemaSyncService:
                     SELECT
                         s.name as schema_name,
                         o.name as function_name,
+                        o.object_id as object_id,
                         o.type as function_type
                     FROM sys.objects o
                     INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
@@ -1128,49 +1280,17 @@ class SchemaSyncService:
                         full_fn_name = f"{schema_name}.{function_name}"
 
                         # Récupérer la définition via le même chunking que
-                        # les vues (cap pyodbc 4KB sur nvarchar(max) → on
-                        # chunke par 2000 chars en UTF-16). Mêmes constants
-                        # que pour les vues — cf. schema_sync_view_chunk_size.
-                        fn_def_query = """
-                            WITH chunks AS (
-                                SELECT n FROM (VALUES
-                                    (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
-                                    (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
-                                    (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
-                                    (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
-                                    (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),
-                                    (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),
-                                    (61),(62),(63),(64)
-                                ) AS v(n)
-                            )
-                            SELECT
-                                c.n AS chunk_idx,
-                                SUBSTRING(m.definition, (c.n - 1) * 2000 + 1, 2000) AS chunk_data,
-                                LEN(m.definition) AS total_len
-                            FROM chunks c
-                            CROSS JOIN sys.sql_modules m
-                            WHERE m.object_id = OBJECT_ID(?)
-                              AND (c.n - 1) * 2000 < LEN(m.definition)
-                            ORDER BY c.n
-                        """
-                        fn_def_result = await connector.execute(
-                            fn_def_query, (full_fn_name,), bypass_admin_cap=True
+                        # les vues (cap pyodbc 4KB sur nvarchar(max)) — helper
+                        # partagé, object_id du catalogue préféré (la
+                        # re-résolution OBJECT_ID(nom) peut renvoyer NULL sur
+                        # compte restreint → fonction sautée en silence).
+                        definition, _total_len = await _fetch_definition_chunked(
+                            connector,
+                            fn_row.get("object_id"),
+                            full_fn_name,
                         )
-                        rows = fn_def_result.to_dicts()
-                        if not rows:
+                        if not definition:
                             continue
-
-                        rows_sorted = sorted(rows, key=lambda r: r.get("chunk_idx") or 0)
-                        definition = "".join((r.get("chunk_data") or "") for r in rows_sorted)
-                        total_len = rows_sorted[-1].get("total_len") if rows_sorted else 0
-                        if total_len and len(definition) < total_len:
-                            logger.warning(
-                                "Fonction %s dépasse la capacité de chunking "
-                                "(%d/%d chars). Élargir si besoin.",
-                                full_fn_name,
-                                len(definition),
-                                total_len,
-                            )
 
                         if definition:
                             definition = definition.strip()
@@ -1204,7 +1324,12 @@ class SchemaSyncService:
                             )
                             functions_synced += 1
 
-                    except (SQLAlchemyError, ConnectionError) as fn_err:
+                    except (SQLAlchemyError, ConnectionError, QueryError) as fn_err:
+                        # QueryError inclus (2026-06-09) : les connecteurs
+                        # lèvent les exceptions applicatives, pas SQLAlchemy —
+                        # sans lui ce filet per-item était inerte. Une
+                        # SageConnectionError (connexion perdue) remonte au
+                        # catch de section ci-dessous → mark("functions").
                         logger.warning(
                             "Impossible de synchroniser la fonction %s: %s",
                             fn_row.get("function_name", "unknown"),
@@ -1215,7 +1340,7 @@ class SchemaSyncService:
                 changes["functions_added"] = functions_synced
                 logger.info("Sync fonctions: %d ajoutées/mises à jour", functions_synced)
 
-            except (SQLAlchemyError, ConnectionError) as fn_outer_err:
+            except (SQLAlchemyError, ConnectionError, DatabaseError) as fn_outer_err:
                 # Échec du SELECT global (BDD legacy sans fonctions, ou
                 # permissions manquantes sur sys.objects). Non-bloquant, mais
                 # tracé comme section incomplète (#76) — Iris ignorera ces
@@ -1279,7 +1404,7 @@ class SchemaSyncService:
                         )
                         synonyms_synced += 1
 
-                    except (SQLAlchemyError, ConnectionError) as syn_err:
+                    except (SQLAlchemyError, ConnectionError, QueryError) as syn_err:
                         logger.warning(
                             "Impossible de synchroniser le synonyme %s: %s",
                             syn_row.get("synonym_name", "unknown"),
@@ -1290,7 +1415,7 @@ class SchemaSyncService:
                 changes["synonyms_added"] = synonyms_synced
                 logger.info("Sync synonymes: %d ajoutés/mis à jour", synonyms_synced)
 
-            except (SQLAlchemyError, ConnectionError) as syn_outer_err:
+            except (SQLAlchemyError, ConnectionError, DatabaseError) as syn_outer_err:
                 # Même gestion que pour les fonctions : non-bloquant + tracé
                 # incomplet (#76). Iris ne résoudra pas ces synonymes.
                 _completeness.mark("synonyms", syn_outer_err)
@@ -2010,7 +2135,11 @@ class SchemaSyncService:
                 **_completeness.as_result_fields(),
             }
 
-        except (SQLAlchemyError, ConnectionError, OSError) as e:
+        except (SQLAlchemyError, ConnectionError, OSError, DatabaseError) as e:
+            # DatabaseError inclus (2026-06-09) : les connecteurs lèvent les
+            # exceptions applicatives (QueryError/SageConnectionError) — sans
+            # lui, un échec connecteur hors-section traversait sans enregistrer
+            # de SchemaSync(success=False) ni retourner d'erreur structurée.
             duration = time.time() - start_time
             async with get_session() as session:
                 sync_record = SchemaSync(
@@ -2579,7 +2708,19 @@ class SchemaSyncService:
         Génère des suggestions via un appel LLM, en lui donnant le contexte
         des tables + l'usage de l'utilisateur. Stocke le résultat en cache.
 
+        **Memoïsé** : court-circuite l'appel LLM si la STRUCTURE du schéma
+        (fingerprint des tables/colonnes du top-N) est identique au dernier
+        appel et qu'un cache non vide existe — l'input étant déterministe, on
+        ne rappelle le LLM que quand la structure change réellement.
+
         Appelé après un sync réussi (générique) ou quand l'usage user a changé.
+
+        ⚠️ La séquence stockage (``deactivate_by_category`` puis ``add`` en
+        boucle) n'est pas transactionnelle : à n'appeler que sous le verrou de
+        sync (``_sync_lock`` des entry points ``sync_from_*``), ce qui est le
+        cas de l'unique caller. Hors verrou, deux exécutions concurrentes
+        pourraient laisser une fenêtre « 0 suggestion active ».
+
         Returns: liste de suggestions ou [] si échec.
         """
         from app.services.ai.llm_providers import LLMRequest
@@ -2656,6 +2797,52 @@ class SchemaSyncService:
                 + ". Oriente les suggestions vers ses centres d'intérêt."
             )
 
+        # ── Memoïsation sur fingerprint structurel ───────────────────────
+        # L'input de cet appel LLM est la STRUCTURE du schéma (noms de tables
+        # + colonnes du top-N, + tables favorites de l'user). Entre deux syncs
+        # cette structure ne bouge quasi jamais : seuls les row counts dérivent,
+        # et les questions générées n'en dépendent pas. Sans garde, CHAQUE sync
+        # (auto 24h + syncs manuels admin + boot) rappelle le LLM avec un input
+        # identique → gaspillage déterministe. On hashe la structure (PAS les
+        # counts ni compteurs d'usage, volatils) et on court-circuite l'appel
+        # quand le cache existant correspond. Doctrine Komptia « Code > Prompt » :
+        # ne pas appeler le LLM quand le code peut décider que rien n'a changé.
+        # Portée = les tables RÉELLEMENT envoyées au LLM (``top_tables``).
+        # Volontaire : les suggestions ne référencent QUE ces tables, donc un
+        # changement hors top-N ne modifierait pas la sortie → le re-générer
+        # serait du gaspillage. Un changement DANS le top-N (table/colonne
+        # ajoutée/supprimée/renommée) reconstruit ``top_tables`` à partir du
+        # ``all_ddl`` courant → le hash bouge → régénération. ``sorted`` (tables
+        # ET colonnes) rend le hash indépendant de l'ordre des lignes BDD
+        # (scores ex-aequo, pas d'ORDER BY garanti) → pas de fausse régénération.
+        fp_parts = [f"{t['name']}|{','.join(sorted(t['cols']))}" for t in top_tables]
+        if table_usage:
+            # tables favorites de l'user, SANS les compteurs (volatils eux aussi)
+            fp_parts.append("favs:" + ",".join(sorted(t for t, _ in top_used)))
+        input_fingerprint = hashlib.sha256(
+            "\n".join(sorted(fp_parts)).encode("utf-8")
+        ).hexdigest()
+
+        cache_category = f"welcome_suggestions_llm:user_{user_id or 'generic'}"
+
+        # Skip l'appel LLM si la structure est identique au dernier appel ET
+        # qu'un cache non vide existe. Le fingerprint voyage comme tag sur les
+        # lignes de suggestions elles-mêmes (cf. boucle de stockage) → une seule
+        # lecture renvoie les deux. Toute erreur → on régénère (fail vers la
+        # correction, jamais vers du stale silencieux).
+        try:
+            cached_fp, existing = await self._read_cached_suggestions_with_fp(cache_category)
+            if cached_fp == input_fingerprint and existing:
+                logger.info(
+                    "Suggestions LLM inchangées (schéma structurel identique) "
+                    "— skip appel LLM (user=%s, %d en cache)",
+                    user_id or "generic",
+                    len(existing),
+                )
+                return existing
+        except Exception as fp_err:  # noqa: BLE001 — fingerprint best-effort
+            logger.debug("Lecture cache suggestions échouée: %s", fp_err)
+
         prompt = f"""Voici les tables d'une base de données d'entreprise :
 
 {tables_text}
@@ -2713,14 +2900,18 @@ Réponds UNIQUEMENT avec un JSON valide, sans texte avant ni après :
             if not valid:
                 return []
 
-            # Stocker en cache
-            cache_category = f"welcome_suggestions_llm:user_{user_id or 'generic'}"
+            # Stocker en cache. Le fingerprint structurel voyage comme tag
+            # ``fp:<hash>`` SUR les lignes de suggestions (pas de ligne ni de
+            # catégorie séparée → aucun embedding ni candidat RAG supplémentaire ;
+            # le tag n'entre pas dans le contenu embeddé ``{category} {doc}``).
+            # Le prochain sync court-circuitera l'appel LLM tant que le hash
+            # correspond.
             await self.training_store.deactivate_by_category(cache_category)
             for idx, sug in enumerate(valid):
                 await self.training_store.add_documentation(
                     doc=json.dumps(sug, ensure_ascii=False),
                     category=f"{cache_category}:{idx}",
-                    tags=["welcome_suggestions", "llm_generated"],
+                    tags=["welcome_suggestions", "llm_generated", f"fp:{input_fingerprint}"],
                     source="llm_suggestions",
                     user_id=user_id,
                 )
@@ -2733,6 +2924,51 @@ Réponds UNIQUEMENT avec un JSON valide, sans texte avant ni après :
         except Exception as e:
             logger.warning("Suggestions LLM échouées (fallback programmatique): %s", e)
             return []
+
+    async def _read_cached_suggestions_with_fp(
+        self, cache_category: str
+    ) -> Tuple[Optional[str], List[Dict[str, str]]]:
+        """Lit en UNE passe les suggestions actives (brutes) d'une catégorie ET
+        leur fingerprint structurel (tag ``fp:<hash>`` posé par
+        :meth:`generate_llm_suggestions`).
+
+        Returns ``(fingerprint | None, suggestions)``. Le fingerprint alimente
+        le skip-path de memoïsation ; les suggestions servent à vérifier qu'un
+        cache non vide existe avant de court-circuiter l'appel LLM.
+
+        Volontairement SANS filtre denied (#141) : cette lecture n'alimente que
+        la décision interne « régénérer ou non », et son retour ne va qu'au sync
+        (cf. caller, qui ne fait que logger ``len()``). Le filtrage user-facing
+        reste appliqué par :meth:`get_cached_llm_suggestions`.
+        """
+        fingerprint: Optional[str] = None
+        out: List[Dict[str, str]] = []
+        async with get_session() as session:
+            from app.models.training_data import TrainingData
+
+            result = await session.execute(
+                select(TrainingData)
+                .where(
+                    TrainingData.category.startswith(cache_category + ":"),
+                    TrainingData.is_active == True,  # noqa: E712
+                )
+                .order_by(TrainingData.category)
+            )
+            for record in result.scalars().all():
+                if fingerprint is None and record.tags:
+                    for tag in record.tags.split(","):
+                        if tag.startswith("fp:"):
+                            fingerprint = tag[3:]
+                            break
+                try:
+                    data = json.loads(record.content)
+                    if "prompt" in data and "label" in data:
+                        out.append(
+                            {"prompt": str(data["prompt"]), "label": str(data["label"])}
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        return fingerprint, out
 
     async def get_cached_llm_suggestions(
         self,

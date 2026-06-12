@@ -37,6 +37,12 @@ TRIGGERED_BY_VALUES = frozenset(
         "copilot",  # reconcile_state au boot d'un classeur
         "auto_classifier",  # auto_classify (Ollama local)
         "system_cleanup",  # cleanup_unused_anonymization_terms_job
+        # Purge des termes unconfirmed+disabled > 30j. Était écrit en BDD
+        # HORS whitelist (cleanup_job construit ses rows AnonymizationAudit
+        # en direct, sans log_audit_action qui valide) → ces audits
+        # existaient mais étaient infiltrables via le filtre triggered_by
+        # de l'API (fix 2026-06-11, tâche #23).
+        "system_cleanup_bloat_30d",
         "system_migration",  # backfill ponctuel via migration BDD
         "proxy",  # anonymize_for_llm proxy (auto-detect terme nouveau)
     ]
@@ -122,5 +128,3 @@ async def log_audit_action(
             exc,
         )
         return None
-
-

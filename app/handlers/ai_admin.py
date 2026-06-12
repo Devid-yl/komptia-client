@@ -38,8 +38,8 @@ import csv
 import io
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import Any, Dict, Final
+from datetime import timedelta
+from typing import Any, Dict, Final, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -58,11 +58,15 @@ from app.handlers.base import BaseHandler, admin_required, require_role
 from app.handlers.base import is_admin as _is_admin
 from app.models.ai_performance import AIPerformanceLog, QueryStatus
 from app.models.training_data import TrainingDataType
-from app.models.user import User, UserRole
+from app.models.user import User
 from app.services.ai.llm_providers import ensure_providers_from_db, get_llm_manager
 from app.services.ai.schema_sync import get_sync_service
 from app.services.ai.stats_service import get_ai_stats_service
-from app.services.ai.training_store import BUSINESS_CONTEXT_CATEGORY, get_training_store
+from app.services.ai.training_store import (
+    BUSINESS_CONTEXT_CATEGORY,
+    PINNED_KNOWLEDGE_CATEGORY,
+    get_training_store,
+)
 from app.services.audit.audit_log import audit_event
 from app.utils.output_safety import csv_safe_cell, safe_json_for_script
 from app.utils.redaction import (
@@ -116,6 +120,7 @@ _TRAINING_PUT_TYPES: Final[tuple[str, ...]] = (
     "documentation",
     "ddl",
     "question_sql",
+    "pinned",
 )
 
 # Rate → classe Tailwind pour le dashboard. Paliers alignés avec
@@ -215,6 +220,8 @@ def _resolve_training_type(raw: str | None) -> tuple[TrainingDataType | None, st
         return None, None, True
     if raw == "business_context":
         return TrainingDataType.DOCUMENTATION, BUSINESS_CONTEXT_CATEGORY, True
+    if raw == "pinned":
+        return TrainingDataType.DOCUMENTATION, PINNED_KNOWLEDGE_CATEGORY, True
     try:
         return TrainingDataType(raw), None, True
     except (ValueError, KeyError):
@@ -322,8 +329,9 @@ def _format_recent_query(raw: dict[str, Any]) -> dict[str, Any]:
     - ``success`` : booléen lisible plutôt que ``status == "success"``.
     - ``attempts`` : placeholder (toujours 1 pour l'instant, colonne future).
     - ``rag_used`` : vrai dès qu'un des compteurs RAG > 0.
-    - ``created_at_formatted`` : DD/MM HH:MM dans la timezone **du serveur**
-      (fallback si aucune tz user ; les timestamps bruts restent ISO UTC).
+    - ``created_at_formatted`` : DD/MM HH:MM dans la TZ serveur configurée
+      (``config.server.timezone`` via ``clock.to_local`` ; les timestamps bruts
+      restent ISO UTC en base).
     """
     formatted: dict[str, Any] = dict(raw)
     formatted["success"] = raw.get("status") == "success"
@@ -334,35 +342,29 @@ def _format_recent_query(raw: dict[str, Any]) -> dict[str, Any]:
         or (raw.get("rag_example_count") or 0) > 0
     )
 
+    # Conversion via la SOURCE DE VÉRITÉ unique (clock.to_local ←
+    # config.server.timezone). Avant : ``datetime.fromisoformat(...).strftime``
+    # affichait l'UTC brut pour les timestamps naïfs (même bug « +4h » que
+    # l'historique sync) et ``astimezone()`` suivait la TZ du process Python,
+    # pas le fuseau configuré par l'admin.
     created_at = raw.get("created_at")
-    if created_at:
-        try:
-            dt = datetime.fromisoformat(created_at)
-            if dt.tzinfo is not None:
-                dt = dt.astimezone()
-            formatted["created_at_formatted"] = dt.strftime("%d/%m %H:%M")
-        except (TypeError, ValueError):
-            formatted["created_at_formatted"] = "-"
-    else:
-        formatted["created_at_formatted"] = "-"
+    local = clock.to_local(created_at) if created_at else None
+    formatted["created_at_formatted"] = (
+        clock.strftime_fr(local, "%d/%m %H:%M") if local is not None else "-"
+    )
     return formatted
 
 
 def _format_iso_date(raw: str | None, *, include_time: bool = False) -> str:
-    """Formate ``YYYY-MM-DDTHH:MM:SS`` en ``DD/MM/YYYY`` (± heure).
+    """Formate un ISO UTC en ``DD/MM/YYYY`` (± heure) dans la TZ serveur configurée.
 
-    Retourne ``"-"`` si ``raw`` est falsy ou trop court pour être parsé.
+    Délègue à :func:`app.core.clock.format_local_fr` (SOURCE DE VÉRITÉ UNIQUE de
+    l'affichage daté serveur) : convertit l'UTC stocké vers
+    ``config.server.timezone`` au lieu d'afficher l'heure UTC brute (l'ancienne
+    version découpait la chaîne ISO → +4h pour ``America/Guadeloupe``). Retourne
+    ``"-"`` si ``raw`` est absent/illisible.
     """
-    if not raw or len(raw) < 10:
-        return "-"
-    try:
-        year, month, day = raw[:10].split("-")
-        formatted = f"{day}/{month}/{year}"
-        if include_time and len(raw) >= 16:
-            formatted += f" {raw[11:16]}"
-        return formatted
-    except (ValueError, IndexError):
-        return raw[:16].replace("T", " ") if include_time else raw[:10]
+    return clock.format_local_fr(raw, with_time=include_time)
 
 
 def _write_json_error(handler: BaseHandler, status: int, message: str) -> None:
@@ -489,7 +491,14 @@ class AIPerformanceDashboardHandler(BaseHandler):
                 return
             days = parsed
 
-        context = await self._build_dashboard_context(days)
+        # Pagination serveur du tableau « Requêtes récentes » (offset + total
+        # calculés dans _build_dashboard_context, mêmes filtres que le count).
+        try:
+            page = int(self.get_argument("page", 1))
+        except (TypeError, ValueError):
+            page = 1
+
+        context = await self._build_dashboard_context(days, page=page)
         self.render(
             "admin/ai_performance.html",
             user=user,
@@ -506,6 +515,10 @@ class AIPerformanceDashboardHandler(BaseHandler):
             rag_stats=safe_json_for_script(context["rag_stats"]),
             current_days=days,
             allowed_periods=list(_ALLOWED_PERIODS),
+            # Pagination du tableau « Requêtes récentes » (UIModule Pagination).
+            current_page=context["recent_page"],
+            total_pages=context["recent_total_pages"],
+            recent_total=context["recent_total"],
             # AI-7 (2026-05-26) : SSoT devise — template ne hardcode plus ``$``.
             pricing_currency_code=PRICING_CURRENCY_CODE,
             pricing_currency_symbol=PRICING_CURRENCY_SYMBOL,
@@ -516,7 +529,7 @@ class AIPerformanceDashboardHandler(BaseHandler):
             page_title="Performance Iris",
         )
 
-    async def _build_dashboard_context(self, days: int) -> dict[str, Any]:
+    async def _build_dashboard_context(self, days: int, page: int = 1) -> dict[str, Any]:
         """Agrège les 7 sources de stats + précalcule les dérivés du template.
 
         Tous les appels de service sont dans un ``try/except`` unique : la
@@ -528,7 +541,13 @@ class AIPerformanceDashboardHandler(BaseHandler):
             stats_service = get_ai_stats_service()
             overview = await stats_service.get_overview(days=days)
             model_comparison = await stats_service.get_model_comparison(days=days)
-            recent_queries = await stats_service.get_recent_queries(limit=DEFAULT_PER_PAGE)
+            per_page = DEFAULT_PER_PAGE
+            recent_total = await stats_service.count_recent_queries()
+            recent_total_pages = max(1, -(-recent_total // per_page))  # ceil
+            recent_page = max(1, min(page, recent_total_pages))
+            recent_queries = await stats_service.get_recent_queries(
+                limit=per_page, offset=(recent_page - 1) * per_page
+            )
             daily_stats = await stats_service.get_daily_stats(days=days)
             rag_impact = await stats_service.get_rag_impact(days=days)
             error_breakdown = await stats_service.get_error_breakdown(days=days)
@@ -594,6 +613,9 @@ class AIPerformanceDashboardHandler(BaseHandler):
                 "evolution_data": evolution_data,
                 "feedback_trends": feedback_trends,
                 "rag_stats": rag_stats,
+                "recent_total": recent_total,
+                "recent_total_pages": recent_total_pages,
+                "recent_page": recent_page,
             }
         except (SQLAlchemyError, KeyError, ValueError, ConnectionError, OSError):
             logger.error("Erreur chargement stats IA", exc_info=True)
@@ -611,6 +633,9 @@ class AIPerformanceDashboardHandler(BaseHandler):
                 "evolution_data": [],
                 "feedback_trends": [],
                 "rag_stats": {"with_rag": 0, "without_rag": 0},
+                "recent_total": 0,
+                "recent_total_pages": 1,
+                "recent_page": 1,
             }
 
 
@@ -794,6 +819,12 @@ class AIRecentQueriesAPIHandler(BaseHandler):
             _write_json_error(self, 500, "Erreur interne lors du chargement des requêtes.")
             return
 
+        # Cohérence avec le rendu SSR (/admin/ai-performance) : on enrichit via
+        # _format_recent_query pour exposer ``created_at_formatted`` (heure
+        # SERVEUR via clock.to_local). Sinon ce JSON ne renverrait que le
+        # ``created_at`` brut NAÏF (AIPerformanceLog.to_dict) — un consommateur
+        # JS qui ferait ``new Date(created_at)`` afficherait +Nh.
+        queries = [_format_recent_query(q) for q in queries]
         self.write({"success": True, "queries": queries})
 
 
@@ -845,8 +876,8 @@ class AITrainingDataAPIHandler(BaseHandler):
             _write_json_error(
                 self,
                 400,
-                "Type de données invalide. Attendu : ddl, documentation, question_sql, "
-                "ou business_context.",
+                "Type de données invalide. Attendu : ddl, view, documentation, question_sql, "
+                "business_context, ou pinned.",
             )
             return
 
@@ -903,6 +934,15 @@ class AITrainingDataAPIHandler(BaseHandler):
             elif data_type == "documentation":
                 content = body.get("content", "")
                 _validate_content_size(content, field="content")
+                # Catégorie réservée : ``pinned_knowledge`` ne se crée QUE via le
+                # type "pinned" dédié. Gate SERVEUR (SSoT) — ne pas se reposer sur
+                # le JS, sinon un cURL pourrait fabriquer une fausse épingle injectée
+                # en tête de TOUS les prompts (revue adversariale 2026-06-10).
+                if (body.get("category") or "").strip() == PINNED_KNOWLEDGE_CATEGORY:
+                    raise ValueError(
+                        "Catégorie réservée — utiliser le type « pinned » pour une "
+                        "connaissance épinglée."
+                    )
                 tags = _coerce_tags(body.get("tags"))
                 record_id = await store.add_documentation(
                     doc=content,
@@ -934,6 +974,18 @@ class AITrainingDataAPIHandler(BaseHandler):
                     content=content,
                     tags_tables=tags_tables,
                     priority=priority,
+                    user_id=user.id,
+                )
+            elif data_type == "pinned":
+                # Connaissance ÉPINGLÉE — documentation TOUJOURS injectée en tête
+                # du prompt Iris (catégorie réservée ``PINNED_KNOWLEDGE_CATEGORY``).
+                # Curé manuellement par l'admin ; généricité = aucun fait hardcodé
+                # côté code, la donnée vit en BDD (doctrine /data-privacy).
+                content = body.get("content", "")
+                _validate_content_size(content, field="content")
+                record_id = await store.add_documentation(
+                    doc=content,
+                    category=PINNED_KNOWLEDGE_CATEGORY,
                     user_id=user.id,
                 )
             else:
@@ -1091,6 +1143,20 @@ class AITrainingDataItemHandler(BaseHandler):
             if data_type == "business_context":
                 updated = await self._update_business_context(store, tid, body)
             elif data_type == "documentation":
+                # Gate serveur SSoT : interdit de promouvoir une doc normale en
+                # épingle via le type "documentation" (la branche "pinned" ci-dessous
+                # est le SEUL chemin légitime). Cf. revue adversariale 2026-06-10.
+                if (body.get("category") or "").strip() == PINNED_KNOWLEDGE_CATEGORY:
+                    raise ValueError(
+                        "Catégorie réservée — utiliser le type « pinned » pour une "
+                        "connaissance épinglée."
+                    )
+                updated = await self._update_documentation(store, tid, body)
+            elif data_type == "pinned":
+                # Force la catégorie épinglée : l'édition ne doit JAMAIS pouvoir
+                # « dé-épingler » par omission du champ category (defense-in-depth,
+                # même si le front l'envoie déjà).
+                body["category"] = PINNED_KNOWLEDGE_CATEGORY
                 updated = await self._update_documentation(store, tid, body)
             elif data_type == "ddl":
                 updated = await self._update_ddl(store, tid, body)
@@ -2017,10 +2083,36 @@ AITrainingDataDeleteHandler = AITrainingDataItemHandler
 # ─────────────────────────────────────────────────────────────────────────
 
 
+class AIModelsPageHandler(BaseHandler):
+    """Page HTML — registre des modèles LLM. ``GET /admin/ai-models``.
+
+    Le contrat « architecture LLM dynamique » (CLAUDE.md) promet un registre
+    BDD éditable « via /admin/ai-models » : le lien « N modèles sans tarif »
+    de /admin/ai-performance et une quinzaine de messages d'erreur runtime
+    (modèle déprécié, prix inconnu, capability à corriger…) renvoient ici.
+    Jusqu'au 2026-06-10 la page n'existait pas (404) — l'admin ne pouvait
+    pas corriger un prix/une fenêtre par l'UI. La page consomme les API
+    existantes : GET /api/admin/llm/models, PATCH /api/admin/llm/models/{name},
+    POST .../sync et .../sync-litellm.
+    """
+
+    @admin_required
+    async def get(self) -> None:
+        self.render(
+            "admin/ai_models.html",
+            user=self.current_user,
+            page_title="Modèles IA",
+        )
+
+
 class LlmModelRegistryHandler(BaseHandler):
     """``/api/admin/llm/models`` — listing du registre BDD + sync depuis API.
 
-    GET   ``/api/admin/llm/models[?provider=anthropic]`` : liste depuis BDD.
+    GET   ``/api/admin/llm/models[?provider=anthropic][&include_deprecated=1]`` :
+          liste depuis BDD. Sans ``include_deprecated``, lecture via le cache
+          runtime (qui EXCLUT les dépréciés, par design — il alimente les
+          calculs). Avec, lecture BDD directe : l'UI admin doit pouvoir voir
+          un modèle déprécié pour le réactiver (sinon piège sans retour).
     POST  ``/api/admin/llm/models/sync`` (body ``{provider}``) : déclenche
           la sync depuis l'API du provider, met à jour la BDD, retourne
           un compteur ``{inserted, updated, skipped_overridden}``.
@@ -2031,6 +2123,21 @@ class LlmModelRegistryHandler(BaseHandler):
         from app.services.ai.llm_model_registry import get_llm_model_registry
 
         provider_filter = self.get_argument("provider", None)
+        include_deprecated = self.get_argument("include_deprecated", "") in ("1", "true")
+        if include_deprecated:
+            from sqlalchemy import select
+
+            from app.models.llm_model import LlmModel
+
+            async with self.db_session() as session:
+                stmt = select(LlmModel)
+                if provider_filter:
+                    stmt = stmt.where(LlmModel.provider == provider_filter)
+                stmt = stmt.order_by(LlmModel.provider, LlmModel.name)
+                rows = (await session.execute(stmt)).scalars().all()
+                models = [row.to_dict() for row in rows]
+            self.write({"success": True, "models": models})
+            return
         registry = get_llm_model_registry()
         async with self.db_session() as session:
             models = await registry.list_all(session, provider=provider_filter)
@@ -2175,6 +2282,11 @@ class LlmModelOverrideHandler(BaseHandler):
                         )
                         return
                     setattr(row, key, val)
+                    if key == "context_window":
+                        # Saisie admin explicite de la fenêtre = source fiable →
+                        # marquer vérifiée (l'indicateur /iris cesse d'afficher
+                        # « à confirmer »). Cf. LlmModel.context_window_verified.
+                        row.context_window_verified = True
                     changed = True
             for key, upper in editable_float_bounds.items():
                 if key in data:
@@ -2248,6 +2360,271 @@ class LlmModelOverrideHandler(BaseHandler):
             self.write({"success": True, "model": row.to_dict()})
 
 
+async def _local_llm_endpoints(handler: BaseHandler) -> "Optional[tuple[str, str]]":
+    """``(base_url OpenAI-compat, racine Ollama sans /v1)`` depuis la config admin.
+
+    Source unique pour TOUS les handlers ``llm-local`` : respecte
+    ``local_llm_base_url`` configuré par l'admin, sinon défaut env-driven
+    (``OLLAMA_BASE_URL`` → sidecar Docker). Élimine les ``http://localhost:11434``
+    en dur — cassés en conteneur, où ``localhost`` désigne le conteneur lui-même
+    et non le sidecar Ollama ni l'hôte.
+
+    **Garde-fou SSRF (review adversariale 2026-06-03)** : valide l'URL via
+    ``_is_safe_local_llm_url`` (même contrôle que le chemin runtime
+    ``_load_local_fallback_from_config``) AVANT que les handlers ne tapent
+    l'endpoint via httpx. Sans ça, un admin (ou un import de config) pourrait
+    pointer ``local_llm_base_url`` sur l'IMDS cloud (169.254.169.254, …) et lire
+    la réponse via ``GET /api/admin/llm-local/status``. Centraliser ici garantit
+    que les 5 handlers (status/pull/delete/install-status/start) sont couverts.
+
+    Retourne ``None`` (et écrit un 400 JSON) si l'URL est refusée — l'appelant
+    doit alors ``return`` immédiatement.
+    """
+    from app.services.ai.config_service import default_local_llm_base_url, get_ai_config_service
+    from app.services.ai.llm_providers import _is_safe_local_llm_url
+
+    cs = get_ai_config_service()
+    base_url = ((await cs.get("local_llm_base_url")) or default_local_llm_base_url()).rstrip("/")
+    if not _is_safe_local_llm_url(base_url):
+        _write_json_error(
+            handler,
+            400,
+            "URL LLM local refusée (anti-SSRF). Schémas autorisés : http/https. "
+            "Hosts metadata cloud (169.254.169.254, metadata.google.internal, "
+            "metadata.azure.com) et IPv6 link-local bloqués. Corrigez "
+            "`local_llm_base_url` dans /admin/ai-config.",
+        )
+        return None
+    return base_url, _ollama_root_from_base(base_url)
+
+
+#: Indice actionnable affiché quand aucun binaire ``ollama`` n'est présent
+#: localement (cas du déploiement conteneur) : le daemon n'est pas géré par
+#: l'app mais par Docker (sidecar) ou par l'hôte.
+_OLLAMA_CONTAINER_HINT = (
+    "Aucun binaire 'ollama' dans ce conteneur : le serveur Ollama n'est pas un "
+    "process de l'application (il vit dans un sidecar Docker, sur l'hôte, ou sur "
+    "une autre machine). En déploiement Docker, activez le sidecar côté serveur en "
+    "une commande : `make llm-local-enable` (démarre le sidecar de façon persistante "
+    "et télécharge un modèle par défaut). Ensuite, tout se pilote ici : choisir le "
+    "modèle, activer le LLM local. Le serveur Ollama est joignable via l'URL "
+    "configurée (`local_llm_base_url`, par défaut le sidecar `http://ollama:11434/v1`)."
+)
+
+#: Indice quand l'app tourne HORS conteneur et qu'aucun binaire ``ollama`` n'est
+#: présent : soit installer Ollama sur cette machine, soit pointer l'URL vers un
+#: serveur Ollama distant. (Distinct de ``_OLLAMA_CONTAINER_HINT`` : ne PAS conseiller
+#: `make llm-local-enable` / un sidecar Docker sur une machine sans Docker.)
+_OLLAMA_BAREMETAL_HINT = (
+    "Aucun serveur Ollama joignable. Sur cette machine (hors conteneur) : installez "
+    "Ollama (https://ollama.com) puis démarrez-le, OU configurez ci-dessus l'URL d'un "
+    "serveur Ollama distant (ex. http://192.168.1.50:11434/v1) qui écoute sur 0.0.0.0."
+)
+
+
+def _local_llm_install_meta(binary_present: bool, in_docker: bool) -> "tuple[str, Optional[str]]":
+    """Décide ``(managed, hint)`` pour l'état d'install du LLM local — pur & testable.
+
+    - binaire présent → ``("binary", None)`` : l'app gère le daemon localement
+      (start/restart/upgrade applicables ; un éventuel lien d'install est géré côté UI).
+    - pas de binaire, EN conteneur → ``("external", _OLLAMA_CONTAINER_HINT)`` : le serveur
+      Ollama vit dans un sidecar Docker / sur l'hôte → guider vers ``make llm-local-enable``.
+    - pas de binaire, HORS conteneur → ``("external", _OLLAMA_BAREMETAL_HINT)`` : installer
+      Ollama ou pointer une URL distante (PAS de conseil Docker trompeur sur une machine
+      sans Docker).
+
+    ``managed="external"`` signifie « serveur Ollama hors du contrôle subprocess de l'app » :
+    les actions start/restart/upgrade ne s'y appliquent pas (l'UI masque ces boutons).
+    """
+    if binary_present:
+        return "binary", None
+    return "external", (_OLLAMA_CONTAINER_HINT if in_docker else _OLLAMA_BAREMETAL_HINT)
+
+
+def _detect_runtime_context() -> "dict":
+    """Contexte d'exécution de l'app : tourne-t-on en conteneur, et le binaire
+    ``ollama`` est-il géré localement ? Sert à proposer les bonnes URL candidates
+    et des messages d'aide adaptés à la topologie. Best-effort (jamais d'exception).
+    """
+    import os
+    import shutil
+
+    in_docker = False
+    try:
+        if os.path.exists("/.dockerenv"):
+            in_docker = True
+        else:
+            with open("/proc/1/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                cgroup = fh.read()
+            in_docker = ("docker" in cgroup) or ("kubepods" in cgroup) or ("containerd" in cgroup)
+    except OSError:
+        in_docker = False
+    return {"in_docker": in_docker, "ollama_binary_local": shutil.which("ollama") is not None}
+
+
+def _default_route_gateway() -> "Optional[str]":
+    """IP de la passerelle par défaut du conteneur (= l'hôte, sur un bridge Docker).
+
+    Lue dynamiquement depuis ``/proc/net/route`` — PAS de ``172.17.0.1`` en dur
+    (faux dès qu'un réseau Docker custom est utilisé). ``None`` hors-Linux ou si
+    indéterminable. Hypothèses : Linux little-endian (x86_64/ARM64 — l'adresse
+    hex de ``/proc/net/route`` est en ordre natif) et réseau IPv4 (pas de route
+    par défaut IPv6 lue). Ce n'est qu'un *candidat* à sonder : une valeur fausse
+    échoue sans danger au probe.
+    """
+    import socket
+    import struct
+
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    for line in lines[1:]:
+        fields = line.strip().split()
+        # Destination 0.0.0.0 = route par défaut ; champ 2 = gateway (hex little-endian).
+        if len(fields) >= 3 and fields[1] == "00000000" and fields[2] != "00000000":
+            try:
+                return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+            except (ValueError, struct.error, OSError):
+                return None
+    return None
+
+
+def _ollama_root_from_base(base_url: str) -> str:
+    """``http://h:11434/v1`` → ``http://h:11434`` (racine API native Ollama)."""
+    base_url = base_url.rstrip("/")
+    return base_url[:-3].rstrip("/") if base_url.endswith("/v1") else base_url
+
+
+async def _probe_ollama(base_url: str, ollama_root: str, timeout: float = 5.0) -> "dict":
+    """Sonde un endpoint Ollama/OpenAI-compat — SSoT pour status + detect.
+
+    Applique le garde SSRF *request-time* (anti-rebinding) AVANT la requête.
+    Retour : ``{reachable, ollama_native, models, reason, error}`` où ``reason``
+    ∈ {ok, ssrf, dns, refused, timeout, http_<code>, bad_payload, error}.
+    """
+    import asyncio
+
+    import httpx
+
+    from app.services.ai.llm_providers import _assert_resolved_ip_safe
+
+    out: "dict" = {
+        "reachable": False,
+        "ollama_native": False,
+        "models": [],
+        "reason": None,
+        "error": None,
+    }
+    safe, ssrf_reason = await asyncio.to_thread(_assert_resolved_ip_safe, base_url)
+    if not safe:
+        out["reason"] = "ssrf"
+        out["error"] = ssrf_reason
+        return out
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            resp = await client.get(f"{ollama_root}/api/tags")
+            if resp.status_code == 200:
+                # Un autre service HTTP peut squatter le port 11434 et répondre
+                # 200 + HTML (pas du JSON) → resp.json() lève ValueError. Sans ce
+                # garde, l'exception remonte et fait 500 le /detect (via gather).
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    out["reason"] = "bad_payload"
+                    return out
+                if isinstance(payload, dict) and isinstance(payload.get("models"), list):
+                    out["reachable"] = True
+                    out["ollama_native"] = True
+                    out["reason"] = "ok"
+                    # Format Ollama : [{"name":"phi3:mini","size":...},...]
+                    out["models"] = [
+                        {
+                            "name": m.get("name", ""),
+                            "size_bytes": m.get("size"),
+                            "modified_at": m.get("modified_at"),
+                        }
+                        for m in payload["models"]
+                        if isinstance(m, dict) and m.get("name")
+                    ]
+                    return out
+                out["reason"] = "bad_payload"
+                return out
+            # Répond mais pas Ollama natif (LM Studio, TGI…) → fallback OpenAI /v1/models.
+            try:
+                resp_v1 = await client.get(f"{base_url}/models")
+                if resp_v1.status_code == 200:
+                    v1 = resp_v1.json()
+                    data = v1.get("data") if isinstance(v1, dict) else None
+                    if isinstance(data, list):
+                        out["reachable"] = True
+                        out["reason"] = "ok"
+                        out["models"] = [
+                            {"name": m.get("id", "")}
+                            for m in data
+                            if isinstance(m, dict) and m.get("id")
+                        ]
+                        return out
+            except (httpx.RequestError, ValueError):
+                pass
+            out["reason"] = f"http_{resp.status_code}"
+            return out
+    except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as exc:
+        out["reason"] = "timeout"
+        out["error"] = str(exc)
+    except httpx.ConnectError as exc:
+        # DNS vs refused : on inspecte l'erreur OS sous-jacente (socket.gaierror =
+        # échec de résolution), robuste cross-plateforme (glibc/musl-Alpine/macOS),
+        # au lieu de matcher le TEXTE du message (locale/version-dépendant).
+        import socket
+
+        cause = exc.__cause__ or exc.__context__
+        out["reason"] = "dns" if isinstance(cause, socket.gaierror) else "refused"
+        out["error"] = str(exc)
+    except (httpx.RequestError, OSError) as exc:
+        out["reason"] = "error"
+        out["error"] = str(exc)
+    return out
+
+
+async def _candidate_local_llm_urls() -> "list[str]":
+    """URL candidates à sonder pour l'auto-détection (dé-dupliquées, ordonnées).
+
+    Ordre = configurée → défaut env (sidecar en compose) → localhost → (si Docker)
+    host.docker.internal + passerelle par défaut. Aucune IP en dur : la passerelle
+    est dérivée dynamiquement, le sidecar provient du défaut env.
+    """
+    from app.services.ai.config_service import (
+        default_local_llm_base_url,
+        get_ai_config_service,
+    )
+
+    cs = get_ai_config_service()
+    ctx = _detect_runtime_context()
+    raw: "list[str]" = []
+    try:
+        configured = (await cs.get("local_llm_base_url")) or ""
+    except Exception:  # noqa: BLE001
+        configured = ""
+    if configured.strip():
+        raw.append(configured.strip().rstrip("/"))
+    raw.append(default_local_llm_base_url().rstrip("/"))
+    raw.append("http://localhost:11434/v1")
+    if ctx["in_docker"]:
+        raw.append("http://host.docker.internal:11434/v1")
+        gw = _default_route_gateway()
+        if gw:
+            raw.append(f"http://{gw}:11434/v1")
+    seen: "set[str]" = set()
+    ranked: "list[str]" = []
+    for url in raw:
+        if url and url not in seen:
+            seen.add(url)
+            ranked.append(url)
+    return ranked
+
+
 class LocalLlmInstallStatusHandler(BaseHandler):
     """``GET /api/admin/llm-local/install-status`` — détecte le binaire Ollama.
 
@@ -2257,9 +2634,13 @@ class LocalLlmInstallStatusHandler(BaseHandler):
     - ``running`` (bool) : le daemon tourne déjà (ping :11434)
     - ``binary_path`` (str | null) : path résolu (debug)
 
-    Usage frontend : si pas installé → afficher lien vers ollama.com.
-    Si installé mais pas running → afficher bouton "Démarrer Ollama".
-    Si running → tout est OK, l'utilisateur peut télécharger un modèle.
+    Usage frontend :
+    - ``managed == "binary"`` (bare-metal) : si pas installé → lien ollama.com ;
+      installé mais pas running → bouton "Démarrer Ollama".
+    - ``managed == "external"`` (conteneur/sidecar/hôte) : pas de binaire local ;
+      l'état dépend uniquement de la joignabilité HTTP de l'endpoint configuré
+      (``hint`` explique comment démarrer le sidecar).
+    - ``running`` → l'utilisateur peut télécharger un modèle.
     """
 
     @admin_required
@@ -2267,13 +2648,20 @@ class LocalLlmInstallStatusHandler(BaseHandler):
         import shutil
         import subprocess
 
-        result = {
+        result: Dict[str, Any] = {
             "installed": False,
             "version": None,
             "running": False,
             "binary_path": None,
+            "managed": "external",
+            "in_docker": False,
+            "hint": None,
         }
+        ctx = _detect_runtime_context()
+        result["in_docker"] = ctx["in_docker"]
         binary = shutil.which("ollama")
+        managed, install_hint = _local_llm_install_meta(bool(binary), ctx["in_docker"])
+        result["managed"] = managed
         if binary:
             result["installed"] = True
             result["binary_path"] = binary
@@ -2286,19 +2674,41 @@ class LocalLlmInstallStatusHandler(BaseHandler):
                     timeout=5,
                     text=True,
                 )
-                if proc.returncode == 0 and proc.stdout:
-                    result["version"] = proc.stdout.strip()[:200]
+                # N'extraire que le numéro de version (ex. "0.24.0"), pas la sortie
+                # brute : daemon éteint → `ollama --version` émet des lignes "Warning:
+                # could not connect…" / "Warning: client version is X" qu'on NE veut
+                # PAS afficher (elles polluaient le badge "installé mais pas démarré").
+                # On scanne stdout+stderr pour le 1er semver, peu importe le wording.
+                import re as _re
+
+                raw = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                match = _re.search(r"\d+\.\d+\.\d+", raw)
+                if match:
+                    result["version"] = match.group(0)
             except (subprocess.TimeoutExpired, OSError) as exc:
                 logger.warning("ollama --version échoué : %s", exc)
+        else:
+            # Pas de binaire local : hint topologie-adapté décidé par le helper pur
+            # (Docker → sidecar/`make llm-local-enable` ; bare-metal → install/URL distante).
+            # Le JS n'affiche ce hint que si le serveur Ollama est injoignable.
+            result["hint"] = install_hint
 
-        # Ping daemon
+        # Ping le daemon à l'URL CONFIGURÉE (jamais localhost en dur : en
+        # conteneur, localhost = le conteneur, pas le sidecar Ollama).
         import httpx
 
+        eps = await _local_llm_endpoints(self)
+        if eps is None:
+            return
+        _, ollama_root = eps
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(2.0)) as client:
-                resp = await client.get("http://localhost:11434/api/tags")
+                resp = await client.get(f"{ollama_root}/api/tags")
                 if resp.status_code == 200:
                     result["running"] = True
+                    # Endpoint joignable = Ollama disponible, même sans binaire local.
+                    if not binary:
+                        result["installed"] = True
         except (httpx.RequestError, OSError):
             pass
         self.write(result)
@@ -2319,10 +2729,15 @@ class LocalLlmRestartHandler(BaseHandler):
 
         binary = shutil.which("ollama")
         if not binary:
+            # Conteneur : le daemon n'est pas un process local à killer/relancer.
+            # On guide vers la gestion Docker du sidecar plutôt que de mentir 404.
             _write_json_error(
                 self,
-                404,
-                "Ollama n'est pas installé. Télécharger depuis https://ollama.com.",
+                409,
+                "Redémarrage non applicable ici : pas de binaire 'ollama' local. "
+                "En conteneur, redémarrez le sidecar : "
+                "`docker compose --profile llm-local restart ollama` "
+                "(ou `make llm-local-up`).",
             )
             return
 
@@ -2359,7 +2774,13 @@ class LocalLlmRestartHandler(BaseHandler):
             _write_json_error(self, 500, f"Relance Ollama échouée : {exc}")
             return
 
-        # Poll que le daemon réponde (10s max, redémarrage = un peu lent)
+        # Poll que le daemon réponde (10s max, redémarrage = un peu lent).
+        # NB : `localhost` est volontaire ici (pas l'URL configurée) — ce chemin
+        # n'est atteint que si un binaire `ollama` local existe (vérifié plus
+        # haut, sinon 409), donc le daemon qu'on vient de relancer est
+        # co-localisé et écoute sur 127.0.0.1 par défaut (son bind suit
+        # OLLAMA_HOST, hérité de l'env de l'app). C'est la gestion du daemon
+        # LOCAL, distincte de l'URL distante que l'app pourrait viser.
         import httpx
 
         for _ in range(100):
@@ -2398,10 +2819,14 @@ class LocalLlmUpgradeHandler(BaseHandler):
 
         ollama_bin = shutil.which("ollama")
         if not ollama_bin:
+            # Conteneur : la mise à jour se fait au niveau de l'image du sidecar.
             _write_json_error(
                 self,
-                404,
-                "Ollama n'est pas installé.",
+                409,
+                "Mise à jour non applicable ici : pas de binaire 'ollama' local. "
+                "En conteneur, mettez à jour l'image du sidecar : "
+                "`docker compose --profile llm-local pull ollama` puis "
+                "`docker compose --profile llm-local up -d ollama`.",
             )
             return
 
@@ -2507,10 +2932,15 @@ class LocalLlmStartHandler(BaseHandler):
 
         import httpx
 
-        # Vérif rapide : déjà running ?
+        # Vérif rapide : l'endpoint CONFIGURÉ répond-il déjà ? (sidecar Docker
+        # déjà up, daemon hôte, ou daemon local) — jamais localhost en dur.
+        eps = await _local_llm_endpoints(self)
+        if eps is None:
+            return
+        _, ollama_root = eps
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(1.5)) as client:
-                resp = await client.get("http://localhost:11434/api/tags")
+                resp = await client.get(f"{ollama_root}/api/tags")
                 if resp.status_code == 200:
                     self.write(
                         {
@@ -2525,11 +2955,14 @@ class LocalLlmStartHandler(BaseHandler):
 
         binary = shutil.which("ollama")
         if not binary:
+            # Conteneur : pas de binaire local à lancer. Le daemon est démarré
+            # par Docker (sidecar), pas par l'app.
             _write_json_error(
                 self,
-                404,
-                "Ollama n'est pas installé. Télécharger depuis https://ollama.com puis "
-                "relancer.",
+                409,
+                "Démarrage non applicable ici : pas de binaire 'ollama' local. "
+                "En conteneur, démarrez le sidecar : "
+                "`docker compose --profile llm-local up -d` (ou `make llm-local-up`).",
             )
             return
 
@@ -2554,7 +2987,12 @@ class LocalLlmStartHandler(BaseHandler):
             _write_json_error(self, 500, f"Lancement Ollama échoué : {exc}")
             return
 
-        # Attend que le daemon réponde (poll 100ms × 50 = 5s max)
+        # Attend que le daemon réponde (poll 100ms × 50 = 5s max).
+        # NB : `localhost` est volontaire (pas l'URL configurée) — ce chemin
+        # n'est atteint que si un binaire `ollama` local existe (vérifié plus
+        # haut), donc le daemon qu'on vient de lancer est co-localisé et écoute
+        # sur 127.0.0.1 par défaut. Gestion du daemon LOCAL, distincte de l'URL
+        # (potentiellement distante) que l'app utilise pour le joindre.
         import asyncio as _asyncio
 
         for _ in range(50):
@@ -2597,8 +3035,6 @@ class LocalLlmStatusHandler(BaseHandler):
 
     @admin_required
     async def get(self) -> None:
-        import httpx
-
         from app.services.ai.config_service import get_ai_config_service
 
         cs = get_ai_config_service()
@@ -2606,59 +3042,97 @@ class LocalLlmStatusHandler(BaseHandler):
             enabled = bool(await cs.get("local_llm_enabled"))
         except Exception:  # noqa: BLE001
             enabled = False
-        base_url = (await cs.get("local_llm_base_url") or "http://localhost:11434/v1").rstrip("/")
         configured_model = await cs.get("local_llm_model") or ""
 
-        # Ollama expose `/api/tags` (sans `/v1`). On retire `/v1` du
-        # base_url s'il y est pour pinger l'API native.
-        ollama_root = base_url[:-3] if base_url.endswith("/v1") else base_url
+        # Si une URL est fournie en query (``?url=``), on sonde CELLE-LÀ (URL
+        # tapée/cliquée non encore sauvegardée) — sinon l'URL en BDD. Même garde
+        # SSRF string que le chemin sauvegardé ; le probe applique aussi le garde
+        # request-time (résolution IP). Sans ça, « Tester » testait l'ancienne URL.
+        override = (self.get_argument("url", "") or "").strip()
+        if override:
+            from app.services.ai.llm_providers import _is_safe_local_llm_url
+
+            if not _is_safe_local_llm_url(override):
+                _write_json_error(
+                    self,
+                    400,
+                    "URL LLM local refusée (anti-SSRF). Schémas http/https ; hosts "
+                    "metadata cloud et IPv6 link-local bloqués.",
+                )
+                return
+            base_url = override.rstrip("/")
+            ollama_root = _ollama_root_from_base(base_url)
+        else:
+            # base_url OpenAI-compat + racine Ollama (`/api/*`) via le helper SSoT.
+            eps = await _local_llm_endpoints(self)
+            if eps is None:
+                return
+            base_url, ollama_root = eps
+        probe = await _probe_ollama(base_url, ollama_root, timeout=5.0)
         result = {
             "enabled": enabled,
             "base_url": base_url,
             "configured_model": configured_model,
-            "reachable": False,
-            "ollama_native": False,
-            "models": [],
-            "error": None,
+            "reachable": probe["reachable"],
+            "ollama_native": probe["ollama_native"],
+            "models": probe["models"],
+            "reason": probe["reason"],
+            "error": probe["error"],
+            "hint": None,
         }
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                resp = await client.get(f"{ollama_root}/api/tags")
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    if isinstance(payload, dict) and isinstance(payload.get("models"), list):
-                        result["reachable"] = True
-                        result["ollama_native"] = True
-                        # Format Ollama : [{"name":"phi3:mini","size":...},...]
-                        result["models"] = [
-                            {
-                                "name": m.get("name", ""),
-                                "size_bytes": m.get("size"),
-                                "modified_at": m.get("modified_at"),
-                            }
-                            for m in payload["models"]
-                            if isinstance(m, dict) and m.get("name")
-                        ]
-                else:
-                    # Endpoint répond mais pas Ollama natif (LM Studio, etc.)
-                    # → on tente OpenAI /v1/models en fallback.
-                    try:
-                        resp_v1 = await client.get(f"{base_url}/models")
-                        if resp_v1.status_code == 200:
-                            v1 = resp_v1.json()
-                            data = v1.get("data") if isinstance(v1, dict) else None
-                            if isinstance(data, list):
-                                result["reachable"] = True
-                                result["models"] = [
-                                    {"name": m.get("id", "")}
-                                    for m in data
-                                    if isinstance(m, dict) and m.get("id")
-                                ]
-                    except (httpx.RequestError, ValueError):
-                        pass
-        except (httpx.RequestError, OSError) as exc:
-            result["error"] = str(exc)
+        # Pas de hint-paragraphe ici : l'explication topologie (OLLAMA_HOST=0.0.0.0,
+        # sidecar/hôte/machine distante) vit dans le (i) cliquable de l'URL, et le bouton
+        # « Tester » sonde déjà les URL standard si l'URL saisie échoue. Le badge
+        # « ✗ Injoignable » suffit côté statut. (`hint` reste None pour cet endpoint.)
         self.write(result)
+
+
+class LocalLlmDetectHandler(BaseHandler):
+    """``GET /api/admin/llm-local/detect`` — auto-détection topologie-agnostique.
+
+    Sonde (côté serveur, concurremment) les URL Ollama candidates dérivées du
+    contexte d'exécution — configurée, défaut env (sidecar compose), localhost,
+    et en conteneur ``host.docker.internal`` + passerelle par défaut — puis
+    renvoie celles joignables + une recommandation. Aide l'admin à trouver la
+    bonne URL « peu importe où tourne l'app » sans connaître le réseau Docker.
+
+    Aucune entrée utilisateur (candidats auto-dérivés) → pas un vecteur SSRF ;
+    chaque sondage passe tout de même par le garde ``_assert_resolved_ip_safe``.
+    """
+
+    _PROBE_TIMEOUT_SECONDS = 2.0
+
+    @admin_required
+    async def get(self) -> None:
+        import asyncio
+
+        ctx = _detect_runtime_context()
+        urls = await _candidate_local_llm_urls()
+
+        async def _probe_one(url: str) -> "dict":
+            probe = await _probe_ollama(
+                url, _ollama_root_from_base(url), timeout=self._PROBE_TIMEOUT_SECONDS
+            )
+            return {
+                "url": url,
+                "reachable": probe["reachable"],
+                "models_count": len(probe["models"]),
+                "reason": probe["reason"],
+            }
+
+        # return_exceptions=True : _probe_ollama est déjà exception-safe, mais on
+        # garantit qu'un imprévu sur UN candidat ne fasse pas 500 tout le /detect.
+        raw = await asyncio.gather(*[_probe_one(u) for u in urls], return_exceptions=True)
+        candidates = [c for c in raw if isinstance(c, dict)]
+        recommended = next((c["url"] for c in candidates if c["reachable"]), None)
+        self.write(
+            {
+                "in_docker": ctx["in_docker"],
+                "ollama_binary_local": ctx["ollama_binary_local"],
+                "candidates": list(candidates),
+                "recommended": recommended,
+            }
+        )
 
 
 class LocalLlmPullHandler(BaseHandler):
@@ -2683,8 +3157,6 @@ class LocalLlmPullHandler(BaseHandler):
     async def post(self) -> None:
         import httpx
 
-        from app.services.ai.config_service import get_ai_config_service
-
         body = self.request.body
         try:
             data = json.loads(body) if body else {}
@@ -2700,9 +3172,10 @@ class LocalLlmPullHandler(BaseHandler):
                 "(pas de '..', '//', ni début par '.' ou '/').",
             )
             return
-        cs = get_ai_config_service()
-        base_url = (await cs.get("local_llm_base_url") or "http://localhost:11434/v1").rstrip("/")
-        ollama_root = base_url[:-3] if base_url.endswith("/v1") else base_url
+        eps = await _local_llm_endpoints(self)
+        if eps is None:
+            return
+        _, ollama_root = eps
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(self._PULL_TIMEOUT_SECONDS)
@@ -2814,9 +3287,14 @@ class LocalLlmDeleteHandler(BaseHandler):
             )
             return
 
+        # ``cs`` est réutilisé plus bas (reset ``local_llm_model`` si on supprime
+        # le modèle actif). ``ollama_root`` vient du helper SSoT (URL configurée,
+        # validée anti-SSRF).
         cs = get_ai_config_service()
-        base_url = (await cs.get("local_llm_base_url") or "http://localhost:11434/v1").rstrip("/")
-        ollama_root = base_url[:-3] if base_url.endswith("/v1") else base_url
+        eps = await _local_llm_endpoints(self)
+        if eps is None:
+            return
+        _, ollama_root = eps
 
         # 1. Suppression côté Ollama.
         try:

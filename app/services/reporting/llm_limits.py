@@ -154,10 +154,27 @@ async def get_active_model_limits() -> Dict[str, Any]:
     reserved_output = get_max_tokens_for_model(effective_model)
     max_input = max(1_000, context_window - reserved_output - _PROMPT_OVERHEAD)
 
+    # Fenêtre vérifiée ? (flag registre BDD). None / modèle absent → False
+    # (prudent : on n'affirme pas « vérifié » pour un modèle pas encore
+    # persisté — ex. choisi dans la dropdown live mais sans refresh). Le flag
+    # ne change PAS ``context_window`` (qui reste >0 pour les calculs) : il
+    # pilote uniquement l'affichage « ≈ à confirmer » de l'indicateur /iris,
+    # pour ne jamais montrer un chiffre faux comme une vérité.
+    cw_verified = False
+    try:
+        from app.services.ai.llm_model_registry import get_llm_model_registry
+
+        cw_verified = bool(
+            get_llm_model_registry().get_field_sync(effective_model, "context_window_verified")
+        )
+    except Exception as e:  # noqa: BLE001 — fail-soft, défaut « non vérifié »
+        logger.debug("get_active_model_limits: lecture context_window_verified KO: %s", e)
+
     return {
         "model": effective_model,
         "configured": True,
         "context_window": context_window,
+        "context_window_verified": cw_verified,
         "reserved_output": reserved_output,
         "reserved_overhead": _PROMPT_OVERHEAD,
         "max_input_tokens": max_input,
@@ -234,6 +251,7 @@ async def resolve_active_window_snapshot() -> Dict[str, Any]:
         return {
             "model_name": None,
             "context_window": None,
+            "context_window_verified": False,
             "model_display": None,
             "configured": False,
         }
@@ -241,6 +259,7 @@ async def resolve_active_window_snapshot() -> Dict[str, Any]:
         return {
             "model_name": None,
             "context_window": None,
+            "context_window_verified": False,
             "model_display": None,
             "configured": False,
         }
@@ -250,6 +269,7 @@ async def resolve_active_window_snapshot() -> Dict[str, Any]:
     return {
         "model_name": name,
         "context_window": cw,
+        "context_window_verified": bool(limits.get("context_window_verified")),
         "model_display": display,
         "configured": True,
     }

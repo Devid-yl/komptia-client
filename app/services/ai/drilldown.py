@@ -133,7 +133,11 @@ def build_drilldown_query(
 
     # Standard GROUP BY drill-down mode
     filter_dims = clicked_col.get("filter_dimensions", [])
-    extra_conditions = _build_where_conditions(filter_dims, row_values)
+    # R4 — résout les alias d'expression (``YEAR(f.d) AS annee``) en expression
+    # réelle pour ne pas émettre ``WHERE [annee]`` (alias inexistant dans le
+    # détail SELECT *, refusé par SQL Server).
+    alias_to_real = _build_alias_to_real(select)
+    extra_conditions = _build_where_conditions(filter_dims, row_values, alias_to_real)
 
     if not extra_conditions and not _extract_group_by_columns(select):
         logger.info("[drilldown] No filters to apply and no GROUP BY — skipping drill-down")
@@ -343,25 +347,76 @@ def _extract_partition_by(
     return result
 
 
-def _build_where_conditions(filter_dims: list[str], row_values: dict[str, Any]) -> list[str]:
-    """Build WHERE conditions from dimension names and row values."""
+def build_drill_predicate(expr: str, value: Any) -> str | None:
+    """Build ONE WHERE predicate ``<expr> = <literal>`` (or ``<expr> IS NULL``).
+
+    ``expr`` is the left-hand SQL expression already qualified/quoted by the
+    caller (e.g. ``[colname]`` or an LLM-provided expression ``YEAR(f.facDate)``).
+    The value is escaped to a T-SQL literal. Returns ``None`` when the value
+    cannot be used in an equality filter (``inf`` / ``nan``) — caller skips it.
+
+    **Single source of truth** for drill-down value escaping: replaces the four
+    copies of ``str(v).replace(chr(39), chr(39)*2)`` that lived in this module
+    (``_build_where_conditions`` + ``_build_cte_drilldown``) and is reused by
+    ``DrillDownHandler`` to bind row values into the LLM-generated skeleton
+    WITHOUT ever sending those values to the LLM (confidentiality Niveau 4/5).
+    """
     import math
 
+    if value is None:
+        return f"{expr} IS NULL"
+    if isinstance(value, bool):
+        # bool est sous-classe d'int : ``<expr> = True`` est invalide en T-SQL.
+        # On mappe sur un bit 1/0.
+        return f"{expr} = {1 if value else 0}"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None  # inf/nan — can't filter by these
+        return f"{expr} = {value}"
+    return f"{expr} = '{str(value).replace(chr(39), chr(39) * 2)}'"
+
+
+def _build_alias_to_real(select_node: exp.Select) -> dict[str, str]:
+    """Map ``alias_select(lower) → SQL de l'expression interne``.
+
+    Résout une dimension agrégée par EXPRESSION (ex. ``YEAR(f.facDate) AS annee``
+    → ``{'annee': 'YEAR(f.facDate)'}``). Gère ISNULL/COALESCE/etc. **SSoT partagée**
+    entre le mode standard GROUP BY (``build_drilldown_query``) et le mode CTE
+    (``_build_cte_drilldown``) — évite la duplication de cette boucle.
+    """
+    mapping: dict[str, str] = {}
+    for sel_expr in select_node.expressions:
+        if isinstance(sel_expr, exp.Alias):
+            try:
+                mapping[sel_expr.alias.lower()] = sel_expr.this.sql(dialect="tsql")
+            except Exception:
+                continue
+    return mapping
+
+
+def _build_where_conditions(
+    filter_dims: list[str],
+    row_values: dict[str, Any],
+    alias_to_real: dict[str, str] | None = None,
+) -> list[str]:
+    """Build WHERE conditions from dimension names and row values.
+
+    ``alias_to_real`` (R4) résout un alias SELECT → expression réelle : dans la
+    requête de détail (``SELECT *``, sans GROUP BY) un alias d'expression
+    (``YEAR(f.d) AS annee``) n'est PAS une colonne, donc ``WHERE [annee] = …``
+    serait rejeté par SQL Server (« Invalid column name 'annee' »). Sans
+    résolution disponible, on retombe sur ``[dim]`` (cas d'une vraie colonne,
+    ex. ``GROUP BY region`` → ``[region]`` valide).
+    """
     conditions = []
+    amap = alias_to_real or {}
     for dim in filter_dims:
         if dim not in row_values:
             continue
-        value = row_values[dim]
-        if value is None:
-            conditions.append(f"[{dim}] IS NULL")
-        elif isinstance(value, str):
-            conditions.append(f"[{dim}] = '{value.replace(chr(39), chr(39)*2)}'")
-        elif isinstance(value, (int, float)):
-            if isinstance(value, float) and not math.isfinite(value):
-                continue  # Skip inf/nan — can't filter by these
-            conditions.append(f"[{dim}] = {value}")
-        else:
-            conditions.append(f"[{dim}] = '{str(value).replace(chr(39), chr(39)*2)}'")
+        lhs = amap.get(dim.lower()) or f"[{dim}]"
+        predicate = build_drill_predicate(lhs, row_values[dim])
+        if predicate is not None:
+            conditions.append(predicate)
     return conditions
 
 
@@ -733,15 +788,10 @@ def _build_cte_drilldown(
             pos += 1
         cte_body = original_sql_text[start : pos - 1].strip()
 
-        # Resolve alias → real column using AST (robust, handles ISNULL/COALESCE/etc.)
-        # E.g., "d.dosNomDossier AS Dossier" → alias "Dossier" maps to "d.dosNomDossier"
-        # E.g., "ISNULL(d.col, 'N/A') AS Name" → "Name" maps to "ISNULL(d.col, 'N/A')"
-        alias_to_real = {}
-        for sel_expr in cte_select.expressions:
-            if isinstance(sel_expr, exp.Alias):
-                alias_name = sel_expr.alias
-                inner_sql = sel_expr.this.sql(dialect="tsql")
-                alias_to_real[alias_name.lower()] = inner_sql
+        # Resolve alias → real expression via AST (robust, handles ISNULL/COALESCE/
+        # etc.). SSoT partagée avec le mode standard GROUP BY (R4 — de-dup).
+        # E.g. "ISNULL(d.col, 'N/A') AS Name" → {"name": "ISNULL(d.col, 'N/A')"}.
+        alias_to_real = _build_alias_to_real(cte_select)
 
         # Remove GROUP BY (and everything after: HAVING, ORDER BY)
         gb_match = re.search(r"\bGROUP\s+BY\b", cte_body, re.IGNORECASE)
@@ -763,21 +813,9 @@ def _build_cte_drilldown(
             filter_expr = alias_to_real.get(dim.lower(), dim)
             if filter_expr != dim:
                 logger.debug(f"[drilldown] Resolved alias '{dim}' → '{filter_expr}'")
-            value = row_values[dim]
-            if value is None:
-                extra_conditions.append(f"{filter_expr} IS NULL")
-            elif isinstance(value, str):
-                extra_conditions.append(f"{filter_expr} = '{value.replace(chr(39), chr(39)*2)}'")
-            elif isinstance(value, (int, float)):
-                import math
-
-                if isinstance(value, float) and not math.isfinite(value):
-                    continue  # Skip inf/nan
-                extra_conditions.append(f"{filter_expr} = {value}")
-            else:
-                extra_conditions.append(
-                    f"{filter_expr} = '{str(value).replace(chr(39), chr(39)*2)}'"
-                )
+            predicate = build_drill_predicate(filter_expr, row_values[dim])
+            if predicate is not None:
+                extra_conditions.append(predicate)
 
         # Append to existing WHERE or create new one
         if extra_conditions:

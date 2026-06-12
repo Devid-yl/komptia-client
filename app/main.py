@@ -123,6 +123,7 @@ from app.config import config  # noqa: E402
 from app.core.database import close_database, init_database  # noqa: E402
 from app.handlers.base import BaseHandler  # noqa: E402
 from app.routes import get_routes  # noqa: E402
+from app.ui_modules import Pagination  # noqa: E402
 from app.services.ai.embedding_service import shutdown_embedding_service  # noqa: E402
 from app.services.ai.llm_providers import ensure_providers_from_db  # noqa: E402
 from app.services.ai.schema_sync_scheduler import (  # noqa: E402
@@ -136,10 +137,13 @@ from app.services.automation import (  # noqa: E402
     start_scheduler,
 )
 from app.services.automation.scheduler import get_scheduler  # noqa: E402
-from app.services.dashboard.delivery_service import send_dashboard_delivery_job  # noqa: E402
 from app.services.database.sage_connector import init_sage_from_db_config  # noqa: E402
 from app.services.diagnostics import startup_check  # noqa: E402
 from app.utils.logger import AppLogger, get_logger  # noqa: E402
+from app.utils.loop_lag_monitor import (  # noqa: E402
+    LoopLagMonitor,
+    start_loop_lag_monitor,
+)
 
 logger = get_logger(__name__)
 
@@ -177,8 +181,25 @@ _SHUTDOWN_DRAIN_DELAY_S: Final[float] = 3.0
 #: Paths qui retournent un 404 silencieux (pas de body, pas de redirect).
 #: ``frozenset`` pour lookup O(1) + immutabilité (évite toute mutation
 #: accidentelle à runtime).
+#: ``/.well-known/`` + ``/apple-touch-icon`` : sondes automatiques du
+#: navigateur (Chrome DevTools probe ``/.well-known/appspecific/
+#: com.chrome.devtools.json`` à chaque ouverture des devtools ; iOS/Safari
+#: sonde ``apple-touch-icon``). Sans ces préfixes, ``prepare()`` les
+#: redirigeait vers ``/`` (302 vers une page HTML — incorrect pour une sonde)
+#: ET loggait un WARNING « Redirection 404 vers / » à chaque fois = bruit de
+#: log. On les traite comme des assets → 404 SILENCIEUX, pas de redirect, pas
+#: de warning. NB : ``/.well-known/acme-challenge/`` (certbot) est servi par
+#: nginx en amont, l'app ne le voit jamais — aucun conflit.
 _ASSET_PREFIXES: Final[frozenset[str]] = frozenset(
-    ("/static/", "/favicon", "/robots.txt", "/manifest.json", "/sitemap")
+    (
+        "/static/",
+        "/favicon",
+        "/robots.txt",
+        "/manifest.json",
+        "/sitemap",
+        "/.well-known/",
+        "/apple-touch-icon",
+    )
 )
 
 
@@ -252,6 +273,10 @@ class Application(tornado.web.Application):
             "autoreload": config.server.autoreload,
             "login_url": "/login",
             "default_handler_class": AppNotFoundHandler,
+            # UIModules partagés — composants serveur réutilisables appelés via
+            # ``{% module X(...) %}``. ``Pagination`` = barre de pagination
+            # unifiée (source unique, cf. app/ui_modules.py).
+            "ui_modules": {"Pagination": Pagination},
             # ``compress_response`` : active la compression gzip pour les
             # réponses HTTP qui dépassent ~1 KB (seuil interne Tornado).
             # Bénéfice typique : -70 % sur HTML/CSS/JS texte. Sans effet
@@ -363,6 +388,9 @@ class _ServerLifecycle:
         self._shutting_down: bool = False
         self._session_cleanup_cb: tornado.ioloop.PeriodicCallback | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # Moniteur de latence event-loop (observabilité H1 : détecte le code
+        # synchrone qui gèle le loop). ``None`` tant que non démarré / désactivé.
+        self._loop_lag_monitor: "LoopLagMonitor | None" = None
 
     # ── Background tasks helper ──────────────────────────────────────────
 
@@ -437,6 +465,9 @@ class _ServerLifecycle:
             "Nettoyage périodique sessions activé",
             extra={"period_seconds": _SESSION_CLEANUP_PERIOD_MS // 1000},
         )
+        # Moniteur de latence event-loop (H1 observabilité) — démarré au boot
+        # avec les autres callbacks périodiques. Retourne None si désactivé par env.
+        self._loop_lag_monitor = start_loop_lag_monitor(io_loop)
         _ = io_loop  # garde la signature stable si on branche plus tard l'io_loop
 
     # ── Shutdown ─────────────────────────────────────────────────────────
@@ -482,6 +513,10 @@ class _ServerLifecycle:
         if self._session_cleanup_cb is not None:
             self._session_cleanup_cb.stop()
             self._session_cleanup_cb = None
+        # Stoppe la sonde de latence event-loop (idempotent, no-op si désactivée).
+        if self._loop_lag_monitor is not None:
+            self._loop_lag_monitor.stop()
+            self._loop_lag_monitor = None
 
         # Drain : laisser les requêtes en vol terminer.
         try:
@@ -544,68 +579,6 @@ class _ServerLifecycle:
 
 
 # ─── Chargement des schedules dashboard ───────────────────────────────────
-
-
-async def _load_active_dashboard_schedules() -> None:
-    """Charge les planifications de dashboard actives et enregistre les jobs.
-
-    Isolé de :func:`load_active_automations` pour que son échec ne casse
-    pas le démarrage du scheduler général (migration en cours, table
-    ``dashboards`` dans un état transitoire, etc.).
-
-    Les imports sont placés ici (pas top-level) pour deux raisons :
-    1. :mod:`app.models.dashboard` tire un graphe SQLAlchemy non nécessaire
-       tant que la fonction n'est pas appelée (optimisation import time).
-    2. :mod:`sqlalchemy.select` doit être importé au premier usage pour
-       éviter les pollutions de namespace.
-
-    Note : ces imports locaux sont acceptés car documentés (règle
-    ``GLOBAL_FINDINGS.md`` — « lazy imports justifiés par docstring »).
-    """
-    from app.core.database import get_session_factory
-    from app.models.dashboard import Dashboard
-    from sqlalchemy import select
-
-    session_factory = get_session_factory()
-    async with session_factory() as session:
-        result = await session.execute(
-            select(Dashboard).where(Dashboard.schedule_enabled.is_(True))
-        )
-        dashboards = list(result.scalars().all())
-
-    if not dashboards:
-        logger.info("Aucune planification dashboard active")
-        return
-
-    scheduler = get_scheduler()
-    loaded = 0
-    for dash in dashboards:
-        stype = dash.schedule_type
-        sconfig = dash.schedule_config or {}
-        if not stype:
-            continue
-        try:
-            scheduler.add_job(
-                job_id=f"dashboard_schedule_{dash.id}",
-                func=send_dashboard_delivery_job,
-                trigger_type=stype,
-                trigger_config=sconfig,
-                args=[dash.id],
-                name=f"Dashboard delivery #{dash.id}",
-            )
-            loaded += 1
-        except (ValueError, KeyError) as exc:
-            logger.warning(
-                "Config schedule invalide pour dashboard",
-                extra={"dashboard_id": dash.id, "error_type": exc.__class__.__name__},
-            )
-    logger.info(
-        "Planifications dashboard chargées",
-        extra={"loaded": loaded, "total": len(dashboards)},
-    )
-
-
-# ─── Préchargement LLM (non-bloquant) ──────────────────────────────────────
 
 
 async def _preload_llm_providers() -> None:
@@ -672,10 +645,6 @@ def _start_automation_schedulers(io_loop: tornado.ioloop.IOLoop) -> None:
     except Exception:  # noqa: BLE001 — un scheduler HS ne doit pas planter l'app
         logger.exception("Erreur démarrage scheduler/automations")
 
-    try:
-        io_loop.run_sync(_load_active_dashboard_schedules, timeout=_STARTUP_STEP_TIMEOUT_S)
-    except Exception:  # noqa: BLE001 — best-effort
-        logger.warning("Erreur chargement planifications dashboard", exc_info=True)
 
 
 def _start_schema_sync_blocking(io_loop: tornado.ioloop.IOLoop) -> None:
@@ -905,6 +874,19 @@ def main() -> None:
 
     # 13. Signal handlers (SIGTERM / SIGINT).
     _install_signal_handlers(io_loop, server, lifecycle)
+
+    # 13b. Watchdog de liveness IOLoop — si la boucle gèle (deadlock, appel
+    #      synchrone bloquant, famine de ressources), il dumpe les stacks de
+    #      tous les threads sur stderr puis fait sortir le process → Docker
+    #      `restart: unless-stopped` (ou systemd/k8s) le relance tout seul.
+    #      Démarré APRÈS le boot synchrone (les run_sync des steps 8-10 ne font
+    #      pas tourner le PeriodicCallback, ce qui fausserait le battement).
+    #      Incident prod 2026-06-08 : gel total (même /health muet) que Docker
+    #      ne récupérait pas (un conteneur `unhealthy` n'est PAS redémarré, seul
+    #      un conteneur qui *sort* l'est). Opt-out : KOMPTIA_WATCHDOG_DISABLE=1.
+    from app.core.io_loop_watchdog import start_io_loop_watchdog
+
+    start_io_loop_watchdog(io_loop)
 
     # 14. Boucle événementielle.
     try:

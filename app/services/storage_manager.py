@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 _DEFAULT_QUOTA_BYTES: Final[int] = 500 * 1024 * 1024  # 500 MiB
 
 
-async def _get_global_quota(db: AsyncSession) -> int:
+async def _get_global_quota(db: Optional[AsyncSession] = None) -> int:
     """Récupère le quota global utilisateur depuis AIConfig.
 
     Source UNIQUE de vérité : valeur saisie par l'admin via
@@ -33,6 +33,10 @@ async def _get_global_quota(db: AsyncSession) -> int:
     pour TOUS les users — ignore le rôle (admin/user/reader). Fallback
     sur ``_DEFAULT_QUOTA_BYTES`` si la clé n'est pas encore en BDD
     (premier boot, avant que l'admin ait sauvé sa valeur).
+
+    Le paramètre ``db`` est conservé pour rétro-compat d'appel mais n'est PAS
+    utilisé (la valeur est lue via le cache du service AIConfig, qui gère sa
+    propre session).
     """
     # Import local pour éviter les cycles : storage_manager est appelé
     # avant que ai_config soit complètement chargé dans certains tests.
@@ -46,6 +50,46 @@ async def _get_global_quota(db: AsyncSession) -> int:
             return value
     except Exception as exc:
         logger.warning("Lecture quota depuis AIConfig échouée (fallback default) : %s", exc)
+    return _DEFAULT_QUOTA_BYTES
+
+
+async def get_storage_quota_bytes() -> int:
+    """SSoT runtime du quota de stockage par utilisateur (octets).
+
+    Valeur admin (/admin/performance → ``STORAGE_QUOTA_PER_USER_BYTES``),
+    identique pour tous les users. **SOURCE UNIQUE de toutes les limites de
+    classeur** : borne le stockage disque ET — depuis la suppression des caps
+    de décompression hardcodés — la taille DÉCOMPRESSÉE maximale d'un
+    ``.afz.json`` (sauvegarde / lecture / export anonymisé / téléchargement).
+
+    ⚠️ Conséquence mémoire : comme la décompression d'un ``.afz.json`` se fait
+    en RAM, ce quota borne aussi le pic mémoire d'une requête. L'admin doit
+    donc le dimensionner en connaissant la RAM du conteneur (le défaut 500 Mio
+    est sûr ; au-delà de ~800 Mio sur un conteneur ~3 Gio, surveiller l'OOM,
+    surtout sous concurrence ou sur le chemin export anonymisé ≈ 3× la taille).
+    """
+    return await _get_global_quota()
+
+
+def get_storage_quota_bytes_sync() -> int:
+    """Version SYNCHRONE de :func:`get_storage_quota_bytes` (lit le cache
+    AIConfig en mémoire) — pour les chemins de décompression exécutés dans un
+    thread (``asyncio.to_thread``) qui ne peuvent pas ``await``.
+
+    Fail-safe : si le cache AIConfig n'est pas encore chargé (boot à froid),
+    retombe sur ``_DEFAULT_QUOTA_BYTES`` (500 Mio) — JAMAIS une valeur trop
+    petite qui bloquerait à tort un classeur légitime.
+    """
+    from app.services.ai.config_service import get_ai_config_service
+    from app.models.ai_config import AIConfigKey
+
+    try:
+        svc = get_ai_config_service()
+        value = svc.get_cached_sync(AIConfigKey.STORAGE_QUOTA_PER_USER_BYTES, _DEFAULT_QUOTA_BYTES)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    except Exception as exc:
+        logger.warning("Lecture quota (sync) échouée (fallback default) : %s", exc)
     return _DEFAULT_QUOTA_BYTES
 
 

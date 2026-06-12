@@ -135,14 +135,13 @@ class SchemaLoader:
         # Sinon, charger depuis la base de données (training_data)
         logger.info("Chargement du schéma depuis training_data...")
         try:
-            import sqlite3
-            from app.config import get_config
+            from app.config import get_config  # utilisé plus bas (sage.database)
+            from app.core.database import open_local_sqlite_connection
 
-            # Connexion directe SQLite (synchrone)
-            config = get_config()
-            db_path = config.database.path
-
-            conn = sqlite3.connect(db_path, timeout=5.0)
+            # Connexion DBAPI brute sur la BDD LOCALE, AVEC le PRAGMA key
+            # SQLCipher posé par le helper (sinon base chiffrée illisible :
+            # « file is not a database »).
+            conn = open_local_sqlite_connection(timeout=5.0)
             try:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA busy_timeout = 30000")

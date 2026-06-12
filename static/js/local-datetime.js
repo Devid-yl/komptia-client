@@ -30,6 +30,18 @@
         try {
             var d = new Date(iso);
             if (isNaN(d.getTime())) return null;
+            // SSoT : déléguer au formateur JS UNIQUE (KomptiaFormat /
+            // format-helpers.js) quand il est chargé — un seul endroit où le
+            // format daté est défini. Fallback toLocale* ci-dessous si
+            // KomptiaFormat n'est pas encore dispo (edge : applyAll immédiat
+            // peut s'exécuter avant format-helpers, chargé juste après ce
+            // script dans base.html) → zéro régression.
+            var KF = (typeof window !== 'undefined') ? window.KomptiaFormat : null;
+            if (KF) {
+                if (mode === 'date') return KF.dateFr(d, { onInvalid: 'null' });
+                if (mode === 'time') return KF.timeHm(d, { onInvalid: 'null' });
+                return KF.dateTimeFr(d, { onInvalid: 'null' }); // datetime / short / fallback
+            }
             var fr = 'fr-FR';
             if (mode === 'date') {
                 return d.toLocaleDateString(fr);

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from sqlalchemy import select as sa_select
+from sqlalchemy import func, or_, select as sa_select
 
 from app.core.database import get_session
 from app.handlers.base import BaseHandler, admin_required
@@ -298,17 +298,74 @@ class DataAccessTablesAPIHandler(BaseHandler):
 
 
 class DataAccessUsersAPIHandler(BaseHandler):
-    """Retourne la liste compacte des users actifs pour le dropdown
-    de la page admin."""
+    """Liste des users actifs pour le picker de la page admin.
+
+    Le picker est un ``<select>`` : une barre de pagination à numéros n'a pas
+    de sens dessus (paginer ferait disparaître l'option sélectionnée). Le bon
+    pattern « état de l'art » pour un grand sélecteur d'utilisateurs est la
+    RECHERCHE serveur (typeahead, type Select2/Ant Select). On expose donc :
+
+      * ``q``                 — recherche serveur sur username/email (typeahead).
+      * ``page``/``per_page`` — pagination OPTIONNELLE (fondation scalable +
+        cohérence avec le reste de l'app). SANS ``page``, on renvoie tous les
+        users actifs filtrés par ``q`` → comportement historique préservé
+        (rétro-compatibilité stricte du dropdown).
+    """
+
+    _PER_PAGE_DEFAULT = 50
+    _PER_PAGE_MAX = 100
 
     @admin_required
     async def get(self) -> None:
-        async with get_session() as session:
-            stmt = (
-                sa_select(User.id, User.username, User.email, User.role, User.is_active)
-                .where(User.is_active.is_(True))
-                .order_by(User.username)
+        q = (self.get_argument("q", "") or "").strip()
+        page_arg = self.get_argument("page", None)
+        paginated = page_arg is not None
+
+        try:
+            per_page = int(self.get_argument("per_page", str(self._PER_PAGE_DEFAULT)))
+        except (TypeError, ValueError):
+            per_page = self._PER_PAGE_DEFAULT
+        per_page = min(max(1, per_page), self._PER_PAGE_MAX)
+
+        try:
+            page = int(page_arg) if paginated else 1
+        except (TypeError, ValueError):
+            page = 1
+        page = max(1, page)
+
+        def _search_clause():
+            # Échappe les wildcards LIKE : un '%' ou '_' tapé par l'admin ne
+            # doit pas se comporter en joker (correctness + anti-DoS).
+            needle = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{needle}%"
+            return or_(
+                User.username.ilike(like, escape="\\"),
+                User.email.ilike(like, escape="\\"),
             )
+
+        async with get_session() as session:
+            stmt = sa_select(
+                User.id, User.username, User.email, User.role, User.is_active
+            ).where(User.is_active.is_(True))
+            if q:
+                stmt = stmt.where(_search_clause())
+            stmt = stmt.order_by(User.username)
+
+            total: Optional[int] = None
+            total_pages: Optional[int] = None
+            if paginated:
+                count_stmt = (
+                    sa_select(func.count())
+                    .select_from(User)
+                    .where(User.is_active.is_(True))
+                )
+                if q:
+                    count_stmt = count_stmt.where(_search_clause())
+                total = int((await session.execute(count_stmt)).scalar() or 0)
+                total_pages = max(1, -(-total // per_page))  # ceil
+                page = min(page, total_pages)
+                stmt = stmt.limit(per_page).offset((page - 1) * per_page)
+
             rows = (await session.execute(stmt)).all()
 
         users: List[dict] = []
@@ -324,7 +381,17 @@ class DataAccessUsersAPIHandler(BaseHandler):
                 }
             )
 
-        self.write_json({"users": users, "count": len(users)})
+        payload: dict = {"users": users, "count": len(users)}
+        if paginated:
+            payload.update(
+                {
+                    "page": page,
+                    "per_page": per_page,
+                    "total": total,
+                    "total_pages": total_pages,
+                }
+            )
+        self.write_json(payload)
 
 
 # ── CRUD règles d'un user ─────────────────────────────────────────

@@ -373,7 +373,15 @@ class SchemaFreshnessChecker:
                 else:
                     # Row malformée — skip plutôt que de crasher.
                     continue
-                live_columns.append((str(name), norm_type, str(is_nullable or "")))
+                # INFORMATION_SCHEMA.IS_NULLABLE renvoie "YES"/"NO" ; le DDL stocké
+                # (donc ``_extract_columns_full_from_ddl``) utilise "NULL"/"NOT NULL".
+                # On normalise le live AU FORMAT DDL pour que
+                # ``_compute_columns_hash(live)`` et ``...(stored)`` soient
+                # comparables. Sans ça, le nullable ne matche JAMAIS → un
+                # ``column_modified`` fantôme est émis pour CHAQUE table inchangée
+                # ayant un DDL stocké (faux positif de dérive de schéma).
+                _nullable_norm = "NULL" if str(is_nullable).strip().upper() == "YES" else "NOT NULL"
+                live_columns.append((str(name), norm_type, _nullable_norm))
             live_names = {col[0].lower() for col in live_columns}
             live_hash = self._compute_columns_hash(live_columns)
 

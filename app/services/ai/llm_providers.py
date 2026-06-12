@@ -972,16 +972,22 @@ def _resolve_compact_summarizer_model(provider: Any, fallback_model: str) -> str
     L'option (1) permet à un admin avec Opus 4.7 ($15/$75 le Mtok) de
     rediriger les compactages vers Haiku 4.5 ($1/$5) → ×15 d'économie.
     """
-    # 1. utility_model BDD (registre éditable admin)
+    # 1. utility_model BDD (registre éditable admin) — DU MÊME PROVIDER que
+    # l'appel parent : le résumé part via ``mgr.generate(provider_name=
+    # provider.provider_name)`` (cf. plus bas), donc un utility d'un AUTRE
+    # provider est garanti 404. Incident 2026-06-12 : sans ce filtre,
+    # ``phi3:mini`` (ollama, is_utility=1 en base) partait sur l'API
+    # Anthropic → 404 → « falling back to truncation » à CHAQUE compaction,
+    # en silence. Accès via l'API publique du registre — l'itération directe
+    # de ``_cache_by_name`` est un anti-pattern (cf. CLAUDE.md).
     try:
-        from app.services.ai.llm_model_registry import LlmModelRegistry
+        from app.services.ai.llm_model_registry import get_llm_model_registry
 
-        instance = LlmModelRegistry._instance
-        if instance is not None:
-            # Cherche un modèle marqué utility (champ optionnel)
-            for meta in instance._cache_by_name.values():
-                if meta.get("is_utility") and meta.get("name"):
-                    return str(meta["name"])
+        utility = get_llm_model_registry().find_utility_model_sync(
+            getattr(provider, "provider_name", None)
+        )
+        if utility:
+            return utility
     except Exception:  # noqa: BLE001
         pass
     # 2. Manager default model
@@ -1436,8 +1442,29 @@ def _should_retry_http(status_code: int) -> bool:
 
 
 def _should_retry_exception(exc: BaseException) -> bool:
-    """True si l'exception réseau est transitoire (à retry)."""
+    """True si l'exception réseau appartient à la catégorie « transitoire ».
+
+    NB : ce classifieur reste vrai pour un ``ConnectError`` (c'EST une erreur
+    réseau). La DÉCISION de ne pas retry un refus de connexion est une politique
+    prise dans les boucles de retry via :func:`_is_connection_refused` (fail-fast
+    UX), pas une propriété de l'exception — on garde les deux notions séparées.
+    """
     return isinstance(exc, _RETRIABLE_NETWORK_EXC)
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    """True si l'exception est un REFUS de connexion / endpoint injoignable
+    (service down, DNS introuvable, no route) — distinct d'un timeout ou d'un
+    reset transitoire.
+
+    On NE retry PAS ces erreurs : « All connection attempts failed » se
+    reproduit à l'identique en 1-2-4 s (Ollama arrêté, API injoignable). Retry
+    = 7 s gaspillés AVANT que le caller / le fallback runtime ne réagisse.
+    Fix prod 2026-06-09 : improve-pseudo restait bloqué 7 s sur un LLM local
+    arrêté à cause des 3 retries provider, alors même que le caller avait
+    demandé un fail-fast.
+    """
+    return isinstance(exc, (httpx.ConnectError, ConnectionRefusedError))
 
 
 def _compute_backoff(
@@ -1761,7 +1788,15 @@ class OpenAIProvider(LLMProvider):
                     )
             return models
         except (ConnectionError, asyncio.TimeoutError, OSError, httpx.ConnectError) as e:
-            logger.error("Erreur listing modèles OpenAI: %s", e)
+            # Provider injoignable (réseau, service local down, base_url
+            # erronée) = condition transitoire ATTENDUE, pas une erreur interne.
+            # WARNING (pas ERROR) pour ne pas polluer les logs / déclencher des
+            # alertes : on dégrade proprement en liste vide. Cohérent avec le
+            # fallback Anthropic list_models et le path local Ollama down.
+            logger.warning(
+                "Provider OpenAI injoignable au listing des modèles (%s) — " "fallback liste vide",
+                type(e).__name__,
+            )
             return []
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -1874,7 +1909,11 @@ class OpenAIProvider(LLMProvider):
                 response = await client.post(f"{self.base_url}/chat/completions", json=payload)
                 duration = time.time() - start
             except _RETRIABLE_NETWORK_EXC as exc:
-                if attempt < max_retries:
+                # Refus de connexion (endpoint injoignable) → PAS de retry :
+                # « All connection attempts failed » se reproduit à l'identique
+                # en 1+2+4 s. Échec immédiat (fix prod 2026-06-09 : improve-pseudo
+                # restait bloqué 7 s sur un Ollama arrêté).
+                if not _is_connection_refused(exc) and attempt < max_retries:
                     delay = _compute_backoff(attempt, None)
                     logger.warning(
                         "OpenAI generate %s, retry %d/%d in %.0fs",
@@ -1885,7 +1924,13 @@ class OpenAIProvider(LLMProvider):
                     )
                     await asyncio.sleep(delay)
                     continue
-                logger.error("OpenAI generate network error après retries: %s", exc)
+                if _is_connection_refused(exc):
+                    logger.warning(
+                        "OpenAI generate: endpoint injoignable (%s) — pas de retry.",
+                        type(exc).__name__,
+                    )
+                else:
+                    logger.error("OpenAI generate network error après retries: %s", exc)
                 raise
 
             if _should_retry_http(response.status_code) and attempt < max_retries:
@@ -5003,57 +5048,125 @@ class LLMManager:
             provider_name=provider.provider_name,
             request=request,
         )
-        async with wrapper:
-            try:
-                async for event in provider.stream_with_tools(
-                    request,
-                    tools,
-                    messages,
-                    thinking_budget=thinking_budget,
-                    user_id=user_id,
-                ):
-                    wrapper.observe(event)
-                    yield event
-            except asyncio.CancelledError:
-                # Cancel légitime (WebSocket fermé, user a quitté l'onglet).
-                # Pas une erreur — laisser le wrapper flush et re-raise pour
-                # signaler propre à la couche caller (qui gère via finally).
-                raise
-            except (httpx.CloseError, RuntimeError) as exc:
-                # Crash provoqué par un ``_reinit_after_config_change``
-                # exécuté pendant que le stream tournait (admin a cliqué
-                # "Effacer la connexion" ou switch modèle). L'``AsyncClient``
-                # httpx en cours d'utilisation a été fermé sous nos pieds.
-                # Plutôt que de remonter une exception opaque qui ferait
-                # crasher la WebSocket Iris avec une 500, on émet un event
-                # d'erreur explicite. Cf. review adversariale 2026-05-14
-                # CRIT2 : on ne se fie PAS au message string (fragile aux
-                # changements Python/httpx) mais à l'état réel du client
-                # via ``_is_provider_client_closed`` (helper avec fallback
-                # safe). Si le client n'est PAS fermé, c'est un vrai bug
-                # → on re-raise pour ne pas masquer.
-                if not self._is_provider_client_closed(provider):
+        # M5 / dette P1#15 (2026-06-10) — fallback Ollama sur le chemin
+        # STREAMING, promesse CLAUDE.md « fallback runtime quand le primary
+        # cloud est indisponible ». Frontière de sécurité : le fallback ne
+        # s'engage QUE si l'échec survient AVANT le premier event yielé —
+        # après, des deltas sont déjà partis au client et re-streamer depuis
+        # le local dupliquerait le contenu (on propage alors, comme avant).
+        # Mécanique : on délègue à ``_simulate_stream_from_non_stream`` qui
+        # passe par ``self.generate_with_tools`` (manager) — lequel wire DÉJÀ
+        # le fallback ``_try_local_fallback_or_reraise`` + accounting. Le
+        # primary y est retenté une fois (un 429/réseau transitoire peut se
+        # résorber sans Ollama) avant la bascule locale.
+        _stream_fallback_exc: Optional[BaseException] = None
+        _yielded_any = False
+        try:
+            async with wrapper:
+                try:
+                    async for event in provider.stream_with_tools(
+                        request,
+                        tools,
+                        messages,
+                        thinking_budget=thinking_budget,
+                        user_id=user_id,
+                    ):
+                        wrapper.observe(event)
+                        _yielded_any = True
+                        yield event
+                except asyncio.CancelledError:
+                    # Cancel légitime (WebSocket fermé, user a quitté l'onglet).
+                    # Pas une erreur — laisser le wrapper flush et re-raise pour
+                    # signaler propre à la couche caller (qui gère via finally).
                     raise
-                logger.warning(
-                    "stream_with_tools interrompu (%s) alors que le client "
-                    "httpx est fermé — émission d'un event provider_reset "
-                    "propre au caller (au lieu d'une 500 opaque).",
-                    type(exc).__name__,
-                )
-                # Format aligné avec la convention agent_service.run() :
-                # ``{"type": "error", "message": "..."}`` — le client iris.js
-                # (case 'error' à iris.js:3194) lit ``event.message`` direct.
-                # ``error_kind`` séparé pour traçabilité / dashboard sans
-                # casser la convention.
-                yield {
-                    "type": "error",
-                    "message": (
-                        "La configuration du provider a été modifiée "
-                        "pendant que la réponse était générée. Réessayez "
-                        "votre demande."
-                    ),
-                    "error_kind": "provider_reset_during_stream",
-                }
+                except (httpx.CloseError, RuntimeError) as exc:
+                    # Crash provoqué par un ``_reinit_after_config_change``
+                    # exécuté pendant que le stream tournait (admin a cliqué
+                    # "Effacer la connexion" ou switch modèle). L'``AsyncClient``
+                    # httpx en cours d'utilisation a été fermé sous nos pieds.
+                    # Plutôt que de remonter une exception opaque qui ferait
+                    # crasher la WebSocket Iris avec une 500, on émet un event
+                    # d'erreur explicite. Cf. review adversariale 2026-05-14
+                    # CRIT2 : on ne se fie PAS au message string (fragile aux
+                    # changements Python/httpx) mais à l'état réel du client
+                    # via ``_is_provider_client_closed`` (helper avec fallback
+                    # safe). Si le client n'est PAS fermé, c'est un vrai bug
+                    # → on re-raise pour ne pas masquer.
+                    if not self._is_provider_client_closed(provider):
+                        # Revue adv. 2026-06-10 (CRITIQUE) : un RuntimeError
+                        # « max retries exceeded » est ÉLIGIBLE au fallback
+                        # (cas P4#26, rate-limit post-retries) mais cette
+                        # branche l'intercepte AVANT le ``except Exception``
+                        # du fallback — sans ce bloc, le fix ratait
+                        # précisément sa cible principale.
+                        if (
+                            not _yielded_any
+                            and fallback_policy != "none"
+                            and self._local_fallback is not None
+                            and self._is_fallback_eligible_error(exc)
+                        ):
+                            _stream_fallback_exc = exc
+                        raise
+                    logger.warning(
+                        "stream_with_tools interrompu (%s) alors que le client "
+                        "httpx est fermé — émission d'un event provider_reset "
+                        "propre au caller (au lieu d'une 500 opaque).",
+                        type(exc).__name__,
+                    )
+                    # Format aligné avec la convention agent_service.run() :
+                    # ``{"type": "error", "message": "..."}`` — le client iris.js
+                    # (case 'error' à iris.js:3194) lit ``event.message`` direct.
+                    # ``error_kind`` séparé pour traçabilité / dashboard sans
+                    # casser la convention.
+                    yield {
+                        "type": "error",
+                        "message": (
+                            "La configuration du provider a été modifiée "
+                            "pendant que la réponse était générée. Réessayez "
+                            "votre demande."
+                        ),
+                        "error_kind": "provider_reset_during_stream",
+                    }
+                except Exception as exc:
+                    if (
+                        not _yielded_any
+                        and fallback_policy != "none"
+                        and self._local_fallback is not None
+                        and self._is_fallback_eligible_error(exc)
+                    ):
+                        # Mémorise puis RE-RAISE : le wrapper (__aexit__ avec
+                        # exception) enregistre l'échec du PRIMARY — métrique
+                        # fidèle. Le try externe absorbe et lance le fallback.
+                        _stream_fallback_exc = exc
+                    raise
+        except BaseException as outer_exc:
+            # Revue adv. 2026-06-10 (Moyen) : test d'IDENTITÉ, pas seulement
+            # de présence — ``wrapper.__aexit__`` fait un ``await flush()``
+            # (écriture BDD) qui peut lever/être annulé et REMPLACER
+            # l'exception du corps. Sans ce check, une CancelledError du
+            # flush serait absorbée (fallback parasite alors que le caller
+            # a annulé) et la cause réelle masquée.
+            if _stream_fallback_exc is None or outer_exc is not _stream_fallback_exc:
+                raise
+            # Échec primary éligible avant le 1er event : absorbé — le flux
+            # simulé (avec fallback Ollama wiré) prend le relais ci-dessous.
+        if _stream_fallback_exc is not None:
+            logger.warning(
+                "stream_with_tools: primary KO avant le 1er event (%s: %s) — "
+                "bascule vers le flux simulé generate_with_tools (fallback "
+                "local wiré).",
+                type(_stream_fallback_exc).__name__,
+                _stream_fallback_exc,
+            )
+            async for event in self._simulate_stream_from_non_stream(
+                request,
+                tools,
+                messages,
+                provider_name=provider_name,
+                thinking_budget=thinking_budget,
+                user_id=user_id,
+            ):
+                yield event
 
     @staticmethod
     def _is_provider_client_closed(provider: Any) -> bool:
@@ -5230,7 +5343,13 @@ class LLMManager:
                 models = await provider.list_models()
                 all_models[name] = models
             except (ConnectionError, asyncio.TimeoutError, OSError, httpx.ConnectError) as e:
-                logger.error("Erreur listing modèles %s: %s", name, e)
+                # Reachability transitoire (cf. note OpenAIProvider.list_models) :
+                # WARNING, pas ERROR — un provider down ne casse pas l'admin.
+                logger.warning(
+                    "Provider %s injoignable au listing des modèles (%s) — " "fallback liste vide",
+                    name,
+                    type(e).__name__,
+                )
                 all_models[name] = []
         return all_models
 
@@ -5244,7 +5363,13 @@ class LLMManager:
         try:
             return await provider.list_models()
         except (ConnectionError, asyncio.TimeoutError, OSError, httpx.ConnectError) as e:
-            logger.error("Erreur listing modèles %s: %s", provider_name, e)
+            # Reachability transitoire (cf. note OpenAIProvider.list_models) :
+            # WARNING, pas ERROR — un provider down ne casse pas l'admin.
+            logger.warning(
+                "Provider %s injoignable au listing des modèles (%s) — " "fallback liste vide",
+                provider_name,
+                type(e).__name__,
+            )
             return []
 
     async def health_check_all(self, force_refresh: bool = False) -> Dict[str, bool]:
@@ -5414,7 +5539,9 @@ async def _load_local_fallback_from_config(manager: "LLMManager", config_service
         return
 
     try:
-        local_url = (await config_service.get("local_llm_base_url")) or "http://localhost:11434/v1"
+        from app.services.ai.config_service import default_local_llm_base_url
+
+        local_url = (await config_service.get("local_llm_base_url")) or default_local_llm_base_url()
         local_model = await config_service.get("local_llm_model") or ""
         # Validation SSRF (review HIGH #1) : refuser les schemes/hosts
         # qui exposent un service interne (metadata cloud, file://, etc.)
@@ -5424,6 +5551,21 @@ async def _load_local_fallback_from_config(manager: "LLMManager", config_service
                 "Schémas autorisés : http/https. Hosts metadata "
                 "(169.254.169.254, metadata.google.internal, "
                 "metadata.azure.com) bloqués.",
+                local_url,
+            )
+            return
+        # Garde request-time (anti DNS-rebinding) : même contrôle que les probes
+        # /status et /detect — résout l'hôte et refuse si une IP résolue est
+        # metadata/link-local (privé/LAN reste autorisé). Symétrie : sans ça, le
+        # chemin runtime (répété, non surveillé) serait MOINS protégé que le
+        # simple test admin. getaddrinfo bloquant → to_thread.
+        import asyncio as _asyncio
+
+        _runtime_safe, _ = await _asyncio.to_thread(_assert_resolved_ip_safe, local_url)
+        if not _runtime_safe:
+            logger.warning(
+                "LLM local : URL refusée (anti-rebinding) — résout vers une IP "
+                "metadata/link-local interdite (%s). Fallback non enregistré.",
                 local_url,
             )
             return
@@ -5588,6 +5730,10 @@ def _is_safe_local_llm_url(url: str) -> bool:
     internes / metadata cloud (review HIGH #1). L'admin peut utiliser
     n'importe quelle URL HTTP locale ou réseau privé légitime
     (Ollama localhost, LM Studio LAN, TGI cluster interne).
+
+    Check *string* bon-marché (au save). Complété au *request-time* par
+    ``_assert_resolved_ip_safe`` (résolution DNS réelle, anti-rebinding) avant
+    toute requête serveur — appeler les DEUX sur un chemin qui fetch l'URL.
     """
     if not url or not isinstance(url, str):
         return False
@@ -5605,6 +5751,8 @@ def _is_safe_local_llm_url(url: str) -> bool:
     # Hosts metadata cloud explicitement bloqués
     blocked_hosts = {
         "169.254.169.254",  # AWS / Azure / GCP IMDS v1
+        "100.100.100.200",  # Alibaba Cloud metadata
+        "192.0.0.192",  # Oracle OCI metadata
         "metadata.google.internal",
         "metadata.azure.com",
         "[fd00:ec2::254]",  # AWS IMDS IPv6
@@ -5615,6 +5763,88 @@ def _is_safe_local_llm_url(url: str) -> bool:
     if host.startswith("fe80:") or host.startswith("[fe80:"):
         return False
     return True
+
+
+# IP littérales de metadata cloud à bloquer même APRÈS résolution DNS
+# (anti-rebinding). Les ranges link-local (169.254/16, fe80::/10) qui les
+# contiennent sont bloqués via ``ipaddress.is_link_local`` ci-dessous.
+_CLOUD_METADATA_IPS = frozenset(
+    {
+        "169.254.169.254",  # AWS / Azure / GCP IMDS v1
+        "100.100.100.200",  # Alibaba Cloud
+        "192.0.0.192",  # Oracle OCI
+        "fd00:ec2::254",  # AWS IMDS IPv6
+    }
+)
+
+
+def _is_blocked_resolved_ip(ip_str: str) -> bool:
+    """True si une IP (résolue ou littérale) doit être bloquée.
+
+    Bloque les littéraux metadata multi-cloud + tout le range link-local
+    (169.254.0.0/16, fe80::/10) qui les contient. AUTORISE explicitement
+    loopback (127/8, ::1) et privé/LAN (10/8, 172.16/12, 192.168/16) —
+    c'est le cas d'usage légitime d'un LLM local.
+    """
+    import ipaddress
+
+    if ip_str in _CLOUD_METADATA_IPS:
+        return True
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    # IPv4-mapped IPv6 (``::ffff:169.254.169.254``) : juger sur le v4 embarqué.
+    # Sinon ``is_link_local`` vaut False sur la forme mappée et un littéral
+    # mappé vers l'IMDS contournerait le garde.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        return _is_blocked_resolved_ip(str(mapped))
+    return bool(ip.is_link_local)
+
+
+def _assert_resolved_ip_safe(url: str) -> "tuple[bool, Optional[str]]":
+    """Garde SSRF *request-time* (anti DNS-rebinding — OWASP SSRF).
+
+    Résout réellement le hostname et bloque si UNE des IP résolues pointe vers
+    un endpoint metadata cloud / link-local. Complète ``_is_safe_local_llm_url``
+    (check string au save) : ici on résout juste avant la requête httpx serveur.
+    ``getaddrinfo`` est bloquant → l'appeler via ``asyncio.to_thread`` depuis un
+    handler async pour ne pas bloquer l'event loop.
+
+    Retour ``(safe, reason)`` :
+      - ``(True, None)`` : sûr, OU hôte non résolvable (on laisse la requête
+        échouer naturellement en « injoignable » — pas de régression vs le
+        check string qui acceptait déjà un hostname interne non résolu).
+      - ``(False, reason)`` : schéma/hôte refusé, ou IP résolue bloquée.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    if not _is_safe_local_llm_url(url):
+        return False, "schéma ou hôte refusé (anti-SSRF)"
+    host = (urlparse(url.strip()).hostname or "").strip("[]")
+    if not host:
+        return False, "hôte vide"
+    # Hôte déjà une IP littérale → pas de DNS, jugement direct.
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(host)
+        if _is_blocked_resolved_ip(host):
+            return False, f"IP metadata/link-local bloquée ({host})"
+        return True, None
+    except ValueError:
+        pass  # hostname → résolution réelle
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return True, None  # non résolvable → échec naturel « injoignable » en aval
+    for info in infos:
+        ip_str = info[4][0]
+        if _is_blocked_resolved_ip(ip_str):
+            return False, f"hôte résout vers une IP bloquée ({ip_str})"
+    return True, None
 
 
 def _warn_if_no_primary_model(api_type: str, primary_model: Optional[str]) -> None:

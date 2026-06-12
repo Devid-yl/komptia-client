@@ -275,17 +275,48 @@ def _groupby(columns: list[str], rows: list[list[Any]], params: dict[str, Any]) 
     elif sort == "asc":
         aggregated.sort(key=lambda x: x[1])
 
-    if limit is not None and limit > 0:
-        aggregated = aggregated[:limit]
+    # #48 — au-delà de `limit`, NE PAS dropper en silence (un camembert affiche
+    # alors des % calculés sur un total partiel présenté comme 100%). Pour les
+    # agg ADDITIVES (sum/count), on regroupe la queue dans « Autres » (total
+    # préservé, % corrects — aligné sur le path 2D :477-501). Pour les agg NON
+    # additives (avg/min/max), un « Autres » serait FAUX → on expose
+    # `truncated_categories` (honnête) pour que le renderer/insight le signale.
+    truncated_categories = 0
+    if limit is not None and limit > 0 and len(aggregated) > limit:
+        if agg in ("sum", "count"):
+            kept = aggregated[: limit - 1] if limit >= 1 else []
+            tail_cats = [c for c, _ in aggregated[len(kept):]]
+            tail_vals: list[float] = []
+            for c in tail_cats:
+                tail_vals.extend(buckets[c])
+            tail_value = _aggregate(tail_vals, agg)
+            # #48 review (Faible) — collision : si une VRAIE catégorie « Autres »
+            # est déjà dans le top, FUSIONNER (additif) au lieu de créer un
+            # label dupliqué (deux parts « Autres » mal rendues).
+            _existing = next(
+                (i for i, (c, _) in enumerate(kept) if str(c) == "Autres"), None
+            )
+            if _existing is not None:
+                kept[_existing] = (kept[_existing][0], kept[_existing][1] + tail_value)
+            else:
+                kept.append(("Autres", tail_value))
+            aggregated = kept
+        else:
+            truncated_categories = len(aggregated) - limit
+            aggregated = aggregated[:limit]
 
     labels = [str(c) for c, _ in aggregated]
     data = [v for _, v in aggregated]
     series_label = params.get("label") or (value_col if value_col else "count")
-    return {
+    result: dict[str, Any] = {
         "type": "chart",
         "labels": labels,
         "datasets": [{"label": series_label, "data": data}],
     }
+    if truncated_categories:
+        # Métadonnée honnête : Top N sur Y catégories (agg non sommable).
+        result["truncated_categories"] = truncated_categories
+    return result
 
 
 def _time_series(
